@@ -227,11 +227,17 @@ def _add_common_scan_args(parser: argparse.ArgumentParser) -> None:
 # COMMAND HANDLERS
 # ══════════════════════════════════════════════════════════════════════
 
-def handle_scan(args: argparse.Namespace, framework_key: str) -> int:
+def handle_scan(args: argparse.Namespace, framework_key: str, extra_args: list[str] | None = None) -> int:
     """Handle a scan framework command (net, web, ad, ai).
 
     Dispatches to the framework script, optionally launching the
     dashboard alongside and setting up multi-target orchestration.
+
+    Args:
+        args:          Parsed common arguments.
+        framework_key: One of "net", "web", "ad", "ai".
+        extra_args:    Unknown/framework-specific args from parse_known_args
+                       that should be forwarded to the framework script.
 
     Returns:
         Exit code.
@@ -255,9 +261,10 @@ def handle_scan(args: argparse.Namespace, framework_key: str) -> int:
         print(f"  [*] Use --target <target>, --targets <file>, or --resume <dir>")
         return 1
 
-    # Build framework command
-    # We pass through all unknown args to the framework script
+    # Build framework command — common args first, then framework-specific extras
     framework_args = _build_framework_args(args, framework_key)
+    if extra_args:
+        framework_args.extend(extra_args)
     cmd = [sys.executable, str(full_path)] + framework_args
 
     # Dashboard co-launch
@@ -445,7 +452,6 @@ def _launch_dashboard_background(
         sys.executable, str(BASE_DIR / "forge.py"),
         "dashboard",
         "--port", str(port),
-        "--no-auth",
     ]
     try:
         proc = subprocess.Popen(
@@ -613,7 +619,7 @@ def _handle_intel_search(args: argparse.Namespace) -> int:
         return 1
 
     engine = IntelEngine()
-    results = engine.search(query=query, limit=args.limit)
+    results = engine.search(query=query, limit=args.limit, severity=args.severity)
     for r in results:
         print(f"  {r}")
     return 0
@@ -750,9 +756,10 @@ def main() -> int:
     # have their own argparse and we pass through unknown args
     if command in FRAMEWORKS:
         parser = build_parser()
-        # Parse only known args — rest goes to framework
+        # Parse only known args — framework-specific flags go into `unknown`
+        # and are forwarded to the framework script unchanged.
         args, unknown = parser.parse_known_args()
-        return handle_scan(args, command)
+        return handle_scan(args, command, unknown)
 
     # Platform commands — full argparse parsing
     if command in ("dashboard", "c2", "intel", "payload"):

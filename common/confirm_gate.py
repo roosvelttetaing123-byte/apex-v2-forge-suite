@@ -1,6 +1,7 @@
 """Operator confirmation gate — required before any active exploitation action."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from typing import Callable
@@ -26,7 +27,7 @@ def set_auto_confirm(enabled: bool) -> None:
         )
 
 
-def confirm(
+async def confirm(
     module: str,
     action: str,
     target: str,
@@ -35,6 +36,8 @@ def confirm(
     on_skip: Callable[[], None] | None = None,
 ) -> bool:
     """Display an operator confirmation prompt before executing a sensitive action.
+
+    This is async so the event loop is not blocked while waiting for input.
 
     Args:
         module:     Module name requesting confirmation (e.g. 'kerberoast').
@@ -71,7 +74,9 @@ def confirm(
     ))
 
     try:
-        answer = input("  Confirm (yes/no): ").strip().lower()
+        # Run blocking input() in a thread so the event loop stays alive.
+        answer = await asyncio.to_thread(input, "  Confirm (yes/no): ")
+        answer = answer.strip().lower()
     except (EOFError, KeyboardInterrupt):
         answer = "no"
 
@@ -107,11 +112,12 @@ class TestConfirmGate:
     """Unit tests for confirm_gate module."""
 
     def test_auto_confirm_mode(self) -> None:
+        import asyncio
         set_auto_confirm(True)
-        result = confirm(
+        result = asyncio.run(confirm(
             module="test", action="test action", target="127.0.0.1",
             risk="low", on_confirm=None, on_skip=None,
-        )
+        ))
         assert result is True
         set_auto_confirm(False)
 
@@ -122,11 +128,12 @@ class TestConfirmGate:
         assert _AUTO_CONFIRM is False
 
     def test_callbacks_called(self) -> None:
+        import asyncio
         called = []
         set_auto_confirm(True)
-        confirm(
+        asyncio.run(confirm(
             module="test", action="act", target="t", risk="r",
             on_confirm=lambda: called.append("confirmed"),
-        )
+        ))
         assert "confirmed" in called
         set_auto_confirm(False)

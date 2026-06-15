@@ -49,6 +49,7 @@ class Finding:
     mitre_attack:        list[str]               = field(default_factory=list)
     port:                int | None              = None
     service:             str | None              = None
+    url:                 str | None              = None
     operator_confirmed:  bool                    = False
     tags:                list[str]               = field(default_factory=list)
 
@@ -72,6 +73,7 @@ class Finding:
             "reproduction_steps":  self.reproduction_steps,
             "remediation":         self.remediation,
             "references":          self.references,
+            "url":                 self.url,
             "cvss_v31_vector":     self.cvss_v31_vector,
             "cvss_v31_score":      self.cvss_v31_score,
             "cvss_v40_vector":     self.cvss_v40_vector,

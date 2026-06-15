@@ -47,6 +47,8 @@ class FindingModel(Base):
     discovered_at    = Column(DateTime,    default=lambda: datetime.now(timezone.utc))
     engagement       = Column(String(200), nullable=True)
     tester           = Column(String(200), nullable=True)
+    run_id           = Column(String(36),  nullable=True)
+    url              = Column(String(2000), nullable=True)
 
 
 class ScanRunModel(Base):
@@ -173,6 +175,8 @@ def save_finding(session: Session, finding_dict: dict[str, Any], run_id: str | N
         pcap_path            = ev.get("pcap_path"),
         operator_confirmed   = finding_dict.get("operator_confirmed", False),
         tags                 = json.dumps(finding_dict.get("tags", [])),
+        run_id               = run_id,
+        url                  = finding_dict.get("url"),
     )
     session.merge(model)
     session.commit()

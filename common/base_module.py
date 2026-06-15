@@ -70,6 +70,7 @@ class BaseModule(ABC):
         self.results_dir = results_dir
         self.run_id      = run_id or str(uuid.uuid4())
         self.findings:   list[Finding] = []
+        self.errors:     list[str]     = []
         self.log         = logging.getLogger(f"forge.{self.NAME}")
         self._last_request_time: float = 0.0
         self._evidence_dir = results_dir / "evidence"
@@ -132,7 +133,7 @@ class BaseModule(ABC):
             module=self.NAME,
             target=finding.target,
             cvss_score=finding.cvss_v31_score,
-            url=getattr(finding, 'url', ''),
+            url=finding.url or "",
             port=finding.port,
             service=finding.service,
             description=finding.description,
@@ -176,7 +177,7 @@ class BaseModule(ABC):
         self.add_finding(f)
         return f
 
-    def confirm_action(
+    async def confirm_action(
         self,
         action: str,
         target: str,
@@ -185,7 +186,7 @@ class BaseModule(ABC):
         on_skip: Any = None,
     ) -> bool:
         """Require operator confirmation before executing a sensitive action."""
-        return confirm(
+        return await confirm(
             module=self.NAME,
             action=action,
             target=target,
@@ -218,8 +219,13 @@ class BaseModule(ABC):
             self.log.debug("Screenshot unavailable: %s", exc)
             return None
 
+    def add_error(self, message: str) -> None:
+        """Record a non-fatal module error for inclusion in the result."""
+        self.errors.append(message)
+        self.log.error("[ERROR] %s: %s", self.NAME, message)
+
     def _make_result(self, start_time: float, skipped: bool = False, skip_reason: str = "") -> ModuleResult:
-        """Build a ModuleResult from accumulated findings."""
+        """Build a ModuleResult from accumulated findings and errors."""
         duration = time.monotonic() - start_time
         if skipped:
             self._emit_event("module_skip", name=self.NAME, reason=skip_reason)
@@ -227,10 +233,12 @@ class BaseModule(ABC):
             self._emit_event(
                 "module_complete", name=self.NAME,
                 findings_count=len(self.findings), duration=duration,
+                error_count=len(self.errors),
             )
         return ModuleResult(
             module_name=self.NAME,
             findings=self.findings,
+            errors=self.errors,
             duration_s=duration,
             skipped=skipped,
             skip_reason=skip_reason,
