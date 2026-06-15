@@ -1,0 +1,21 @@
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  path_instructions:
+    - path: "netforge/**"
+      instructions: "This is a network penetration testing module. Focus on async safety, error handling, and OpSec correctness."
+    - path: "webforge/**"
+      instructions: "This is a web application security testing module. Focus on payload correctness, false positive reduction, and request safety."
+    - path: "adforge/**"
+      instructions: "This is an Active Directory attack/audit module. Focus on Kerberos protocol correctness, LDAP query safety, and error handling."
+    - path: "aiforge/**"
+      instructions: "This is an AI/LLM security testing module. Focus on test coverage completeness and result accuracy."
+    - path: "forge_c2/**"
+      instructions: "This is a C2 framework. Focus on encryption correctness, beacon reliability, and operator safety controls."
+    - path: "common/**"
+      instructions: "Shared utilities. Focus on correctness, thread safety, and reuse across modules."
