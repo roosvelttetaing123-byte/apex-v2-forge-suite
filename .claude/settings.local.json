@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python -c ' *)",
+      "PowerShell(python -c \"import sys; print\\(sys.version\\); import yaml; import rich; import sqlalchemy; import pydantic; print\\('core deps OK'\\)\" 2>&1)",
+      "Bash(gh auth *)",
+      "PowerShell(gh --version 2>&1)",
+      "PowerShell(winget list --name \"GitHub CLI\" 2>&1)"
+    ]
+  }
+}

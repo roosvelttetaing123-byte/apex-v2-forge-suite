@@ -1,0 +1,32 @@
+target: ""
+engagement: "engagement"
+tester: "anonymous"
+mode: "unauth"
+workers: 10
+verbose: false
+quiet: false
+dry_run: false
+auto_confirm: false
+
+rate:
+  requests_per_second: 5.0
+  burst: 10
+  backoff_factor: 2.0
+  max_backoff_seconds: 60.0
+
+brute_force:
+  timeout_seconds: 30
+  delay_seconds: 3.0
+  max_attempts: 3
+  lockout_threshold: 5
+  spray_delay_seconds: 60.0
+  spray_max_rounds: 1
+
+report:
+  formats:
+    - html
+    - pdf
+  output_dir: "results"
+
+scope: []
+excluded: []

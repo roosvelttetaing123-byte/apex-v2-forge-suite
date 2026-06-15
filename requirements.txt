@@ -1,0 +1,52 @@
+# forge-suite v5 APEX — combined requirements
+# ─────────────────────────────────────────────
+# Python 3.10+ required
+
+# ── Core HTTP ──────────────────────────────────
+aiohttp>=3.9.0
+requests>=2.31.0
+urllib3>=2.0.0
+
+# ── Dashboard (Pillar 2) ──────────────────────
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
+
+# ── UI / Terminal ──────────────────────────────
+rich>=13.7.0
+colorama>=0.4.6
+
+# ── Data / Storage ─────────────────────────────
+sqlalchemy>=2.0.0
+pydantic[email]>=2.5.0
+pyyaml>=6.0.1
+
+# ── Security / Crypto (C2 + Auth) ─────────────
+cryptography>=41.0.0
+pyjwt>=2.8.0
+
+# ── Reporting ──────────────────────────────────
+jinja2>=3.1.2
+weasyprint>=60.0
+
+# ── Browser / Screenshots ─────────────────────
+selenium>=4.18.0
+Pillow>=10.2.0
+
+# ── Network / Security ────────────────────────
+scapy>=2.5.0
+impacket>=0.11.0
+ldap3>=2.9.1
+
+# ── Graph (AD attack path + pivot topology) ───
+networkx>=3.2.0
+
+# ── Static Analysis ───────────────────────────
+bandit>=1.7.6
+
+# ── Testing ────────────────────────────────────
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+
+# ── Misc ───────────────────────────────────────
+python-dateutil>=2.8.2

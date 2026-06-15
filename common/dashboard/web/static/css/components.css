@@ -1,0 +1,732 @@
+/* ═══════════════════════════════════════════════════════════════
+   Forge Suite — Component Library
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Tables ────────────────────────────────────────────────── */
+.forge-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+}
+
+.forge-table thead th {
+    background: var(--bg-2);
+    color: var(--text-2);
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    padding: 8px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+    white-space: nowrap;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+
+.forge-table tbody tr {
+    transition: background 0.1s;
+}
+
+.forge-table tbody tr:hover {
+    background: var(--bg-2);
+}
+
+.forge-table tbody td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-0);
+    vertical-align: middle;
+}
+
+.forge-table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+/* ── Severity Badges ───────────────────────────────────────── */
+.sev-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border-radius: var(--radius-sm);
+    font-size: 0.68rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.sev-badge--critical {
+    color: var(--sev-critical);
+    background: var(--sev-critical-bg);
+}
+
+.sev-badge--high {
+    color: var(--sev-high);
+    background: var(--sev-high-bg);
+}
+
+.sev-badge--medium {
+    color: var(--sev-medium);
+    background: var(--sev-medium-bg);
+}
+
+.sev-badge--low {
+    color: var(--sev-low);
+    background: var(--sev-low-bg);
+}
+
+.sev-badge--informational,
+.sev-badge--info {
+    color: var(--sev-info);
+    background: var(--sev-info-bg);
+}
+
+/* ── Generic Badges (used by findings.js: badge--critical etc) */
+.badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border-radius: var(--radius-sm);
+    font-size: 0.68rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+}
+
+.badge--critical {
+    color: var(--sev-critical);
+    background: var(--sev-critical-bg);
+}
+
+.badge--high {
+    color: var(--sev-high);
+    background: var(--sev-high-bg);
+}
+
+.badge--medium {
+    color: var(--sev-medium);
+    background: var(--sev-medium-bg);
+}
+
+.badge--low {
+    color: var(--sev-low);
+    background: var(--sev-low-bg);
+}
+
+.badge--info,
+.badge--informational {
+    color: var(--sev-info);
+    background: var(--sev-info-bg);
+}
+
+.badge--framework {
+    color: var(--text-1);
+    background: var(--bg-3);
+}
+
+/* ── Status Dots ───────────────────────────────────────────── */
+.status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.status-dot--initializing {
+    background: var(--text-2);
+    animation: pulse 2s infinite;
+}
+
+.status-dot--connected {
+    background: var(--status-running);
+}
+
+.status-dot--disconnected {
+    background: var(--sev-critical);
+}
+
+.status-dot--running {
+    background: var(--status-running);
+    animation: pulse 1.5s infinite;
+}
+
+.status-dot--paused {
+    background: var(--status-paused);
+}
+
+.status-dot--complete,
+.status-dot--completed {
+    background: var(--status-complete);
+}
+
+.status-dot--failed {
+    background: var(--sev-critical);
+}
+
+.status-dot--queued,
+.status-dot--scanning {
+    background: var(--text-2);
+}
+
+/* ── OpSec Indicator Dot ───────────────────────────────────── */
+.opsec-indicator__dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.opsec--normal {
+    background: var(--status-running);
+}
+
+.opsec--stealth {
+    background: var(--accent);
+}
+
+.opsec--aggressive {
+    background: var(--sev-critical);
+}
+
+/* ── Module Items ──────────────────────────────────────────── */
+.module-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.module-item:last-child {
+    border-bottom: none;
+}
+
+/* Hide emoji icon; module-item__status is the emoji span from modules.js */
+.module-item__status {
+    font-size: 0;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--text-2);
+}
+
+.module-item__icon {
+    font-size: 0;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.module-item__icon--running {
+    background: var(--status-running);
+    animation: pulse 1.5s infinite;
+}
+
+.module-item__icon--complete {
+    background: var(--status-complete);
+}
+
+.module-item__icon--failed {
+    background: var(--sev-critical);
+}
+
+.module-item__icon--queued {
+    background: var(--text-2);
+}
+
+.module-item__name {
+    flex: 1;
+    font-size: 0.78rem;
+    color: var(--text-0);
+    font-family: var(--font-mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.module-item__duration {
+    font-size: 0.68rem;
+    color: var(--text-2);
+    font-family: var(--font-mono);
+    min-width: 60px;
+    text-align: right;
+}
+
+.module-item__findings {
+    font-size: 0.68rem;
+    color: var(--accent);
+    font-family: var(--font-mono);
+    min-width: 24px;
+    text-align: right;
+}
+
+/* Progress bar (used inside module-item__progress) */
+.module-item__progress {
+    width: 80px;
+    flex-shrink: 0;
+}
+
+.module-item__bar {
+    width: 80px;
+    height: 3px;
+    background: var(--bg-3);
+    border-radius: 2px;
+    overflow: hidden;
+    flex-shrink: 0;
+}
+
+.module-item__fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.3s ease;
+}
+
+/* Progress bar (generic, used by modules.js via progress-bar class) */
+.progress-bar {
+    height: 3px;
+    background: var(--bg-3);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.progress-bar__fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 2px;
+    transition: width 0.3s ease;
+}
+
+/* ── Control Buttons ───────────────────────────────────────── */
+.ctrl-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: var(--bg-2);
+    color: var(--text-1);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    transition: all 0.15s;
+}
+
+.ctrl-btn:hover {
+    background: var(--bg-3);
+    color: var(--text-0);
+}
+
+.ctrl-btn--abort:hover {
+    border-color: var(--sev-critical);
+    color: var(--sev-critical);
+}
+
+.ctrl-btn--pause:hover {
+    border-color: var(--status-paused);
+    color: var(--status-paused);
+}
+
+.ctrl-btn--resume:hover {
+    border-color: var(--status-running);
+    color: var(--status-running);
+}
+
+/* ctrl-btn inner icon span */
+.ctrl-btn__icon {
+    pointer-events: none;
+}
+
+/* ── Icon Buttons ──────────────────────────────────────────── */
+.icon-btn {
+    width: 30px;
+    height: 30px;
+    border: none;
+    background: transparent;
+    color: var(--text-1);
+    cursor: pointer;
+    border-radius: var(--radius-sm);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: color 0.15s;
+}
+
+.icon-btn:hover {
+    color: var(--text-0);
+    background: var(--bg-2);
+}
+
+/* ── Form Controls ─────────────────────────────────────────── */
+.forge-select,
+.forge-input {
+    background: var(--bg-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-0);
+    padding: 5px 10px;
+    font-size: 0.8rem;
+    font-family: var(--font-ui);
+    outline: none;
+    transition: border-color 0.15s;
+}
+
+.forge-select:focus,
+.forge-input:focus {
+    border-color: var(--accent);
+}
+
+.forge-input::placeholder {
+    color: var(--text-2);
+}
+
+.forge-select {
+    appearance: none;
+    padding-right: 28px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' fill='%23484f58'%3E%3Cpath d='M6 8.5L1 3.5h10z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    cursor: pointer;
+}
+
+/* ── Forge Buttons ─────────────────────────────────────────── */
+.forge-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    font-size: 0.78rem;
+    font-family: var(--font-ui);
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+
+.forge-btn--secondary {
+    background: var(--bg-2);
+    color: var(--text-1);
+}
+
+.forge-btn--secondary:hover {
+    background: var(--bg-3);
+    color: var(--text-0);
+}
+
+.forge-btn--primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+}
+
+.forge-btn--primary:hover {
+    filter: brightness(1.1);
+}
+
+.forge-btn--danger {
+    background: var(--sev-critical-bg);
+    color: var(--sev-critical);
+    border-color: var(--sev-critical);
+}
+
+.forge-btn--danger:hover {
+    background: var(--sev-critical);
+    color: #fff;
+}
+
+/* ── Finding Rows ──────────────────────────────────────────── */
+.finding-row {
+    cursor: pointer;
+}
+
+.finding-row--critical td:first-child {
+    border-left: 3px solid var(--sev-critical);
+}
+
+.finding-row--high td:first-child {
+    border-left: 3px solid var(--sev-high);
+}
+
+.finding-row--medium td:first-child {
+    border-left: 3px solid var(--sev-medium);
+}
+
+.finding-row--low td:first-child {
+    border-left: 3px solid var(--sev-low);
+}
+
+.finding-row--informational td:first-child,
+.finding-row--info td:first-child {
+    border-left: 3px solid var(--sev-info);
+}
+
+/* ── Finding Items (compact list in overview) ──────────────── */
+.finding-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--border-subtle);
+    cursor: pointer;
+    transition: background 0.1s;
+}
+
+.finding-item:hover {
+    background: var(--bg-2);
+    margin: 0 -14px;
+    padding-left: 14px;
+    padding-right: 14px;
+}
+
+.finding-item:last-child {
+    border-bottom: none;
+}
+
+.finding-item__severity {
+    width: 4px;
+    height: 28px;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+
+.finding-item__severity--Critical     { background: var(--sev-critical); }
+.finding-item__severity--High         { background: var(--sev-high); }
+.finding-item__severity--Medium       { background: var(--sev-medium); }
+.finding-item__severity--Low          { background: var(--sev-low); }
+.finding-item__severity--Informational { background: var(--sev-info); }
+
+.finding-item__content {
+    flex: 1;
+    min-width: 0;
+}
+
+.finding-item__title {
+    font-size: 0.8rem;
+    color: var(--text-0);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.finding-item__meta {
+    font-size: 0.7rem;
+    color: var(--text-2);
+    font-family: var(--font-mono);
+    margin-top: 2px;
+}
+
+/* ── Recent Finding Items ──────────────────────────────────── */
+.recent-finding-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.recent-finding-item:last-child {
+    border-bottom: none;
+}
+
+.recent-finding-item__sev {
+    flex-shrink: 0;
+    margin-top: 1px;
+}
+
+.recent-finding-item__title {
+    font-size: 0.8rem;
+    color: var(--text-0);
+    margin-bottom: 2px;
+}
+
+.recent-finding-item__meta {
+    font-size: 0.7rem;
+    color: var(--text-2);
+    font-family: var(--font-mono);
+}
+
+/* ── Empty State ───────────────────────────────────────────── */
+.empty-state {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 32px;
+    color: var(--text-2);
+    font-size: 0.82rem;
+    text-align: center;
+}
+
+/* ── Timeline Items ────────────────────────────────────────── */
+.timeline-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 7px 16px;
+    border-bottom: 1px solid var(--border-subtle);
+    transition: background 0.1s;
+}
+
+.timeline-item:hover {
+    background: var(--bg-1);
+}
+
+.timeline-item:last-child {
+    border-bottom: none;
+}
+
+.timeline-item__time {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--text-2);
+    min-width: 68px;
+    flex-shrink: 0;
+    white-space: nowrap;
+}
+
+.timeline-item__icon {
+    font-size: 0.85rem;
+    flex-shrink: 0;
+    min-width: 20px;
+}
+
+.timeline-item__message {
+    flex: 1;
+    font-size: 0.8rem;
+    color: var(--text-0);
+}
+
+.timeline-item__source {
+    font-size: 0.68rem;
+    color: var(--text-2);
+    font-family: var(--font-mono);
+    padding: 1px 5px;
+    background: var(--bg-3);
+    border-radius: var(--radius-sm);
+    flex-shrink: 0;
+}
+
+/* ── Target Cards ──────────────────────────────────────────── */
+.target-card {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px;
+    transition: border-color 0.15s;
+}
+
+.target-card:hover {
+    border-color: var(--accent);
+}
+
+.target-card--pwned {
+    border-color: var(--sev-high);
+}
+
+.target-card--shell {
+    border-color: var(--sev-critical);
+}
+
+.target-card__header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.target-card__status {
+    font-size: 0.85rem;
+}
+
+.target-card__ip {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    color: var(--text-0);
+    font-size: 0.85rem;
+    flex: 1;
+}
+
+.target-card__details {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.target-card__tag {
+    background: var(--bg-3);
+    border-radius: var(--radius-sm);
+    padding: 2px 8px;
+    font-size: 0.7rem;
+    color: var(--text-2);
+    font-family: var(--font-mono);
+}
+
+/* ── Toast Notifications ───────────────────────────────────── */
+.toast {
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 16px;
+    min-width: 280px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    animation: fadeInUp 0.2s ease;
+    color: var(--text-0);
+    font-size: 0.82rem;
+    pointer-events: auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    max-width: 380px;
+}
+
+.toast--success  { border-left: 3px solid var(--status-running); }
+.toast--critical { border-left: 3px solid var(--sev-critical); }
+.toast--high     { border-left: 3px solid var(--sev-high); }
+.toast--medium   { border-left: 3px solid var(--sev-medium); }
+.toast--info     { border-left: 3px solid var(--accent); }
+
+.toast__icon {
+    font-size: 1.1rem;
+    flex-shrink: 0;
+}
+
+.toast__content {
+    flex: 1;
+    min-width: 0;
+}
+
+.toast__title {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-0);
+}
+
+.toast__message {
+    font-size: 0.7rem;
+    color: var(--text-1);
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.toast__close {
+    background: none;
+    border: none;
+    color: var(--text-2);
+    cursor: pointer;
+    padding: 4px;
+    font-size: 0.9rem;
+    flex-shrink: 0;
+}
+
+.toast__close:hover {
+    color: var(--text-1);
+}

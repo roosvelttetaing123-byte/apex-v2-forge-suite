@@ -1,0 +1,35 @@
+/* ═══════════════════════════════════════════════════════════════
+   Forge Suite — Theme Variables
+   GitHub-dark instrument aesthetic
+   ═══════════════════════════════════════════════════════════════ */
+
+:root {
+    --bg-0:              #0d1117;
+    --bg-1:              #161b22;
+    --bg-2:              #1c2128;
+    --bg-3:              #21262d;
+    --border:            #30363d;
+    --border-subtle:     #21262d;
+    --accent:            #388bfd;
+    --accent-glow:       rgba(56, 139, 253, 0.15);
+    --sev-critical:      #da3633;
+    --sev-critical-bg:   rgba(218, 54, 51, 0.12);
+    --sev-high:          #e3702b;
+    --sev-high-bg:       rgba(227, 112, 43, 0.12);
+    --sev-medium:        #d29922;
+    --sev-medium-bg:     rgba(210, 153, 34, 0.12);
+    --sev-low:           #388bfd;
+    --sev-low-bg:        rgba(56, 139, 253, 0.12);
+    --sev-info:          #57606a;
+    --sev-info-bg:       rgba(87, 96, 106, 0.12);
+    --status-running:    #2ea043;
+    --status-paused:     #d29922;
+    --status-complete:   #388bfd;
+    --text-0:            #e6edf3;
+    --text-1:            #8b949e;
+    --text-2:            #484f58;
+    --radius:            6px;
+    --radius-sm:         4px;
+    --font-mono:         'JetBrains Mono', monospace;
+    --font-ui:           'Inter', sans-serif;
+}

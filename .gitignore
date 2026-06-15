@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Results / engagement data — NEVER commit
+webforge/results/
+netforge/results/
+adforge/results/
+aiforge/results/
+forge_c2/results/
+forge_payload/results/
+logs/
+data/loot/
+data/captures/
+
+# Databases and scan artifacts
+*.db
+*.sqlite
+*.db-shm
+*.db-wal
+
+# Credentials and secrets
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
+# Large binaries / test data
+*.png
+*.jpg
+*.jpeg
+*.pdf
+logo.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Wordlists / payloads (often large)
+data/wordlists/
+data/payloads/

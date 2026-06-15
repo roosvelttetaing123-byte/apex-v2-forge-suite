@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="hacker-dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Forge Suite — Login</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        :root {
+            --bg-primary: #0a0e1a;
+            --bg-secondary: #0f1629;
+            --bg-card: #141d35;
+            --border: #1e2d4a;
+            --accent: #00d4ff;
+            --accent-dim: rgba(0,212,255,.15);
+            --text-primary: #e8eaf6;
+            --text-secondary: #8892b0;
+            --red: #ff4757;
+            --green: #00ff88;
+        }
+        body {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: 'Inter', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background-image: radial-gradient(ellipse at 50% 0%, rgba(0,212,255,.06) 0%, transparent 70%);
+        }
+        .login-box {
+            width: 380px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 40px 36px;
+            box-shadow: 0 20px 60px rgba(0,0,0,.5), 0 0 0 1px rgba(0,212,255,.05);
+        }
+        .logo {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+        .logo-title {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: var(--accent);
+            letter-spacing: 0.1em;
+        }
+        .logo-sub {
+            font-size: 0.72rem;
+            color: var(--text-secondary);
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            margin-top: 4px;
+        }
+        .form-group { margin-bottom: 18px; }
+        label {
+            display: block;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 6px;
+        }
+        input {
+            width: 100%;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            padding: 10px 14px;
+            outline: none;
+            transition: border-color .2s;
+        }
+        input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+        .btn {
+            width: 100%;
+            background: var(--accent);
+            color: #000;
+            border: none;
+            border-radius: 6px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            font-weight: 700;
+            padding: 12px;
+            cursor: pointer;
+            margin-top: 8px;
+            letter-spacing: 0.05em;
+            transition: opacity .2s, transform .1s;
+        }
+        .btn:hover { opacity: .9; }
+        .btn:active { transform: scale(.98); }
+        .btn:disabled { opacity: .5; cursor: not-allowed; }
+        .error {
+            background: rgba(255,71,87,.1);
+            border: 1px solid rgba(255,71,87,.3);
+            border-radius: 6px;
+            color: var(--red);
+            font-size: 0.82rem;
+            padding: 10px 14px;
+            margin-top: 14px;
+            display: none;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 28px;
+            font-size: 0.7rem;
+            color: var(--text-secondary);
+            font-family: 'JetBrains Mono', monospace;
+        }
+    </style>
+</head>
+<body>
+<div class="login-box">
+    <div class="logo">
+        <div class="logo-title">⚔ FORGE SUITE</div>
+        <div class="logo-sub">War Room v5 APEX</div>
+    </div>
+    <form id="login-form">
+        <div class="form-group">
+            <label for="username">Operator</label>
+            <input type="text" id="username" name="username" value="operator" autocomplete="username" required>
+        </div>
+        <div class="form-group">
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" autocomplete="current-password" required>
+        </div>
+        <button type="submit" class="btn" id="login-btn">ACCESS WAR ROOM</button>
+        <div class="error" id="error-msg"></div>
+    </form>
+    <div class="footer">AUTHORIZED PERSONNEL ONLY</div>
+</div>
+<script>
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('login-btn');
+    const errEl = document.getElementById('error-msg');
+    const username = document.getElementById('username').value.trim();
+    const password = document.getElementById('password').value;
+    btn.disabled = true;
+    btn.textContent = 'AUTHENTICATING...';
+    errEl.style.display = 'none';
+    try {
+        const res = await fetch('/api/v1/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password }),
+        });
+        const data = await res.json();
+        if (res.ok && data.token) {
+            localStorage.setItem('forge_token', data.token);
+            window.location.href = '/';
+        } else {
+            errEl.textContent = data.detail || 'Invalid credentials';
+            errEl.style.display = 'block';
+            btn.disabled = false;
+            btn.textContent = 'ACCESS WAR ROOM';
+        }
+    } catch (err) {
+        errEl.textContent = 'Server unreachable';
+        errEl.style.display = 'block';
+        btn.disabled = false;
+        btn.textContent = 'ACCESS WAR ROOM';
+    }
+});
+// Auto-focus password if username pre-filled
+document.getElementById('password').focus();
+</script>
+</body>
+</html>

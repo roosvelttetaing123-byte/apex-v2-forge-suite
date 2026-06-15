@@ -1,0 +1,72 @@
+target: ""
+engagement: "engagement"
+tester: "anonymous"
+mode: "internal"
+workers: 10
+verbose: false
+quiet: false
+dry_run: false
+auto_confirm: false
+
+rate:
+  requests_per_second: 10.0
+  burst: 20
+  backoff_factor: 2.0
+  max_backoff_seconds: 60.0
+
+brute_force:
+  timeout_seconds: 30
+  delay_seconds: 3.0
+  max_attempts: 3
+  lockout_threshold: 5
+  spray_delay_seconds: 60.0
+  spray_max_rounds: 1
+
+# Operational Security — controls evasion and stealth behavior
+# Profiles: stealth | normal | aggressive
+opsec:
+  profile: "normal"
+  # Override individual settings (takes precedence over profile defaults)
+  # jitter_min_s: 0.5
+  # jitter_max_s: 3.0
+  # max_threads: 10
+  # randomize_modules: false
+  # inject_decoys: false
+  # suppress_console: false
+
+report:
+  formats:
+    - html
+    - pdf
+  output_dir: "results"
+
+# Red Team — exploitation module configuration
+# Requires --red-team CLI flag to activate
+red_team:
+  enabled: false
+  attacker_ip: ""           # Your IP for reverse shells/callbacks
+  attacker_port: 4444       # Default listener port
+  ssh_pubkey: ""            # SSH public key for Redis key injection
+  auto_chain: true          # Auto-feed creds between modules
+  confirm_exploits: true    # Require operator confirmation before exploiting
+
+  # Exploit-specific settings
+  exploits:
+    heartbleed:
+      max_reads: 10         # How many 64KB memory reads (max 640KB)
+      ports: [443, 8443, 4443, 993, 995, 465, 636]
+    redis_rce:
+      port: 6379
+      chains: ["ssh_key", "crontab", "enumerate"]
+    eternalblue:
+      detect_only: false    # Set true to skip exploitation even in red-team mode
+    bluekeep:
+      detect_only: false
+    zerologon:
+      max_attempts: 2000    # Expected: 256 attempts (1/256 probability)
+    ntlm_relay:
+      check_ldap: true      # Check LDAP channel binding
+      check_coercion: true  # Check PetitPotam/PrinterBug
+
+scope: []
+excluded: []

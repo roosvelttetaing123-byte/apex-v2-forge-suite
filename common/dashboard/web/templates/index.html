@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="hacker-dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Forge Suite v5 APEX — Real-time offensive security War Room dashboard">
+    <title>Forge Suite — War Room</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/themes.css">
+    <link rel="stylesheet" href="/static/css/components.css">
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+    <link rel="icon" href="/static/img/logo.png">
+</head>
+<body>
+    <!-- ═══ TOP COMMAND BAR ═══ -->
+    <header id="command-bar" class="command-bar">
+        <div class="command-bar__left">
+            <div class="logo">
+                <img src="/static/img/logo.png" class="logo__img" alt="" onerror="this.style.display='none'">
+                <span class="logo__text">FORGE<span class="logo__accent">SUITE</span></span>
+                <span class="logo__version">v5</span>
+            </div>
+            <div class="engagement-info">
+                <span id="engagement-name" class="engagement-info__name">—</span>
+                <span class="engagement-info__separator">›</span>
+                <span id="engagement-target" class="engagement-info__target">—</span>
+                <span class="engagement-info__separator">›</span>
+                <span id="engagement-framework" class="badge badge--framework">—</span>
+            </div>
+        </div>
+        <div class="command-bar__center">
+            <div class="scan-controls" id="scan-controls">
+                <button id="btn-pause" class="ctrl-btn ctrl-btn--pause" title="Pause Scan">
+                    <span class="ctrl-btn__icon">⏸</span>
+                </button>
+                <button id="btn-resume" class="ctrl-btn ctrl-btn--resume" title="Resume Scan" style="display:none">
+                    <span class="ctrl-btn__icon">▶</span>
+                </button>
+                <button id="btn-abort" class="ctrl-btn ctrl-btn--abort" title="Abort Scan">
+                    <span class="ctrl-btn__icon">⏹</span>
+                </button>
+            </div>
+            <div class="scan-status" id="scan-status-container">
+                <span id="scan-status-indicator" class="status-dot status-dot--initializing"></span>
+                <span id="scan-status-text">INITIALIZING</span>
+            </div>
+            <div class="elapsed-time">
+                <span class="elapsed-time__label">ELAPSED</span>
+                <span id="elapsed-time-value" class="elapsed-time__value">00:00:00</span>
+            </div>
+        </div>
+        <div class="command-bar__right">
+            <div class="opsec-indicator" id="opsec-indicator">
+                <span class="opsec-indicator__dot opsec--normal"></span>
+                <span id="opsec-level" class="opsec-indicator__text">NORMAL</span>
+            </div>
+            <div class="theme-switcher">
+                <button id="btn-theme" class="icon-btn" title="Switch Theme">🎨</button>
+            </div>
+            <div class="connection-status">
+                <span id="ws-status" class="status-dot status-dot--disconnected" title="WebSocket"></span>
+            </div>
+        </div>
+    </header>
+
+    <!-- ═══ KILL CHAIN PIPELINE ═══ -->
+    <section id="kill-chain-section" class="kill-chain-section">
+        <div class="kill-chain-pipeline" id="kill-chain-pipeline">
+            <div class="kc-phase" data-phase="1" id="kc-recon">
+                <div class="kc-phase__icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                </div>
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__label">Recon</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="2" id="kc-weaponize">
+                <div class="kc-phase__icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+                </div>
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__label">Weaponize</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="3" id="kc-deliver">
+                <div class="kc-phase__icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                </div>
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__label">Deliver</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="4" id="kc-exploit">
+                <div class="kc-phase__icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+                </div>
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__label">Exploit</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="5" id="kc-install">
+                <div class="kc-phase__icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                </div>
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__label">Install</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="6" id="kc-c2">
+                <div class="kc-phase__icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1.25 17.25a11 11 0 0 1 21.5 0"/><path d="M5 12.5a7 7 0 0 1 14 0"/><path d="M8.75 7.75a3.5 3.5 0 0 1 6.5 0"/><circle cx="12" cy="19.25" r="1"/></svg>
+                </div>
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__label">C2</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="7" id="kc-actions">
+                <div class="kc-phase__icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                </div>
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__label">Actions</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+        </div>
+        <div class="kill-chain-summary">
+            <span id="kc-progress-text">0% Complete</span>
+            <span id="kc-status-text">Initializing</span>
+        </div>
+    </section>
+
+    <!-- ═══ TAB NAVIGATION ═══ -->
+    <nav id="tab-nav" class="tab-nav">
+        <button class="tab-nav__btn tab-nav__btn--active" data-tab="overview">Overview</button>
+        <button class="tab-nav__btn" data-tab="findings">Findings <span id="tab-findings-count" class="tab-badge">0</span></button>
+        <button class="tab-nav__btn" data-tab="targets">Targets <span id="tab-targets-count" class="tab-badge">0</span></button>
+        <button class="tab-nav__btn" data-tab="credentials">Credentials <span id="tab-creds-count" class="tab-badge">0</span></button>
+        <button class="tab-nav__btn" data-tab="c2">C2 Sessions <span id="tab-sessions-count" class="tab-badge">0</span></button>
+        <button class="tab-nav__btn" data-tab="timeline">Timeline</button>
+    </nav>
+
+    <!-- ═══ MAIN CONTENT AREA ═══ -->
+    <main id="main-content" class="main-content">
+
+        <!-- OVERVIEW TAB -->
+        <div id="tab-overview" class="tab-panel tab-panel--active">
+            <div class="overview-grid">
+                <!-- Stats Cards -->
+                <div class="stats-row">
+                    <div class="stat-card stat-card--critical" id="stat-critical">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">Critical</div>
+                    </div>
+                    <div class="stat-card stat-card--high" id="stat-high">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">High</div>
+                    </div>
+                    <div class="stat-card stat-card--medium" id="stat-medium">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">Medium</div>
+                    </div>
+                    <div class="stat-card stat-card--low" id="stat-low">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">Low</div>
+                    </div>
+                    <div class="stat-card stat-card--info" id="stat-info">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">Info</div>
+                    </div>
+                    <div class="stat-card stat-card--total" id="stat-total">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">Total</div>
+                    </div>
+                </div>
+
+                <!-- Two-column layout -->
+                <div class="overview-columns">
+                    <!-- Left: Module Progress -->
+                    <div class="panel" id="modules-panel">
+                        <div class="panel__header">
+                            <h2 class="panel__title">Module Progress</h2>
+                            <span id="modules-summary" class="panel__subtitle">0/0 complete</span>
+                        </div>
+                        <div class="panel__body" id="modules-list">
+                            <div class="empty-state">Waiting for scan to start...</div>
+                        </div>
+                    </div>
+
+                    <!-- Right: Metrics + Recent Findings -->
+                    <div class="panel-stack">
+                        <!-- Metrics -->
+                        <div class="panel" id="metrics-panel">
+                            <div class="panel__header">
+                                <h2 class="panel__title">Metrics</h2>
+                            </div>
+                            <div class="panel__body">
+                                <div class="metrics-grid">
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-requests">0</span>
+                                        <span class="metric__label">Requests</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-rps">0</span>
+                                        <span class="metric__label">Req/s</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-errors">0</span>
+                                        <span class="metric__label">Errors</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-waf">0</span>
+                                        <span class="metric__label">WAF Blocks</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-bandwidth">0 B</span>
+                                        <span class="metric__label">Bandwidth</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-modules">0/0</span>
+                                        <span class="metric__label">Modules</span>
+                                    </div>
+                                </div>
+                                <div class="chart-container">
+                                    <canvas id="rps-chart" width="400" height="120"></canvas>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Recent Findings -->
+                        <div class="panel" id="recent-findings-panel">
+                            <div class="panel__header">
+                                <h2 class="panel__title">Recent Findings</h2>
+                            </div>
+                            <div class="panel__body" id="recent-findings-list">
+                                <div class="empty-state">No findings yet...</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- FINDINGS TAB -->
+        <div id="tab-findings" class="tab-panel">
+            <div class="findings-layout">
+                <div class="findings-toolbar">
+                    <div class="filter-group">
+                        <select id="filter-severity" class="forge-select">
+                            <option value="">All Severities</option>
+                            <option value="Critical">Critical</option>
+                            <option value="High">High</option>
+                            <option value="Medium">Medium</option>
+                            <option value="Low">Low</option>
+                            <option value="Informational">Informational</option>
+                        </select>
+                        <input type="text" id="filter-search" class="forge-input" placeholder="Search findings...">
+                    </div>
+                    <button id="btn-export-findings" class="forge-btn forge-btn--secondary">Export</button>
+                </div>
+                <div class="findings-table-container">
+                    <table class="forge-table" id="findings-table">
+                        <thead>
+                            <tr>
+                                <th>Severity</th>
+                                <th>Title</th>
+                                <th>Module</th>
+                                <th>Target</th>
+                                <th>CVSS</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="findings-tbody">
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- TARGETS TAB -->
+        <div id="tab-targets" class="tab-panel">
+            <div class="targets-grid" id="targets-grid">
+                <div class="empty-state">No targets discovered yet...</div>
+            </div>
+        </div>
+
+        <!-- CREDENTIALS TAB -->
+        <div id="tab-credentials" class="tab-panel">
+            <div class="creds-layout">
+                <table class="forge-table" id="creds-table">
+                    <thead>
+                        <tr>
+                            <th>Type</th>
+                            <th>Account</th>
+                            <th>Secret</th>
+                            <th>Target</th>
+                            <th>Source</th>
+                            <th>Time</th>
+                        </tr>
+                    </thead>
+                    <tbody id="creds-tbody">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- C2 SESSIONS TAB -->
+        <div id="tab-c2" class="tab-panel">
+            <div class="c2-layout">
+                <div class="c2-beacons" id="c2-beacons">
+                    <div class="empty-state">No active beacons. Start a C2 listener to receive callbacks.</div>
+                </div>
+                <div class="c2-console" id="c2-console" style="display:none">
+                    <div class="console-header" id="console-header">Beacon Console</div>
+                    <div class="console-output" id="console-output"></div>
+                    <div class="console-input-row">
+                        <span class="console-prompt" id="console-prompt">forge></span>
+                        <input type="text" id="console-input" class="console-input" placeholder="Type command...">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- TIMELINE TAB -->
+        <div id="tab-timeline" class="tab-panel">
+            <div class="timeline-container" id="timeline-container">
+                <div class="empty-state">Timeline will populate as events occur...</div>
+            </div>
+        </div>
+    </main>
+
+    <!-- ═══ NOTIFICATION CONTAINER ═══ -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- ═══ FINDING DETAIL MODAL ═══ -->
+    <div id="finding-modal" class="modal" style="display:none">
+        <div class="modal__backdrop"></div>
+        <div class="modal__content">
+            <div class="modal__header">
+                <h2 id="modal-title" class="modal__title">Finding Details</h2>
+                <button id="modal-close" class="modal__close">✕</button>
+            </div>
+            <div class="modal__body" id="modal-body"></div>
+        </div>
+    </div>
+
+    <!-- ═══ SCRIPTS ═══ -->
+    <script>window.FORGE_AUTH_ENABLED = {{ 'true' if auth_enabled else 'false' }};</script>
+    <script src="/static/js/websocket.js"></script>
+    <script src="/static/js/charts.js"></script>
+    <script src="/static/js/notifications.js"></script>
+    <script src="/static/js/kill_chain.js"></script>
+    <script src="/static/js/findings.js"></script>
+    <script src="/static/js/targets.js"></script>
+    <script src="/static/js/modules.js"></script>
+    <script src="/static/js/timeline.js"></script>
+    <script src="/static/js/credentials.js"></script>
+    <script src="/static/js/sessions.js"></script>
+    <script src="/static/js/c2_panel.js"></script>
+    <script src="/static/js/controls.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
