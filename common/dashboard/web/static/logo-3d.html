@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Forge Suite APEX — 3D Logo Generator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #060606;
+      color: #ccc;
+      font-family: 'JetBrains Mono', monospace;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+      gap: 0;
+    }
+
+    header {
+      width: 100%;
+      max-width: 860px;
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 1.5rem;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .logo-text {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: .12em;
+      color: #e63329;
+    }
+
+    .logo-text span { color: #888; font-weight: 400; }
+
+    .cmd {
+      font-size: 11px;
+      color: #555;
+      background: #111;
+      border: 1px solid #222;
+      padding: 4px 10px;
+      border-radius: 4px;
+      letter-spacing: .05em;
+    }
+
+    .card {
+      width: 100%;
+      max-width: 860px;
+      background: #0d0d0d;
+      border: 1px solid #1e1e1e;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 480px;
+      cursor: crosshair;
+    }
+
+    .controls {
+      padding: 14px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      border-top: 1px solid #1a1a1a;
+    }
+
+    .tool-row {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .tbtn {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .07em;
+      padding: 5px 11px;
+      border: 1px solid #2a2a2a;
+      background: transparent;
+      color: #444;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: border-color .2s, color .2s;
+    }
+
+    .tbtn.active-forge { border-color: #e63329; color: #e63329; border-width: 1.5px; }
+    .tbtn:hover { border-color: #444; color: #888; }
+
+    .ctrl-row {
+      display: flex;
+      gap: 20px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .ctrl-label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: #444;
+      letter-spacing: .06em;
+    }
+
+    input[type=range] {
+      width: 90px;
+      accent-color: #e63329;
+      cursor: pointer;
+    }
+
+    .ctrl-val {
+      min-width: 18px;
+      font-size: 11px;
+      color: #666;
+    }
+
+    .export-btn {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      padding: 5px 14px;
+      border: 1px solid #2a2a2a;
+      background: transparent;
+      color: #555;
+      border-radius: 4px;
+      cursor: pointer;
+      margin-left: auto;
+      transition: border-color .2s, color .2s;
+    }
+
+    .export-btn:hover { border-color: #555; color: #aaa; }
+
+    .subtitle {
+      font-size: 11px;
+      color: #333;
+      text-align: center;
+      letter-spacing: .1em;
+    }
+
+    .loading-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: #060606;
+      gap: 10px;
+      pointer-events: none;
+      z-index: 2;
+    }
+
+    .scan-bar {
+      height: 2px;
+      background: #e63329;
+      animation: scan 1.2s ease-in-out infinite alternate;
+    }
+
+    .loading-text {
+      font-size: 11px;
+      color: #333;
+      letter-spacing: .18em;
+    }
+
+    @keyframes scan {
+      from { width: 20px; opacity: .4; }
+      to   { width: 55px; opacity: 1; }
+    }
+
+    .canvas-wrap {
+      position: relative;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="logo-text">FORGE<span>SUITE</span> APEX <span>v5</span></div>
+    <div class="cmd">python3 forge.py [net|web|ad|ai]</div>
+  </header>
+
+  <div class="card">
+    <div class="canvas-wrap">
+      <canvas id="fg3"></canvas>
+      <div class="loading-overlay" id="ld">
+        <div class="scan-bar" id="sb"></div>
+        <div class="loading-text">INITIALIZING 3D ENGINE...</div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <div class="tool-row" id="tbtns">
+        <button class="tbtn active-forge" id="b-forge" onclick="sw('forge')">FORGE APEX</button>
+        <button class="tbtn" id="b-net"   onclick="sw('net')">NetForge</button>
+        <button class="tbtn" id="b-web"   onclick="sw('web')">WebForge</button>
+        <button class="tbtn" id="b-ad"    onclick="sw('ad')">ADForge</button>
+        <button class="tbtn" id="b-ai"    onclick="sw('ai')">AIForge</button>
+      </div>
+
+      <div class="ctrl-row">
+        <label class="ctrl-label">
+          SPEED
+          <input type="range" id="spd" min="0" max="20" value="4" step="1">
+          <span class="ctrl-val" id="sv">4</span>
+        </label>
+        <label class="ctrl-label">
+          EXTRUDE
+          <input type="range" id="dep" min="1" max="12" value="4" step="1">
+          <span class="ctrl-val" id="dv">4</span>
+        </label>
+        <button class="export-btn" onclick="dl()">↓ Export PNG</button>
+      </div>
+
+      <div class="subtitle" id="sub">RED TEAM OPERATIONS PLATFORM</div>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/FontLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/geometries/TextGeometry.js"></script>
+  <script>
+  (function () {
+    var cv = document.getElementById('fg3');
+    var H  = 480;
+    var W  = cv.parentElement.clientWidth || 860;
+
+    var rdr = new THREE.WebGLRenderer({ canvas: cv, antialias: true, preserveDrawingBuffer: true });
+    rdr.setSize(W, H);
+    rdr.setPixelRatio(Math.min(devicePixelRatio, 2));
+    rdr.setClearColor(0x060606);
+
+    var sc  = new THREE.Scene();
+    var cam = new THREE.PerspectiveCamera(50, W / H, 0.1, 100);
+    cam.position.set(0, 0, 7);
+
+    sc.add(new THREE.AmbientLight(0xffffff, 0.45));
+
+    var kl = new THREE.DirectionalLight(0xffffff, 2.0);
+    kl.position.set(5, 10, 6);
+    sc.add(kl);
+
+    var fl = new THREE.DirectionalLight(0x6688ff, 0.35);
+    fl.position.set(-6, -2, 4);
+    sc.add(fl);
+
+    var al  = new THREE.PointLight(0xff2200, 5, 15);
+    al.position.set(2, 2, 6);
+    sc.add(al);
+
+    var al2 = new THREE.PointLight(0xff2200, 2.5, 10);
+    al2.position.set(-2, -1, 5);
+    sc.add(al2);
+
+    var mainGrp = new THREE.Group();
+    sc.add(mainGrp);
+
+    // ── Circuit background
+    function mkCircuit(lc) {
+      var col = new THREE.Color(lc).multiplyScalar(0.06);
+      var mat = new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.7 });
+      var pos = [];
+      for (var i = 0; i < 130; i++) {
+        var x = (Math.random() - .5) * 24, y = (Math.random() - .5) * 16;
+        var l = Math.random() * 3.5 + .2;
+        Math.random() > .5 ? pos.push(x, y, -6, x + l, y, -6) : pos.push(x, y, -6, x, y + l, -6);
+        if (Math.random() > .62) {
+          var nx = x + (Math.random() - .5) * 2, ny = y + (Math.random() - .5) * 2;
+          pos.push(x, y, -6, nx, ny, -6);
+        }
+      }
+      var g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+      return new THREE.LineSegments(g, mat);
+    }
+
+    var circ = mkCircuit(0xff2200);
+    sc.add(circ);
+
+    // ── Particles
+    var pa = new Float32Array(600 * 3);
+    for (var i = 0; i < pa.length; i++) pa[i] = (Math.random() - .5) * 28;
+    var pg = new THREE.BufferGeometry();
+    pg.setAttribute('position', new THREE.BufferAttribute(pa, 3));
+    var pm = new THREE.PointsMaterial({
+      color: new THREE.Color(0xff2200).multiplyScalar(0.12),
+      size: .05, transparent: true, opacity: .5
+    });
+    sc.add(new THREE.Points(pg, pm));
+
+    // ── Text group
+    var tg = new THREE.Group();
+    mainGrp.add(tg);
+
+    // ── Tool config
+    var T = {
+      forge: { a: 'FORGE', b: 'APEX',  ac: 0xd8d8d8, as: 0xffffff, bc: 0xcc1111, bs: 0xff5555, be: 0x440000, lc: 0xff2200, sub: 'RED TEAM OPERATIONS PLATFORM' },
+      net:   { a: 'NET',   b: 'FORGE', ac: 0x00d4ff, as: 0x99eeff, bc: 0x007799, bs: 0x00ccee, be: 0x002233, lc: 0x00aaff, sub: 'NETWORK PENTEST + RED TEAM' },
+      web:   { a: 'WEB',   b: 'FORGE', ac: 0x00ff99, as: 0x99ffcc, bc: 0x009944, bs: 0x00ee66, be: 0x002211, lc: 0x00ff77, sub: 'WEB APPLICATION SECURITY' },
+      ad:    { a: 'AD',    b: 'FORGE', ac: 0xee77ff, as: 0xffccff, bc: 0x8811bb, bs: 0xdd44ff, be: 0x220033, lc: 0xcc33ff, sub: 'ACTIVE DIRECTORY ATTACK & AUDIT' },
+      ai:    { a: 'AI',    b: 'FORGE', ac: 0xffaa33, as: 0xffdd99, bc: 0xcc5500, bs: 0xff8833, be: 0x331100, lc: 0xff8800, sub: 'LLM / AI RED TEAMING' },
+    };
+
+    var BC = { forge: '#e63329', net: '#00d4ff', web: '#00ff88', ad: '#cc44ff', ai: '#ff8800' };
+
+    var cur = 'forge', font = null, spd = 0.004, dep = 0.3, ry = 0, mx = 0, my = 0;
+
+    function rebuild() {
+      while (tg.children.length) tg.remove(tg.children[0]);
+      if (!font) return;
+      var t = T[cur];
+
+      var g1 = new THREE.TextGeometry(t.a, {
+        font: font, size: .88, height: dep, curveSegments: 14,
+        bevelEnabled: true, bevelThickness: dep * .12, bevelSize: dep * .07, bevelSegments: 7
+      });
+      g1.computeBoundingBox();
+      g1.translate(-(g1.boundingBox.max.x - g1.boundingBox.min.x) / 2, 0, -dep / 2);
+      tg.add(new THREE.Mesh(g1, new THREE.MeshPhongMaterial({
+        color: t.ac, specular: t.as, shininess: 165
+      })));
+
+      var g2 = new THREE.TextGeometry(t.b, {
+        font: font, size: .60, height: dep * .72, curveSegments: 12,
+        bevelEnabled: true, bevelThickness: dep * .09, bevelSize: dep * .05, bevelSegments: 6
+      });
+      g2.computeBoundingBox();
+      g2.translate(-(g2.boundingBox.max.x - g2.boundingBox.min.x) / 2, 0, -(dep * .72) / 2);
+      var m2 = new THREE.Mesh(g2, new THREE.MeshPhongMaterial({
+        color: t.bc, specular: t.bs, shininess: 90,
+        emissive: new THREE.Color(t.be), emissiveIntensity: 1
+      }));
+      m2.position.y = -0.96;
+      tg.add(m2);
+
+      al.color.setHex(t.lc);
+      al2.color.setHex(t.lc);
+      pm.color.set(new THREE.Color(t.lc).multiplyScalar(0.12));
+      sc.remove(circ);
+      circ = mkCircuit(t.lc);
+      sc.add(circ);
+
+      document.getElementById('sub').textContent = t.sub;
+    }
+
+    new THREE.FontLoader().load(
+      'https://cdn.jsdelivr.net/npm/three@0.128.0/examples/fonts/helvetiker_bold.typeface.json',
+      function (f) {
+        font = f;
+        rebuild();
+        var ld = document.getElementById('ld');
+        if (ld) {
+          ld.style.transition = 'opacity .6s';
+          ld.style.opacity = '0';
+          setTimeout(function () { ld.style.display = 'none'; }, 650);
+        }
+      }
+    );
+
+    cv.addEventListener('mousemove', function (e) {
+      var r = cv.getBoundingClientRect();
+      mx = (e.clientX - r.left) / r.width * 2 - 1;
+      my = -((e.clientY - r.top) / r.height * 2 - 1);
+    });
+    cv.addEventListener('mouseleave', function () { mx = 0; my = 0; });
+
+    (function loop() {
+      requestAnimationFrame(loop);
+      ry += spd;
+      mainGrp.rotation.y = ry + mx * .38;
+      mainGrp.rotation.x += (my * .16 - mainGrp.rotation.x) * .07;
+      rdr.render(sc, cam);
+    })();
+
+    window.addEventListener('resize', function () {
+      var nw = cv.parentElement.clientWidth;
+      rdr.setSize(nw, H);
+      cam.aspect = nw / H;
+      cam.updateProjectionMatrix();
+    });
+
+    document.getElementById('spd').oninput = function (e) {
+      spd = e.target.value * .001;
+      document.getElementById('sv').textContent = e.target.value;
+    };
+    document.getElementById('dep').oninput = function (e) {
+      dep = e.target.value * .075;
+      document.getElementById('dv').textContent = e.target.value;
+      rebuild();
+    };
+
+    window.sw = function (key) {
+      cur = key;
+      document.querySelectorAll('.tbtn').forEach(function (b) {
+        b.className = 'tbtn';
+      });
+      var btn = document.getElementById('b-' + key);
+      btn.style.borderColor = BC[key];
+      btn.style.borderWidth = '1.5px';
+      btn.style.color = BC[key];
+    };
+
+    window.dl = function () {
+      rdr.render(sc, cam);
+      var a = document.createElement('a');
+      a.download = cur + '-logo-3d.png';
+      a.href = cv.toDataURL('image/png');
+      a.click();
+    };
+  })();
+  </script>
+</body>
+</html>
