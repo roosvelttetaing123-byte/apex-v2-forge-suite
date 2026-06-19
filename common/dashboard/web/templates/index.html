@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="hacker-dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Forge Suite v5 APEX — Real-time offensive security War Room dashboard">
+    <title>Forge Suite — War Room</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Manrope:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/themes.css">
+    <link rel="stylesheet" href="/static/css/components.css">
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔥</text></svg>">
+</head>
+<body>
+    <canvas id="rainCanvas" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: -1;"></canvas>
+    <div class="ambient-mist"></div>
+    <div class="ambient-mist ambient-mist--secondary"></div>
+
+    <div class="app-layout">
+        <aside class="sidebar">
+            <div class="sidebar__logo">
+                <div class="logo-3d-container">
+                    <img class="logo__img logo-3d" src="/static/images/cyber_demon_logo.png" alt="Forge Suite Logo" style="height:64px;">
+                </div>
+                <span class="logo__text" style="font-size: 1.8rem; margin-top: 8px;">FORGE<span class="logo__accent">SUITE</span></span>
+            </div>
+            
+            <nav class="sidebar-nav" id="tab-nav">
+                <div class="nav-group">DASHBOARD</div>
+                <button class="nav-item tab-nav__btn tab-nav__btn--active" data-tab="overview">📊 Global Overview</button>
+                <button class="nav-item tab-nav__btn" data-tab="operations">⚙️ Active Operations</button>
+                <button class="nav-item tab-nav__btn" data-tab="targets">🎯 Target Inventory <span id="tab-targets-count" class="tab-badge">0</span></button>
+                
+                <div class="nav-group">ANALYSIS</div>
+                <button class="nav-item tab-nav__btn" data-tab="findings">🔥 Vulnerabilities <span id="tab-findings-count" class="tab-badge">0</span></button>
+                <button class="nav-item tab-nav__btn" data-tab="credentials">🔑 Credentials <span id="tab-creds-count" class="tab-badge">0</span></button>
+                <button class="nav-item tab-nav__btn" data-tab="timeline">📜 Timeline</button>
+                
+                <div class="nav-group">EXPLOITATION</div>
+                <button class="nav-item tab-nav__btn" data-tab="c2">💀 C2 Sessions <span id="tab-sessions-count" class="tab-badge">0</span></button>
+                
+                <div class="nav-group">MANAGEMENT</div>
+                <button class="nav-item tab-nav__btn" data-tab="reports">📄 Reports</button>
+            </nav>
+        </aside>
+
+        <main class="main-content">
+            <header class="top-bar" id="command-bar">
+                <div class="breadcrumb">
+                    <span id="engagement-name">Engagement</span> / <span id="engagement-target" class="accent" style="color:var(--accent-primary);">Target</span>
+                </div>
+                <div class="scan-controls" id="scan-controls">
+                    <button id="btn-pause" class="ctrl-btn ctrl-btn--pause" title="Pause"><span class="ctrl-btn__icon">⏸</span></button>
+                    <button id="btn-resume" class="ctrl-btn ctrl-btn--resume" title="Resume" style="display:none"><span class="ctrl-btn__icon">▶</span></button>
+                    <button id="btn-abort" class="ctrl-btn ctrl-btn--abort" title="Abort"><span class="ctrl-btn__icon">⏹</span></button>
+                </div>
+                <div class="scan-status" id="scan-status-container" style="display:flex; align-items:center; gap:8px;">
+                    <span id="scan-status-indicator" class="status-dot status-dot--initializing"></span>
+                    <span id="scan-status-text">INITIALIZING</span>
+                </div>
+                <div class="elapsed-time" style="margin-left:auto;">
+                    <span id="elapsed-time-value" class="elapsed-time__value" style="font-family:'JetBrains Mono'; font-size:1.2rem;">00:00:00</span>
+                </div>
+                <div class="opsec-indicator" id="opsec-indicator">
+                    <span class="opsec-indicator__dot opsec--normal"></span>
+                    <span id="opsec-level" class="opsec-indicator__text">NORMAL</span>
+                </div>
+            </header>
+
+            <div class="content-body" id="main-content">
+                <!-- OVERVIEW TAB -->
+        <div id="tab-overview" class="tab-panel tab-panel--active">
+            <div class="overview-grid">
+                <!-- Stats Cards -->
+                <div class="stats-row">
+                    <div class="stat-card stat-card--critical" id="stat-critical">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">Critical</div>
+                        <div class="stat-card__icon">🔴</div>
+                    </div>
+                    <div class="stat-card stat-card--high" id="stat-high">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">High</div>
+                        <div class="stat-card__icon">🟠</div>
+                    </div>
+                    <div class="stat-card stat-card--medium" id="stat-medium">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">Medium</div>
+                        <div class="stat-card__icon">🟡</div>
+                    </div>
+                    <div class="stat-card stat-card--low" id="stat-low">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">Low</div>
+                        <div class="stat-card__icon">🔵</div>
+                    </div>
+                    <div class="stat-card stat-card--info" id="stat-info">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">Info</div>
+                        <div class="stat-card__icon">⚪</div>
+                    </div>
+                    <div class="stat-card stat-card--total" id="stat-total">
+                        <div class="stat-card__value">0</div>
+                        <div class="stat-card__label">Total</div>
+                        <div class="stat-card__icon">📊</div>
+                    </div>
+                </div>
+
+                <!-- Two-column layout -->
+                <div class="overview-columns">
+                    <!-- Left: Module Progress -->
+                    <div class="panel" id="modules-panel">
+                        <div class="panel__header">
+                            <h2 class="panel__title">⚙️ Module Progress</h2>
+                            <span id="modules-summary" class="panel__subtitle">0/0 complete</span>
+                        </div>
+                        <div class="panel__body" id="modules-list">
+                            <div class="empty-state">Waiting for scan to start...</div>
+                        </div>
+                    </div>
+
+                    <!-- Right: Metrics + Recent Findings -->
+                    <div class="panel-stack">
+                        <!-- Metrics -->
+                        <div class="panel" id="metrics-panel">
+                            <div class="panel__header">
+                                <h2 class="panel__title">📈 Metrics</h2>
+                            </div>
+                            <div class="panel__body">
+                                <div class="metrics-grid">
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-requests">0</span>
+                                        <span class="metric__label">Requests</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-rps">0</span>
+                                        <span class="metric__label">Req/s</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-errors">0</span>
+                                        <span class="metric__label">Errors</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-waf">0</span>
+                                        <span class="metric__label">WAF Blocks</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-bandwidth">0 B</span>
+                                        <span class="metric__label">Bandwidth</span>
+                                    </div>
+                                    <div class="metric">
+                                        <span class="metric__value" id="metric-modules">0/0</span>
+                                        <span class="metric__label">Modules</span>
+                                    </div>
+                                </div>
+                                <div class="chart-container">
+                                    <canvas id="rps-chart" width="400" height="120"></canvas>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Recent Findings -->
+                        <div class="panel" id="recent-findings-panel">
+                            <div class="panel__header">
+                                <h2 class="panel__title">🔥 Recent Findings</h2>
+                            </div>
+                            <div class="panel__body" id="recent-findings-list">
+                                <div class="empty-state">No findings yet...</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        
+                
+        <!-- OPERATIONS TAB -->
+        <div id="tab-operations" class="tab-panel">
+            <!-- ═══ KILL CHAIN PIPELINE ═══ -->
+    <section id="kill-chain-section" class="kill-chain-section">
+        <div class="kill-chain-pipeline" id="kill-chain-pipeline">
+            <div class="kc-phase" data-phase="1" id="kc-recon">
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__icon">🔍</div>
+                <div class="kc-phase__label">Recon</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="2" id="kc-weaponize">
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__icon">⚔️</div>
+                <div class="kc-phase__label">Weaponize</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="3" id="kc-deliver">
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__icon">📨</div>
+                <div class="kc-phase__label">Deliver</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="4" id="kc-exploit">
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__icon">💥</div>
+                <div class="kc-phase__label">Exploit</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="5" id="kc-install">
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__icon">📥</div>
+                <div class="kc-phase__label">Install</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="6" id="kc-c2">
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__icon">🎯</div>
+                <div class="kc-phase__label">C2</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+            <div class="kc-connector"><div class="kc-connector__line"></div></div>
+            <div class="kc-phase" data-phase="7" id="kc-actions">
+                <div class="kc-phase__progress"><div class="kc-phase__fill"></div></div>
+                <div class="kc-phase__icon">🏴</div>
+                <div class="kc-phase__label">Actions</div>
+                <div class="kc-phase__count">0</div>
+            </div>
+        </div>
+        <div class="kill-chain-summary">
+            <span id="kc-progress-text">0% Complete</span>
+            <span id="kc-status-text">⏳ Initializing</span>
+        </div>
+    </section>
+            <div class="operations-layout" style="margin-top: 16px;">
+                <div class="panel">
+                    <div class="panel__header"><h2 class="panel__title">⚙️ Active Tools Execution</h2></div>
+                    <div class="panel__body" id="active-tools-list">
+                        <table class="forge-table">
+                            <thead>
+                                <tr><th>Phase</th><th>Tool</th><th>Status</th><th>Output</th></tr>
+                            </thead>
+                            <tbody>
+                                <tr><td>Recon</td><td>nmap (Subnet Scan)</td><td><span class="status-dot status-dot--running"></span> Running</td><td>[10%] Scanning...</td></tr>
+                                <tr><td>Weaponize</td><td>Payload Gen</td><td><span class="status-dot status-dot--queued"></span> Queued</td><td>Waiting...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+                <!-- FINDINGS TAB -->
+        <div id="tab-findings" class="tab-panel">
+            <div class="findings-layout">
+                <div class="findings-toolbar">
+                    <div class="filter-group">
+                        <select id="filter-severity" class="forge-select">
+                            <option value="">All Severities</option>
+                            <option value="Critical">Critical</option>
+                            <option value="High">High</option>
+                            <option value="Medium">Medium</option>
+                            <option value="Low">Low</option>
+                            <option value="Informational">Informational</option>
+                        </select>
+                        <input type="text" id="filter-search" class="forge-input" placeholder="Search findings...">
+                    </div>
+                    <button id="btn-export-findings" class="forge-btn forge-btn--secondary">📥 Export</button>
+                </div>
+                <div class="findings-table-container">
+                    <table class="forge-table" id="findings-table">
+                        <thead>
+                            <tr>
+                                <th class="sortable" data-sort="severity">Severity <span class="sort-icon"></span></th>
+                                <th class="sortable" data-sort="title">Title <span class="sort-icon"></span></th>
+                                <th class="sortable" data-sort="module">Module <span class="sort-icon"></span></th>
+                                <th class="sortable" data-sort="target">Target <span class="sort-icon"></span></th>
+                                <th class="sortable" data-sort="cvss">CVSS <span class="sort-icon"></span></th>
+                                <th class="sortable" data-sort="time">Time <span class="sort-icon"></span></th>
+                            </tr>
+                        </thead>
+                        <tbody id="findings-tbody">
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        
+                <!-- TARGETS TAB -->
+        <div id="tab-targets" class="tab-panel">
+            <div class="targets-grid" id="targets-grid">
+                <div class="empty-state">No targets discovered yet...</div>
+            </div>
+        </div>
+
+        
+                <!-- CREDENTIALS TAB -->
+        <div id="tab-credentials" class="tab-panel">
+            <div class="creds-layout">
+                <table class="forge-table" id="creds-table">
+                    <thead>
+                        <tr>
+                            <th>Type</th>
+                            <th>Account</th>
+                            <th>Secret</th>
+                            <th>Target</th>
+                            <th>Source</th>
+                            <th>Time</th>
+                        </tr>
+                    </thead>
+                    <tbody id="creds-tbody">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        
+                <!-- C2 SESSIONS TAB -->
+        <div id="tab-c2" class="tab-panel">
+            <div class="c2-layout">
+                <div class="c2-beacons" id="c2-beacons">
+                    <div class="empty-state">No active beacons. Start a C2 listener to receive callbacks.</div>
+                </div>
+                <div class="c2-console" id="c2-console" style="display:none">
+                    <div class="console-header" id="console-header">Beacon Console</div>
+                    <div class="console-output" id="console-output"></div>
+                    <div class="console-input-row">
+                        <span class="console-prompt" id="console-prompt">forge></span>
+                        <input type="text" id="console-input" class="console-input" placeholder="Type command...">
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        
+                <!-- TIMELINE TAB -->
+        <div id="tab-timeline" class="tab-panel">
+            <div class="timeline-container" id="timeline-container">
+                <div class="empty-state">Timeline will populate as events occur...</div>
+            </div>
+        </div>
+    </main>
+
+    
+                
+        <!-- REPORTS TAB -->
+        <div id="tab-reports" class="tab-panel">
+            <div class="reports-layout">
+                <div class="panel">
+                    <div class="panel__header"><h2 class="panel__title">📄 Generate Report</h2></div>
+                    <div class="panel__body">
+                        <p>Export current engagement data.</p>
+                        <button class="forge-btn forge-btn--primary">PDF Report</button>
+                        <button class="forge-btn forge-btn--secondary">JSON Export</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+            </div>
+        </main>
+    </div>
+
+    <!-- ═══ NOTIFICATION CONTAINER ═══ -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- ═══ FINDING DETAIL MODAL ═══ -->
+    <div id="finding-modal" class="modal" style="display:none">
+        <div class="modal__backdrop"></div>
+        <div class="modal__content modal__content--large">
+            <div class="modal__header">
+                <h2 id="modal-title" class="modal__title">Finding Details</h2>
+                <div class="modal__actions">
+                    <button id="modal-btn-export" class="icon-btn" title="Export Finding">📥</button>
+                    <button id="modal-close" class="modal__close">✕</button>
+                </div>
+            </div>
+            <div class="modal__body split-layout" id="modal-body">
+                <div class="split-layout__left" id="modal-details">
+                    <!-- Finding text details injected here -->
+                </div>
+                <div class="split-layout__right" id="modal-poc" style="display:none">
+                    <div class="poc-header">Proof of Concept</div>
+                    <div class="poc-viewer" id="poc-viewer">
+                        <img id="poc-image" class="poc-image" src="" alt="PoC Screenshot" />
+                        <div class="poc-controls">
+                            <button class="icon-btn" id="poc-zoom-in">🔍+</button>
+                            <button class="icon-btn" id="poc-zoom-out">🔍-</button>
+                            <button class="icon-btn" id="poc-reset">⟲</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ═══ SCRIPTS ═══ -->
+    <script src="/static/js/websocket.js"></script>
+    <script src="/static/js/charts.js"></script>
+    <script src="/static/js/notifications.js"></script>
+    <script src="/static/js/kill_chain.js"></script>
+    <script src="/static/js/findings.js"></script>
+    <script src="/static/js/targets.js"></script>
+    <script src="/static/js/modules.js"></script>
+    <script src="/static/js/timeline.js"></script>
+    <script src="/static/js/credentials.js"></script>
+    <script src="/static/js/sessions.js"></script>
+    <script src="/static/js/c2_panel.js"></script>
+    <script src="/static/js/controls.js"></script>
+    <script src="/static/js/app.js"></script>
+
+
+</body>
+</html>

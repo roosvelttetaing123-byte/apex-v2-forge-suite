@@ -1,0 +1,73 @@
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  Forge Suite v5 APEX — Docker Compose                               ║
+# ║  Full deployment: Dashboard + C2 + Intel DB                          ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+#
+# Usage:
+#   docker compose up -d            # Start all services
+#   docker compose up forge-scan    # Run a one-shot scan
+#   docker compose logs -f          # Tail all logs
+#   docker compose down             # Tear down
+
+services:
+  # ── War Room Dashboard ─────────────────────────────────────────────
+  forge-dashboard:
+    build: .
+    image: forge-suite:5.0.0
+    container_name: forge-dashboard
+    command: ["forge.py", "dashboard", "--host", "0.0.0.0", "--port", "1337"]
+    ports:
+      - "1337:1337"
+    environment:
+      - FORGE_DASHBOARD_PASSWORD=${FORGE_DASHBOARD_PASSWORD:-forge2026}
+    volumes:
+      - forge-results:/opt/forge-suite/results
+      - forge-intel:/opt/forge-suite/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsk", "https://localhost:1337/api/v1/state"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── C2 Team Server ────────────────────────────────────────────────
+  forge-c2:
+    build: .
+    image: forge-suite:5.0.0
+    container_name: forge-c2
+    command: ["forge.py", "c2", "server", "--bind", "0.0.0.0", "--port", "8443"]
+    ports:
+      - "8443:8443"     # HTTPS listener
+      - "50050:50050"   # Operator API
+      - "8080:8080"     # HTTP listener (optional)
+      - "53:53/udp"     # DNS listener (optional)
+    environment:
+      - FORGE_C2_ADMIN_PW=${FORGE_C2_ADMIN_PW:-changeme}
+    volumes:
+      - forge-c2-data:/opt/forge-suite/forge_c2/data
+    restart: unless-stopped
+
+  # ── One-shot scan container (use with docker compose run) ──────────
+  forge-scan:
+    build: .
+    image: forge-suite:5.0.0
+    container_name: forge-scan
+    # Override command at runtime:
+    #   docker compose run forge-scan forge.py net --target 10.0.0.0/24
+    command: ["forge.py", "--help"]
+    environment:
+      - FORGE_DASHBOARD_PASSWORD=${FORGE_DASHBOARD_PASSWORD:-forge2026}
+    volumes:
+      - forge-results:/opt/forge-suite/results
+      - forge-intel:/opt/forge-suite/data
+    network_mode: host
+    profiles:
+      - scan
+
+volumes:
+  forge-results:
+    driver: local
+  forge-intel:
+    driver: local
+  forge-c2-data:
+    driver: local

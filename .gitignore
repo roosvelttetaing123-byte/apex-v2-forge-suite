@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.tox/
+venv/
+.venv/
+env/
+
+# Runtime / database
+*.db
+*.sqlite3
+
+# Engagement artefacts (target-specific — keep out of source control)
+*.json
+!requirements*.json
+
+# Logs and evidence output
+*.log
+results/
+evidence/
+screenshots/
+
+# Secrets / env
+.env
+.env.*
+secrets.*
+credentials.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
