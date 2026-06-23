@@ -1,3 +1,4 @@
+import React from 'react';
 import Card from './Card';
 
 const AUTH_TYPES = [
@@ -6,14 +7,17 @@ const AUTH_TYPES = [
   { value: 'cookie',  label: 'Session Capture / Cookie Jar' },
 ];
 
-function Field({ label, children }) {
+function Field({ label, htmlFor, children }) {
   return (
     <div>
-      <label style={{
-        display: 'block', marginBottom: '6px', fontSize: '11px',
-        fontFamily: 'var(--font-mono)', color: 'var(--text-muted)',
-        textTransform: 'uppercase', letterSpacing: '0.5px',
-      }}>
+      <label
+        htmlFor={htmlFor}
+        style={{
+          display: 'block', marginBottom: '6px', fontSize: '11px',
+          fontFamily: 'var(--font-mono)', color: 'var(--text-muted)',
+          textTransform: 'uppercase', letterSpacing: '0.5px',
+        }}
+      >
         {label}
       </label>
       {children}
@@ -23,7 +27,7 @@ function Field({ label, children }) {
 
 function SecretInput({ value, onChange, show, onToggle, placeholder, id, label }) {
   return (
-    <Field label={label}>
+    <Field label={label} htmlFor={id}>
       <div style={{ position: 'relative' }}>
         <input
           id={id}
@@ -72,8 +76,9 @@ export default function CredentialsCard({
       <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
 
         {/* Auth Type */}
-        <Field label="Authentication Type">
+        <Field label="Authentication Type" htmlFor="cred-auth-type">
           <select
+            id="cred-auth-type"
             value={authType}
             onChange={e => setAuthType(e.target.value)}
             style={{ width: '100%' }}
@@ -87,8 +92,9 @@ export default function CredentialsCard({
         {/* Form Login */}
         {authType === 'form' && (
           <>
-            <Field label="Username">
+            <Field label="Username" htmlFor="cred-username">
               <input
+                id="cred-username"
                 type="text"
                 value={username}
                 onChange={e => setUsername(e.target.value)}
@@ -107,8 +113,9 @@ export default function CredentialsCard({
               onToggle={() => setShowPassword(v => !v)}
               placeholder="••••••••"
             />
-            <Field label="Login URL">
+            <Field label="Login URL" htmlFor="cred-login-url">
               <input
+                id="cred-login-url"
                 type="text"
                 value={loginUrl}
                 onChange={e => setLoginUrl(e.target.value)}
@@ -133,8 +140,9 @@ export default function CredentialsCard({
               onToggle={() => setShowToken(v => !v)}
               placeholder="eyJhbGciOiJIUzI1NiJ9…"
             />
-            <Field label="Header Name">
+            <Field label="Header Name" htmlFor="cred-header-name">
               <input
+                id="cred-header-name"
                 type="text"
                 value={headerName}
                 onChange={e => setHeaderName(e.target.value)}
@@ -144,8 +152,9 @@ export default function CredentialsCard({
                 style={{ width: '100%', boxSizing: 'border-box' }}
               />
             </Field>
-            <Field label="Validation URL (optional)">
+            <Field label="Validation URL (optional)" htmlFor="cred-bearer-validation-url">
               <input
+                id="cred-bearer-validation-url"
                 type="text"
                 value={loginUrl}
                 onChange={e => setLoginUrl(e.target.value)}
@@ -161,8 +170,9 @@ export default function CredentialsCard({
         {/* Cookie Jar */}
         {authType === 'cookie' && (
           <>
-            <Field label="Cookie Header (paste raw Cookie: value)">
+            <Field label="Cookie Header (paste raw Cookie: value)" htmlFor="cred-cookie-jar">
               <textarea
+                id="cred-cookie-jar"
                 value={cookieJar}
                 onChange={e => setCookieJar(e.target.value)}
                 placeholder={'session=abc123; role=admin; csrf_token=xyz'}
@@ -180,8 +190,9 @@ export default function CredentialsCard({
               Tip: Copy from DevTools → Network → Request Headers → Cookie, or export via Burp Suite.
               The "Cookie:" prefix is stripped automatically.
             </div>
-            <Field label="Validation URL (optional)">
+            <Field label="Validation URL (optional)" htmlFor="cred-cookie-validation-url">
               <input
+                id="cred-cookie-validation-url"
                 type="text"
                 value={loginUrl}
                 onChange={e => setLoginUrl(e.target.value)}
