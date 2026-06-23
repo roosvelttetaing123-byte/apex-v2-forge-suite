@@ -18,6 +18,17 @@ class Evidence:
     pcap_path:            str | None = None   # PCAP file path
     extra:                dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize evidence for events, storage, and reports."""
+        return {
+            "request_raw": self.request_raw,
+            "response_raw": self.response_raw,
+            "screenshot_path": self.screenshot_path,
+            "console_capture_path": self.console_capture_path,
+            "pcap_path": self.pcap_path,
+            "extra": self.extra,
+        }
+
     def screenshot_as_base64(self) -> str | None:
         """Return screenshot as base64 data URI for HTML embedding."""
         if not self.screenshot_path:

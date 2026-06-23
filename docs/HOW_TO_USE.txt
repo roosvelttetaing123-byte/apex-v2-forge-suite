@@ -1,0 +1,495 @@
+================================================================================
+  FORGE-SUITE — HOW TO USE
+  MPTC Cambodia Authorized Security Training Workshop
+  Version 1.0  |  Updated: June 2026
+================================================================================
+
+FOR AUTHORIZED PENETRATION TESTING ONLY.
+All three frameworks require explicit operator authorization before any scan
+begins. You will be prompted to type "yes" at startup to confirm scope.
+
+--------------------------------------------------------------------------------
+QUICK START — WHICH TOOL DO I USE?
+--------------------------------------------------------------------------------
+
+  WEBFORGE  →  target is a URL (web app, API, portal)
+  NETFORGE  →  target is an IP, CIDR, or hostname (network infrastructure)
+  ADFORGE   →  target is an Active Directory / Windows domain
+
+All tools are located in their own subdirectory and run with Python 3.10+:
+
+  cd /home/kali/Desktop/lab/forge-suite
+  python3 webforge/webforge.py   --help
+  python3 netforge/netforge.py   --help
+  python3 adforge/adforge.py     --help
+
+--------------------------------------------------------------------------------
+DEPENDENCIES (install once on Kali)
+--------------------------------------------------------------------------------
+
+  pip3 install aiohttp ldap3 impacket rich jinja2 cryptography \
+               dnspython pyOpenSSL reportlab pillow sqlalchemy
+
+  Optional (enable extra modules):
+    pip3 install python-nmap nuclei          # NetForge vuln scanning
+    pip3 install selenium playwright         # WebForge screenshots
+    pip3 install bloodhound                  # ADForge BloodHound export
+
+================================================================================
+  WEBFORGE — Web Application Pentesting  (12 phases)
+================================================================================
+
+MODES:
+  blackbox   No credentials. Full passive + active recon. (default)
+  greybox    Credentials provided. Tests authenticated endpoints.
+  whitebox   Source code path provided. Adds static analysis phases.
+
+BASIC USAGE:
+
+  # Blackbox scan — no credentials
+  python3 webforge/webforge.py \
+    --target https://target.com \
+    --engagement "Client_WebApp" \
+    --tester "YourName"
+
+  # Greybox — username + password
+  python3 webforge/webforge.py \
+    --target https://target.com \
+    --mode greybox \
+    --username admin --password "P@ssw0rd" \
+    --engagement "Client_WebApp"
+
+  # Greybox — Bearer/JWT token
+  python3 webforge/webforge.py \
+    --target https://target.com \
+    --mode greybox \
+    --token "eyJhbGciOiJSUzI1NiIsIn..." \
+    --jwt-token "eyJhbGciOiJSUzI1NiIsIn..."
+
+  # Greybox — cookie session
+  python3 webforge/webforge.py \
+    --target https://target.com \
+    --mode greybox \
+    --cookie "session=abc123; csrf=xyz" \
+    --engagement "Client_WebApp"
+
+  # SSO / complex login — launches browser capture first
+  python3 webforge/webforge.py \
+    --target https://target.com \
+    --mode greybox \
+    --sso
+
+  # Whitebox — with source code
+  python3 webforge/webforge.py \
+    --target https://target.com \
+    --mode whitebox \
+    --source /path/to/repo \
+    --engagement "Client_Whitebox"
+
+  # Through Burp proxy (intercept/replay)
+  python3 webforge/webforge.py \
+    --target https://target.com \
+    --proxy http://127.0.0.1:8080
+
+USEFUL FLAGS:
+  --dry-run             Show all modules that would run, send nothing
+  --list-modules        Print all modules grouped by phase and exit
+  --modules sqli_scanner,xss_scanner   Run only these modules
+  --skip-modules login_brute           Skip specific modules
+  --rate 5.0            Slow down to 5 requests/second
+  --workers 5           Reduce concurrent workers (default: 10)
+  --report-format html,pdf,json,csv    Choose output formats
+  --auto-confirm        Skip interactive confirmation gates (CI/pipeline use)
+  --resume results/...  Resume an interrupted scan
+  --no-screenshot       Disable browser screenshots (faster)
+  --verbose             Show full debug output
+
+PHASES RUN (in order):
+  1  Recon          — CMS detect, dir fuzzing, JS analysis, subdomain takeover
+  2  SSL            — TLS version, cipher suite, certificate checks
+  3  Headers        — CORS, CSP, cookie flags, SRI, clickjacking
+  4  Injection      — SQLi, XSS, XXE, SSTI, CMDi, LDAP, NoSQL, CRLF
+  5  Auth           — Session, JWT, OAuth, login brute, MFA bypass
+  6  Access Control — IDOR, privilege escalation, path traversal, 403 bypass
+  7  API            — REST, GraphQL (introspection/batching/APQ), SOAP/WSDL
+  8  File           — SSRF, LFI/RFI, upload bypass
+  9  Business Logic — Open redirect, price tamper, workflow bypass, race condition
+  10 Advanced       — WebSocket, HTTP/2, HTTP smuggling, cache attacks, prototype
+                      pollution, deserialization, email security, ZIP slip
+  11 Whitebox       — Source audit, secret scan, dependency audit, config review
+  12 Reporting      — HTML + PDF + JSON + CSV report generation
+
+OUTPUTS (saved to webforge/results/<engagement>_<host>_<timestamp>/):
+  webforge.db          SQLite database of all findings
+  report.html          Full HTML report with evidence
+  report.pdf           PDF version
+  findings.json        Machine-readable JSON
+  findings.csv         Spreadsheet-compatible CSV
+  evidence/            Screenshots and raw HTTP evidence
+
+================================================================================
+  NETFORGE — Network Pentesting  (8 phases)
+================================================================================
+
+MODES:
+  internal   Assumes access to internal network (skips external recon)
+  external   External perimeter scan (skips ARP/DHCP/VLAN phases)
+  full       All phases — use when you have both internal and external access
+
+BASIC USAGE:
+
+  # Internal network scan — full /24 subnet
+  python3 netforge/netforge.py \
+    --target 10.0.0.0/24 \
+    --mode internal \
+    --engagement "Client_Internal" \
+    --tester "YourName"
+
+  # External perimeter scan
+  python3 netforge/netforge.py \
+    --target 203.0.113.0/24 \
+    --mode external \
+    --engagement "Client_External"
+
+  # Single host — full scan
+  python3 netforge/netforge.py \
+    --target 10.0.0.5 \
+    --mode full \
+    --engagement "Client_SingleHost"
+
+  # Passive + capture mode (saves PCAP)
+  python3 netforge/netforge.py \
+    --target 10.0.0.0/24 \
+    --mode internal \
+    --capture \
+    --interface eth0
+
+  # Slow/stealth scan (avoids IDS triggers)
+  python3 netforge/netforge.py \
+    --target 10.0.0.0/24 \
+    --mode internal \
+    --stealth \
+    --rate 1.0
+
+  # Quick vuln check only — skip discovery
+  python3 netforge/netforge.py \
+    --target 10.0.0.1 \
+    --modules cve_matcher,nuclei_runner,exploit_suggest
+
+BRUTE FORCE FLAGS (always check lockout policy first):
+  --bf-delay 10         Seconds between brute force attempts (default: 3)
+  --bf-max 2            Max attempts per account (default: 3)
+  --bf-timeout 60       Timeout per brute force session (default: 30)
+
+PHASES RUN (in order):
+  1  Host Discovery    — Ping sweep, port scan, OS detect, service ID, topology
+  2  External Recon    — DNS, SSL/TLS, SMTP, firewall detect, exposure check
+  3  Internal Analysis — ARP monitor, DHCP, VLAN, CDP/LDP, IPv6, LLMNR/NBT-NS
+  4  Service Auditing  — SMB, FTP, SSH, Telnet, RDP, SNMP, NFS, databases,
+                         Redis, Mongo, Elasticsearch, VNC, TFTP, VoIP, IPMI,
+                         Kubernetes, Docker, cloud metadata, ICS/SCADA, UPnP
+  5  Vuln Matching     — CVE matcher (56 CVEs incl. 2025-2026), nmap vulns,
+                         Nuclei runner, exploit suggestions
+  6  Brute Force       — Smart brute, Hydra wrapper, credential spray
+  7  Post-Exploitation — Pivot finder, loot parser, tunnel suggestions
+  8  Reporting         — HTML, PDF, CSV, network diagram
+
+OUTPUTS (saved to netforge/results/<engagement>_<target>_<timestamp>/):
+  netforge.db          SQLite findings database
+  report.html / .pdf   Full reports
+  findings.json/.csv   Machine-readable output
+  network_diagram.*    Visual topology diagram
+  pcaps/               Packet captures (if --capture used)
+
+================================================================================
+  ADFORGE — Active Directory Pentesting  (14 phases)
+================================================================================
+
+MODES:
+  unauth   No credentials. Tests null session, LDAP anon, Kerberos user enum.
+  auth     Valid domain user. Full enumeration + attacks.  (most common)
+  admin    Domain Admin / high-priv account. Full attack + post-exploitation.
+
+REQUIRED ARGUMENTS:
+  --dc       Domain controller IP address
+  --domain   Domain name (e.g. corp.local)
+
+BASIC USAGE:
+
+  # Phase 1 only — no credentials (unauthenticated recon)
+  python3 adforge/adforge.py \
+    --dc 10.0.0.1 \
+    --domain corp.local \
+    --mode unauth \
+    --engagement "Client_AD"
+
+  # Full authenticated scan — regular domain user
+  python3 adforge/adforge.py \
+    --dc 10.0.0.1 \
+    --domain corp.local \
+    --mode auth \
+    --username jsmith \
+    --password "Password123" \
+    --engagement "Client_AD" \
+    --tester "YourName"
+
+  # Pass-the-Hash (no plaintext password)
+  python3 adforge/adforge.py \
+    --dc 10.0.0.1 \
+    --domain corp.local \
+    --mode auth \
+    --username jsmith \
+    --hash "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0"
+
+  # Kerberos ticket (ccache)
+  python3 adforge/adforge.py \
+    --dc 10.0.0.1 \
+    --domain corp.local \
+    --mode auth \
+    --username jsmith \
+    --ticket /tmp/jsmith.ccache
+
+  # Full admin mode — with DCSync and BloodHound export
+  python3 adforge/adforge.py \
+    --dc 10.0.0.1 \
+    --domain corp.local \
+    --mode admin \
+    --username administrator \
+    --password "DomainAdminP@ss!" \
+    --dcsync \
+    --bloodhound \
+    --engagement "Client_AD_Full"
+
+  # Password spray — set safe delay (always check lockout policy first!)
+  python3 adforge/adforge.py \
+    --dc 10.0.0.1 \
+    --domain corp.local \
+    --mode auth \
+    --username jsmith --password "Start123" \
+    --modules password_spray \
+    --spray-delay 120 \
+    --spray-max-rounds 1
+
+  # ADCS audit only
+  python3 adforge/adforge.py \
+    --dc 10.0.0.1 \
+    --domain corp.local \
+    --mode auth \
+    --username jsmith --password "Password123" \
+    --modules adcs_enum,esc1_check,esc2_check,esc3_check,esc4_check,esc6_check,esc7_check,esc8_check
+
+  # Run everything without confirmation prompts (training lab / autopilot)
+  python3 adforge/adforge.py \
+    --dc 10.0.0.1 \
+    --domain corp.local \
+    --mode admin \
+    --username administrator --password "DaPass!" \
+    --autopilot
+
+SPECIAL FLAGS:
+  --dcsync           Enable DCSync module in Phase 13 (admin mode only)
+  --bloodhound       Export BloodHound-compatible JSON for graph analysis
+  --autopilot        Skip all confirmation gates (lab/training use only)
+  --spray-delay N    Seconds between password spray rounds (default: 60)
+  --spray-max-rounds N  Maximum spray rounds (default: 1 — never exceed!)
+  --dry-run          Show plan, make no connections
+
+PHASES RUN (in order, mode controls which run):
+  1  Unauthenticated Recon  — Null session, LDAP anon, Kerberos user enum,
+                               RID cycling, DNS enumeration
+                               [unauth + auth + admin]
+  2  Domain Enumeration     — Users, groups, computers, OUs, GPOs, trusts,
+                               schema, fine-grained PSP, admin count, GPP passwords
+                               [auth + admin]
+  3  Attack Surface         — ACL enum, SPNs, ASREP candidates, LAPS, gMSA,
+                               ADCS CAs, RC4 encryption audit, Entra hybrid
+                               [auth + admin]
+  4  Vulnerability Checks   — Zerologon, PetitPotam, noPac, PrintSpooler,
+                               MS14-068, DFSCoerce, DCShadow, ShadowCoerce,
+                               Certifried, Pre-Win2000 machine accounts
+                               [auth + admin]
+  5  Kerberos Attacks       — Kerberoasting (TGS), AS-REP Roasting (TGT)
+                               [auth + admin]
+  6  Password Attacks       — Password spray (lockout-aware)
+                               [auth + admin]
+  7  Credential Attacks     — NTLM relay, Pass-the-Hash, Pass-the-Ticket
+                               [auth + admin]
+  8  Ticket Attacks         — Golden ticket, Silver ticket
+                               [admin only]
+  9  ACL Abuse Analysis     — DACL abuse, ForceChangePassword, AddMember,
+                               Shadow Credentials, ACL scanner
+                               [auth + admin]
+  10 GPO + Delegation       — GPO path check, linked GPO, unconstrained
+                               delegation, constrained delegation, RBCD attack
+                               [auth + admin]
+  11 AD CS Audit            — ESC1 through ESC14 certificate template checks
+                               (14 attack vectors covered)
+                               [auth + admin]
+  12 Lateral Movement       — SMB exec, WMI exec, RDP check
+                               [auth + admin]
+  13 Post-Exploitation      — DA check, DCSync (--dcsync flag), secretsdump,
+                               loot collector, BitLocker, recycle bin,
+                               backup check, persistence, AdminSDHolder
+                               [admin only]
+  14 Reporting              — HTML, PDF, JSON, CSV, BloodHound JSON,
+                               attack path SVG diagram
+                               [all modes]
+
+OUTPUTS (saved to adforge/results/<engagement>_<domain>_<timestamp>/):
+  adforge.db           SQLite findings database
+  report.html / .pdf   Full penetration test report
+  findings.json/.csv   Machine-readable output
+  hashes/              Kerberoast / AS-REP / DCSync hash files
+                         (format: hashcat-compatible)
+  bloodhound/          BloodHound JSON files (if --bloodhound used)
+                         Import into BloodHound GUI for graph analysis
+  loot/                Collected credentials and sensitive data
+
+CRACKING HASHES (after ADForge run):
+  # Kerberoast (hashcat mode 13100)
+  hashcat -m 13100 adforge/results/.../hashes/kerberoast_hashes.txt \
+    /usr/share/wordlists/rockyou.txt --force
+
+  # AS-REP Roast (hashcat mode 18200)
+  hashcat -m 18200 adforge/results/.../hashes/asrep_hashes.txt \
+    /usr/share/wordlists/rockyou.txt --force
+
+  # NTLM hashes (hashcat mode 1000)
+  hashcat -m 1000 adforge/results/.../hashes/ntlm_hashes.txt \
+    /usr/share/wordlists/rockyou.txt --force
+
+================================================================================
+  COMMON WORKFLOWS
+================================================================================
+
+WORKFLOW 1 — Full Web App Assessment (1 day):
+  1. python3 webforge/webforge.py --target https://app.corp.com --mode blackbox --dry-run
+     (review what will run)
+  2. python3 webforge/webforge.py --target https://app.corp.com --mode blackbox
+  3. python3 webforge/webforge.py --target https://app.corp.com --mode greybox \
+       --username testuser --password "TestPass1"
+  4. Review HTML report in webforge/results/
+
+WORKFLOW 2 — Internal Network Pentest:
+  1. python3 netforge/netforge.py --target 10.0.0.0/24 --mode internal --dry-run
+  2. python3 netforge/netforge.py --target 10.0.0.0/24 --mode internal
+  3. python3 netforge/netforge.py --target 10.0.0.0/24 --mode internal --capture --interface eth0
+  4. Review network_diagram and report in netforge/results/
+
+WORKFLOW 3 — Active Directory Full Assessment:
+  Step 1 — Unauthenticated (what can an outsider see?):
+    python3 adforge/adforge.py --dc 10.0.0.1 --domain corp.local --mode unauth
+
+  Step 2 — Authenticated (regular user foothold):
+    python3 adforge/adforge.py --dc 10.0.0.1 --domain corp.local \
+      --mode auth --username jsmith --password "Password123"
+
+  Step 3 — Admin (full compromise path):
+    python3 adforge/adforge.py --dc 10.0.0.1 --domain corp.local \
+      --mode admin --username administrator --password "DaPass!" \
+      --dcsync --bloodhound
+
+  Step 4 — Import bloodhound JSON into BloodHound GUI, analyze attack paths
+
+WORKFLOW 4 — Quick ADCS Audit (certificate template attacks):
+  python3 adforge/adforge.py --dc 10.0.0.1 --domain corp.local \
+    --mode auth --username jsmith --password "Password123" \
+    --modules adcs_enum,esc1_check,esc2_check,esc3_check,esc4_check,\
+esc6_check,esc7_check,esc8_check,esc9_check,esc10_check,esc11_check,esc13_check,esc14_check
+
+WORKFLOW 5 — Chained Web + AD (real-world scenario):
+  1. WebForge → find credentials or tokens in web app
+  2. Use found credentials in ADForge --username / --password
+  3. NetForge → scan internal network found via SSRF or lateral movement
+
+================================================================================
+  SAFETY RULES (NON-NEGOTIABLE)
+================================================================================
+
+1. SCOPE GATE    Every module checks scope before sending any packet.
+                 Out-of-scope hosts are automatically skipped.
+
+2. CONFIRM GATE  Destructive/active modules ask for operator confirmation.
+                 Use --auto-confirm / --autopilot ONLY in isolated lab environments.
+
+3. RATE LIMITING Every module rate-limits itself. Default: 10 req/s.
+                 Reduce with --rate 2.0 for production systems.
+
+4. LOCKOUT SAFE  Password spray queries the domain lockout policy first.
+                 It will never exceed (threshold - 1) attempts per account.
+                 Always set --spray-delay >= 60 seconds (recommendation: 120+).
+
+5. NO INTERNET   Modules that need online resources (Nuclei updates, NVD) ask
+                 for explicit permission before making outbound connections.
+
+6. EVIDENCE ONLY Results are written to disk only. Nothing is exfiltrated.
+                 Hash files stay in the results/ directory.
+
+================================================================================
+  TROUBLESHOOTING
+================================================================================
+
+Module skipped / "not yet built":
+  → The module imported correctly but returned early (scope or credential check).
+    Check --verbose output for the reason.
+
+LDAP connection failed:
+  → Verify DC IP and domain. Try: ldapsearch -H ldap://10.0.0.1 -x
+  → For LDAPS, ensure port 636 is open.
+
+Kerberoast/ASREP returns no hashes:
+  → Run spn_enum / asrep_enum first to populate config.extra.
+    The attack modules read their target list from prior enumeration results.
+
+Import error (impacket / ldap3 / aiohttp):
+  → pip3 install impacket ldap3 aiohttp cryptography
+  → On Kali: sudo apt install python3-impacket
+
+Report is empty:
+  → Check results/<run>/webforge.db / adforge.db with sqlite3 for raw findings.
+  → Ensure --engagement name doesn't contain spaces (use underscores).
+
+BloodHound JSON not generated:
+  → Add --bloodhound flag AND --mode admin to the ADForge command.
+  → Import the JSON files from adforge/results/.../bloodhound/ into
+    BloodHound 4.x or CE via the upload button.
+
+================================================================================
+  FILE STRUCTURE REFERENCE
+================================================================================
+
+forge-suite/
+├── common/               Shared base classes, config, DB, reporting
+│   ├── base_module.py    BaseModule — all modules inherit from this
+│   ├── config.py         BaseForgeConfig — loaded from *.yaml
+│   ├── reporter.py       BaseReporter — generates HTML/PDF/JSON/CSV
+│   └── finding.py        Finding + Severity + Evidence models
+├── webforge/
+│   ├── webforge.py       MASTER ENTRY POINT
+│   ├── webforge.yaml     Config (rate, timeouts, user-agents)
+│   ├── modules/          57 scan modules across 11 phases
+│   └── results/          Scan output (created at runtime)
+├── netforge/
+│   ├── netforge.py       MASTER ENTRY POINT
+│   ├── netforge.yaml     Config
+│   ├── modules/          47 scan modules across 8 phases
+│   └── results/
+└── adforge/
+    ├── adforge.py        MASTER ENTRY POINT
+    ├── adforge.yaml      Config
+    ├── modules/          70 scan modules across 14 phases
+    ├── core/             LDAP client, Kerberos client, credential engine
+    └── results/
+
+================================================================================
+  TOTAL COVERAGE SUMMARY
+================================================================================
+
+  WebForge  : 57 modules | OWASP Top 10 + API Top 10 + Advanced
+  NetForge  : 47 modules | 56 CVEs (legacy 2014 → 2026) | ICS/Cloud/K8s
+  ADForge   : 70 modules | ESC1-14 | Pre-Win2000 → Entra ID / PRT theft
+
+  Total     : 174 modules | 391 findings | 412 CVSS 3.1 vectors
+              All syntax-verified | Python 3.10+ | June 2026 current
+
+================================================================================

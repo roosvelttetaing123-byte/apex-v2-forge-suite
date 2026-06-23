@@ -114,7 +114,7 @@ class SubdomainTakeover(BaseModule):
                                 "fingerprint": fingerprint,
                             },
                         )
-                        ev.screenshot_path = await self.capture_screenshot(
+                        ev.screenshot_path = self.capture_screenshot(
                             f"http://{subdomain}", finding_id=f"takeover_{subdomain}"
                         )
                         self.new_finding(

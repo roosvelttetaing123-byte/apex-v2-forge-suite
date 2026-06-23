@@ -66,6 +66,8 @@ class IcsAudit(BaseModule):
         await self._check_modbus(host)
         await self._check_s7comm(host)
         await self._check_dnp3(host)
+        await self._check_bacnet(host)
+        await self._check_enip(host)
 
     async def _check_modbus(self, host: str) -> None:
         """Test Modbus TCP access — read coils and holding registers."""
@@ -113,6 +115,14 @@ class IcsAudit(BaseModule):
                         register_values.append(val)
 
             writer.close()
+
+            # Only report if we got a valid Modbus protocol response, not just a TCP connection
+            modbus_confirmed = (
+                (len(data) > 9 and data[7] == 0x2B) or registers_read
+            )
+            if not modbus_confirmed:
+                self.log.debug("TCP 502 connected on %s but no Modbus protocol response", host)
+                return
 
             ev = Evidence(
                 request_raw=f"Modbus TCP Read Holding Registers → {host}:502",
@@ -222,6 +232,19 @@ class IcsAudit(BaseModule):
         except Exception:
             pass
 
+    @staticmethod
+    def _dnp3_crc(data: bytes) -> int:
+        """CRC-16 for DNP3 (polynomial 0x3D65, reflected)."""
+        crc = 0x0000
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 0x0001:
+                    crc = (crc >> 1) ^ 0xA6BC
+                else:
+                    crc >>= 1
+        return (~crc) & 0xFFFF
+
     async def _check_dnp3(self, host: str) -> None:
         """Detect DNP3 service on TCP 20000."""
         port = 20000
@@ -229,16 +252,16 @@ class IcsAudit(BaseModule):
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port), timeout=5
             )
-            # DNP3 data link layer: start bytes 0x0564
-            # Send a minimal DNP3 link layer frame
-            dnp3_probe = bytes([
+            # DNP3 data link layer frame with correct CRC-16
+            header = bytes([
                 0x05, 0x64,  # Start bytes
-                0x05,        # Length
-                0xc0,        # Control (DIR, PRM, FCB)
-                0x01, 0x00,  # Destination
-                0x00, 0x00,  # Source
-                0x00, 0x00,  # CRC (placeholder)
+                0x05,        # Length (5 bytes after this field)
+                0xc0,        # Control (DIR, PRM, FCB, RESET_LINK)
+                0x01, 0x00,  # Destination address (1)
+                0x00, 0x00,  # Source address (0)
             ])
+            crc_val = self._dnp3_crc(header)
+            dnp3_probe = header + struct.pack("<H", crc_val)
             writer.write(dnp3_probe)
             await writer.drain()
             data = await asyncio.wait_for(reader.read(256), timeout=5)
@@ -266,6 +289,140 @@ class IcsAudit(BaseModule):
                     cvss_v31_vector=CVSS_DETECT,
                     cvss_v40_vector=CVSS40_DETECT,
                     port=port, service="dnp3", target=host,
+                )
+        except Exception:
+            pass
+
+    async def _check_bacnet(self, host: str) -> None:
+        """BACnet/IP device discovery via UDP broadcast on port 47808."""
+        port = 47808
+        # BACnet Who-Is request (BVLC + NPDU + APDU)
+        who_is = bytes([
+            0x81, 0x0b,        # BVLC type: Original-Broadcast-NPDU
+            0x00, 0x08,        # BVLC length
+            0x01, 0x20,        # NPDU: version 1, expecting reply
+            0xff, 0xff,        # Destination network (broadcast)
+            0x00,              # Destination MAC length (0 = broadcast)
+            0x10,              # Hop count
+            0x10, 0x08,        # APDU: Unconfirmed-Request, Who-Is service
+        ])
+        try:
+            loop = asyncio.get_event_loop()
+            transport, _ = await loop.create_datagram_endpoint(
+                asyncio.DatagramProtocol,
+                remote_addr=(host, port),
+                family=10,  # AF_INET6 fallback; use AF_INET
+            )
+            transport.close()
+        except Exception:
+            pass
+
+        try:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3)
+            sock.sendto(who_is, (host, port))
+            try:
+                data, _ = sock.recvfrom(512)
+                sock.close()
+                # I-Am response starts with 0x81 (BVLC) and APDU service 0x10 0x00 (I-Am)
+                if len(data) >= 4 and data[0] == 0x81:
+                    ev = Evidence(
+                        request_raw=f"BACnet Who-Is UDP → {host}:{port}",
+                        extra={"host": host, "response_bytes": list(data[:16])},
+                    )
+                    self.new_finding(
+                        title=f"BACnet Device Exposed — {host}:{port}",
+                        severity=Severity.HIGH,
+                        description=(
+                            f"BACnet/IP device responded to Who-Is broadcast on {host}:{port}. "
+                            "BACnet is used in building automation and SCADA. "
+                            "Unauthenticated access allows reading/writing object properties "
+                            "(temperature setpoints, HVAC control, alarm systems)."
+                        ),
+                        reproduction_steps=[
+                            f"nmap -sU -p 47808 --script bacnet-info {host}",
+                            "# Python: bacpypes or scapy BACnet layer",
+                        ],
+                        remediation=(
+                            "Segment BACnet network from corporate/internet. "
+                            "Enable BACnet/SC (secure connect) where supported. "
+                            "Deploy industrial firewall to restrict Who-Is broadcasts."
+                        ),
+                        references=["CWE-306", "ASHRAE 135", "ICS-CERT"],
+                        evidence=ev,
+                        cvss_v31_vector=CVSS_DETECT,
+                        cvss_v40_vector=CVSS40_DETECT,
+                        port=port, service="bacnet", target=host,
+                    )
+            except socket.timeout:
+                sock.close()
+        except Exception:
+            pass
+
+    async def _check_enip(self, host: str) -> None:
+        """EtherNet/IP List Identity request on TCP 44818."""
+        port = 44818
+        # EtherNet/IP encapsulation: List Identity command (0x0063)
+        list_identity = bytes([
+            0x63, 0x00,  # Command: List Identity
+            0x00, 0x00,  # Length: 0
+            0x00, 0x00, 0x00, 0x00,  # Session handle
+            0x00, 0x00, 0x00, 0x00,  # Status
+            0x00, 0x00, 0x00, 0x00,  # Sender context (8 bytes)
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,  # Options
+        ])
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=5
+            )
+            writer.write(list_identity)
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(512), timeout=5)
+            writer.close()
+
+            # EtherNet/IP response starts with command echo 0x63 0x00
+            if len(data) >= 4 and data[0] == 0x63 and data[1] == 0x00:
+                # Try to extract product name from identity response
+                product_name = ""
+                try:
+                    # Identity object: after fixed header, find ASCII product name
+                    name_bytes = data[30:60]
+                    product_name = name_bytes.decode(errors="ignore").strip("\x00")
+                except Exception:
+                    pass
+
+                ev = Evidence(
+                    request_raw=f"EtherNet/IP List Identity → {host}:{port}",
+                    extra={"host": host, "product_name": product_name, "response_bytes": list(data[:16])},
+                )
+                self.new_finding(
+                    title=f"EtherNet/IP PLC Exposed — {host}:{port}",
+                    severity=Severity.CRITICAL,
+                    description=(
+                        f"EtherNet/IP device responded to List Identity on {host}:{port}. "
+                        f"Product: {product_name or 'unknown'}. "
+                        "EtherNet/IP (CIP) is used for Allen-Bradley, Rockwell, and Omron PLCs. "
+                        "Unauthenticated CIP access allows reading/writing I/O and program tags, "
+                        "stopping CPU execution, and uploading/downloading PLC programs."
+                    ),
+                    reproduction_steps=[
+                        f"nmap -p 44818 --script enip-info {host}",
+                        "# CIP exploit: plcscan, CPPPO, EIPScanner",
+                        f"python3 -c \"import cpppo; ...\" {host}",
+                    ],
+                    remediation=(
+                        "Isolate PLCs in dedicated OT VLAN behind industrial DMZ. "
+                        "Enable CIP security (CIP Security profile, TLS 1.2+). "
+                        "Disable remote programming access from untrusted networks. "
+                        "Deploy Rockwell Automation Security Wizard configuration."
+                    ),
+                    references=["CWE-306", "ODVA EtherNet/IP Spec", "ICS-CERT Advisory"],
+                    evidence=ev,
+                    cvss_v31_vector=CVSS_MODBUS,
+                    cvss_v40_vector=CVSS40_MODBUS,
+                    port=port, service="enip", target=host,
                 )
         except Exception:
             pass

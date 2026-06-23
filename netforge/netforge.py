@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
+import json
 import sys
 import time
 import uuid
@@ -82,18 +83,23 @@ log = get_logger("netforge")
 VERSION = "5.0.0"
 
 PHASES: list[tuple[int, str, list[str]]] = [
-    (1, "Host Discovery",    ["host_discover","port_scanner","os_detect","service_id","topology_map"]),
-    (2, "External Recon",    ["dns_recon","ssl_audit","smtp_check","firewall_detect","exposure_check","firewall_rule_check"]),
-    (3, "Internal Analysis", ["arp_monitor","dhcp_audit","vlan_check","cdp_ldp","ipv6_audit","llmnr_detect"]),
-    (4, "Service Auditing",  ["smb_audit","ftp_audit","ssh_audit","telnet_audit","rdp_audit","snmp_audit",
-                               "nfs_audit","mssql_audit","mysql_audit","redis_audit","mongo_audit",
-                               "elastic_audit","vnc_audit","tftp_audit","printer_audit","voip_audit",
-                               "ipmi_audit","kubernetes_audit","docker_audit","cloud_metadata","ics_audit","upnp_audit"]),
-    (5, "Vuln Matching",     ["cve_matcher","nmap_vulns","nuclei_runner","exploit_suggest"]),
-    (6, "Brute Force",       ["native_brute","smart_brute","cred_spray","hydra_wrap"]),
-    (7, "Exploitation",      ["heartbleed","redis_rce","ntlm_relay","eternalblue","bluekeep","zerologon"]),
-    (8, "Post-Exploitation", ["pivot_finder","loot_parse","tunnel_suggest"]),
-    (9, "Reporting",         ["html_report","pdf_report","json_export","csv_export","network_diagram"]),
+    (1,  "Host Discovery",         ["host_discover","port_scanner","os_detect","service_id","topology_map"]),
+    (2,  "External Recon",         ["dns_recon","ssl_audit","smtp_check","firewall_detect","exposure_check","firewall_rule_check"]),
+    (3,  "Internal Analysis",      ["arp_monitor","dhcp_audit","vlan_check","cdp_ldp","ipv6_audit","llmnr_detect"]),
+    (4,  "Service Auditing",       ["smb_audit","ftp_audit","ssh_audit","telnet_audit","rdp_audit","snmp_audit",
+                                     "nfs_audit","mssql_audit","mysql_audit","redis_audit","mongo_audit",
+                                     "elastic_audit","vnc_audit","tftp_audit","printer_audit","voip_audit",
+                                     "ipmi_audit","kubernetes_audit","docker_audit","cloud_metadata","ics_audit","upnp_audit"]),
+    (5,  "Vuln Matching",          ["cve_matcher","nmap_vulns","nuclei_runner","exploit_suggest"]),
+    (6,  "Brute Force",            ["native_brute","smart_brute","cred_spray","hydra_wrap"]),
+    (7,  "Exploitation",           ["heartbleed","redis_rce","ntlm_relay","eternalblue","bluekeep","zerologon"]),
+    (8,  "Credential Harvesting",  ["mimikatz_exec","sam_dump","ntds_dump","token_steal"]),
+    (9,  "Lateral Movement",       ["lateral_psexec","lateral_smb","lateral_ssh","lateral_winrm","lateral_wmi"]),
+    (10, "Evasion",                ["amsi_bypass","etw_blind","process_hollow"]),
+    (11, "Persistence",            ["persist_cron","persist_registry","persist_schtask","persist_service",
+                                     "kernel_rootkit","userland_rootkit"]),
+    (12, "Post-Exploit Intel",     ["pivot_finder","loot_parse","tunnel_suggest"]),
+    (13, "Reporting",              ["html_report","pdf_report","json_export","csv_export","network_diagram"]),
 ]
 
 MODULE_MAP: dict[str, str] = {
@@ -151,10 +157,33 @@ MODULE_MAP: dict[str, str] = {
     "eternalblue":      "netforge.modules.exploit.eternalblue",
     "bluekeep":         "netforge.modules.exploit.bluekeep",
     "zerologon":        "netforge.modules.exploit.zerologon",
-    # ── Post-Exploitation ─────────────────────────────────────────
+    # ── Credential Harvesting (Red Team only) ─────────────────────
+    "mimikatz_exec":    "netforge.modules.post_exploit.mimikatz_exec",
+    "sam_dump":         "netforge.modules.post_exploit.sam_dump",
+    "ntds_dump":        "netforge.modules.post_exploit.ntds_dump",
+    "token_steal":      "netforge.modules.post_exploit.token_steal",
+    # ── Lateral Movement (Red Team only) ──────────────────────────
+    "lateral_psexec":   "netforge.modules.post_exploit.lateral_psexec",
+    "lateral_smb":      "netforge.modules.post_exploit.lateral_smb",
+    "lateral_ssh":      "netforge.modules.post_exploit.lateral_ssh",
+    "lateral_winrm":    "netforge.modules.post_exploit.lateral_winrm",
+    "lateral_wmi":      "netforge.modules.post_exploit.lateral_wmi",
+    # ── Evasion (Red Team only) ───────────────────────────────────
+    "amsi_bypass":      "netforge.modules.rootkit.amsi_bypass",
+    "etw_blind":        "netforge.modules.rootkit.etw_blind",
+    "process_hollow":   "netforge.modules.rootkit.process_hollow",
+    # ── Persistence / Rootkit (Red Team only) ─────────────────────
+    "persist_cron":     "netforge.modules.post_exploit.persist_cron",
+    "persist_registry":  "netforge.modules.post_exploit.persist_registry",
+    "persist_schtask":  "netforge.modules.post_exploit.persist_schtask",
+    "persist_service":  "netforge.modules.post_exploit.persist_service",
+    "kernel_rootkit":   "netforge.modules.rootkit.kernel_rootkit",
+    "userland_rootkit":  "netforge.modules.rootkit.userland_rootkit",
+    # ── Post-Exploit Intel ────────────────────────────────────────
     "pivot_finder":     "netforge.modules.post_exploit.pivot_finder",
     "loot_parse":       "netforge.modules.post_exploit.loot_parse",
     "tunnel_suggest":   "netforge.modules.post_exploit.tunnel_suggest",
+    # ── Reporting ─────────────────────────────────────────────────
     "html_report":      "netforge.modules.reporting.html_report",
     "pdf_report":       "netforge.modules.reporting.pdf_report",
     "json_export":      "netforge.modules.reporting.json_export",
@@ -163,17 +192,41 @@ MODULE_MAP: dict[str, str] = {
 }
 
 CLASS_NAME_MAP: dict[str, str] = {k: "".join(p.capitalize() for p in k.split("_")) for k in MODULE_MAP}
-CLASS_NAME_MAP.update({"llmnr_detect": "LlmnrDetect", "cdp_ldp": "CdpLdp",
-                        "ics_audit": "IcsAudit", "upnp_audit": "UpnpAudit",
-                        "ipmi_audit": "IpmiAudit",
-                        "redis_rce": "RedisRce", "ntlm_relay": "NtlmRelay",
-                        "native_brute": "NativeBrute"})
+CLASS_NAME_MAP.update({
+    "llmnr_detect": "LlmnrDetect", "cdp_ldp": "CdpLdp",
+    "ics_audit": "IcsAudit", "upnp_audit": "UpnpAudit",
+    "ipmi_audit": "IpmiAudit",
+    "redis_rce": "RedisRce", "ntlm_relay": "NtlmRelay",
+    "native_brute": "NativeBrute",
+    # ── Credential Harvesting class name overrides ────────────────
+    "sam_dump": "SAMDump", "ntds_dump": "NTDSDump",
+    # ── Lateral Movement class name overrides ─────────────────────
+    "lateral_psexec": "LateralPsExec", "lateral_smb": "LateralSMB",
+    "lateral_ssh": "LateralSSH", "lateral_winrm": "LateralWinRM",
+    "lateral_wmi": "LateralWMI",
+    # ── Evasion class name overrides ──────────────────────────────
+    "amsi_bypass": "AMSIBypass", "etw_blind": "ETWBlind",
+    # ── Persistence class name overrides ──────────────────────────
+    "persist_schtask": "PersistScheduledTask",
+})
 
 # Exploitation modules — ONLY loaded when --red-team is active
-RED_TEAM_MODULES = {"heartbleed", "redis_rce", "ntlm_relay", "eternalblue", "bluekeep", "zerologon"}
+RED_TEAM_MODULES = {
+    # Exploitation
+    "heartbleed", "redis_rce", "ntlm_relay", "eternalblue", "bluekeep", "zerologon",
+    # Credential Harvesting
+    "mimikatz_exec", "sam_dump", "ntds_dump", "token_steal",
+    # Lateral Movement
+    "lateral_psexec", "lateral_smb", "lateral_ssh", "lateral_winrm", "lateral_wmi",
+    # Evasion
+    "amsi_bypass", "etw_blind", "process_hollow",
+    # Persistence / Rootkit
+    "persist_cron", "persist_registry", "persist_schtask", "persist_service",
+    "kernel_rootkit", "userland_rootkit",
+}
 
 # Phases that must run sequentially — active exploitation is never parallelised.
-SEQUENTIAL_PHASES = {7}
+SEQUENTIAL_PHASES = {7, 8, 9, 10, 11}
 
 
 # ── EventBus helpers ──────────────────────────────────────────────────
@@ -217,17 +270,21 @@ class ScanControl:
         aborted: bool flag checked in the scan loop.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, control_file: str | None = None) -> None:
         self._paused = asyncio.Event()
         self._paused.set()            # starts in running state
         self._aborted = False
+        self._control_file = Path(control_file) if control_file else None
+        self._control_mtime = 0.0
 
     @property
     def is_paused(self) -> bool:
+        self._refresh_file_state()
         return not self._paused.is_set()
 
     @property
     def is_aborted(self) -> bool:
+        self._refresh_file_state()
         return self._aborted
 
     def pause(self) -> None:
@@ -245,7 +302,26 @@ class ScanControl:
 
     async def wait_if_paused(self) -> None:
         """Block until un-paused. Returns immediately if not paused."""
-        await self._paused.wait()
+        while self.is_paused and not self.is_aborted:
+            await asyncio.sleep(0.5)
+
+    def _refresh_file_state(self) -> None:
+        if not self._control_file:
+            return
+        try:
+            stat = self._control_file.stat()
+            if stat.st_mtime <= self._control_mtime:
+                return
+            self._control_mtime = stat.st_mtime
+            data = json.loads(self._control_file.read_text(encoding="utf-8"))
+            if data.get("aborted"):
+                self.abort()
+            elif data.get("paused"):
+                self.pause()
+            else:
+                self.resume()
+        except Exception as exc:
+            log.debug("Control file refresh failed: %s", exc)
 
 
 def parse_args() -> argparse.Namespace:
@@ -278,6 +354,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--version",      action="version", version=f"NetForge {VERSION}")
     p.add_argument("--dashboard-url", default=None,
                    help="Live dashboard URL (e.g. http://localhost:1337) — streams events in real time")
+    p.add_argument("--control-file",  default=None,
+                   help="JSON control file used by dashboard pause/resume/abort")
     return p.parse_args()
 
 
@@ -324,7 +402,7 @@ async def run_scan(
         Summary dict with 'findings', 'errors', 'duration'.
     """
     bus, Event, EventType = _get_event_bus(event_bus)
-    ctrl = scan_control or ScanControl()
+    ctrl = scan_control or ScanControl(getattr(args, "control_file", None))
     eng_bus = _get_eng_bus()
 
     # ── OpSec Profile (graceful if unavailable) ───────────────────────
@@ -381,7 +459,8 @@ async def run_scan(
     mode_label = f"{args.mode}"
     if args.red_team:
         mode_label += " [bold red][RED TEAM][/bold red]"
-    console.print(f"Mode: [yellow]{mode_label}[/yellow] | OpSec: [yellow]{opsec.level.value}[/yellow]")
+    total_phases = len([p for p in PHASES if True])  # dynamic count
+    console.print(f"Mode: [yellow]{mode_label}[/yellow] | Phases: {total_phases} | OpSec: [yellow]{opsec.level.value}[/yellow]")
     if args.red_team:
         console.print("[bold red]RED TEAM MODE — exploitation modules ACTIVE[/bold red]")
         console.print(f"[red]Attacker IP: {args.attacker_ip or 'NOT SET (use --attacker-ip)'}[/red]")
@@ -391,6 +470,21 @@ async def run_scan(
     all_findings = []
     errors = []
     start_time = time.monotonic()
+
+    # Count total modules for progress calculation
+    total_modules = 0
+    for _, pname, pmods in PHASES:
+        if args.mode == "external" and pname == "Internal Analysis":
+            continue
+        if args.mode == "internal" and pname == "External Recon":
+            continue
+        filt = [m for m in pmods
+                if (not include or m in include) and (not skip or m not in skip)]
+        if not args.red_team:
+            filt = [m for m in filt if m not in RED_TEAM_MODULES]
+        total_modules += len(filt)
+    modules_completed = 0
+    _progress_lock = asyncio.Lock()
 
     for phase_num, phase_name, phase_mods in PHASES:
         # ── Abort check ───────────────────────────────────────────────
@@ -427,7 +521,7 @@ async def run_scan(
         if opsec and hasattr(opsec, 'shuffle_modules'):
             filtered = opsec.shuffle_modules(filtered)
 
-        phase_banner(phase_num, 9, phase_name)
+        phase_banner(phase_num, len(PHASES), phase_name)
 
         # ── Emit: phase_start ─────────────────────────────────────────
         _emit(bus, Event, EventType, "phase_start", source="netforge",
@@ -441,6 +535,7 @@ async def run_scan(
 
         async def _exec(mname: str) -> tuple[list, list]:
             """Run one module within the phase semaphore."""
+            nonlocal modules_completed
             async with phase_sem:
                 if ctrl.is_aborted:
                     return [], []
@@ -449,6 +544,11 @@ async def run_scan(
                     log.debug("Module not yet built: %s", mname)
                     _emit(bus, Event, EventType, "module_skip", source=mname,
                           name=mname, reason="not built")
+                    async with _progress_lock:
+                        modules_completed += 1
+                        pct = round(modules_completed / total_modules * 100) if total_modules else 0
+                    _emit(bus, Event, EventType, "module_progress", source=mname,
+                          name=mname, progress=pct)
                     return [], []
                 try:
                     if opsec and hasattr(opsec, 'maybe_inject_decoy'):
@@ -460,14 +560,29 @@ async def run_scan(
                         log.info("[DRY RUN] Would run: %s", mname)
                         _emit(bus, Event, EventType, "module_skip", source=mname,
                               name=mname, reason="dry run")
+                        async with _progress_lock:
+                            modules_completed += 1
+                            pct = round(modules_completed / total_modules * 100) if total_modules else 0
+                        _emit(bus, Event, EventType, "module_progress", source=mname,
+                              name=mname, progress=pct)
                         return [], []
                     _emit(bus, Event, EventType, "module_start", source=mname,
                           name=mname, phase=phase_num)
+                    # Emit current progress at module start
+                    async with _progress_lock:
+                        pct = round(modules_completed / total_modules * 100) if total_modules else 0
+                    _emit(bus, Event, EventType, "module_progress", source=mname,
+                          name=mname, progress=pct)
                     if opsec and hasattr(opsec, 'jitter'):
                         await opsec.jitter()
                     result = await mod.run()
+                    async with _progress_lock:
+                        modules_completed += 1
+                        pct = round(modules_completed / total_modules * 100) if total_modules else 0
                     _emit(bus, Event, EventType, "module_complete", source=mname,
                           name=mname, findings_count=len(result.findings))
+                    _emit(bus, Event, EventType, "module_progress", source=mname,
+                          name=mname, progress=pct)
                     for finding in result.findings:
                         _emit(bus, Event, EventType, "finding_new", source=mname,
                               **finding.to_dict())
@@ -479,8 +594,13 @@ async def run_scan(
                     return result.findings, []
                 except Exception as exc:
                     log.error("Module %s failed: %s", mname, exc)
+                    async with _progress_lock:
+                        modules_completed += 1
+                        pct = round(modules_completed / total_modules * 100) if total_modules else 0
                     _emit(bus, Event, EventType, "module_fail", source=mname,
                           name=mname, error=str(exc))
+                    _emit(bus, Event, EventType, "module_progress", source=mname,
+                          name=mname, progress=pct)
                     return [], [f"{mname}: {exc}"]
 
         # Check pause before dispatching the phase
@@ -502,7 +622,7 @@ async def run_scan(
               number=phase_num, name=phase_name, duration=round(phase_duration, 1))
 
         # After each phase: check attack chain for recommended actions
-        if attack_chain and phase_num in (5, 6, 7):
+        if attack_chain and phase_num in (5, 6, 7, 8, 9, 10, 11):
             actions = attack_chain.recommend_next()
             if actions:
                 log.info("[CHAIN] %d recommended actions after phase %d",

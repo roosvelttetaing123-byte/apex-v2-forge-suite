@@ -35,7 +35,7 @@ class ReportConfig(BaseModel):
     @field_validator("formats")
     @classmethod
     def validate_formats(cls, v: list[str]) -> list[str]:
-        valid = {"html", "pdf", "json", "csv"}
+        valid = {"html", "pdf", "json", "csv", "docx"}
         for f in v:
             if f not in valid:
                 raise ValueError(f"Invalid report format: {f}. Valid: {valid}")
@@ -59,6 +59,7 @@ class BaseForgeConfig(BaseModel):
     dry_run:       bool            = False
     auto_confirm:  bool            = False
     proxy:         str | None      = None
+    verify_findings: bool          = True
     extra:         dict[str, Any]  = Field(default_factory=dict)
 
 

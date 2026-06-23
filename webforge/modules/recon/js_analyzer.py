@@ -44,9 +44,9 @@ SECRET_PATTERNS: list[tuple[str, str, Severity]] = [
     (r"(?i)(private[_\-]?key|rsa[_\-]?key)[\s]*[=:\"']+\s*([^\s\"'&]{20,})",
      "Private Key Reference", Severity.HIGH),
     (r"(?i)google[_\-]?api[_\-]?key[\s]*[=:\"']+\s*([A-Za-z0-9\-_]{30,50})",
-     "Google API Key", Severity.HIGH),
+     "Google API Key", Severity.LOW),
     (r"AIza[0-9A-Za-z\-_]{35}",
-     "Google API Key (pattern)", Severity.HIGH),
+     "Google API Key (pattern)", Severity.LOW),
     (r"(?i)stripe[_\-]?secret[\s]*[=:\"']+\s*(sk_(?:live|test)_[A-Za-z0-9]{24,})",
      "Stripe Secret Key", Severity.CRITICAL),
     (r"(?i)(db[_\-]?password|database[_\-]?password)[\s]*[=:\"']+\s*([^\s\"'&]{8,})",
@@ -61,7 +61,7 @@ SECRET_PATTERNS: list[tuple[str, str, Severity]] = [
      "Hardcoded HMAC/Signing Secret (hex-64)", Severity.CRITICAL),
     # Custom auth header name patterns — reveals proprietary auth schemes in JS
     (r"""["'](X-[A-Z][A-Z0-9\-]{3,30}-(?:KEY|TOKEN|SECRET|HASH|SIG|TS))["']""",
-     "Custom Authentication Header Name", Severity.HIGH),
+     "Custom Authentication Header Name", Severity.INFORMATIONAL),
     # reCAPTCHA Enterprise / v3 site keys (starts with 6L, 38–50 chars)
     (r"6L[A-Za-z0-9_\-]{38,50}",
      "reCAPTCHA Site Key", Severity.INFORMATIONAL),
@@ -202,9 +202,11 @@ class JsAnalyzer(BaseModule):
                 value_key = match.group()[:80]
                 if value_key in found_values:
                     continue
+                snippet = content[max(0, match.start()-30):match.end()+30]
+                if self._is_secret_false_positive(name, match.group(), snippet):
+                    continue
                 found_types.add(name)
                 found_values.add(value_key)
-                snippet = content[max(0, match.start()-30):match.end()+30]
                 ev = Evidence(
                     response_raw=snippet,
                     extra={"js_file": js_url, "pattern": name, "match": match.group()[:80]},
@@ -234,6 +236,15 @@ class JsAnalyzer(BaseModule):
                     target=target,
                     url=js_url,
                 )
+
+    def _is_secret_false_positive(self, name: str, value: str, snippet: str) -> bool:
+        """Suppress common public identifiers and placeholders."""
+        haystack = f"{name} {value} {snippet}".lower()
+        if any(token in haystack for token in ("example", "placeholder", "your_", "changeme", "dummy")):
+            return True
+        if name == "Hardcoded Password" and any(token in haystack for token in ("password field", "type=\"password\"", "newpassword")):
+            return True
+        return False
 
     def _extract_endpoints(self, content: str, js_url: str, target: str) -> None:
         """Extract API endpoint paths for further testing."""

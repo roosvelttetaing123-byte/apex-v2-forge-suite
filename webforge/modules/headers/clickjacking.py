@@ -47,7 +47,7 @@ class Clickjacking(BaseModule):
                     "csp_frame_ancestors": has_csp_protection,
                 },
             )
-            ev.screenshot_path = await self.capture_screenshot(
+            ev.screenshot_path = self.capture_screenshot(
                 target, finding_id="clickjacking"
             )
             self.new_finding(

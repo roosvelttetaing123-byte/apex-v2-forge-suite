@@ -83,7 +83,7 @@ class IdorScanner(BaseModule):
                 try:
                     resp = await session.get(test_url)
                     body = await resp.text()
-                    if resp.status == 200 and abs(len(body) - original_len) < original_len * 0.3:
+                    if resp.status == 200 and abs(len(body) - original_len) < max(original_len * 0.3, 100):
                         if body != original_body and len(body) > 100:
                             ss = self.capture_screenshot(test_url, f"idor_{test_id}")
                             ev = Evidence(

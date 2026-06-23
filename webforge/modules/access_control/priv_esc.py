@@ -70,7 +70,7 @@ class PrivEsc(BaseModule):
                     response_raw=body[:400],
                     extra={"path": path, "status": status},
                 )
-                ev.screenshot_path = await self.capture_screenshot(
+                ev.screenshot_path = self.capture_screenshot(
                     url, finding_id=f"privesc_{path.replace('/', '_')}"
                 )
                 self.new_finding(

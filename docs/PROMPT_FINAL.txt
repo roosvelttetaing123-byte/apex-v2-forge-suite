@@ -1,0 +1,1437 @@
+You are a senior offensive security engineer, penetration tester, and Python
+architect with 15+ years of experience in web, network, and Active Directory
+security assessments. You specialize in building production-grade, audit-ready
+VAPT tooling for authorized professional engagements.
+
+Your task is to build THREE complete, professional-grade, standalone, offline
+VAPT automation frameworks for Kali Linux, organized under a single
+forge-suite/ monorepo.
+
+CRITICAL BUILD RULES — NO EXCEPTIONS:
+- Write COMPLETE, fully working code — no truncation, no stubs, no TODOs
+- No "# implement this", no placeholder pass statements, no "..." ellipsis
+- Every file is immediately runnable after writing
+- ALL modules run through ONE master entry-point script per framework
+- Modules execute in PHASE ORDER — never out of sequence
+- Say "NEXT: [filename]" after each completed file
+- If response approaches length limit, say "CONTINUE?" and wait
+
+═══════════════════════════════════════════════════════════════════════════
+UNIVERSAL RULES — NON-NEGOTIABLE — APPLY TO ALL THREE FRAMEWORKS
+═══════════════════════════════════════════════════════════════════════════
+
+SAFETY RULES:
+1. NO destructive exploits — no file deletion, no service crashes,
+   no data corruption. CHECK and DETECT only, never destroy.
+2. NO DDoS or denial-of-service — no flood attacks, no amplification,
+   no resource exhaustion. All scanning must be rate-limited and throttled.
+3. BRUTE FORCE SAFETY (every brute/spray module MUST implement ALL):
+   - --bf-timeout flag (default 30s per attempt)
+   - --bf-delay flag (default 3s between attempts)
+   - --bf-max flag (default 3 max attempts per account)
+   - Auto-detect account lockout policy BEFORE any spraying
+   - Hard stop if attempts reach lockout_threshold - 1
+   - Exponential backoff on connection timeout/reset
+   - Pattern-match lockout responses: "locked", "too many attempts",
+     "banned", "suspended", "temporarily disabled", "account disabled"
+   - If >50% connections reset/dropped: auto-switch to stealth timing + alert
+   - Log every attempt with ISO 8601 timestamp for full audit trail
+4. AUTHORIZATION PROMPT — every tool MUST display at startup:
+   ╔══════════════════════════════════════════════════════════╗
+   ║  AUTHORIZED PENETRATION TESTING TOOL                    ║
+   ║  Confirm written authorization to test this target.     ║
+   ║  Type 'yes' to continue or 'no' to exit:               ║
+   ╚══════════════════════════════════════════════════════════╝
+   Exit code 1 immediately if answer is not exactly "yes".
+5. SCOPE ENFORCEMENT — hard-coded scope checker on every outbound
+   request, packet, and connection. Any target outside defined scope
+   is silently blocked and logged as "out_of_scope" event.
+6. ALL ACTIONS LOGGED — every scan, request, finding, attempt, error,
+   and operator confirmation decision written to timestamped JSONL log.
+   Log format: {"ts": ISO8601, "level": str, "module": str, "event": str,
+                "target": str, "detail": dict, "operator_confirmed": bool}
+7. LATERAL MOVEMENT CONFIRMATION GATE — for ANY module that would
+   execute an active exploitation action (not just detection), ALWAYS
+   display and wait for operator confirmation via common/confirm_gate.py:
+   ╔══════════════════════════════════════════════════════════╗
+   ║  ACTION REQUIRES OPERATOR CONFIRMATION                  ║
+   ║  Module  : [module_name]                                ║
+   ║  Action  : [what will happen]                           ║
+   ║  Target  : [ip/host/object]                             ║
+   ║  Risk    : [impact description]                         ║
+   ║  Execute this action? (yes/no):                        ║
+   ╚══════════════════════════════════════════════════════════╝
+   - If "yes": execute, log {"operator_confirmed": true}
+   - If "no":  skip, log {"operator_confirmed": false}, still report finding
+   - --auto-confirm flag: skip prompts for fully automated pipelines
+     (ONLY enable if operator explicitly passes this flag)
+   Modules requiring confirmation gate (MUST NOT execute without it):
+   WebForge:  login_brute, upload_bypass (payload upload), race_condition
+   NetForge:  hydra_wrap, cred_spray, smart_brute, loot_parse (write ops),
+              nfs_audit (mount attempt), redis_audit (write check)
+   ADForge:   password_spray, kerberoast, asrep_roast, pass_hash,
+              pass_ticket, golden_ticket, silver_ticket, dcsync,
+              acl_scanner (abuse chain), dacl_abuse, forcechangepw,
+              add_member, shadow_creds, smb_exec, wmi_exec,
+              secretsdump, loot_collector
+8. RATE LIMITING on ALL modules:
+   - Default max 10 requests/second per host
+   - Configurable via --rate flag (float, 0.1 to 100)
+   - Auto-throttle on 429/503 responses (exponential backoff)
+   - Per-host rate tracking across all concurrent modules
+9. DEPENDENCY PRE-FLIGHT — every tool checks at startup that all
+   required external binaries are installed. Print clear install
+   command and exit(1) if any are missing.
+10. DRY RUN MODE (--dry-run) — show what would run, which targets,
+    which phases, but send zero packets. Used for client briefings.
+
+═══════════════════════════════════════════════════════════════════════════
+GLOBAL TECHNICAL REQUIREMENTS (ALL FRAMEWORKS)
+═══════════════════════════════════════════════════════════════════════════
+
+LANGUAGE + TYPING:
+- Python 3.10+, fully typed with type hints everywhere
+- PEP 8 compliant, max line length 100
+- Dataclasses and Pydantic v2 for all data models
+- No untyped dicts — use TypedDict or dataclass for all structured data
+
+STORAGE:
+- SQLite for all persistent storage (findings, hosts, creds, runs, events)
+- SQLAlchemy 2.0 ORM, schema auto-created via Base.metadata.create_all()
+- All sensitive values in DB encrypted with Fernet (cryptography lib)
+
+UI / OUTPUT:
+- Rich terminal UI: live tables, progress bars, spinners, panels, syntax highlight
+- Phase banners: "═══ PHASE 3/12: INJECTION TESTING ═══" before each phase
+- --quiet flag: suppress all UI, structured JSON to stdout only
+- --verbose flag: full HTTP request/response debug output
+
+CONCURRENCY:
+- asyncio + aiohttp for all HTTP (WebForge)
+- asyncio for network scanning (NetForge)
+- asyncio + ldap3 async for LDAP (ADForge)
+- ThreadPoolExecutor for CPU-bound tasks
+- Configurable --workers flag (default 10)
+
+PLUGIN ARCHITECTURE:
+- Every module inherits from BaseModule (common/base_module.py)
+- BaseModule provides: run(), validate_scope(), log(), save_finding(),
+  rate_limit(), check_authorization(), capture_screenshot(), confirm_gate()
+- --list-modules shows all available modules + descriptions
+
+CONFIGURATION:
+- YAML config file, validated against Pydantic schema at startup
+- --config to specify alternate config path
+- --generate-config to write default config to disk
+
+RESUME / CHECKPOINT:
+- --resume flag: continue from last checkpoint
+- Checkpoint saved to SQLite after each phase completes
+- Clean Ctrl-C handler: saves checkpoint, exits gracefully
+
+SCREENSHOT / POC EVIDENCE (common/screenshot.py):
+- Selenium + system Chromium (pre-installed on Kali)
+- Headless, --no-sandbox (Kali runs as root)
+- capture(url, wait_ms=1000, highlight_js=None) → screenshot_path
+- highlight_js: optional JS snippet to highlight the vulnerable element
+  before capture (e.g., highlight an XSS alert box, a reflected payload)
+- Screenshots saved to results/evidence/screenshots/finding_{uuid}.png
+- Every finding that involves a browser-visible vulnerability MUST
+  capture a screenshot as part of evidence
+- Modules that MUST capture screenshots:
+  WebForge: xss_scanner (show payload rendered), sqli_scanner (show error),
+            ssti_scanner (show output), open_redirect (show final URL),
+            clickjacking (show framed page), cors_check (show allowed origin),
+            403_bypass (show bypassed content), idor_scanner (show data leak),
+            login_brute (show successful login), jwt_audit (show auth bypass),
+            upload_bypass (show uploaded file accessible), ssrf_scanner,
+            header_audit (show missing headers in response), cache_poison
+- For non-browser findings (network, AD): capture Rich console panel as
+  SVG/HTML using rich.console.Console(record=True) + console.export_html()
+
+REPORTING:
+- Jinja2 HTML report (single-file, all CSS/images embedded as base64)
+- PDF export via WeasyPrint
+- JSON export (DefectDojo/Jira-compatible)
+- CSV export (finding name, severity, CVSS, target, status)
+- --report-format html,pdf,json,csv (default: html,pdf)
+
+FINDINGS:
+Every finding MUST include:
+  * id: UUID
+  * title: str
+  * severity: Critical | High | Medium | Low | Informational
+  * cvss_v31_vector: str
+  * cvss_v31_score: float
+  * cvss_v40_vector: str | None
+  * cvss_v40_score: float | None
+  * mitre_attack: list[str]  # e.g. ["TA0001/T1190"]
+  * target: str
+  * port: int | None
+  * service: str | None
+  * evidence: Evidence
+    - request_raw: str | None
+    - response_raw: str | None
+    - screenshot_path: str | None
+    - console_capture_path: str | None
+    - pcap_path: str | None
+    - extra: dict
+  * reproduction_steps: list[str]
+  * remediation: str
+  * references: list[str]
+  * discovered_at: datetime
+  * module: str
+  * operator_confirmed: bool  # True if confirmation gate was passed
+
+CODE QUALITY:
+- 100% offline after pip install — zero external API calls ever
+- Full exception handling — every module catches all exceptions,
+  logs them, and continues. The entire scan NEVER crashes.
+- Modular: every module importable as standalone library
+- Unit test class at bottom of every file (class Test<ClassName>)
+- Docstring on every class and public method
+
+__init__.py RULE:
+Create an empty __init__.py in EVERY package directory shown in the
+architecture before writing the first module inside that package.
+This applies to: common/, webforge/, webforge/core/, webforge/modules/,
+webforge/modules/recon/, webforge/modules/ssl/, webforge/modules/headers/,
+webforge/modules/injection/, webforge/modules/auth/,
+webforge/modules/access_control/, webforge/modules/api/,
+webforge/modules/file/, webforge/modules/business_logic/,
+webforge/modules/advanced/, webforge/modules/whitebox/,
+webforge/modules/reporting/, netforge/, netforge/core/,
+netforge/modules/ and all its subdirectories, adforge/, adforge/core/,
+adforge/modules/ and all its subdirectories.
+
+═══════════════════════════════════════════════════════════════════════════
+MONOREPO STRUCTURE
+═══════════════════════════════════════════════════════════════════════════
+
+forge-suite/
+├── common/
+│   ├── __init__.py
+│   ├── base_module.py         # Abstract BaseModule
+│   ├── finding.py             # Finding dataclass + CVSS 3.1/4.0 calculator
+│   ├── db.py                  # SQLAlchemy ORM base models
+│   ├── logger.py              # Rich colored logger
+│   ├── config.py              # Pydantic config base + YAML loader/validator
+│   ├── scope.py               # IP/URL scope enforcer
+│   ├── evidence.py            # Evidence dataclass
+│   ├── screenshot.py          # Selenium Chromium screenshotter
+│   ├── confirm_gate.py        # Operator confirmation prompt
+│   ├── auth_prompt.py         # Authorization confirmation at startup
+│   └── reporter.py            # Base report orchestrator
+├── webforge/
+├── netforge/
+├── adforge/
+├── requirements.txt           # All combined
+├── requirements-webforge.txt
+├── requirements-netforge.txt
+├── requirements-adforge.txt
+├── install.sh
+└── Makefile
+
+═══════════════════════════════════════════════════════════════════════════
+FRAMEWORK 1: WebForge — webforge/webforge.py (SINGLE ENTRY POINT)
+Web Application Deep Dive (Black / Grey / White Box)
+═══════════════════════════════════════════════════════════════════════════
+
+MODES:
+  --mode blackbox   → No creds, external attacker perspective
+  --mode greybox    → Has credentials, partial knowledge
+  --mode whitebox   → Full source code + config access
+
+webforge/webforge.py is the ONLY way to run WebForge.
+It runs ALL applicable modules in PHASE ORDER shown below.
+Individual modules CANNOT be run directly (they are libraries).
+--modules sqli,xss flag limits which modules run within the phase order.
+--skip-modules flag skips specified modules but keeps phase order.
+
+EXECUTION PHASES (webforge.py runs these in order, 1 through 12):
+
+PHASE  1 — RECONNAISSANCE
+  tech_detect → cms_detect → robots_sitemap → dir_fuzzer → vhost_enum
+  → link_crawler → js_analyzer → api_discover → param_discover
+  → subdomain_takeover
+
+PHASE  2 — SSL/TLS AUDIT
+  ssl_audit → cert_inspect → hsts_check
+
+PHASE  3 — SECURITY HEADERS
+  header_audit → cors_check → csp_audit → cookie_audit → sri_check
+  → clickjacking
+
+PHASE  4 — INJECTION TESTING
+  sqli_scanner → xss_scanner → xxe_scanner → ssti_scanner → cmd_inject
+  → ldap_inject → nosql_inject → jsonp_inject → host_header_inject
+
+PHASE  5 — AUTHENTICATION
+  session_audit → password_policy → jwt_audit → oauth_check
+  → login_brute [CONFIRM GATE] → mfa_bypass
+
+PHASE  6 — ACCESS CONTROL
+  idor_scanner → priv_esc → path_traversal → forced_browse
+  → 403_bypass → mass_assignment
+
+PHASE  7 — API SECURITY
+  rest_audit → graphql_audit → soap_audit → api_rate_check
+
+PHASE  8 — FILE OPERATIONS
+  ssrf_scanner → lfi_rfi → upload_bypass [CONFIRM GATE]
+
+PHASE  9 — BUSINESS LOGIC
+  open_redirect → price_tamper → workflow_bypass
+  → race_condition [CONFIRM GATE]
+
+PHASE 10 — ADVANCED ATTACKS
+  websocket_audit → http2_audit → http_smuggling → cache_poison
+  → prototype_poll → deserialization → email_security
+
+PHASE 11 — WHITEBOX (--mode whitebox only)
+  source_audit → secret_scan → dep_audit → config_audit → code_flow
+
+PHASE 12 — REPORTING
+  html_report → pdf_report → json_export → csv_export
+
+ARCHITECTURE:
+webforge/
+├── __init__.py
+├── webforge.py                  # MASTER ENTRY POINT — runs all phases
+├── webforge.yaml
+├── core/
+│   ├── __init__.py
+│   ├── session.py               # aiohttp session + retry + proxy
+│   ├── scheduler.py             # Async phase/task queue
+│   ├── waf_detect.py            # WAF fingerprint + evasion payload switch
+│   └── mode_engine.py           # Module selector per mode + phase builder
+├── modules/
+│   ├── recon/
+│   │   ├── __init__.py
+│   │   ├── tech_detect.py
+│   │   ├── cms_detect.py
+│   │   ├── dir_fuzzer.py
+│   │   ├── vhost_enum.py
+│   │   ├── js_analyzer.py
+│   │   ├── link_crawler.py
+│   │   ├── robots_sitemap.py
+│   │   ├── api_discover.py
+│   │   ├── param_discover.py
+│   │   └── subdomain_takeover.py
+│   ├── ssl/
+│   │   ├── __init__.py
+│   │   ├── ssl_audit.py
+│   │   ├── cert_inspect.py
+│   │   └── hsts_check.py
+│   ├── headers/
+│   │   ├── __init__.py
+│   │   ├── header_audit.py
+│   │   ├── cors_check.py
+│   │   ├── csp_audit.py
+│   │   ├── cookie_audit.py
+│   │   ├── sri_check.py
+│   │   └── clickjacking.py
+│   ├── injection/
+│   │   ├── __init__.py
+│   │   ├── sqli_scanner.py
+│   │   ├── xss_scanner.py
+│   │   ├── xxe_scanner.py
+│   │   ├── ssti_scanner.py
+│   │   ├── cmd_inject.py
+│   │   ├── ldap_inject.py
+│   │   ├── nosql_inject.py
+│   │   ├── jsonp_inject.py
+│   │   └── host_header_inject.py
+│   ├── auth/
+│   │   ├── __init__.py
+│   │   ├── login_brute.py       # CONFIRM GATE
+│   │   ├── jwt_audit.py
+│   │   ├── oauth_check.py
+│   │   ├── session_audit.py
+│   │   ├── password_policy.py
+│   │   └── mfa_bypass.py
+│   ├── access_control/
+│   │   ├── __init__.py
+│   │   ├── idor_scanner.py
+│   │   ├── priv_esc.py
+│   │   ├── path_traversal.py
+│   │   ├── forced_browse.py
+│   │   ├── 403_bypass.py
+│   │   └── mass_assignment.py
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── rest_audit.py
+│   │   ├── graphql_audit.py
+│   │   ├── soap_audit.py
+│   │   └── api_rate_check.py
+│   ├── file/
+│   │   ├── __init__.py
+│   │   ├── upload_bypass.py     # CONFIRM GATE
+│   │   ├── lfi_rfi.py
+│   │   └── ssrf_scanner.py
+│   ├── business_logic/
+│   │   ├── __init__.py
+│   │   ├── price_tamper.py
+│   │   ├── workflow_bypass.py
+│   │   ├── race_condition.py    # CONFIRM GATE
+│   │   └── open_redirect.py
+│   ├── advanced/
+│   │   ├── __init__.py
+│   │   ├── websocket_audit.py
+│   │   ├── http2_audit.py
+│   │   ├── http_smuggling.py
+│   │   ├── cache_poison.py
+│   │   ├── prototype_poll.py
+│   │   ├── deserialization.py
+│   │   └── email_security.py
+│   ├── whitebox/
+│   │   ├── __init__.py
+│   │   ├── source_audit.py
+│   │   ├── secret_scan.py
+│   │   ├── dep_audit.py
+│   │   ├── config_audit.py
+│   │   └── code_flow.py
+│   └── reporting/
+│       ├── __init__.py
+│       ├── html_report.py
+│       ├── pdf_report.py
+│       ├── json_export.py
+│       ├── csv_export.py
+│       └── burp_export.py
+├── data/
+│   ├── payloads/
+│   │   ├── sqli.txt
+│   │   ├── xss.txt
+│   │   ├── xxe.txt
+│   │   ├── ssti.txt
+│   │   ├── ssrf.txt
+│   │   ├── lfi.txt
+│   │   ├── cmd.txt
+│   │   └── traversal.txt
+│   ├── wordlists/
+│   │   ├── dirs_common.txt
+│   │   ├── dirs_api.txt
+│   │   ├── params_common.txt
+│   │   ├── vhosts.txt
+│   │   └── subdomains.txt
+│   ├── wappalyzer_db.json
+│   └── templates/
+│       ├── html_report.j2
+│       └── pdf_report.j2
+└── results/
+    └── {target}_{timestamp}/
+        ├── webforge.db
+        ├── webforge.log
+        ├── report.html
+        ├── report.pdf
+        ├── findings.json
+        ├── findings.csv
+        └── evidence/
+            ├── screenshots/         # PNG screenshots per finding
+            └── http/                # Raw request/response captures
+
+KEY FEATURES:
+1. SINGLE ENTRY POINT — webforge.py is the only runner
+   All 12 phases execute in sequence automatically
+   Rich progress: "Phase 4/12: Injection Testing [████░░] 60%"
+   Phase summary after each phase: findings count, time taken
+
+2. WAF DETECTION + EVASION
+   Detect vendor: Cloudflare/Akamai/AWS WAF/F5/Imperva/ModSec
+   Auto-switch evasion payloads on WAF detect
+   Alert operator, reduce rate automatically
+
+3. OWASP TOP 10 2021 LIVE COVERAGE TRACKER
+   Rich table: A01-A10 with live finding counts per category
+
+4. SCREENSHOT POC EVIDENCE
+   Selenium headless Chromium captures vulnerable state
+   highlight_js parameter highlights the vulnerable element
+   Embedded as base64 in HTML report — zero external deps
+
+5. AUTHENTICATED CRAWLING
+   Login form detection or manual --login-url
+   Session maintained across all phases
+
+6. BURP INTEGRATION
+   --proxy http://127.0.0.1:8080 routes all traffic
+   Export as Burp XML
+
+7. PROFESSIONAL REPORT
+   Executive summary, methodology, risk matrix, OWASP heatmap
+   Per-finding: CVSS 3.1+4.0, evidence, screenshot, repro steps,
+   remediation with code examples, references
+
+CLI:
+  python webforge.py --target https://target.com \
+    --mode blackbox --engagement "Client_2024" --tester "Name" \
+    --rate 5 --autopilot
+
+  python webforge.py --target https://target.com \
+    --mode greybox --username admin --password Pass123 \
+    --proxy http://127.0.0.1:8080
+
+  python webforge.py --target https://target.com --dry-run
+  python webforge.py --target https://target.com --resume results/target_20240101/
+  python webforge.py --target https://target.com --skip-modules soap_audit,sri_check
+
+═══════════════════════════════════════════════════════════════════════════
+FRAMEWORK 2: NetForge — netforge/netforge.py (SINGLE ENTRY POINT)
+External / Internal Network Penetration Testing
+═══════════════════════════════════════════════════════════════════════════
+
+MODES:
+  --mode external   → Internet-facing perimeter
+  --mode internal   → Inside LAN/corporate network
+  --mode full       → External + internal chained
+
+netforge/netforge.py is the ONLY way to run NetForge.
+Runs ALL applicable modules in PHASE ORDER shown below.
+
+EXECUTION PHASES (netforge.py runs these in order, 1 through 8):
+
+PHASE 1 — DISCOVERY
+  host_discover → port_scanner → os_detect → service_id → topology_map
+
+PHASE 2 — EXTERNAL ASSESSMENT (--mode external or full)
+  dns_recon → ssl_audit → smtp_check → firewall_detect
+  → exposure_check → firewall_rule_check
+
+PHASE 3 — INTERNAL ASSESSMENT (--mode internal or full)
+  arp_monitor → dhcp_audit → vlan_check → cdp_ldp → ipv6_audit
+
+PHASE 4 — SERVICE AUDITING
+  smb_audit → ftp_audit → ssh_audit → telnet_audit → rdp_audit
+  → snmp_audit → nfs_audit → mssql_audit → mysql_audit → redis_audit
+  → mongo_audit → elastic_audit → vnc_audit → tftp_audit
+  → printer_audit → voip_audit → ipmi_audit → kubernetes_audit
+  → docker_audit → cloud_metadata → ics_audit
+
+PHASE 5 — VULNERABILITY MATCHING
+  cve_matcher → nmap_vulns → nuclei_runner → exploit_suggest
+
+PHASE 6 — BRUTE FORCE [ALL MODULES REQUIRE CONFIRM GATE]
+  smart_brute → hydra_wrap → cred_spray
+  (wordlist_mgr and password_quality are libraries used by above)
+
+PHASE 7 — POST-EXPLOITATION INTELLIGENCE
+  pivot_finder → loot_parse [CONFIRM GATE] → tunnel_suggest
+
+PHASE 8 — REPORTING
+  html_report → pdf_report → json_export → csv_export → network_diagram
+
+ARCHITECTURE:
+netforge/
+├── __init__.py
+├── netforge.py                  # MASTER ENTRY POINT
+├── netforge.yaml
+├── core/
+│   ├── __init__.py
+│   ├── session.py
+│   ├── scheduler.py
+│   ├── network_map.py           # Live topology mapper + SVG
+│   ├── host_scorer.py           # Smart host priority scoring 0-100
+│   ├── cred_engine.py           # Credential reuse tracking
+│   └── capture.py               # Passive PCAP (scapy, no injection)
+├── modules/
+│   ├── discovery/
+│   │   ├── __init__.py
+│   │   ├── host_discover.py
+│   │   ├── port_scanner.py
+│   │   ├── service_id.py
+│   │   ├── os_detect.py
+│   │   └── topology_map.py
+│   ├── external/
+│   │   ├── __init__.py
+│   │   ├── dns_recon.py
+│   │   ├── ssl_audit.py
+│   │   ├── smtp_check.py
+│   │   ├── firewall_detect.py
+│   │   ├── exposure_check.py
+│   │   └── firewall_rule_check.py
+│   ├── internal/
+│   │   ├── __init__.py
+│   │   ├── arp_monitor.py
+│   │   ├── dhcp_audit.py
+│   │   ├── vlan_check.py
+│   │   ├── cdp_ldp.py
+│   │   └── ipv6_audit.py
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── smb_audit.py
+│   │   ├── ftp_audit.py
+│   │   ├── ssh_audit.py
+│   │   ├── telnet_audit.py
+│   │   ├── rdp_audit.py
+│   │   ├── snmp_audit.py
+│   │   ├── nfs_audit.py         # CONFIRM GATE on mount attempt
+│   │   ├── mssql_audit.py
+│   │   ├── mysql_audit.py
+│   │   ├── redis_audit.py       # CONFIRM GATE on write check
+│   │   ├── mongo_audit.py
+│   │   ├── elastic_audit.py
+│   │   ├── vnc_audit.py
+│   │   ├── tftp_audit.py
+│   │   ├── printer_audit.py
+│   │   ├── voip_audit.py
+│   │   ├── ipmi_audit.py
+│   │   ├── kubernetes_audit.py
+│   │   ├── docker_audit.py
+│   │   ├── cloud_metadata.py
+│   │   └── ics_audit.py         # BACnet (47808) + Modbus (502) detection
+│   ├── vuln/
+│   │   ├── __init__.py
+│   │   ├── cve_matcher.py
+│   │   ├── nmap_vulns.py
+│   │   ├── nuclei_runner.py
+│   │   └── exploit_suggest.py
+│   ├── bruteforce/
+│   │   ├── __init__.py
+│   │   ├── smart_brute.py       # CONFIRM GATE
+│   │   ├── hydra_wrap.py        # CONFIRM GATE
+│   │   ├── wordlist_mgr.py      # Library (no confirm needed)
+│   │   ├── cred_spray.py        # CONFIRM GATE
+│   │   └── password_quality.py  # Library (no confirm needed)
+│   ├── post_exploit/
+│   │   ├── __init__.py
+│   │   ├── pivot_finder.py
+│   │   ├── tunnel_suggest.py
+│   │   └── loot_parse.py        # CONFIRM GATE on write ops
+│   └── reporting/
+│       ├── __init__.py
+│       ├── html_report.py
+│       ├── pdf_report.py
+│       ├── json_export.py
+│       ├── csv_export.py
+│       └── network_diagram.py   # Pure SVG, no graphviz required
+├── data/
+│   ├── cve_db.sqlite
+│   ├── cve_import.py            # Seeds cve_db.sqlite from NVD JSON
+│   ├── wordlists/
+│   │   ├── ssh_users.txt
+│   │   ├── ftp_users.txt
+│   │   ├── smb_users.txt
+│   │   ├── common_passwords.txt
+│   │   └── snmp_communities.txt
+│   └── templates/
+│       ├── html_report.j2
+│       └── pdf_report.j2
+└── results/
+    └── {engagement}_{timestamp}/
+        ├── netforge.db
+        ├── netforge.log
+        ├── report.html
+        ├── report.pdf
+        ├── findings.json
+        ├── findings.csv
+        ├── topology.svg
+        └── pcaps/
+
+KEY FEATURES:
+1. SINGLE ENTRY POINT — all 8 phases in order
+2. SMART HOST SCORING — 0-100 score, highest attacked first
+3. LIVE SVG TOPOLOGY — updates in real time, embedded in report
+4. CREDENTIAL REUSE ENGINE — found creds tested across all services
+5. ICS/OT DETECTION — BACnet/Modbus flag as critical infrastructure
+6. PASSIVE PCAP CAPTURE (--capture) — extract cleartext creds
+7. MITRE ATT&CK MAPPING + Navigator JSON export
+8. CONFIRM GATE on all brute force and active write operations
+
+CLI:
+  python netforge.py --target 10.0.0.0/24 --mode internal \
+    --interface eth0 --capture --autopilot --bf-delay 5
+
+  python netforge.py --target 203.0.113.0/24 --mode external \
+    --engagement "Client_Ext" --rate 5
+
+  python netforge.py --target 192.168.1.0/24 --mode internal \
+    --stealth --rate 2
+
+  python netforge.py --target 10.0.0.0/24 --dry-run
+  python netforge.py --target 10.0.0.0/24 --resume results/eng_20240101/
+
+═══════════════════════════════════════════════════════════════════════════
+FRAMEWORK 3: ADForge — adforge/adforge.py (SINGLE ENTRY POINT)
+Active Directory Penetration Testing
+═══════════════════════════════════════════════════════════════════════════
+
+MODES:
+  --mode unauth   → No credentials
+  --mode auth     → Standard domain user (or --hash / --ticket)
+  --mode admin    → Admin/DA level
+
+adforge/adforge.py is the ONLY way to run ADForge.
+Runs ALL applicable modules in PHASE ORDER shown below.
+
+EXECUTION PHASES (adforge.py runs these in order, 1 through 12):
+
+PHASE  1 — UNAUTHENTICATED RECON
+  null_session → ldap_anon → kerb_user_enum → rid_cycle → dns_enum
+
+PHASE  2 — DOMAIN ENUMERATION (--mode auth or admin)
+  domain_enum → user_enum → group_enum → computer_enum → ou_enum
+  → gpo_enum → trust_enum → schema_enum → fine_grained_psp
+  → admin_count → inactive_account → service_account_audit
+
+PHASE  3 — ATTACK SURFACE MAPPING
+  acl_enum → spn_enum → asrep_enum → laps_enum → gmsa_enum → adcs_enum
+
+PHASE  4 — VULNERABILITY CHECKS (detect only, no exploitation)
+  zerologon → petitpotam → nopac → printspooler → ms14_068 → dfscoerce
+
+PHASE  5 — KERBEROS ATTACKS [CONFIRM GATE]
+  kerberoast → asrep_roast
+  (requests TGS/AS-REP tickets — operator confirms before hash extraction)
+
+PHASE  6 — PASSWORD ATTACKS [CONFIRM GATE]
+  password_spray
+  (always queries domain policy first, hard lockout safety)
+
+PHASE  7 — CREDENTIAL ATTACKS [CONFIRM GATE]
+  ntlm_relay → pass_hash → pass_ticket
+  (ntlm_relay generates command; pass_hash/pass_ticket require confirmation)
+
+PHASE  8 — GOLDEN / SILVER TICKETS [CONFIRM GATE, admin mode only]
+  golden_ticket → silver_ticket
+  (only runs if krbtgt/service hash provided by operator)
+
+PHASE  9 — ACL ABUSE ANALYSIS [CONFIRM GATE on execution]
+  acl_scanner → dacl_abuse → forcechangepw → add_member → shadow_creds
+  (detect paths passively; if operator confirms: execute abuse chain)
+
+PHASE 10 — GPO + DELEGATION ANALYSIS
+  gpo_scanner → gpo_path_check → linked_gpo_check
+  → uncons_deleg → cons_deleg → rbcd_attack
+
+PHASE 11 — AD CS AUDIT
+  esc1_check → esc2_check → esc3_check → esc4_check
+  → esc6_check → esc7_check → esc8_check
+
+PHASE 12 — LATERAL MOVEMENT [CONFIRM GATE]
+  smb_exec → wmi_exec → rdp_check
+  (check access; if operator confirms: execute and capture output)
+
+PHASE 13 — POST-EXPLOITATION [CONFIRM GATE, admin mode only]
+  da_check → secretsdump → loot_collector → bitlocker_check
+  → recycle_bin → ad_backup_check → persist_check → privileged_group_mon
+
+PHASE 14 — REPORTING
+  html_report → pdf_report → json_export → csv_export
+  → bloodhound_export → attack_path_svg
+
+ARCHITECTURE:
+adforge/
+├── __init__.py
+├── adforge.py                   # MASTER ENTRY POINT
+├── adforge.yaml
+├── core/
+│   ├── __init__.py
+│   ├── scheduler.py
+│   ├── ldap_client.py           # ldap3 async + paging
+│   ├── kerberos_client.py       # impacket Kerberos TGT/TGS/S4U
+│   ├── smb_client.py            # impacket SMB session manager
+│   ├── ad_graph.py              # Directed ACL graph (networkx DiGraph)
+│   └── attack_path.py           # Shortest path to DA (Dijkstra)
+├── modules/
+│   ├── enum/
+│   │   ├── __init__.py
+│   │   ├── domain_enum.py
+│   │   ├── user_enum.py
+│   │   ├── group_enum.py
+│   │   ├── computer_enum.py
+│   │   ├── gpo_enum.py
+│   │   ├── ou_enum.py
+│   │   ├── trust_enum.py
+│   │   ├── acl_enum.py
+│   │   ├── spn_enum.py
+│   │   ├── asrep_enum.py
+│   │   ├── laps_enum.py
+│   │   ├── gmsa_enum.py
+│   │   ├── adcs_enum.py
+│   │   ├── schema_enum.py
+│   │   ├── fine_grained_psp.py
+│   │   ├── admin_count.py
+│   │   ├── inactive_account.py
+│   │   └── service_account_audit.py
+│   ├── unauth/
+│   │   ├── __init__.py
+│   │   ├── null_session.py
+│   │   ├── ldap_anon.py
+│   │   ├── rid_cycle.py
+│   │   ├── kerb_user_enum.py
+│   │   └── dns_enum.py
+│   ├── attacks/
+│   │   ├── __init__.py
+│   │   ├── kerberoast.py        # CONFIRM GATE
+│   │   ├── asrep_roast.py       # CONFIRM GATE
+│   │   ├── password_spray.py    # CONFIRM GATE
+│   │   ├── ntlm_relay.py        # Generates command (no auto-exec)
+│   │   ├── pass_hash.py         # CONFIRM GATE
+│   │   ├── pass_ticket.py       # CONFIRM GATE
+│   │   ├── golden_ticket.py     # CONFIRM GATE
+│   │   ├── silver_ticket.py     # CONFIRM GATE
+│   │   ├── dcsync.py            # CONFIRM GATE (admin only)
+│   │   ├── zerologon.py         # CHECK only — no reset
+│   │   ├── petitpotam.py        # CHECK only — no coerce
+│   │   ├── nopac.py             # CHECK only
+│   │   ├── printspooler.py      # CHECK only
+│   │   ├── ms14_068.py          # CHECK only
+│   │   └── dfscoerce.py         # CHECK only
+│   ├── acl_abuse/
+│   │   ├── __init__.py
+│   │   ├── acl_scanner.py       # CONFIRM GATE on execution
+│   │   ├── dacl_abuse.py        # CONFIRM GATE on execution
+│   │   ├── forcechangepw.py     # CONFIRM GATE on execution
+│   │   ├── add_member.py        # CONFIRM GATE on execution
+│   │   └── shadow_creds.py      # CONFIRM GATE on execution
+│   ├── gpo_abuse/
+│   │   ├── __init__.py
+│   │   ├── gpo_scanner.py
+│   │   ├── gpo_path_check.py
+│   │   └── linked_gpo_check.py
+│   ├── delegation/
+│   │   ├── __init__.py
+│   │   ├── uncons_deleg.py
+│   │   ├── cons_deleg.py
+│   │   └── rbcd_attack.py
+│   ├── adcs/
+│   │   ├── __init__.py
+│   │   ├── esc1_check.py
+│   │   ├── esc2_check.py
+│   │   ├── esc3_check.py
+│   │   ├── esc4_check.py
+│   │   ├── esc6_check.py
+│   │   ├── esc7_check.py
+│   │   └── esc8_check.py
+│   ├── lateral/
+│   │   ├── __init__.py
+│   │   ├── smb_exec.py          # CONFIRM GATE
+│   │   ├── wmi_exec.py          # CONFIRM GATE
+│   │   └── rdp_check.py         # Verify only (no confirm needed)
+│   ├── post/
+│   │   ├── __init__.py
+│   │   ├── secretsdump.py       # CONFIRM GATE (admin only)
+│   │   ├── loot_collector.py    # CONFIRM GATE
+│   │   ├── da_check.py
+│   │   ├── persist_check.py
+│   │   ├── privileged_group_mon.py
+│   │   ├── recycle_bin.py
+│   │   ├── bitlocker_check.py
+│   │   └── ad_backup_check.py
+│   └── reporting/
+│       ├── __init__.py
+│       ├── html_report.py
+│       ├── pdf_report.py
+│       ├── json_export.py
+│       ├── csv_export.py
+│       ├── bloodhound_export.py
+│       └── attack_path_svg.py   # Pure SVG, no graphviz
+├── data/
+│   ├── wordlists/
+│   │   ├── spray_small.txt      # Top 20 passwords
+│   │   ├── spray_medium.txt     # Top 500 passwords
+│   │   └── usernames.txt
+│   └── templates/
+│       ├── html_report.j2
+│       └── pdf_report.j2
+└── results/
+    └── {domain}_{timestamp}/
+        ├── adforge.db
+        ├── adforge.log
+        ├── report.html
+        ├── report.pdf
+        ├── findings.json
+        ├── findings.csv
+        ├── hashes/              # Kerberoast/AS-REP — hashcat ready
+        ├── bloodhound/          # BloodHound CE + legacy JSON
+        └── attack_path.svg
+
+KEY FEATURES:
+1. SINGLE ENTRY POINT — all 14 phases in order
+2. FULL AD ENUMERATION — complete LDAP dump into SQLite
+3. ATTACK PATH ENGINE — Dijkstra shortest path to DA in ad_graph
+4. KERBEROS SUITE — Kerberoast + AS-REP, hashcat format, confirm gated
+5. PASSWORD SPRAY SAFETY — queries domain policy first, per-user counter
+6. NTLM RELAY DETECTION — generate exact ntlmrelayx command for operator
+7. AD CS FULL AUDIT — ESC1-ESC8, certipy command per finding
+8. ACL ABUSE DETECTION — full chain, generate exact commands, confirm gated
+9. DELEGATION ABUSE — unconstrained/constrained/RBCD detection
+10. LATERAL MOVEMENT — confirm gated: smb_exec, wmi_exec, rdp_check
+11. POST-EXPLOITATION — confirm gated: secretsdump, LAPS, gMSA, ccache
+12. BLOODHOUND EXPORT — CE + legacy compatible, custom queries file
+13. AD SECURITY SCORECARD — A-F grade across 10 categories
+14. CONFIRM GATE on all 17 active execution modules
+
+CLI:
+  python adforge.py --dc 10.0.0.1 --domain corp.local \
+    --mode auth --username jsmith --password Pass123 --autopilot
+
+  python adforge.py --dc 10.0.0.1 --domain corp.local \
+    --mode admin --username da_user --password DaPass! \
+    --autopilot --dcsync --bloodhound
+
+  python adforge.py --dc 10.0.0.1 --domain corp.local \
+    --mode auth --username administrator \
+    --hash aad3b435b51404eeaad3b435b51404ee:8846f7eaee8fb117ad06bdd830b7586c
+
+  python adforge.py --dc 10.0.0.1 --domain corp.local --dry-run
+  python adforge.py --dc 10.0.0.1 --domain corp.local \
+    --resume results/corp.local_20240101/
+
+  # Fully automated pipeline (skip all confirm gates):
+  python adforge.py --dc 10.0.0.1 --domain corp.local \
+    --mode admin --username da_user --password DaPass! \
+    --autopilot --auto-confirm
+
+═══════════════════════════════════════════════════════════════════════════
+COMPLETE BUILD ORDER — 232 FILES — ALL FRAMEWORKS
+═══════════════════════════════════════════════════════════════════════════
+
+Build in this exact order. Complete one file fully before starting the next.
+
+INFRASTRUCTURE + SHARED COMMON (build first):
+  0a.  forge-suite/install.sh
+       (check Python 3.10+, pip install, check nmap/hydra/impacket/nuclei/
+        chromium, seed cve_db.sqlite via cve_import.py, create results/ dirs)
+  0b.  forge-suite/requirements.txt
+  0c.  forge-suite/requirements-webforge.txt
+  0d.  forge-suite/requirements-netforge.txt
+  0e.  forge-suite/requirements-adforge.txt
+  0f.  forge-suite/Makefile
+       (targets: install, test, clean, lint, update-cve-db)
+  0g.  forge-suite/common/__init__.py
+  0h.  forge-suite/common/logger.py
+  0i.  forge-suite/common/finding.py      (+ CVSS 3.1 + CVSS 4.0 calculator)
+  0j.  forge-suite/common/db.py           (SQLAlchemy 2.0, create_all, Fernet)
+  0k.  forge-suite/common/config.py       (Pydantic v2 schema + YAML loader)
+  0l.  forge-suite/common/scope.py
+  0m.  forge-suite/common/evidence.py     (Evidence dataclass with screenshot_path)
+  0n.  forge-suite/common/screenshot.py   (Selenium + headless Chromium, highlight_js)
+  0o.  forge-suite/common/confirm_gate.py (Operator confirmation prompt)
+  0p.  forge-suite/common/auth_prompt.py
+  0q.  forge-suite/common/base_module.py  (BaseModule abstract: all hooks)
+  0r.  forge-suite/common/reporter.py
+
+WEBFORGE:
+  1.   webforge/__init__.py
+  2.   webforge/core/__init__.py
+  3.   webforge/core/session.py
+  4.   webforge/core/scheduler.py
+  5.   webforge/core/waf_detect.py
+  6.   webforge/core/mode_engine.py
+  7.   webforge/modules/__init__.py
+  8.   webforge/modules/recon/__init__.py
+  9.   webforge/modules/recon/tech_detect.py
+  10.  webforge/modules/recon/cms_detect.py
+  11.  webforge/modules/recon/dir_fuzzer.py
+  12.  webforge/modules/recon/vhost_enum.py
+  13.  webforge/modules/recon/js_analyzer.py
+  14.  webforge/modules/recon/link_crawler.py
+  15.  webforge/modules/recon/robots_sitemap.py
+  16.  webforge/modules/recon/api_discover.py
+  17.  webforge/modules/recon/param_discover.py
+  18.  webforge/modules/recon/subdomain_takeover.py
+  19.  webforge/modules/ssl/__init__.py
+  20.  webforge/modules/ssl/ssl_audit.py
+  21.  webforge/modules/ssl/cert_inspect.py
+  22.  webforge/modules/ssl/hsts_check.py
+  23.  webforge/modules/headers/__init__.py
+  24.  webforge/modules/headers/header_audit.py
+  25.  webforge/modules/headers/cors_check.py
+  26.  webforge/modules/headers/csp_audit.py
+  27.  webforge/modules/headers/cookie_audit.py
+  28.  webforge/modules/headers/sri_check.py
+  29.  webforge/modules/headers/clickjacking.py
+  30.  webforge/modules/injection/__init__.py
+  31.  webforge/modules/injection/sqli_scanner.py
+  32.  webforge/modules/injection/xss_scanner.py
+  33.  webforge/modules/injection/xxe_scanner.py
+  34.  webforge/modules/injection/ssti_scanner.py
+  35.  webforge/modules/injection/cmd_inject.py
+  36.  webforge/modules/injection/ldap_inject.py
+  37.  webforge/modules/injection/nosql_inject.py
+  38.  webforge/modules/injection/jsonp_inject.py
+  39.  webforge/modules/injection/host_header_inject.py
+  40.  webforge/modules/auth/__init__.py
+  41.  webforge/modules/auth/login_brute.py
+  42.  webforge/modules/auth/jwt_audit.py
+  43.  webforge/modules/auth/oauth_check.py
+  44.  webforge/modules/auth/session_audit.py
+  45.  webforge/modules/auth/password_policy.py
+  46.  webforge/modules/auth/mfa_bypass.py
+  47.  webforge/modules/access_control/__init__.py
+  48.  webforge/modules/access_control/idor_scanner.py
+  49.  webforge/modules/access_control/priv_esc.py
+  50.  webforge/modules/access_control/path_traversal.py
+  51.  webforge/modules/access_control/forced_browse.py
+  52.  webforge/modules/access_control/403_bypass.py
+  53.  webforge/modules/access_control/mass_assignment.py
+  54.  webforge/modules/api/__init__.py
+  55.  webforge/modules/api/rest_audit.py
+  56.  webforge/modules/api/graphql_audit.py
+  57.  webforge/modules/api/soap_audit.py
+  58.  webforge/modules/api/api_rate_check.py
+  59.  webforge/modules/file/__init__.py
+  60.  webforge/modules/file/upload_bypass.py
+  61.  webforge/modules/file/lfi_rfi.py
+  62.  webforge/modules/file/ssrf_scanner.py
+  63.  webforge/modules/business_logic/__init__.py
+  64.  webforge/modules/business_logic/price_tamper.py
+  65.  webforge/modules/business_logic/workflow_bypass.py
+  66.  webforge/modules/business_logic/race_condition.py
+  67.  webforge/modules/business_logic/open_redirect.py
+  68.  webforge/modules/advanced/__init__.py
+  69.  webforge/modules/advanced/websocket_audit.py
+  70.  webforge/modules/advanced/http2_audit.py
+  71.  webforge/modules/advanced/http_smuggling.py
+  72.  webforge/modules/advanced/cache_poison.py
+  73.  webforge/modules/advanced/prototype_poll.py
+  74.  webforge/modules/advanced/deserialization.py
+  75.  webforge/modules/advanced/email_security.py
+  76.  webforge/modules/whitebox/__init__.py
+  77.  webforge/modules/whitebox/source_audit.py
+  78.  webforge/modules/whitebox/secret_scan.py
+  79.  webforge/modules/whitebox/dep_audit.py
+  80.  webforge/modules/whitebox/config_audit.py
+  81.  webforge/modules/whitebox/code_flow.py
+  82.  webforge/modules/reporting/__init__.py
+  83.  webforge/modules/reporting/html_report.py
+  84.  webforge/modules/reporting/pdf_report.py
+  85.  webforge/modules/reporting/json_export.py
+  86.  webforge/modules/reporting/csv_export.py
+  87.  webforge/modules/reporting/burp_export.py
+  88.  webforge/data/wappalyzer_db.json
+  89.  webforge/data/payloads/sqli.txt
+  90.  webforge/data/payloads/xss.txt
+  91.  webforge/data/payloads/xxe.txt
+  92.  webforge/data/payloads/ssti.txt
+  93.  webforge/data/payloads/ssrf.txt
+  94.  webforge/data/payloads/lfi.txt
+  95.  webforge/data/payloads/cmd.txt
+  96.  webforge/data/payloads/traversal.txt
+  97.  webforge/data/wordlists/dirs_common.txt
+  98.  webforge/data/wordlists/dirs_api.txt
+  99.  webforge/data/wordlists/params_common.txt
+  100. webforge/data/wordlists/vhosts.txt
+  101. webforge/data/wordlists/subdomains.txt
+  102. webforge/data/templates/html_report.j2
+  103. webforge/data/templates/pdf_report.j2
+  104. webforge/webforge.yaml
+  105. webforge/webforge.py              ← MASTER ENTRY POINT (builds all 12 phases)
+
+NETFORGE:
+  106. netforge/__init__.py
+  107. netforge/core/__init__.py
+  108. netforge/core/session.py
+  109. netforge/core/scheduler.py
+  110. netforge/core/network_map.py
+  111. netforge/core/host_scorer.py
+  112. netforge/core/cred_engine.py
+  113. netforge/core/capture.py
+  114. netforge/modules/__init__.py
+  115. netforge/modules/discovery/__init__.py
+  116. netforge/modules/discovery/host_discover.py
+  117. netforge/modules/discovery/port_scanner.py
+  118. netforge/modules/discovery/service_id.py
+  119. netforge/modules/discovery/os_detect.py
+  120. netforge/modules/discovery/topology_map.py
+  121. netforge/modules/external/__init__.py
+  122. netforge/modules/external/dns_recon.py
+  123. netforge/modules/external/ssl_audit.py
+  124. netforge/modules/external/smtp_check.py
+  125. netforge/modules/external/firewall_detect.py
+  126. netforge/modules/external/exposure_check.py
+  127. netforge/modules/external/firewall_rule_check.py
+  128. netforge/modules/internal/__init__.py
+  129. netforge/modules/internal/arp_monitor.py
+  130. netforge/modules/internal/dhcp_audit.py
+  131. netforge/modules/internal/vlan_check.py
+  132. netforge/modules/internal/cdp_ldp.py
+  133. netforge/modules/internal/ipv6_audit.py
+  134. netforge/modules/services/__init__.py
+  135. netforge/modules/services/smb_audit.py
+  136. netforge/modules/services/ftp_audit.py
+  137. netforge/modules/services/ssh_audit.py
+  138. netforge/modules/services/telnet_audit.py
+  139. netforge/modules/services/rdp_audit.py
+  140. netforge/modules/services/snmp_audit.py
+  141. netforge/modules/services/nfs_audit.py
+  142. netforge/modules/services/mssql_audit.py
+  143. netforge/modules/services/mysql_audit.py
+  144. netforge/modules/services/redis_audit.py
+  145. netforge/modules/services/mongo_audit.py
+  146. netforge/modules/services/elastic_audit.py
+  147. netforge/modules/services/vnc_audit.py
+  148. netforge/modules/services/tftp_audit.py
+  149. netforge/modules/services/printer_audit.py
+  150. netforge/modules/services/voip_audit.py
+  151. netforge/modules/services/ipmi_audit.py
+  152. netforge/modules/services/kubernetes_audit.py
+  153. netforge/modules/services/docker_audit.py
+  154. netforge/modules/services/cloud_metadata.py
+  155. netforge/modules/services/ics_audit.py
+  156. netforge/modules/vuln/__init__.py
+  157. netforge/modules/vuln/cve_matcher.py
+  158. netforge/modules/vuln/nmap_vulns.py
+  159. netforge/modules/vuln/nuclei_runner.py
+  160. netforge/modules/vuln/exploit_suggest.py
+  161. netforge/modules/bruteforce/__init__.py
+  162. netforge/modules/bruteforce/smart_brute.py
+  163. netforge/modules/bruteforce/hydra_wrap.py
+  164. netforge/modules/bruteforce/wordlist_mgr.py
+  165. netforge/modules/bruteforce/cred_spray.py
+  166. netforge/modules/bruteforce/password_quality.py
+  167. netforge/modules/post_exploit/__init__.py
+  168. netforge/modules/post_exploit/pivot_finder.py
+  169. netforge/modules/post_exploit/tunnel_suggest.py
+  170. netforge/modules/post_exploit/loot_parse.py
+  171. netforge/modules/reporting/__init__.py
+  172. netforge/modules/reporting/html_report.py
+  173. netforge/modules/reporting/pdf_report.py
+  174. netforge/modules/reporting/json_export.py
+  175. netforge/modules/reporting/csv_export.py
+  176. netforge/modules/reporting/network_diagram.py
+  177. netforge/data/cve_db.sqlite         (empty schema, seeded by cve_import.py)
+  178. netforge/data/cve_import.py         (NVD JSON → SQLite importer)
+  179. netforge/data/wordlists/ssh_users.txt
+  180. netforge/data/wordlists/ftp_users.txt
+  181. netforge/data/wordlists/smb_users.txt
+  182. netforge/data/wordlists/common_passwords.txt
+  183. netforge/data/wordlists/snmp_communities.txt
+  184. netforge/data/templates/html_report.j2
+  185. netforge/data/templates/pdf_report.j2
+  186. netforge/netforge.yaml
+  187. netforge/netforge.py               ← MASTER ENTRY POINT (builds all 8 phases)
+
+ADFORGE:
+  188. adforge/__init__.py
+  189. adforge/core/__init__.py
+  190. adforge/core/scheduler.py
+  191. adforge/core/ldap_client.py
+  192. adforge/core/kerberos_client.py
+  193. adforge/core/smb_client.py
+  194. adforge/core/ad_graph.py
+  195. adforge/core/attack_path.py
+  196. adforge/modules/__init__.py
+  197. adforge/modules/enum/__init__.py
+  198. adforge/modules/enum/domain_enum.py
+  199. adforge/modules/enum/user_enum.py
+  200. adforge/modules/enum/group_enum.py
+  201. adforge/modules/enum/computer_enum.py
+  202. adforge/modules/enum/gpo_enum.py
+  203. adforge/modules/enum/ou_enum.py
+  204. adforge/modules/enum/trust_enum.py
+  205. adforge/modules/enum/acl_enum.py
+  206. adforge/modules/enum/spn_enum.py
+  207. adforge/modules/enum/asrep_enum.py
+  208. adforge/modules/enum/laps_enum.py
+  209. adforge/modules/enum/gmsa_enum.py
+  210. adforge/modules/enum/adcs_enum.py
+  211. adforge/modules/enum/schema_enum.py
+  212. adforge/modules/enum/fine_grained_psp.py
+  213. adforge/modules/enum/admin_count.py
+  214. adforge/modules/enum/inactive_account.py
+  215. adforge/modules/enum/service_account_audit.py
+  216. adforge/modules/unauth/__init__.py
+  217. adforge/modules/unauth/null_session.py
+  218. adforge/modules/unauth/ldap_anon.py
+  219. adforge/modules/unauth/rid_cycle.py
+  220. adforge/modules/unauth/kerb_user_enum.py
+  221. adforge/modules/unauth/dns_enum.py
+  222. adforge/modules/attacks/__init__.py
+  223. adforge/modules/attacks/kerberoast.py
+  224. adforge/modules/attacks/asrep_roast.py
+  225. adforge/modules/attacks/password_spray.py
+  226. adforge/modules/attacks/ntlm_relay.py
+  227. adforge/modules/attacks/pass_hash.py
+  228. adforge/modules/attacks/pass_ticket.py
+  229. adforge/modules/attacks/golden_ticket.py
+  230. adforge/modules/attacks/silver_ticket.py
+  231. adforge/modules/attacks/dcsync.py
+  232. adforge/modules/attacks/zerologon.py
+  233. adforge/modules/attacks/petitpotam.py
+  234. adforge/modules/attacks/nopac.py
+  235. adforge/modules/attacks/printspooler.py
+  236. adforge/modules/attacks/ms14_068.py
+  237. adforge/modules/attacks/dfscoerce.py
+  238. adforge/modules/acl_abuse/__init__.py
+  239. adforge/modules/acl_abuse/acl_scanner.py
+  240. adforge/modules/acl_abuse/dacl_abuse.py
+  241. adforge/modules/acl_abuse/forcechangepw.py
+  242. adforge/modules/acl_abuse/add_member.py
+  243. adforge/modules/acl_abuse/shadow_creds.py
+  244. adforge/modules/gpo_abuse/__init__.py
+  245. adforge/modules/gpo_abuse/gpo_scanner.py
+  246. adforge/modules/gpo_abuse/gpo_path_check.py
+  247. adforge/modules/gpo_abuse/linked_gpo_check.py
+  248. adforge/modules/delegation/__init__.py
+  249. adforge/modules/delegation/uncons_deleg.py
+  250. adforge/modules/delegation/cons_deleg.py
+  251. adforge/modules/delegation/rbcd_attack.py
+  252. adforge/modules/adcs/__init__.py
+  253. adforge/modules/adcs/esc1_check.py
+  254. adforge/modules/adcs/esc2_check.py
+  255. adforge/modules/adcs/esc3_check.py
+  256. adforge/modules/adcs/esc4_check.py
+  257. adforge/modules/adcs/esc6_check.py
+  258. adforge/modules/adcs/esc7_check.py
+  259. adforge/modules/adcs/esc8_check.py
+  260. adforge/modules/lateral/__init__.py
+  261. adforge/modules/lateral/smb_exec.py
+  262. adforge/modules/lateral/wmi_exec.py
+  263. adforge/modules/lateral/rdp_check.py
+  264. adforge/modules/post/__init__.py
+  265. adforge/modules/post/secretsdump.py
+  266. adforge/modules/post/loot_collector.py
+  267. adforge/modules/post/da_check.py
+  268. adforge/modules/post/persist_check.py
+  269. adforge/modules/post/privileged_group_mon.py
+  270. adforge/modules/post/recycle_bin.py
+  271. adforge/modules/post/bitlocker_check.py
+  272. adforge/modules/post/ad_backup_check.py
+  273. adforge/modules/reporting/__init__.py
+  274. adforge/modules/reporting/html_report.py
+  275. adforge/modules/reporting/pdf_report.py
+  276. adforge/modules/reporting/json_export.py
+  277. adforge/modules/reporting/csv_export.py
+  278. adforge/modules/reporting/bloodhound_export.py
+  279. adforge/modules/reporting/attack_path_svg.py
+  280. adforge/data/wordlists/spray_small.txt
+  281. adforge/data/wordlists/spray_medium.txt
+  282. adforge/data/wordlists/usernames.txt
+  283. adforge/data/templates/html_report.j2
+  284. adforge/data/templates/pdf_report.j2
+  285. adforge/adforge.yaml
+  286. adforge/adforge.py                 ← MASTER ENTRY POINT (builds all 14 phases)
+
+TOTAL: 286 files
+
+═══════════════════════════════════════════════════════════════════════════
+REQUIREMENTS SPECIFICATION
+═══════════════════════════════════════════════════════════════════════════
+
+requirements.txt (all frameworks combined):
+# Core async HTTP
+aiohttp>=3.9.0
+requests>=2.31.0
+urllib3>=2.0.0
+# UI
+rich>=13.7.0
+# Data / Storage
+sqlalchemy>=2.0.0
+pydantic[email]>=2.5.0
+pyyaml>=6.0.1
+cryptography>=41.0.0
+# Reporting
+jinja2>=3.1.2
+weasyprint>=60.0
+# Screenshots / Browser
+selenium>=4.18.0
+# Network / Security
+scapy>=2.5.0
+impacket>=0.11.0
+ldap3>=2.9.1
+# Graph (AD attack path)
+networkx>=3.2.0
+# Static analysis
+bandit>=1.7.6
+# Testing
+pytest>=7.4.0
+
+# External tools required (checked by install.sh):
+# nmap, hydra, nuclei, chromium, testssl.sh
+
+NOTE: selenium uses the system Chromium already on Kali Linux.
+Run: which chromium || apt-get install -y chromium
+No additional webdriver download needed — ChromeDriver is bundled.
+
+═══════════════════════════════════════════════════════════════════════════
+FINAL REMINDERS — NO EXCEPTIONS
+═══════════════════════════════════════════════════════════════════════════
+
+SAFETY:
+- NO destructive code in any module under any circumstance
+- NO DDoS, flood, or amplification in any module
+- EVERY brute force module implements the full lockout safety engine
+- EVERY module validates scope before any packet/request/connection
+- Authorization prompt on every tool startup — exit(1) on "no"
+- Lateral movement / exploitation: CONFIRM GATE before ANY execution
+- --auto-confirm flag exists but is clearly documented as dangerous
+
+ARCHITECTURE:
+- ONE master entry point per framework — webforge.py, netforge.py, adforge.py
+- ALL modules run in PHASE ORDER through the master script
+- Empty __init__.py in every package directory BEFORE writing modules
+- common/ is the shared base — no duplicated logger/db/finding code
+
+EVIDENCE:
+- Screenshots via Selenium for all browser-visible findings
+- Rich console captures for terminal-output findings
+- Every finding has evidence attached before being saved
+
+CODE:
+- Write COMPLETE code — no TODOs, no placeholders, no truncation
+- Say "NEXT: [filename]" after each file
+- Say "CONTINUE?" if approaching response length limit
+- CVSS 3.1 required on every finding; CVSS 4.0 where calculable
+- Dependency pre-flight on startup for all three tools
+
+═══════════════════════════════════════════════════════════════════════════
+BROWSER DETECTION + SSO / MANUAL LOGIN BRIDGE (WebForge only)
+═══════════════════════════════════════════════════════════════════════════
+
+Add these files to the WebForge build, inserted BEFORE webforge.py:
+
+NEW FILE: webforge/core/browser_detect.py
+  Purpose: Detect the best available browser on Kali Linux at runtime.
+  Priority order (fastest/lightest headless first):
+    1. google-chrome / google-chrome-stable  (Chrome)
+    2. chromium / chromium-browser           (Chromium — default on Kali)
+    3. firefox / firefox-esr                 (Firefox fallback)
+  Logic:
+    - shutil.which() each binary name in priority order
+    - Return a BrowserConfig dataclass:
+        type: Literal["chrome", "chromium", "firefox"]
+        binary_path: str
+        driver_class: type  (webdriver.Chrome | webdriver.Firefox)
+        options_class: type (ChromeOptions | FirefoxOptions)
+    - For Chrome/Chromium: add --no-sandbox, --headless=new,
+        --disable-dev-shm-usage, --disable-gpu, --window-size=1920,1080
+    - For Firefox: add -headless, set window size 1920x1080
+    - Selenium 4.6+ selenium-manager auto-downloads matching WebDriver —
+      no manual chromedriver/geckodriver install needed
+    - If NO browser found: print clear apt-get install instructions, exit(1)
+    - Export: get_browser_config() → BrowserConfig
+               build_driver(config: BrowserConfig, headless: bool = True) → WebDriver
+
+NEW FILE: webforge/core/session_bridge.py
+  Purpose: Allow operator to manually complete ANY login type (SSO, MFA,
+  CAPTCHA, hardware token, biometric, QR code, Okta/Azure AD/Google
+  Workspace/Ping/ADFS, smart card) in a VISIBLE browser, then capture
+  the full session so WebForge can continue automated testing.
+
+  How it works:
+    1. Opens a VISIBLE (non-headless) browser window using browser_detect.py
+    2. Navigates to --login-url
+    3. Prints to terminal:
+       ╔══════════════════════════════════════════════════════════════╗
+       ║  MANUAL LOGIN REQUIRED                                      ║
+       ║  Browser window is open. Please complete login now.         ║
+       ║  Supports: SSO, MFA, CAPTCHA, QR, Hardware Token,          ║
+       ║            Biometric, Smart Card, Okta, Azure AD,           ║
+       ║            Google Workspace, Ping, ADFS, and any other.     ║
+       ║  When login is COMPLETE and you see the app dashboard,      ║
+       ║  press Enter here to capture the session.                   ║
+       ╚══════════════════════════════════════════════════════════════╝
+    4. input("Press Enter when logged in...") — blocks until operator ready
+    5. Captures from the browser:
+       - All cookies (name, value, domain, path, secure, httpOnly, sameSite)
+       - localStorage keys/values (scan for token, auth, jwt, bearer, access)
+       - sessionStorage keys/values (same scan)
+       - Common auth header patterns detected in cookies/storage:
+         Bearer tokens, JWT tokens, session IDs, CSRF tokens
+       - Current URL after login (detect redirect destination)
+    6. Saves to --output file (default: session.json):
+       {
+         "captured_at": ISO8601,
+         "login_url": str,
+         "post_login_url": str,
+         "cookies": [...],
+         "localStorage": {...},
+         "sessionStorage": {...},
+         "detected_tokens": {
+           "bearer": str | null,
+           "jwt": str | null,
+           "csrf": str | null,
+           "session_id": str | null
+         },
+         "selenium_cookies": [...]  # ready for driver.add_cookie()
+       }
+    7. Prints session summary to terminal (token types found, cookie count)
+    8. Browser stays open for 5s then closes (gives operator time to see)
+
+  Integration with WebForge:
+    webforge.py --session session.json loads this file and:
+    - Injects all cookies into the aiohttp session
+    - Sets Authorization header if bearer/jwt token detected
+    - Sets X-CSRF-Token header if csrf token detected
+    - Uses selenium_cookies to seed the Selenium driver for screenshots
+    - All modules then run with the pre-authenticated session
+
+NEW FILE: webforge/session_capture.py  (STANDALONE SCRIPT, not a module)
+  Purpose: User runs this BEFORE webforge.py when target uses SSO/complex auth.
+  This is a simple CLI wrapper around session_bridge.py.
+
+  Usage:
+    python session_capture.py --target https://app.example.com/login
+    python session_capture.py --target https://app.example.com/login \
+      --output my_session.json --wait-url https://app.example.com/dashboard
+
+  Flags:
+    --target        Login URL to open in browser (required)
+    --output        Session file path (default: session.json)
+    --wait-url      Optional: if provided, auto-detect login completion
+                    when browser navigates to this URL (no Enter needed)
+    --browser       Force browser: chrome | chromium | firefox (default: auto)
+    --timeout       Max wait time for manual login in seconds (default: 300)
+
+  Output:
+    - Saves session.json (or --output path)
+    - Prints: "Session captured. Run: python webforge.py --target <url> --session session.json"
+
+  Then webforge.py accepts:
+    --session session.json          Load pre-captured session
+    --sso                           Shortcut: auto-launch session_capture.py
+                                    before starting scan, use that session
+
+BROWSER DETECTION NOTE FOR install.sh:
+  Add browser detection to install.sh output:
+    echo "[*] Detecting available browsers..."
+    for b in google-chrome google-chrome-stable chromium chromium-browser firefox firefox-esr; do
+      which $b 2>/dev/null && echo "    [+] Found: $b" && break
+    done
+  If none found: echo "    [!] No browser found. Install: apt-get install -y chromium"
+
+UPDATE TO BUILD ORDER — insert after step 105 (webforge/core/mode_engine.py → step 6):
+  6a. webforge/core/browser_detect.py
+  6b. webforge/core/session_bridge.py
+  And after the last webforge module (step 105 webforge.py):
+  After step 104 (webforge.yaml), before step 105 (webforge.py):
+  104a. webforge/session_capture.py
+
+UPDATE TO common/screenshot.py:
+  Import and use browser_detect.get_browser_config() instead of
+  hardcoding Chrome. Pass headless=True for automated screenshots.
+  Pass headless=False only when session_bridge.py opens visible window.
+
+UPDATE TO webforge.py CLI flags:
+  --session PATH      Load pre-captured session from session_capture.py
+  --sso               Auto-launch session_capture.py visible browser first,
+                      then run full scan with captured session
+  --browser           Force browser: chrome|chromium|firefox (default: auto-detect)
+
+TYPES OF LOGIN WEBFORGE CAN HANDLE NATIVELY (no bridge needed):
+  - Form-based login (username + password fields) via login_brute.py
+  - HTTP Basic Auth (--username + --password flags)
+  - Bearer token (--token flag)
+  - Cookie-based (--cookie "name=value")
+  - API key header (--api-key flag)
+
+TYPES REQUIRING session_capture.py (manual bridge):
+  - SAML 2.0 / SSO (Okta, Azure AD, ADFS, Google Workspace, Ping)
+  - FIDO2 / WebAuthn / Hardware Token (YubiKey, etc.)
+  - Push MFA (Duo, Microsoft Authenticator push)
+  - Complex CAPTCHA (reCAPTCHA v3, hCaptcha)
+  - Biometric / Smart Card / Certificate login
+  - QR code login
+  - Custom JavaScript-heavy login flows
+
+  When webforge.py detects login failure after --username/--password attempt,
+  it automatically suggests:
+    "[!] Automated login failed. If target uses SSO/MFA/CAPTCHA:
+     Run: python session_capture.py --target <login_url>
+     Then: python webforge.py --target <url> --session session.json"
+
+═══════════════════════════════════════════════════════════════════════════
+
+Start now with:  forge-suite/install.sh

@@ -153,6 +153,7 @@ class CmsDetect(BaseModule):
             # Detect SPA catch-all routing to avoid reporting the app shell
             # as sensitive files (Vercel/Next.js returns index.html for all paths).
             spa_fp = await self._spa_fingerprint(target)
+            soft404_fps = await self._soft_404_fingerprints(target)
 
             # Check sensitive files
             exposed = []
@@ -165,6 +166,12 @@ class CmsDetect(BaseModule):
                             if len(body) > 10 and "404" not in body[:100].lower():
                                 # Skip if this is just the SPA shell, not a real file
                                 if self._is_spa_body(body, spa_fp):
+                                    continue
+                                if self._is_waf_placeholder(body, resp.status, resp.headers):
+                                    continue
+                                if self._is_soft_404_body(body, resp.status, soft404_fps):
+                                    continue
+                                if not self._has_sensitive_file_content(path, body):
                                     continue
                                 exposed.append({"path": path, "size": len(body)})
                 except Exception:
@@ -187,6 +194,29 @@ class CmsDetect(BaseModule):
                     target=target)
 
         return self._make_result(start)
+
+    def _has_sensitive_file_content(self, path: str, body: str) -> bool:
+        """Require path-specific file evidence before reporting exposure."""
+        lower_path = path.lower()
+        sample = body[:12000]
+        sample_lower = sample.lower()
+        if ".env" in lower_path:
+            return any(token in sample for token in ("APP_KEY=", "DB_PASSWORD=", "DATABASE_URL=", "AWS_SECRET_ACCESS_KEY="))
+        if ".git/head" in lower_path:
+            return "ref: refs/heads/" in sample_lower or sample.strip().startswith("ref:")
+        if "wp-config" in lower_path:
+            return "db_password" in sample_lower or "wp-config" in sample_lower
+        if "web.config" in lower_path:
+            return "<configuration" in sample_lower or "<system.webserver" in sample_lower
+        if "server-status" in lower_path:
+            return "apache server status" in sample_lower or "server uptime" in sample_lower
+        if "server-info" in lower_path:
+            return "apache server information" in sample_lower or "server settings" in sample_lower
+        if lower_path.endswith((".htaccess", ".htpasswd")):
+            return any(token in sample_lower for token in ("rewriteengine", "authuserfile", "authtype", "require valid-user"))
+        if "phpinfo" in lower_path:
+            return "php version" in sample_lower and "phpinfo()" in sample_lower
+        return False
 
 class TestCmsDetect:
     def test_signatures(self) -> None:

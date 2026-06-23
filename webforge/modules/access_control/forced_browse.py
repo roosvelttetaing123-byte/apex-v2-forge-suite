@@ -78,7 +78,7 @@ class ForcedBrowse(BaseModule):
                     response_raw=body[:500],
                     extra={"path": path, "status": status, "body_length": len(body)},
                 )
-                ev.screenshot_path = await self.capture_screenshot(
+                ev.screenshot_path = self.capture_screenshot(
                     url, finding_id=f"forced_browse_{path.replace('/', '_')}"
                 )
                 self.new_finding(

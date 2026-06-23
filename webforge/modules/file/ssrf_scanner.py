@@ -134,6 +134,13 @@ class SsrfScanner(BaseModule):
                  for url, param in test_targets[:30]]
         await asyncio.gather(*tasks, return_exceptions=True)
 
+        if forms:
+            self.log.info("Testing %d form(s) for POST SSRF", len(forms))
+            await self._post_forms_for_ssrf(forms, target)
+
+        # OOB blind SSRF via ForgeCollab (Pillar 17B)
+        await self._test_blind_ssrf_oob(test_targets[:10], target)
+
         return self._make_result(start)
 
     async def _test_ssrf(
@@ -173,9 +180,15 @@ class SsrfScanner(BaseModule):
                         ) as resp:
                             body = await resp.text(errors="ignore")
 
-                    # Check if cloud metadata appeared in response
+                    if self._is_waf_placeholder(body, resp.status, resp.headers):
+                        continue
+
+                    # Check if cloud metadata or service-specific content appeared.
+                    # Generic localhost HTML is not proof of SSRF; SPAs and WAFs
+                    # commonly return the public app shell for every probe.
                     indicators = CLOUD_INDICATORS.get(ssrf_target_name, [])
-                    if any(ind in body for ind in indicators):
+                    hits = [i for i in indicators if i in body]
+                    if hits and self._strong_ssrf_indicator(ssrf_target_name, body, hits):
                         severity = Severity.CRITICAL
                         ev = Evidence(
                             request_raw=f"GET {test_url}",
@@ -184,10 +197,10 @@ class SsrfScanner(BaseModule):
                                 "param":          param_name,
                                 "ssrf_target":    ssrf_target_name,
                                 "ssrf_url":       ssrf_url,
-                                "indicators_hit": [i for i in indicators if i in body],
+                                "indicators_hit": hits,
                             },
                         )
-                        ev.screenshot_path = await self.capture_screenshot(
+                        ev.screenshot_path = self.capture_screenshot(
                             test_url, finding_id=f"ssrf_{param_name}"
                         )
                         self.new_finding(
@@ -247,6 +260,120 @@ class SsrfScanner(BaseModule):
                                     self.log.warning("SSRF in POST form: %s=%s", input_name, ssrf_url)
                         except Exception:
                             pass
+
+
+    async def _test_blind_ssrf_oob(
+        self, test_targets: list[tuple[str, str]], base_target: str
+    ) -> None:
+        """Test for blind SSRF using ForgeCollab OOB callbacks (Pillar 17B).
+
+        For each URL/param pair, injects a ForgeCollab callback URL as the
+        SSRF value. If the target server fetches it, ForgeCollab receives a
+        DNS/HTTP ping → confirmed blind SSRF even without visible response.
+        """
+        try:
+            from forge_collab.server import CollabClient
+        except ImportError:
+            return
+
+        collab_domain = self.config.extra.get("collab_domain", "")
+        if not collab_domain:
+            import os
+            collab_domain = os.environ.get("FORGE_COLLAB_DOMAIN", "")
+        if not collab_domain:
+            return
+
+        collab = CollabClient(domain=collab_domain)
+
+        for url, param in test_targets[:5]:
+            await self.rate_limit()
+            try:
+                token = collab.register("ssrf_scanner", "blind_ssrf", url, param)
+                oob_url = collab.build_url(token)
+                parsed = urlparse(url)
+                params = parse_qs(parsed.query, keep_blank_values=True)
+                test_params = {k: v[0] for k, v in params.items()}
+                test_params[param] = oob_url
+                test_url = (
+                    f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                    f"?{urlencode(test_params)}"
+                )
+
+                import aiohttp
+                async with aiohttp.ClientSession(
+                    connector=aiohttp.TCPConnector(ssl=False)
+                ) as session:
+                    async with session.get(
+                        test_url, timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        await resp.read()
+
+                got_cb = await collab.wait_for_callback(token, timeout=8.0)
+                if got_cb:
+                    from common.evidence import Evidence
+                    ev = Evidence(
+                        request_raw=f"GET {test_url}",
+                        response_raw=f"ForgeCollab OOB callback received for token {token[:8]}",
+                        extra={"param": param, "oob_url": oob_url, "token": token},
+                    )
+                    self.new_finding(
+                        title=f"Blind SSRF (OOB Confirmed) — {param}",
+                        severity=Severity.HIGH,
+                        description=(
+                            f"Blind SSRF confirmed in '{param}' via ForgeCollab OOB callback. "
+                            f"The server fetched {oob_url}, generating a DNS/HTTP ping back "
+                            f"to the Forge Collaborator infrastructure. No visible response "
+                            "was needed — true blind SSRF with OOB proof."
+                        ),
+                        reproduction_steps=[
+                            f"1. Register ForgeCollab token: {token[:8]}",
+                            f"2. Set {param}={oob_url}",
+                            f"3. GET {test_url}",
+                            "4. ForgeCollab callback received — server fetched OOB URL",
+                        ],
+                        remediation=(
+                            "Validate and restrict outbound HTTP requests. "
+                            "Implement allowlisting for external fetch endpoints. "
+                            "Deploy egress filtering to block SSRF at the network layer."
+                        ),
+                        references=["CWE-918", "OWASP A10:2021"],
+                        evidence=ev,
+                        cvss_v31_vector=CVSS_SSRF_BLIND,
+                        cvss_v40_vector=CVSS40_SSRF_BLIND,
+                        mitre_attack=["TA0001/T1190"],
+                        target=base_target,
+                        url=url,
+                    )
+            except Exception as exc:
+                self.log.debug("OOB SSRF test error (%s, %s): %s", url, param, exc)
+
+    def _strong_ssrf_indicator(self, target_name: str, body: str, hits: list[str]) -> bool:
+        """Require target-specific proof instead of generic HTML/server words."""
+        lower_name = target_name.lower()
+        lower_body = body[:12000].lower()
+        if "localhost" in lower_name:
+            return any(
+                token in lower_body
+                for token in (
+                    "apache server status",
+                    "server uptime",
+                    "redis_version",
+                    "mongodb",
+                    "cluster_name",
+                    "kubernetes",
+                )
+            )
+        if "file read" in lower_name:
+            return any(token in lower_body for token in ("root:x:", "daemon:x:", "127.0.0.1 localhost"))
+        if "redis" in lower_name:
+            return any(token in lower_body for token in ("+pong", "redis_version", "-err"))
+        if "postgres" in lower_name:
+            return any(token in lower_body for token in ("postgresql", "fatal"))
+        if "mongo" in lower_name:
+            return any(token in lower_body for token in ("mongodb", '"ok"', "ismaster"))
+        if "elastic" in lower_name:
+            return any(token in lower_body for token in ("cluster_name", "elasticsearch"))
+        return bool(hits)
 
 
 class TestSsrfScanner:

@@ -81,6 +81,9 @@ class DirFuzzer(BaseModule):
         self._spa_fp = await self._spa_fingerprint(target)
         if self._spa_fp:
             self.log.info("SPA catch-all detected — filtering false-positive admin/sensitive findings")
+        self._soft404_fps = await self._soft_404_fingerprints(target)
+        if self._soft404_fps:
+            self.log.info("Soft-404/firewall baseline detected — filtering placeholder responses")
 
         await self._check_known_sensitive(target)
         await self._check_admin_panels(target)
@@ -107,6 +110,11 @@ class DirFuzzer(BaseModule):
                             # Vercel/Next.js returns index.html for all unknown paths.
                             if self._is_spa_body(body, spa_fp):
                                 continue
+                            if self._is_placeholder_response(body, resp.status, resp.headers):
+                                continue
+                            if not self._has_sensitive_content(path, body):
+                                self.log.debug("Skipping %s: no path-specific sensitive evidence", path)
+                                continue
                             await self._report_sensitive(target, path, resp.status, body, resp.headers)
             except Exception:
                 pass
@@ -127,7 +135,11 @@ class DirFuzzer(BaseModule):
                             # path is the SPA catch-all, not a real admin interface.
                             if resp.status == 200 and self._is_spa_body(body, spa_fp):
                                 continue
+                            if self._is_placeholder_response(body, resp.status, resp.headers):
+                                continue
                             title = self._extract_title(body)
+                            if resp.status == 200 and not self._looks_like_admin_panel(path, title, body):
+                                continue
                             ev = Evidence(
                                 request_raw=f"GET {path} HTTP/1.1\nHost: {target}",
                                 response_raw=body[:500],
@@ -174,12 +186,14 @@ class DirFuzzer(BaseModule):
 
                             # Directory listing
                             if "Index of /" in body or "Directory listing" in body:
+                                if self._is_placeholder_response(body, resp.status, resp.headers):
+                                    return
                                 ev = Evidence(
                                     request_raw=f"GET {clean_path} HTTP/1.1",
                                     response_raw=body[:1000],
                                     extra={"path": clean_path, "status": 200},
                                 )
-                                ev.screenshot_path = await self.capture_screenshot(
+                                ev.screenshot_path = self.capture_screenshot(
                                     f"{target}{clean_path}", finding_id=f"dirlist_{clean_path}"
                                 )
                                 self.new_finding(
@@ -229,7 +243,7 @@ class DirFuzzer(BaseModule):
             response_raw=body[:500],
             extra={"path": path, "status": status, "size": len(body)},
         )
-        ev.screenshot_path = await self.capture_screenshot(
+        ev.screenshot_path = self.capture_screenshot(
             f"{target}{path}", finding_id=f"sensitive_{path.replace('/', '_')}"
         )
         self.new_finding(
@@ -271,6 +285,53 @@ class DirFuzzer(BaseModule):
             lines = wl_path.read_text().splitlines()
             return [l.strip() for l in lines if l.strip() and not l.startswith("#")]
         return DEFAULT_WORDLIST
+
+    def _is_placeholder_response(self, body: str, status: int, headers: Any) -> bool:
+        """Filter WAF/firewall block pages and unknown-path soft responses."""
+        if self._is_waf_placeholder(body, status, headers):
+            return True
+        return self._is_soft_404_body(
+            body,
+            status,
+            getattr(self, "_soft404_fps", set()),
+        )
+
+    def _has_sensitive_content(self, path: str, body: str) -> bool:
+        """Require content-specific proof before reporting sensitive path exposure."""
+        lower_path = path.lower()
+        sample = body[:12000]
+        sample_lower = sample.lower()
+        if ".env" in lower_path:
+            return any(
+                token in sample
+                for token in ("APP_KEY=", "APP_SECRET=", "DB_PASSWORD=", "DATABASE_URL=", "AWS_SECRET_ACCESS_KEY=")
+            )
+        if ".git/head" in lower_path:
+            return "ref: refs/heads/" in sample_lower or sample.strip().startswith(("ref:", "000000"))
+        if lower_path.endswith((".htaccess", ".htpasswd")):
+            return any(token in sample_lower for token in ("rewriteengine", "authuserfile", "authtype", "require valid-user"))
+        if "phpinfo" in lower_path or lower_path.endswith("/info.php"):
+            return "php version" in sample_lower and "phpinfo()" in sample_lower
+        if "server-status" in lower_path:
+            return "apache server status" in sample_lower or "server uptime" in sample_lower
+        if "server-info" in lower_path:
+            return "apache server information" in sample_lower or "server settings" in sample_lower
+        if "web.config" in lower_path:
+            return "<configuration" in sample_lower or "<system.webserver" in sample_lower
+        if lower_path.endswith((".sql", ".dump")):
+            return any(token in sample_lower for token in ("create table", "insert into", "mysqldump", "postgresql database dump"))
+        if "backup" in lower_path or lower_path.endswith((".bak", ".zip", ".tar.gz", ".backup")):
+            ctype = sample[:4]
+            return ctype.startswith(("PK", "\x1f\x8b")) or len(body) > 4096
+        if lower_path.endswith((".json", ".yaml", ".yml", ".xml", ".config")):
+            return any(token in sample_lower for token in ("password", "secret", "connectionstring", "api_key", "apikey"))
+        return len(body.strip()) > 0
+
+    def _looks_like_admin_panel(self, path: str, title: str, body: str) -> bool:
+        """Avoid treating every HTTP 200 app shell as an admin panel."""
+        haystack = f"{path} {title} {body[:2000]}".lower()
+        admin_terms = ("admin", "administrator", "dashboard", "control panel", "management", "sign in", "login")
+        return any(term in haystack for term in admin_terms)
 
 
 class TestDirFuzzer:

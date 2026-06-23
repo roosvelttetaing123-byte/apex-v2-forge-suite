@@ -1,0 +1,270 @@
+:root {
+  --bg-app: #080c14;
+  --bg-sidebar: #0c1019;
+  --bg-card: #0f1520;
+  --bg-input: #131c2e;
+  --border-color: #1a2235;
+  --border-secondary: #222f45;
+
+  --text-primary: #dce6f8;
+  --text-secondary: #7a8db0;
+  --text-muted: #5a6d8a;
+  --text-dimmed: #3d4f6e;
+  --text-very-dim: #2a3a55;
+
+  --color-critical: #ff4444;
+  --color-high: #ff8c00;
+  --color-medium: #ffc400;
+  --color-low: #00d8f0;
+  --color-success: #00c853;
+  --color-info: #2979ff;
+  --color-brand-red: #e53935;
+  --color-brand-red-hover: #c62828;
+
+  --font-heading: 'Rajdhani', sans-serif;
+  --font-body: 'IBM Plex Sans', sans-serif;
+  --font-mono: 'IBM Plex Mono', monospace;
+
+  --space: 8px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--bg-app);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow: hidden;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading);
+  margin: 0;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Layout */
+.app-container {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+}
+
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow-y: auto;
+  position: relative;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-app);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-secondary);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dimmed);
+}
+
+/* Animations */
+@keyframes pulse {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(var(--pulse-color), 0.7); }
+  70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(var(--pulse-color), 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(var(--pulse-color), 0); }
+}
+
+@keyframes slideIn {
+  from { opacity: 0; transform: translateX(40px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes slideInRight {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+
+.status-dot.pulse {
+  animation: pulse 2s infinite;
+}
+
+/* Base Components */
+input, select {
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-color);
+  color: var(--text-primary);
+  border-radius: 4px;
+  padding: 8px 12px;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+input:focus, select:focus {
+  border-color: var(--color-brand-red);
+}
+
+input::placeholder {
+  color: var(--text-muted);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th {
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+td {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 14px;
+}
+
+tr:hover td {
+  background-color: rgba(255, 255, 255, 0.02);
+}
+
+tr.clickable-row {
+  cursor: pointer;
+}
+
+tr.clickable-row:focus-visible td {
+  outline: 1px solid var(--color-brand-red);
+  outline-offset: -1px;
+  background-color: rgba(229, 57, 53, 0.06);
+}
+
+/* Utilities */
+.text-critical { color: var(--color-critical); }
+.text-high { color: var(--color-high); }
+.text-medium { color: var(--color-medium); }
+.text-low { color: var(--color-low); }
+.text-success { color: var(--color-success); }
+.text-info { color: var(--color-info); }
+.text-muted { color: var(--text-muted); }
+
+.bg-critical { --pulse-color: 255,68,68; background-color: var(--color-critical); }
+.bg-high { --pulse-color: 255,140,0; background-color: var(--color-high); }
+.bg-medium { --pulse-color: 255,196,0; background-color: var(--color-medium); }
+.bg-low { --pulse-color: 0,216,240; background-color: var(--color-low); }
+.bg-success { --pulse-color: 0,200,83; background-color: var(--color-success); }
+.bg-info { --pulse-color: 41,121,255; background-color: var(--color-info); }
+.bg-dimmed { background-color: var(--text-dimmed); }
+
+.font-mono { font-family: var(--font-mono); }
+.font-heading { font-family: var(--font-heading); }
+
+.flex { display: flex; }
+.flex-col { display: flex; flex-direction: column; }
+.items-center { align-items: center; }
+.justify-between { justify-content: space-between; }
+.justify-center { justify-content: center; }
+.gap-1 { gap: 8px; }
+.gap-2 { gap: 16px; }
+.gap-3 { gap: 24px; }
+.gap-4 { gap: 32px; }
+
+.w-full { width: 100%; }
+.flex-1 { flex: 1; }
+
+/* Responsive Overrides */
+@media (max-width: 1280px) {
+  /* Wrap rows of cards */
+  div[style*="display: flex; gap: 14px;"],
+  div[style*="display: flex; gap: 12px;"] {
+    flex-wrap: wrap;
+  }
+  
+  /* Make fixed width sidebars and panels fluid */
+  div[style*="width: 220px"], 
+  div[style*="width: 260px"],
+  div[style*="width: 520px"] {
+    width: 100% !important;
+    flex: none !important;
+  }
+
+  /* Target 2/3-column layouts in pages like Vulnerabilities, C2Console, Policies */
+  .main-content > div > div[style*="display: flex; flex: 1 1 0%;"],
+  .main-content > div > div[style*="display: flex; gap: 14px; flex: 1 1 0%;"],
+  .main-content > div > div[style*="flex: 1"] {
+    flex-direction: column !important;
+    overflow-y: auto !important;
+  }
+  
+  /* Adjust main container padding */
+  .main-content > div > div {
+    padding: 16px !important;
+  }
+  
+  /* Tables horizontally scrollable */
+  div > table {
+    display: block;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 768px) {
+  aside {
+    width: 64px !important;
+  }
+  aside .nav-item span, aside h1, aside .text-muted, aside div[style*="font-size: 8px"], aside div[style*="font-size: 10px"] {
+    display: none !important;
+  }
+  aside div[style*="padding: 0px 24px"] {
+    display: none !important;
+  }
+  aside .nav-item {
+    justify-content: center;
+    padding: 12px 0 !important;
+  }
+  aside div[style*="align-items: center; gap: 12px"] {
+    justify-content: center;
+  }
+}

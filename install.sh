@@ -211,6 +211,31 @@ fi
 # ══════════════════════════════════════════════════════════════════════
 # DIRECTORY STRUCTURE
 # ══════════════════════════════════════════════════════════════════════
+section "ForgeBrain (AI Engine)"
+
+info "Checking ANTHROPIC_API_KEY for ForgeBrain..."
+if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+  ok "ANTHROPIC_API_KEY set ✓ — ForgeBrain AI reasoning enabled"
+  # Verify the anthropic SDK is installed
+  if $PYTHON -c "import anthropic" 2>/dev/null; then
+    ok "anthropic SDK installed ✓"
+  else
+    warn "anthropic SDK missing — installing..."
+    pip3 install -q "anthropic>=0.40.0" && ok "anthropic SDK installed ✓" || \
+      warn "anthropic install failed — ForgeBrain will use rule-based fallbacks"
+  fi
+else
+  warn "ANTHROPIC_API_KEY not set — ForgeBrain will use rule-based heuristics (all tools still work)"
+  info "To enable AI reasoning: export ANTHROPIC_API_KEY=sk-ant-..."
+  info "Or copy .env.example to .env and fill in your key"
+fi
+
+if [[ ! -f "${FORGE_DIR}/.env" && -f "${FORGE_DIR}/.env.example" ]]; then
+  info "Creating .env from .env.example..."
+  cp "${FORGE_DIR}/.env.example" "${FORGE_DIR}/.env"
+  ok ".env created — edit with your API keys"
+fi
+
 section "Directory Setup"
 
 for d in "${RESULTS_DIRS[@]}"; do

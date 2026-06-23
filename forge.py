@@ -37,7 +37,9 @@ import os
 import sys
 import subprocess
 import logging
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 log = logging.getLogger("forge")
 
@@ -55,6 +57,8 @@ BANNER = r"""
 VERSION = "5.0.0"
 
 BASE_DIR = Path(__file__).resolve().parent
+
+TRUTHY_ENV = {"1", "true", "yes", "on"}
 
 # ── Framework registry ────────────────────────────────────────────────
 
@@ -106,7 +110,7 @@ Examples:
     # ── Dashboard ──────────────────────────────────────────────────
     dash = subparsers.add_parser("dashboard", help="Launch the War Room dashboard")
     dash.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
-    dash.add_argument("--port", type=int, default=1337, help="Bind port (default: 1337)")
+    dash.add_argument("--port", type=_port, default=1337, help="Bind port (default: 1337)")
     dash.add_argument("--tui", action="store_true", help="Launch Rich terminal TUI instead of web")
     dash.add_argument("--no-auth", action="store_true", help="Disable dashboard authentication")
     dash.add_argument("--attach", metavar="DIR", help="Attach to a running/completed engagement")
@@ -118,9 +122,11 @@ Examples:
 
     c2_server = c2_sub.add_parser("server", help="Start the C2 team server")
     c2_server.add_argument("--bind", default="0.0.0.0", help="Bind address")
-    c2_server.add_argument("--port", type=int, default=8443, help="Server port")
+    c2_server.add_argument("--port", type=_port, default=8443, help="Server port")
     c2_server.add_argument("--password", help="Team server password")
     c2_server.add_argument("--dashboard", action="store_true", help="Launch dashboard alongside C2")
+    c2_server.add_argument("--red-team", action="store_true",
+                            help="Confirm this is for an authorized engagement")
 
     c2_connect = c2_sub.add_parser("connect", help="Connect to a team server as operator")
     c2_connect.add_argument("--server", required=True, help="Team server address (host:port)")
@@ -131,16 +137,20 @@ Examples:
     c2_listener.add_argument("action", choices=["add", "remove", "list"], help="Listener action")
     c2_listener.add_argument("--type", choices=["https", "http", "dns", "tcp", "smb"],
                               help="Listener type")
-    c2_listener.add_argument("--port", type=int, help="Listener port")
+    c2_listener.add_argument("--port", type=_port, help="Listener port")
     c2_listener.add_argument("--host", help="Listener bind host")
+    c2_listener.add_argument("--red-team", action="store_true",
+                             help="Confirm this is for an authorized engagement")
 
     c2_payload = c2_sub.add_parser("payload", help="Generate C2 payload/beacon")
     c2_payload.add_argument("--type", default="beacon_https", help="Payload type")
     c2_payload.add_argument("--lhost", required=True, help="Callback host")
-    c2_payload.add_argument("--lport", type=int, default=443, help="Callback port")
+    c2_payload.add_argument("--lport", type=_port, default=443, help="Callback port")
     c2_payload.add_argument("--format", default="exe", help="Output format")
     c2_payload.add_argument("--arch", default="x64", choices=["x86", "x64", "arm64"])
     c2_payload.add_argument("--output", "-o", help="Output file path")
+    c2_payload.add_argument("--red-team", action="store_true",
+                            help="Confirm this payload is for an authorized engagement")
 
     # ── Intelligence Pipeline ─────────────────────────────────────
     intel = subparsers.add_parser("intel", help="Intelligence pipeline management")
@@ -159,9 +169,50 @@ Examples:
     intel_search.add_argument("--cve", help="Search by CVE ID (e.g., CVE-2024-1234)")
     intel_search.add_argument("--product", help="Search by product name")
     intel_search.add_argument("--severity", choices=["critical", "high", "medium", "low"])
-    intel_search.add_argument("--limit", type=int, default=20, help="Max results")
+    intel_search.add_argument("--limit", type=_positive_int, default=20, help="Max results")
 
     intel_status = intel_sub.add_parser("status", help="Show intel sync status")
+
+    # ── Autonomous VAPT ───────────────────────────────────────────
+    auto_p = subparsers.add_parser("auto", help="Fully autonomous AI-driven VAPT engagement")
+    auto_p.add_argument("--target", "-t", required=True, help="Target (URL, IP, CIDR)")
+    auto_p.add_argument("--frameworks", default="netforge,webforge",
+                         help="Comma-separated frameworks (default: netforge,webforge)")
+    auto_p.add_argument("--opsec", default="standard",
+                         choices=["stealth", "standard", "noisy"],
+                         help="OPSEC level (default: standard)")
+    auto_p.add_argument("--max-time", type=_positive_int, default=3600,
+                         help="Max engagement duration in seconds (default: 3600)")
+    auto_p.add_argument("--max-findings", type=_positive_int, default=100,
+                         help="Stop after N findings (default: 100)")
+    auto_p.add_argument("--brain-key", metavar="KEY",
+                         help="Anthropic API key (overrides ANTHROPIC_API_KEY env var)")
+    auto_p.add_argument("--no-stop-on-critical", action="store_true",
+                         help="Don't stop on first critical finding")
+    auto_p.add_argument("--no-fn-sweep", action="store_true",
+                         help="Disable false-negative sweep between phases")
+    auto_p.add_argument("--output-dir", "-o", metavar="DIR", help="Results output directory")
+
+    # ── ForgeCollab OOB Server ─────────────────────────────────────
+    collab = subparsers.add_parser("collab", help="ForgeCollab OOB testing infrastructure")
+    collab_sub = collab.add_subparsers(dest="collab_action", help="Collab actions")
+
+    collab_start = collab_sub.add_parser("start", help="Start ForgeCollab OOB server")
+    collab_start.add_argument("--domain", default="",
+                               help="Collab domain (e.g., collab.example.com)")
+    collab_start.add_argument("--listen", default="0.0.0.0", help="Bind address")
+    collab_start.add_argument("--http-port", type=_port, default=8888, help="HTTP listener port")
+    collab_start.add_argument("--dns-port", type=_optional_port, default=53, help="DNS port (0 to disable)")
+    collab_start.add_argument("--smtp-port", type=_optional_port, default=25, help="SMTP port (0 to disable)")
+    collab_start.add_argument("--api-port", type=_port, default=8889, help="API port")
+    collab_start.add_argument("--response-ip", default=None, help="IP for DNS responses")
+    collab_start.add_argument("--local", action="store_true",
+                               help="Local mode (HTTP only, no DNS/SMTP)")
+
+    collab_gen = collab_sub.add_parser("token", help="Generate a test OOB token")
+    collab_gen.add_argument("--module", default="manual", help="Module name")
+    collab_gen.add_argument("--vuln-type", default="ssrf", help="Vulnerability type")
+    collab_gen.add_argument("--target", default="", help="Target URL")
 
     # ── Session Import ────────────────────────────────────────────
     import_sess = subparsers.add_parser(
@@ -181,16 +232,36 @@ Examples:
     # ── Payload Generation ────────────────────────────────────────
     payload = subparsers.add_parser("payload", help="Standalone payload generation")
     payload.add_argument("--type", default="reverse_tcp", help="Payload type")
-    payload.add_argument("--lhost", required=True, help="Callback host")
-    payload.add_argument("--lport", type=int, default=4444, help="Callback port")
+    payload.add_argument("--lhost", help="Callback host")
+    payload.add_argument("--lport", type=_port, default=4444, help="Callback port")
     payload.add_argument("--format", default="exe",
-                          choices=["exe", "dll", "elf", "ps1", "hta", "vba", "msi", "iso", "raw"],
+                          choices=["exe", "dll", "elf", "ps1", "hta", "vba", "msi",
+                                   "iso", "raw", "c", "cs", "py", "sh", "lnk", "zip", "one"],
                           help="Output format")
     payload.add_argument("--arch", default="x64", choices=["x86", "x64", "arm64"])
-    payload.add_argument("--encode", choices=["xor", "aes", "polymorphic", "sgn", "none"],
+    payload.add_argument("--encode", choices=["xor", "aes", "rc4", "polymorphic", "uuid", "b64", "chain", "none"],
                           default="none", help="Encoding/encryption method")
-    payload.add_argument("--iterations", type=int, default=1, help="Encoding iterations")
+    payload.add_argument("--iterations", type=_positive_int, default=1, help="Encoding iterations")
     payload.add_argument("--output", "-o", help="Output file path")
+    payload.add_argument("--env-key", default="", help="Environmental keying: only execute on this domain")
+    payload.add_argument("--kill-date", default="", help="Kill date ISO string (YYYY-MM-DD)")
+    payload.add_argument("--sleep", type=_positive_int, default=60, dest="sleep_seconds", help="Beacon sleep interval")
+    payload.add_argument("--jitter", type=_percent, default=30, dest="jitter_percent", help="Sleep jitter percent")
+    payload.add_argument("--no-sandbox-detect", action="store_false", dest="sandbox_detect",
+                          default=False,
+                          help="Disable sandbox detection checks")
+    payload.add_argument("--no-amsi-bypass", action="store_false", dest="amsi_bypass",
+                          default=False,
+                          help="Disable AMSI bypass code")
+    payload.add_argument("--no-etw-bypass", action="store_false", dest="etw_bypass",
+                          default=False,
+                          help="Disable ETW bypass code")
+    payload.add_argument("--sleep-mask", action="store_true", help="Enable sleep masking (beacon only)")
+    payload.add_argument("--indirect-syscalls", action="store_true", help="Use indirect syscalls in loader")
+    payload.add_argument("--ppid-spoof", action="store_true", help="Enable PPID spoofing")
+    payload.add_argument("--byovd", action="store_true", help="Show BYOVD driver reference table")
+    payload.add_argument("--red-team", action="store_true",
+                          help="Confirm this payload is for an authorized engagement")
     payload.add_argument("--list", action="store_true", dest="list_payloads",
                           help="List available payload types")
 
@@ -204,7 +275,7 @@ def _add_common_scan_args(parser: argparse.ArgumentParser) -> None:
     target_group.add_argument("--target", "--url", "-t", help="Single target (URL, IP, CIDR)")
     target_group.add_argument("--targets", "-T", metavar="FILE",
                                help="Multi-target file (one target per line)")
-    target_group.add_argument("--parallel", type=int, default=3,
+    target_group.add_argument("--parallel", type=_positive_int, default=3,
                                help="Max parallel targets (default: 3)")
     target_group.add_argument("--resume", metavar="DIR",
                                help="Resume a previous multi-target scan")
@@ -213,7 +284,7 @@ def _add_common_scan_args(parser: argparse.ArgumentParser) -> None:
     dash_group = parser.add_argument_group("dashboard")
     dash_group.add_argument("--dashboard", action="store_true",
                              help="Launch live dashboard alongside scan")
-    dash_group.add_argument("--dashboard-port", type=int, default=1337,
+    dash_group.add_argument("--dashboard-port", type=_port, default=1337,
                              help="Dashboard port (default: 1337)")
     dash_group.add_argument("--dashboard-tui", action="store_true",
                              help="Use terminal TUI dashboard instead of web")
@@ -236,6 +307,120 @@ def _add_common_scan_args(parser: argparse.ArgumentParser) -> None:
     # Output
     parser.add_argument("--output-dir", "-o", metavar="DIR",
                          help="Results output directory")
+
+
+def _positive_int(value: str) -> int:
+    """argparse type for positive integers."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def _port(value: str) -> int:
+    """argparse type for TCP/UDP ports."""
+    parsed = _positive_int(value)
+    if parsed > 65535:
+        raise argparse.ArgumentTypeError("must be between 1 and 65535")
+    return parsed
+
+
+def _optional_port(value: str) -> int:
+    """argparse type for ports where 0 means disabled."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0 or parsed > 65535:
+        raise argparse.ArgumentTypeError("must be between 0 and 65535")
+    return parsed
+
+
+def _percent(value: str) -> int:
+    """argparse type for percentage values."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0 or parsed > 100:
+        raise argparse.ArgumentTypeError("must be between 0 and 100")
+    return parsed
+
+
+def _read_targets_file(path_value: str) -> list[str]:
+    """Load a target file with comments and blank lines removed."""
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    if not path.exists():
+        raise FileNotFoundError(f"Target file not found: {path}")
+    if not path.is_file():
+        raise ValueError(f"Target path is not a file: {path}")
+    targets: list[str] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        value = line.strip()
+        if value and not value.startswith("#"):
+            targets.append(value)
+    return targets
+
+
+def _validate_target_value(target: str) -> str:
+    """Validate a target enough to catch common CLI mistakes early."""
+    value = target.strip()
+    if not value:
+        raise ValueError("target cannot be empty")
+    if any(ch.isspace() for ch in value):
+        raise ValueError(f"target contains whitespace: {target!r}")
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    if "://" in value and parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"unsupported URL scheme for scan target: {parsed.scheme}")
+    host = parsed.hostname if parsed.hostname else value.split("/", 1)[0]
+    if not host:
+        raise ValueError(f"missing target host: {target!r}")
+    return value
+
+
+def _validate_common_scan_inputs(args: argparse.Namespace) -> list[str]:
+    """Return normalized target values after validating common scan inputs."""
+    target = getattr(args, "target", None)
+    targets_file = getattr(args, "targets", None)
+    resume_dir = getattr(args, "resume", None)
+
+    specified = sum(1 for item in (target, targets_file, resume_dir) if item)
+    if specified == 0:
+        raise ValueError("Use --target <target>, --targets <file>, or --resume <dir>")
+    if specified > 1:
+        raise ValueError("Use only one of --target, --targets, or --resume")
+
+    if getattr(args, "parallel", 1) > 100:
+        raise ValueError("--parallel is capped at 100")
+
+    if resume_dir:
+        resume_path = Path(resume_dir).expanduser()
+        if not resume_path.exists() or not resume_path.is_dir():
+            raise ValueError(f"Resume directory not found: {resume_path}")
+        return []
+
+    if target:
+        return [_validate_target_value(target)]
+
+    targets = [_validate_target_value(item) for item in _read_targets_file(targets_file)]
+    if not targets:
+        raise ValueError(f"Target file has no usable targets: {targets_file}")
+    return targets
+
+
+def _validate_kill_date(kill_date: str) -> None:
+    """Validate payload kill-date formatting when provided."""
+    if not kill_date:
+        return
+    try:
+        datetime.strptime(kill_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("--kill-date must use YYYY-MM-DD") from exc
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -269,9 +454,10 @@ def handle_scan(
     targets_file = known_args.get("targets")
     resume_dir = known_args.get("resume")
 
-    if not target and not targets_file and not resume_dir:
-        print(f"  [!] No target specified.")
-        print(f"  [*] Use --target <target>, --targets <file>, or --resume <dir>")
+    try:
+        normalized_targets = _validate_common_scan_inputs(args)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"  [!] Invalid scan options: {exc}")
         return 1
 
     # Build framework command — start with known args, then append any
@@ -292,14 +478,17 @@ def handle_scan(
     # Log the launch
     print(f"  [*] Launching {name} — {desc}")
     if targets_file:
-        print(f"  [*] Multi-target mode: {targets_file} (parallel={known_args.get('parallel', 3)})")
+        print(
+            f"  [*] Multi-target mode: {targets_file} "
+            f"({len(normalized_targets)} targets, parallel={known_args.get('parallel', 3)})"
+        )
     if known_args.get("schedule"):
         print(f"  [*] Scheduled: {known_args['schedule']}")
     if known_args.get("continuous"):
         print(f"  [*] Continuous monitoring: interval={known_args.get('interval', '24h')}")
     if dashboard_proc:
         port = known_args.get("dashboard_port", 1337)
-        print(f"  [*] Dashboard: https://localhost:{port}")
+        print(f"  [*] Dashboard: https://localhost:{port}  (accept self-signed cert)")
     print(f"  [*] {' '.join(cmd)}")
     print()
 
@@ -349,9 +538,10 @@ def _build_framework_args(args: argparse.Namespace, framework_key: str) -> list[
 
     # Output
     if known.get("output_dir"):
-        result.extend(["--output-dir", known["output_dir"]])
+        result.extend(["--output", known["output_dir"]])
 
-    # Dashboard relay — tell the framework where to stream events
+    # Dashboard relay — tell the framework where to stream events.
+    # Dashboard always runs HTTPS (self-signed cert); RemoteEventBus skips verify.
     if known.get("dashboard"):
         port = known.get("dashboard_port", 1337)
         result.extend(["--dashboard-url", f"https://localhost:{port}"])
@@ -389,6 +579,11 @@ def _launch_web_dashboard(
     replay_dir: str | None = None,
 ) -> int:
     """Launch the web dashboard server."""
+    if not auth and host not in {"127.0.0.1", "localhost", "::1"}:
+        print("  [!] Refusing to disable dashboard authentication on a non-loopback bind address.")
+        print("  [*] Use --host 127.0.0.1 with --no-auth, or leave authentication enabled.")
+        return 1
+
     try:
         from common.dashboard.server import DashboardServer
         from common.dashboard.event_bus import EventBus
@@ -423,10 +618,9 @@ def _launch_web_dashboard(
             pass
     print(BANNER)
     print(f"  [*] War Room Dashboard starting...")
-    protocol = "https" if auth else "http"
-    print(f"  [*] URL: {protocol}://localhost:{port}")
+    print(f"  [*] URL: https://localhost:{port}  (accept self-signed cert in browser)")
     if not auth:
-        print(f"  [*] Authentication DISABLED")
+        print(f"  [*] Authentication DISABLED — no login required")
     print()
 
     try:
@@ -473,6 +667,7 @@ def _launch_dashboard_background(
     cmd = [
         sys.executable, str(BASE_DIR / "forge.py"),
         "dashboard",
+        "--host", "127.0.0.1",
         "--port", str(port),
         "--no-auth",
     ]
@@ -515,6 +710,10 @@ def handle_c2(args: argparse.Namespace) -> int:
 
 def _handle_c2_server(args: argparse.Namespace) -> int:
     """Start the C2 team server."""
+    if not _is_high_risk_enabled(args):
+        _print_high_risk_notice("C2 server")
+        return 1
+
     try:
         from forge_c2.server import C2Server
     except ImportError:
@@ -557,6 +756,10 @@ def _handle_c2_connect(args: argparse.Namespace) -> int:
 
 def _handle_c2_listener(args: argparse.Namespace) -> int:
     """Manage C2 listeners."""
+    if not _is_high_risk_enabled(args):
+        _print_high_risk_notice("C2 listener management")
+        return 1
+
     print(f"  [*] C2 Listener: {args.action}")
     print("  [!] Listener management requires a running C2 server.")
     print("  [*] Start a server first: python3 forge.py c2 server")
@@ -565,12 +768,35 @@ def _handle_c2_listener(args: argparse.Namespace) -> int:
 
 def _handle_c2_payload(args: argparse.Namespace) -> int:
     """Generate a C2 beacon payload."""
+    if not _is_high_risk_enabled(args):
+        _print_high_risk_notice("C2 payload generation")
+        print("  [*] Usage: FORGE_ENABLE_HIGH_RISK=1 forge.py c2 payload --red-team --type beacon_https --lhost 10.0.0.5 --format exe")
+        return 1
+
+    try:
+        from forge_payload.payload_factory import PayloadFactory
+    except ImportError:
+        print("  [!] forge_payload/ module not found — run: pip install -r requirements.txt")
+        return 1
+
     print(f"  [*] Generating C2 payload: type={args.type}")
     print(f"  [*] Callback: {args.lhost}:{args.lport}")
     print(f"  [*] Format: {args.format} | Arch: {args.arch}")
-    print("  [!] Payload generation module not yet available.")
-    print("  [*] The payload factory (forge_payload/) is planned for a future build.")
-    return 1
+    try:
+        output = PayloadFactory().generate(
+            payload_type=args.type,
+            lhost=args.lhost,
+            lport=args.lport,
+            fmt=args.format,
+            arch=args.arch,
+            output_path=getattr(args, "output", "") or "",
+        )
+    except ValueError as exc:
+        print(f"  [!] Unsupported payload option: {exc}")
+        print("  [*] Run: forge.py payload --list")
+        return 1
+    print(f"  [+] Payload written to: {output}")
+    return 0
 
 
 def handle_intel(args: argparse.Namespace) -> int:
@@ -661,37 +887,238 @@ def _handle_intel_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_autonomous(args: argparse.Namespace) -> int:
+    """Handle the autonomous VAPT command.
+
+    Runs a fully AI-driven engagement from RECON → REPORT.
+
+    Returns:
+        Exit code.
+    """
+    if getattr(args, "brain_key", None):
+        os.environ["ANTHROPIC_API_KEY"] = args.brain_key
+
+    try:
+        from common.brain.autonomous import AutonomousEngine, EngagementConfig, OpsecLevel
+        from common.brain.brain import ForgeBrain
+        from common.brain.planner import AttackPlanner
+        from common.brain.analyst import FindingAnalyst
+        from common.brain.narrator import ReportNarrator
+        from common.brain.engagement_bus import EngagementBus
+    except ImportError as exc:
+        print(f"  [!] Brain modules not available: {exc}")
+        return 1
+
+    print(BANNER)
+    frameworks = [f.strip() for f in args.frameworks.split(",")]
+    opsec = OpsecLevel(args.opsec)
+
+    print(f"  [*] Autonomous VAPT starting")
+    print(f"  [*] Target:       {args.target}")
+    print(f"  [*] Frameworks:   {', '.join(frameworks)}")
+    print(f"  [*] Opsec level:  {opsec.value}")
+    print(f"  [*] Max time:     {args.max_time}s")
+    print(f"  [*] Brain:        {'AI-powered' if os.environ.get('ANTHROPIC_API_KEY') else 'rule-based (no API key)'}")
+    print()
+
+    brain = ForgeBrain()
+    planner = AttackPlanner(brain)
+    analyst = FindingAnalyst(brain)
+    narrator = ReportNarrator(brain)
+    eng_bus = EngagementBus.get_instance(brain=brain, planner=planner)
+
+    engine = AutonomousEngine(
+        brain=brain,
+        planner=planner,
+        engagement_bus=eng_bus,
+        narrator=narrator,
+        analyst=analyst,
+    )
+
+    config = EngagementConfig(
+        target=args.target,
+        frameworks=frameworks,
+        opsec_level=opsec,
+        stop_on_critical=not getattr(args, "no_stop_on_critical", False),
+        max_findings=args.max_findings,
+        max_time_seconds=float(args.max_time),
+        fn_sweep_enabled=not getattr(args, "no_fn_sweep", False),
+    )
+
+    try:
+        report = asyncio.run(engine.run_engagement(config))
+    except KeyboardInterrupt:
+        print("\n  [!] Autonomous engagement aborted by operator")
+        return 130
+
+    print(f"\n  [+] Engagement complete: {report.engagement_id}")
+    print(f"  [+] Stop reason:  {report.stop_reason.value}")
+    print(f"  [+] Duration:     {report.duration_seconds:.0f}s")
+    print(f"  [+] Findings:     {report.findings_summary.get('total', 0)}")
+    print(f"  [+] Phase:        {report.phase_reached.value}")
+
+    # Write report to file if output dir specified
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir:
+        import json as _json
+        import pathlib as _pl
+        _pl.Path(output_dir).mkdir(parents=True, exist_ok=True)
+        report_path = _pl.Path(output_dir) / f"autonomous_{report.engagement_id}.json"
+        with open(report_path, "w") as f:
+            _json.dump(report.to_dict(), f, indent=2)
+        print(f"  [+] Report saved: {report_path}")
+
+        if report.executive_summary:
+            summary_path = _pl.Path(output_dir) / f"executive_summary_{report.engagement_id}.md"
+            summary_path.write_text(report.executive_summary)
+            print(f"  [+] Executive summary: {summary_path}")
+
+    return 0
+
+
+def handle_collab(args: argparse.Namespace) -> int:
+    """Handle ForgeCollab OOB server commands.
+
+    Returns:
+        Exit code.
+    """
+    action = getattr(args, "collab_action", None)
+    if not action:
+        print("  [!] No collab action specified.")
+        print("  [*] Available: start, token")
+        print("  [*] Run: python3 forge.py collab --help")
+        return 1
+
+    if action == "start":
+        return _handle_collab_start(args)
+    elif action == "token":
+        return _handle_collab_token(args)
+    return 1
+
+
+def _handle_collab_start(args: argparse.Namespace) -> int:
+    """Start the ForgeCollab OOB server."""
+    try:
+        from forge_collab.server import ForgeCollabServer
+    except ImportError as exc:
+        print(f"  [!] ForgeCollab not available: {exc}")
+        return 1
+
+    print(BANNER)
+    domain = args.domain or os.environ.get("FORGE_COLLAB_DOMAIN", "collab.forge.local")
+    print(f"  [*] ForgeCollab starting — domain: {domain}")
+    print(f"  [*] HTTP:  {args.listen}:{args.http_port}")
+    if not args.local:
+        print(f"  [*] DNS:   {args.listen}:{args.dns_port}")
+        print(f"  [*] SMTP:  {args.listen}:{args.smtp_port}")
+    print(f"  [*] API:   127.0.0.1:{args.api_port}")
+    print(f"  [*] Token: {{token}}.{domain}")
+    print()
+
+    server = ForgeCollabServer(
+        domain=domain,
+        listen_ip=args.listen,
+        http_port=args.http_port,
+        dns_port=0 if args.local else args.dns_port,
+        smtp_port=0 if args.local else args.smtp_port,
+        api_port=args.api_port,
+        response_ip=args.response_ip,
+        local_mode=args.local,
+    )
+    try:
+        asyncio.run(server.run_forever())
+    except KeyboardInterrupt:
+        print("\n  [*] ForgeCollab stopped.")
+    return 0
+
+
+def _handle_collab_token(args: argparse.Namespace) -> int:
+    """Generate and display a ForgeCollab test token."""
+    import uuid as _uuid
+    domain = os.environ.get("FORGE_COLLAB_DOMAIN", "collab.forge.local")
+    token = _uuid.uuid4().hex[:24]
+    print(f"  [*] OOB Token: {token}")
+    print(f"  [*] HTTP URL:  http://{token}.{domain}/")
+    print(f"  [*] DNS host:  {token}.{domain}")
+    print(f"  [*] Email:     {token}@{domain}")
+    print(f"  [*] Poll:      http://127.0.0.1:8889/api/callbacks/{token}")
+    return 0
+
+
 def handle_payload(args: argparse.Namespace) -> int:
     """Handle standalone payload generation.
 
     Returns:
         Exit code.
     """
+    # BYOVD driver reference table
+    if getattr(args, "byovd", False):
+        try:
+            from forge_payload.evasion.byovd import print_driver_table
+            print(print_driver_table())
+        except ImportError:
+            print("  [!] BYOVD module not available")
+        return 0
+
     if args.list_payloads:
         try:
             from forge_payload.payload_factory import PayloadFactory
             print(PayloadFactory.list_payloads())
         except ImportError:
-            print("  [!] Payload factory not yet available.")
-            print("  [*] The payload module (forge_payload/) is planned for a future build.")
+            print("  [!] forge_payload/ module not found — check installation")
         return 0
+
+    if not args.lhost:
+        print("  [!] Missing required callback host: --lhost")
+        print("  [*] Usage: forge.py payload --red-team --type reverse_tcp --lhost 10.0.0.5 --format exe")
+        return 1
+    try:
+        _validate_target_value(args.lhost)
+        _validate_kill_date(getattr(args, "kill_date", ""))
+    except ValueError as exc:
+        print(f"  [!] Invalid payload option: {exc}")
+        return 1
+
+    # Require --red-team flag for payload generation
+    if not _is_high_risk_enabled(args):
+        _print_high_risk_notice("Payload generation")
+        print("  [*] Usage: FORGE_ENABLE_HIGH_RISK=1 forge.py payload --red-team --type reverse_tcp --lhost 10.0.0.5 ...")
+        return 1
 
     try:
         from forge_payload.payload_factory import PayloadFactory
     except ImportError:
-        print("  [!] Payload factory module not yet available.")
-        print("  [*] The payload module (forge_payload/) is planned for a future build.")
+        print("  [!] forge_payload/ module not found — run: pip install -r requirements.txt")
         return 1
 
     print(BANNER)
-    print(f"  [*] Payload Generation")
-    print(f"  [*] Type:     {args.type}")
-    print(f"  [*] Callback: {args.lhost}:{args.lport}")
-    print(f"  [*] Format:   {args.format}")
-    print(f"  [*] Arch:     {args.arch}")
-    print(f"  [*] Encoding: {args.encode}")
+    print(f"  [*] Payload Generation — Forge Suite v5 APEX")
+    print(f"  [*] Type:           {args.type}")
+    print(f"  [*] Callback:       {args.lhost}:{args.lport}")
+    print(f"  [*] Format:         {args.format}")
+    print(f"  [*] Arch:           {args.arch}")
+    print(f"  [*] Encoding:       {args.encode}")
     if args.encode != "none":
-        print(f"  [*] Iterations: {args.iterations}")
+        print(f"  [*] Iterations:     {args.iterations}")
+    if getattr(args, "env_key", ""):
+        print(f"  [*] Env keying:     {args.env_key}")
+    if getattr(args, "kill_date", ""):
+        print(f"  [*] Kill date:      {args.kill_date}")
+    evasion_flags = []
+    if getattr(args, "sandbox_detect", True):
+        evasion_flags.append("sandbox-detect")
+    if getattr(args, "amsi_bypass", True):
+        evasion_flags.append("AMSI-bypass")
+    if getattr(args, "etw_bypass", True):
+        evasion_flags.append("ETW-bypass")
+    if getattr(args, "sleep_mask", False):
+        evasion_flags.append("sleep-mask")
+    if getattr(args, "indirect_syscalls", False):
+        evasion_flags.append("indirect-syscalls")
+    if getattr(args, "ppid_spoof", False):
+        evasion_flags.append("PPID-spoof")
+    if evasion_flags:
+        print(f"  [*] Evasion:        {', '.join(evasion_flags)}")
     print()
 
     factory = PayloadFactory()
@@ -703,10 +1130,34 @@ def handle_payload(args: argparse.Namespace) -> int:
         arch=args.arch,
         encoder=args.encode,
         iterations=args.iterations,
-        output_path=args.output,
+        output_path=getattr(args, "output", ""),
+        env_key=getattr(args, "env_key", ""),
+        kill_date=getattr(args, "kill_date", ""),
+        sleep_seconds=getattr(args, "sleep_seconds", 60),
+        jitter_percent=getattr(args, "jitter_percent", 30),
+        sandbox_detect=getattr(args, "sandbox_detect", True),
+        amsi_bypass=getattr(args, "amsi_bypass", True),
+        etw_bypass=getattr(args, "etw_bypass", True),
+        sleep_mask=getattr(args, "sleep_mask", False),
+        indirect_syscalls=getattr(args, "indirect_syscalls", False),
+        ppid_spoof=getattr(args, "ppid_spoof", False),
     )
     print(f"  [+] Payload written to: {output}")
     return 0
+
+
+def _is_high_risk_enabled(args: argparse.Namespace) -> bool:
+    """Require both an explicit CLI flag and environment opt-in for high-risk paths."""
+    has_cli_ack = bool(getattr(args, "red_team", False))
+    has_env_ack = os.environ.get("FORGE_ENABLE_HIGH_RISK", "").strip().lower() in TRUTHY_ENV
+    return has_cli_ack and has_env_ack
+
+
+def _print_high_risk_notice(feature: str) -> None:
+    """Explain why a high-risk command is blocked."""
+    print(f"  [!] {feature} is disabled by default.")
+    print("  [*] Required for authorized engagements: --red-team and FORGE_ENABLE_HIGH_RISK=1")
+    print("  [*] Safer audit workflows remain available through: forge.py web|net|ad|ai")
 
 
 def handle_import_session(args: argparse.Namespace) -> int:
@@ -768,6 +1219,8 @@ def print_help():
     print(f"    {'intel':10s}  Intelligence pipeline (CVE sync, search)")
     print(f"    {'payload':10s}  Payload generation factory")
     print(f"    {'import-session':10s}  Import engagement session JSON into brain")
+    print(f"    {'auto':10s}  Autonomous AI-driven VAPT engagement (RECON→REPORT)")
+    print(f"    {'collab':10s}  ForgeCollab OOB callback server (blind vuln confirmation)")
     print()
     print("  ─── Scan Options ─────────────────────────────────────")
     print("    --target <target>      Single target (URL, IP, CIDR)")
@@ -785,9 +1238,9 @@ def print_help():
     print("    python3 forge.py web --targets targets.txt --parallel 5")
     print("    python3 forge.py net --targets hosts.txt --schedule daily:02:00")
     print("    python3 forge.py dashboard --tui")
-    print("    python3 forge.py c2 server --port 8443")
+    print("    FORGE_ENABLE_HIGH_RISK=1 python3 forge.py c2 server --red-team --port 8443")
     print("    python3 forge.py intel sync --all")
-    print("    python3 forge.py payload --type reverse_tcp --lhost 10.0.0.5 --format exe")
+    print("    FORGE_ENABLE_HIGH_RISK=1 python3 forge.py payload --red-team --type reverse_tcp --lhost 10.0.0.5 --format exe")
     print()
     print("  For command-specific help:")
     print("    python3 forge.py dashboard --help")
@@ -823,7 +1276,7 @@ def main() -> int:
         return handle_scan(args, command, extra_args=unknown)
 
     # Platform commands — full argparse parsing
-    if command in ("dashboard", "c2", "intel", "payload", "import-session"):
+    if command in ("dashboard", "c2", "intel", "payload", "import-session", "auto", "collab"):
         parser = build_parser()
         args = parser.parse_args()
 
@@ -837,10 +1290,14 @@ def main() -> int:
             return handle_payload(args)
         elif command == "import-session":
             return handle_import_session(args)
+        elif command == "auto":
+            return handle_autonomous(args)
+        elif command == "collab":
+            return handle_collab(args)
 
     # Unknown command
     print(f"  [!] Unknown command: '{sys.argv[1]}'")
-    print(f"  [*] Available: {', '.join(list(FRAMEWORKS.keys()) + ['dashboard', 'c2', 'intel', 'payload', 'import-session'])}")
+    print(f"  [*] Available: {', '.join(list(FRAMEWORKS.keys()) + ['dashboard', 'c2', 'intel', 'payload', 'import-session', 'auto', 'collab'])}")
     print(f"  [*] Run 'python3 forge.py --help' for usage")
     return 1
 

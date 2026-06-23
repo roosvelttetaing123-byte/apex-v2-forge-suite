@@ -65,6 +65,11 @@ def _build_chrome_driver(config: BrowserConfig, headless: bool = True):
     opts.add_argument("--disable-web-security")
     opts.add_argument("--allow-running-insecure-content")
     opts.add_argument("--ignore-certificate-errors")
+    # Suppress c-ares inotify watch exhaustion spam on Linux
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--dns-prefetch-disable")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--disable-default-apps")
     # selenium-manager auto-downloads matching chromedriver
     return webdriver.Chrome(options=opts)
 

@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_LFI = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
 CVSS40_LFI = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:N/VA:N/SC:N/SI:N/SA:N"
@@ -96,6 +97,10 @@ class LfiRfi(BaseModule):
                 test_targets.append((f"{target}{path}?{param}=home", param))
 
         self.log.info("Testing %d parameter(s) for LFI/RFI", len(test_targets))
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         sem = asyncio.Semaphore(2)
         tasks = [self._test_param(url, param, target, sem)
@@ -135,12 +140,26 @@ class LfiRfi(BaseModule):
 
                     # Direct file read
                     if any(ind in body for ind in PASSWD_INDICATORS):
+                        # FPReducer: verify /etc/passwd pattern with 2 probe variants
+                        fp_result = await self._fp.verify(
+                            "lfi", url, param_name, method="GET"
+                        )
+                        if not self._fp.should_report(fp_result):
+                            self.log.debug(
+                                "LFI suppressed by FPReducer (%s): %s[%s]",
+                                fp_result.confidence.value, url, param_name,
+                            )
+                            continue
                         ev = Evidence(
                             request_raw=f"GET {test_url}",
                             response_raw=body[:500],
-                            extra={"param": param_name, "payload": payload, "type": "LFI"},
+                            extra={
+                                "param": param_name, "payload": payload, "type": "LFI",
+                                "fp_confidence": fp_result.confidence.value,
+                                "fp_evidence": fp_result.evidence,
+                            },
                         )
-                        ev.screenshot_path = await self.capture_screenshot(
+                        ev.screenshot_path = self.capture_screenshot(
                             test_url, finding_id=f"lfi_{param_name}"
                         )
                         self.new_finding(

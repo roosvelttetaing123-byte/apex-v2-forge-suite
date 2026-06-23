@@ -41,6 +41,11 @@ class FindingEntry:
     description: str = ""
     mitre:       list[str] = field(default_factory=list)
     evidence:    dict[str, Any] = field(default_factory=dict)
+    confidence:  str = "UNVERIFIED"
+    status:      str = "open"
+    vpr_score:   float | None = None
+    vpr_priority: str = ""
+    verification: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -49,6 +54,9 @@ class FindingEntry:
             "cvss_score": self.cvss_score, "timestamp": self.timestamp,
             "url": self.url, "port": self.port, "service": self.service,
             "description": self.description, "mitre": self.mitre,
+            "evidence": self.evidence, "confidence": self.confidence,
+            "status": self.status, "vpr_score": self.vpr_score,
+            "vpr_priority": self.vpr_priority, "verification": self.verification,
         }
 
 
@@ -359,6 +367,11 @@ class StateStore:
             description=d.get("description", ""),
             mitre=d.get("mitre_attack", []),
             evidence=d.get("evidence", {}),
+            confidence=d.get("confidence", "UNVERIFIED"),
+            status=d.get("status", "open"),
+            vpr_score=d.get("vpr_score"),
+            vpr_priority=d.get("vpr_priority", ""),
+            verification=d.get("verification", {}),
         )
         with self._lock:
             self.findings.append(entry)

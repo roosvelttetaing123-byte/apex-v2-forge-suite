@@ -154,7 +154,7 @@ class CorsCheck(BaseModule):
                     ),
                     extra={"acao": acao_this, "acac": acac_this, "origin_sent": origin},
                 )
-                ev.screenshot_path = await self.capture_screenshot(
+                ev.screenshot_path = self.capture_screenshot(
                     url, finding_id=f"cors_{url.replace('https://','').replace('/','_')}"
                 )
                 self.new_finding(

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
+import json
 import sys
 import time
 import uuid
@@ -61,6 +62,7 @@ MODULE_MAP: dict[str, str] = {
     "api_discover":      "webforge.modules.recon.api_discover",
     "param_discover":    "webforge.modules.recon.param_discover",
     "subdomain_takeover":"webforge.modules.recon.subdomain_takeover",
+    "git_exposure":      "webforge.modules.recon.git_exposure",
     # Phase 2 — SSL
     "ssl_audit":         "webforge.modules.ssl.ssl_audit",
     "cert_inspect":      "webforge.modules.ssl.cert_inspect",
@@ -83,6 +85,7 @@ MODULE_MAP: dict[str, str] = {
     "jsonp_inject":      "webforge.modules.injection.jsonp_inject",
     "host_header_inject":"webforge.modules.injection.host_header_inject",
     "crlf_inject":       "webforge.modules.injection.crlf_inject",
+    "log4shell_scanner": "webforge.modules.injection.log4shell_scanner",
     "parameter_pollution":"webforge.modules.injection.parameter_pollution",
     # Phase 5 — Auth
     "session_audit":     "webforge.modules.auth.session_audit",
@@ -143,6 +146,7 @@ CLASS_NAME_MAP: dict[str, str] = {
     "api_discover":      "ApiDiscover",
     "param_discover":    "ParamDiscover",
     "subdomain_takeover":"SubdomainTakeover",
+    "git_exposure":      "GitExposure",
     "ssl_audit":         "SslAudit",
     "cert_inspect":      "CertInspect",
     "hsts_check":        "HstsCheck",
@@ -162,6 +166,7 @@ CLASS_NAME_MAP: dict[str, str] = {
     "jsonp_inject":      "JsonpInject",
     "host_header_inject":"HostHeaderInject",
     "crlf_inject":       "CrlfInject",
+    "log4shell_scanner": "Log4ShellScanner",
     "parameter_pollution":"ParameterPollution",
     "session_audit":     "SessionAudit",
     "password_policy":   "PasswordPolicy",
@@ -241,17 +246,21 @@ def _emit(bus: Any, Event: Any, EventType: Any, etype: str, source: str = "webfo
 class ScanControl:
     """Async-safe scan control flags."""
 
-    def __init__(self) -> None:
+    def __init__(self, control_file: str | None = None) -> None:
         self._paused = asyncio.Event()
         self._paused.set()
         self._aborted = False
+        self._control_file = Path(control_file) if control_file else None
+        self._control_mtime = 0.0
 
     @property
     def is_paused(self) -> bool:
+        self._refresh_file_state()
         return not self._paused.is_set()
 
     @property
     def is_aborted(self) -> bool:
+        self._refresh_file_state()
         return self._aborted
 
     def pause(self) -> None:
@@ -268,7 +277,26 @@ class ScanControl:
         log.info("Scan ABORTED by operator")
 
     async def wait_if_paused(self) -> None:
-        await self._paused.wait()
+        while self.is_paused and not self.is_aborted:
+            await asyncio.sleep(0.5)
+
+    def _refresh_file_state(self) -> None:
+        if not self._control_file:
+            return
+        try:
+            stat = self._control_file.stat()
+            if stat.st_mtime <= self._control_mtime:
+                return
+            self._control_mtime = stat.st_mtime
+            data = json.loads(self._control_file.read_text(encoding="utf-8"))
+            if data.get("aborted"):
+                self.abort()
+            elif data.get("paused"):
+                self.pause()
+            else:
+                self.resume()
+        except Exception as exc:
+            log.debug("Control file refresh failed: %s", exc)
 
 
 def parse_args() -> argparse.Namespace:
@@ -276,7 +304,7 @@ def parse_args() -> argparse.Namespace:
         description="WebForge — Web Application Penetration Testing Framework",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--target",        required=True,           help="Target URL (e.g. https://target.com)")
+    parser.add_argument("--target",        default=None,            help="Target URL (e.g. https://target.com)")
     parser.add_argument("--mode",          default="blackbox",
                         choices=["blackbox","greybox","whitebox"],   help="Scan mode (default: blackbox)")
     parser.add_argument("--engagement",    default="engagement",    help="Engagement name for report")
@@ -303,13 +331,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auto-confirm",  action="store_true",     help="Skip confirmation gates (pipeline mode)")
     parser.add_argument("--browser",       default=None,
                         choices=["chrome","chromium","firefox"],     help="Force browser for screenshots")
+    parser.add_argument("--browser-render", action="store_true",
+                        help="Render target with Playwright before scanning to discover SPA routes, forms, and XHR endpoints")
+    parser.add_argument("--login-url",     default=None,
+                        help="Login URL for browser-based authenticated scanning")
+    parser.add_argument("--auth-type",     default=None,
+                        choices=["form", "bearer", "cookie"],
+                        help="Authentication type (set by dashboard for greybox/whitebox scans)")
+    parser.add_argument("--header-name",   default="Authorization",
+                        help="Custom header name for bearer token auth (default: Authorization)")
+    parser.add_argument("--auth-state",    default=None,
+                        help="Playwright storage-state JSON to reuse authenticated browser session")
     parser.add_argument("--no-screenshot", action="store_true",     help="Disable screenshot capture")
     parser.add_argument("--list-modules",  action="store_true",     help="List all available modules and exit")
+    parser.add_argument("--profile",       default=None,
+                        help="Scan profile: quick, standard, full, api, compliance, stealth")
+    parser.add_argument("--list-profiles", action="store_true",     help="List available scan profiles and exit")
     parser.add_argument("--verbose",       action="store_true",     help="Verbose debug output")
     parser.add_argument("--quiet",         action="store_true",     help="Suppress UI output")
     parser.add_argument("--version",       action="version", version=f"WebForge {VERSION}")
     parser.add_argument("--dashboard-url", default=None,
                         help="Live dashboard URL (e.g. http://localhost:1337) — streams events in real time")
+    parser.add_argument("--control-file",  default=None,
+                        help="JSON control file used by dashboard pause/resume/abort")
     return parser.parse_args()
 
 
@@ -334,10 +378,106 @@ def load_module_class(module_name: str):
         return None
     try:
         mod = importlib.import_module(module_path)
-        return getattr(mod, class_name, None)
-    except ImportError as exc:
-        log.debug("Module not yet available: %s — %s", module_name, exc)
+        return getattr(mod, class_name)
+    except Exception as exc:
+        log.warning("Could not load module %s: %s", module_name, exc)
         return None
+
+
+async def prepare_browser_context(
+    cfg: BaseForgeConfig,
+    args: argparse.Namespace,
+    results_dir: Path,
+) -> None:
+    """Populate cfg.extra with browser-discovered auth/session artifacts."""
+    if not (args.browser_render or args.login_url or args.auth_state):
+        return
+
+    browser_name = args.browser or "chromium"
+
+    if args.auth_state:
+        from webforge.core.auth_recorder import AuthRecorder
+        auth = AuthRecorder(results_dir, proxy=cfg.proxy).import_storage_state(Path(args.auth_state))
+        cfg.extra["browser_storage_state"] = auth.storage_state_path
+        if auth.headers:
+            cfg.extra["session_headers"] = {**cfg.extra.get("session_headers", {}), **auth.headers}
+        if auth.cookies:
+            cfg.extra["session_cookies"] = auth.cookies
+        log.info("Loaded browser auth state from %s", args.auth_state)
+
+    if args.login_url:
+        from webforge.core.auth_recorder import AuthRecorder
+        auth = await AuthRecorder(results_dir, proxy=cfg.proxy).replay_login(
+            args.login_url,
+            username=args.username or "",
+            password=args.password or "",
+            browser=browser_name,
+        )
+        cfg.extra["browser_auth"] = auth.to_dict()
+        if auth.storage_state_path:
+            cfg.extra["browser_storage_state"] = auth.storage_state_path
+        if auth.headers:
+            cfg.extra["session_headers"] = {**cfg.extra.get("session_headers", {}), **auth.headers}
+        if auth.cookies:
+            cfg.extra["session_cookies"] = auth.cookies
+        if auth.error:
+            log.warning("Browser login did not complete cleanly: %s", auth.error)
+        else:
+            log.info("Browser login replay completed; storage state exported")
+
+    if args.browser_render:
+        from webforge.core.browser_engine import BrowserEngine
+        if not BrowserEngine.available():
+            log.warning("Playwright unavailable — skipping browser render discovery")
+            return
+        try:
+            async with BrowserEngine(
+                results_dir=results_dir,
+                browser=browser_name,
+                proxy=cfg.proxy,
+                storage_state=cfg.extra.get("browser_storage_state"),
+            ) as engine:
+                snap = await engine.render(cfg.target)
+            cfg.extra["browser_snapshot"] = snap.to_dict()
+            cfg.extra["found_forms"] = _merge_unique_forms(
+                cfg.extra.get("found_forms", []),
+                snap.forms,
+            )
+            cfg.extra["api_endpoints"] = sorted(set(
+                cfg.extra.get("api_endpoints", []) + snap.ajax_endpoints
+            ))
+            cfg.extra["browser_links"] = snap.links
+            cfg.extra["js_resources"] = snap.js_resources
+            cfg.extra["spa_framework"] = snap.framework
+            if snap.storage_state_path:
+                cfg.extra["browser_storage_state"] = snap.storage_state_path
+            if snap.error:
+                log.warning("Browser render discovery failed: %s", snap.error)
+            else:
+                log.info(
+                    "Browser discovery: framework=%s forms=%d ajax=%d links=%d",
+                    snap.framework or "unknown",
+                    len(snap.forms),
+                    len(snap.ajax_endpoints),
+                    len(snap.links),
+                )
+        except Exception as exc:
+            log.warning("Browser render discovery unavailable: %s", exc)
+
+
+def _merge_unique_forms(existing: list[dict], discovered: list[dict]) -> list[dict]:
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    merged: list[dict] = []
+    for form in existing + discovered:
+        key = (
+            form.get("action", ""),
+            form.get("method", "GET"),
+            tuple(sorted(form.get("inputs", []))),
+        )
+        if key not in seen:
+            seen.add(key)
+            merged.append(form)
+    return merged
 
 
 async def run_scan(
@@ -360,7 +500,7 @@ async def run_scan(
         Summary dict with 'findings', 'errors', 'duration'.
     """
     bus, Event, EventType = _get_event_bus(event_bus)
-    ctrl = scan_control or ScanControl()
+    ctrl = scan_control or ScanControl(getattr(args, "control_file", None))
     eng_bus = _get_eng_bus()
 
     # Database
@@ -381,9 +521,17 @@ async def run_scan(
     db_session.commit()
 
     # Determine phases
-    include = [m.strip() for m in args.modules.split(",")] if args.modules else None
+    include = (
+        [m.strip() for m in args.modules.split(",")]
+        if args.modules
+        else cfg.extra.get("profile_modules")  # profile_modules set when --profile used
+    )
     skip    = [m.strip() for m in args.skip_modules.split(",")] if args.skip_modules else None
-    has_session = bool(args.username or args.token or args.session or args.sso)
+    has_session = bool(
+        args.username or args.token or args.session or args.sso
+        or cfg.extra.get("password") or cfg.extra.get("token")
+        or cfg.extra.get("cookie") or cfg.extra.get("auth_type")
+    )
     phases  = get_phases(args.mode, include_modules=include, skip_modules=skip,
                          has_session=has_session)
 
@@ -404,6 +552,7 @@ async def run_scan(
     all_findings: list[Finding] = []
     errors: list[str] = []
     start_time = time.monotonic()
+    modules_completed = 0  # running counter for overall progress
 
     for phase in phases:
         # ── Abort check ───────────────────────────────────────────────
@@ -445,11 +594,20 @@ async def run_scan(
                 log.debug("Module not available: %s (not yet built)", module_name)
                 _emit(bus, Event, EventType, "module_skip", source=module_name,
                       name=module_name, reason="not built")
+                modules_completed += 1
+                # Emit progress so dashboard knows we moved forward
+                _emit(bus, Event, EventType, "module_progress", source=module_name,
+                      name=module_name,
+                      progress=round(modules_completed / total_modules * 100) if total_modules else 0)
                 continue
 
-            # ── Emit: module_start ────────────────────────────────────
+            # ── Emit: module_start + progress ─────────────────────────
             _emit(bus, Event, EventType, "module_start", source=module_name,
                   name=module_name, phase=phase.number)
+            # Emit progress at start of module (current position in the scan)
+            _emit(bus, Event, EventType, "module_progress", source=module_name,
+                  name=module_name,
+                  progress=round(modules_completed / total_modules * 100) if total_modules else 0)
 
             mod_instance = cls(
                 config=cfg,
@@ -462,6 +620,8 @@ async def run_scan(
 
             try:
                 result = await mod_instance.run()
+                modules_completed += 1
+
                 if result and hasattr(result, "findings"):
                     all_findings.extend(result.findings)
 
@@ -479,16 +639,56 @@ async def run_scan(
                     _emit(bus, Event, EventType, "module_complete", source=module_name,
                           name=module_name, findings_count=0)
 
+                # Emit progress after module completion
+                _emit(bus, Event, EventType, "module_progress", source=module_name,
+                      name=module_name,
+                      progress=round(modules_completed / total_modules * 100) if total_modules else 0)
+
             except Exception as exc:
                 log.error("Module %s failed: %s", module_name, exc)
                 errors.append(f"{module_name}: {exc}")
+                modules_completed += 1
                 _emit(bus, Event, EventType, "module_fail", source=module_name,
                       name=module_name, error=str(exc))
+                # Still emit progress even on failure
+                _emit(bus, Event, EventType, "module_progress", source=module_name,
+                      name=module_name,
+                      progress=round(modules_completed / total_modules * 100) if total_modules else 0)
 
         # ── Emit: phase_complete ──────────────────────────────────────
         phase_duration = time.monotonic() - phase_start
         _emit(bus, Event, EventType, "phase_complete", source="webforge",
               number=phase.number, name=phase.name, duration=round(phase_duration, 1))
+
+        # ── Session health check (greybox/whitebox only) ──────────────
+        if cfg.mode in ("greybox", "whitebox") and getattr(args, "login_url", None):
+            try:
+                import aiohttp
+                from webforge.core.auth_recorder import SessionHealthChecker, AuthRecorder
+                _checker = SessionHealthChecker(
+                    target=cfg.target,
+                    auth_indicator=cfg.extra.get("auth_indicator", ""),
+                )
+                _hdrs = cfg.extra.get("session_headers", {})
+                async with aiohttp.ClientSession(headers=_hdrs) as _hs:
+                    if not await _checker.is_healthy(_hs):
+                        log.warning(
+                            "Session may have expired after phase %d — re-authenticating",
+                            phase.number,
+                        )
+                        _recorder = AuthRecorder(results_dir, proxy=cfg.proxy)
+                        _reauth = await _checker.re_authenticate(
+                            _recorder, args.login_url,
+                            username=args.username or "",
+                            password=args.password or "",
+                        )
+                        if _reauth.authenticated:
+                            cfg.extra["session_headers"] = _reauth.headers or {}
+                            log.info("Re-authentication successful after phase %d", phase.number)
+                        else:
+                            log.warning("Re-authentication failed: %s", _reauth.error)
+            except Exception as _exc:
+                log.debug("Session health check skipped: %s", _exc)
 
     # Update run record
     run.ended_at = datetime.now(timezone.utc)
@@ -578,7 +778,10 @@ async def run_for_target(
         cfg.extra["password"] = args.password
     if args.token:
         cfg.extra["token"] = args.token
+    if getattr(args, "auth_state", None):
+        cfg.extra["browser_storage_state"] = args.auth_state
 
+    await prepare_browser_context(cfg, args, results_dir)
     return await run_scan(cfg, args, results_dir, event_bus, scan_control)
 
 
@@ -588,6 +791,17 @@ async def main() -> None:
     if args.list_modules:
         describe_phases(args.mode)
         return
+
+    if args.list_profiles:
+        from webforge.core.scan_profile import describe_profiles
+        describe_profiles()
+        return
+
+    if not args.target:
+        log.error("--target is required. Use --list-modules or --list-profiles to explore without a target.")
+        sys.exit(1)
+    if not args.target.startswith(("http://", "https://")):
+        args.target = "https://" + args.target
 
     if not args.auto_confirm:
         require_authorization(args.target, "WebForge")
@@ -636,6 +850,77 @@ async def main() -> None:
     if args.cookie:
         cfg.extra["cookie"] = args.cookie
 
+    # ── Dashboard env-based auth (secrets travel via env, never argv) ──
+    import os as _os
+    _env_auth_type = _os.environ.get("FORGE_AUTH_TYPE", "") or (args.auth_type or "")
+    _env_password  = _os.environ.get("FORGE_PASSWORD", "")
+    _env_token     = _os.environ.get("FORGE_TOKEN", "")
+    _env_cookie    = _os.environ.get("FORGE_COOKIE_JAR", "")
+
+    if _env_auth_type:
+        cfg.extra["auth_type"] = _env_auth_type
+    if _env_password and not args.password:
+        cfg.extra["password"] = _env_password
+        args.password = _env_password          # so has_session detects it
+    if _env_token and not args.token:
+        cfg.extra["token"] = _env_token
+        args.token = _env_token
+    if _env_cookie:
+        cfg.extra["cookie"] = _env_cookie
+        if not args.cookie:
+            args.cookie = _env_cookie
+
+    # Populate session_headers / session_cookies from env auth
+    if _env_auth_type == "bearer" and (args.token or _env_token):
+        _hdr_name = getattr(args, "header_name", "Authorization")
+        _bearer_val = args.token or _env_token
+        _hdr_val = f"Bearer {_bearer_val}" if _hdr_name == "Authorization" else _bearer_val
+        cfg.extra.setdefault("session_headers", {})[_hdr_name] = _hdr_val
+    if _env_auth_type == "cookie" and _env_cookie:
+        cfg.extra.setdefault("session_headers", {})["Cookie"] = _env_cookie
+        # Also parse cookie pairs into session_cookies dict
+        _cookie_dict = {}
+        for _pair in _env_cookie.split(";"):
+            _pair = _pair.strip()
+            if "=" in _pair:
+                _k, _v = _pair.split("=", 1)
+                _cookie_dict[_k.strip()] = _v.strip()
+        if _cookie_dict:
+            cfg.extra.setdefault("session_cookies", {}).update(_cookie_dict)
+    if _env_auth_type == "form" and _env_password:
+        # Form auth: password is available for auth_recorder login replay
+        cfg.extra["password"] = _env_password
+
+    # Apply scan profile (overrides defaults; explicit CLI flags take priority)
+    if args.profile:
+        from webforge.core.scan_profile import get_profile, validate_profile
+        try:
+            _profile = get_profile(args.profile)
+        except (KeyError, ValueError):
+            log.error(
+                "Unknown profile '%s'. Use --list-profiles to see available profiles.",
+                args.profile,
+            )
+            sys.exit(1)
+        _invalid = validate_profile(_profile, set(MODULE_MAP.keys()))
+        if _invalid:
+            log.error(
+                "Profile '%s' references unknown modules: %s", args.profile, _invalid,
+            )
+            sys.exit(1)
+        if not args.modules:
+            cfg.extra["profile_modules"] = _profile.modules
+        if args.rate == 10.0:
+            cfg.rate.requests_per_second = _profile.rate_limit
+        if args.workers == 10:
+            cfg.workers = _profile.max_workers
+        cfg.verify_findings = _profile.verify_findings
+        log.info(
+            "Profile '%s' active (%d modules, rate=%.1f req/s, verify=%s)",
+            _profile.name, len(_profile.modules),
+            _profile.rate_limit, _profile.verify_findings,
+        )
+
     # Load pre-captured session
     if args.session:
         from webforge.core.session_bridge import load_session
@@ -650,12 +935,14 @@ async def main() -> None:
                 cfg.extra["token"] = tokens["jwt"]
                 cfg.extra["jwt_token"] = tokens["jwt"]
 
+    await prepare_browser_context(cfg, args, results_dir)
+
     # Wire EventBus — remote when dashboard URL given, local otherwise
     event_bus = None
     if args.dashboard_url:
         try:
             from common.dashboard.event_bus import RemoteEventBus
-            event_bus = RemoteEventBus(args.dashboard_url, run_id=run_id if 'run_id' in dir() else "")
+            event_bus = RemoteEventBus(args.dashboard_url, run_id=str(uuid.uuid4())[:8])
             event_bus.start()
             log.info("Dashboard relay: %s", args.dashboard_url)
         except Exception as exc:

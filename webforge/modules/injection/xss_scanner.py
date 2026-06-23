@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 # Polyglot payloads — work across multiple XSS contexts
 PAYLOADS_REFLECTED = [
@@ -103,6 +104,12 @@ class XssScanner(BaseModule):
         if not self.check_scope(target):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
+        # Initialise FPReducer for UUID-canary XSS verification
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
+
         from webforge.core.session import ForgeSession
         async with ForgeSession(
             rate=self.config.rate.requests_per_second,
@@ -135,7 +142,7 @@ class XssScanner(BaseModule):
                     body = await resp.text()
                     if tagged in body or canary in body:
                         # Check if not HTML-encoded
-                        if "&lt;" not in body[body.find(canary)-20:body.find(canary)+20]:
+                        if "&lt;" not in body[max(0, body.find(canary)-200):body.find(canary)+200]:
                             ev = Evidence(
                                 request_raw=f"POST {action} | {field_name}={tagged}",
                                 response_raw=body[:2000],
@@ -189,6 +196,16 @@ class XssScanner(BaseModule):
                         idx = body.find(canary)
                         context_slice = body[max(0, idx-30):idx+30]
                         if "&lt;" not in context_slice and "&amp;" not in context_slice:
+                            # FPReducer: require canary to survive 2/2 variant probes
+                            fp_result = await self._fp.verify(
+                                "xss", url, param_name, method="GET"
+                            )
+                            if not self._fp.should_report(fp_result):
+                                self.log.debug(
+                                    "XSS suppressed by FPReducer (%s): %s[%s]",
+                                    fp_result.confidence.value, url, param_name,
+                                )
+                                break
                             ss = self.capture_screenshot(
                                 test_url, f"xss_{param_name}",
                                 highlight_js=(
@@ -200,7 +217,11 @@ class XssScanner(BaseModule):
                                 request_raw=f"GET {test_url}",
                                 response_raw=body[:3000],
                                 screenshot_path=ss,
-                                extra={"param": param_name, "payload": tagged_payload},
+                                extra={
+                                    "param": param_name, "payload": tagged_payload,
+                                    "fp_confidence": fp_result.confidence.value,
+                                    "fp_evidence": fp_result.evidence,
+                                },
                             )
                             self.new_finding(
                                 title=f"Reflected XSS — Parameter '{param_name}'",
@@ -312,8 +333,8 @@ class XssScanner(BaseModule):
             driver = None
             try:
                 driver = build_driver(cfg, headless=True)
-                driver.get(test_url)
-                import time as _time; _time.sleep(1)
+                await asyncio.to_thread(driver.get, test_url)
+                await asyncio.sleep(1)
                 # Check for alert dialog (indicates XSS execution)
                 try:
                     alert = driver.switch_to.alert

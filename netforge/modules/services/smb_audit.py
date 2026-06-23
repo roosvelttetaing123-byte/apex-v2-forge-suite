@@ -188,8 +188,8 @@ class SmbAudit(BaseModule):
             return
         except ImportError:
             pass
-        except Exception:
-            pass
+        except Exception as exc:
+            self.log.debug("impacket SMB signing check failed, falling back to raw probe: %s", exc)
 
         # Raw SMB2 negotiate packet
         try:

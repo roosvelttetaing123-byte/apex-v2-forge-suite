@@ -25,6 +25,7 @@ class FindingModel(Base):
     title            = Column(String(500), nullable=False)
     severity         = Column(String(20),  nullable=False)
     target           = Column(String(500), nullable=False)
+    url              = Column(String(1000), nullable=True)
     port             = Column(Integer,     nullable=True)
     service          = Column(String(100), nullable=True)
     module           = Column(String(100), nullable=False)
@@ -44,6 +45,11 @@ class FindingModel(Base):
     pcap_path        = Column(String(500), nullable=True)
     operator_confirmed = Column(Boolean,   default=False)
     tags             = Column(Text,        nullable=True)   # JSON list
+    confidence       = Column(String(20),  nullable=True)
+    status           = Column(String(50),  nullable=True)
+    vpr_score        = Column(Float,       nullable=True)
+    vpr_priority     = Column(String(20),  nullable=True)
+    verification     = Column(Text,        nullable=True)   # JSON dict
     discovered_at    = Column(DateTime,    default=lambda: datetime.now(timezone.utc))
     engagement       = Column(String(200), nullable=True)
     tester           = Column(String(200), nullable=True)
@@ -142,8 +148,31 @@ def create_db(db_path: Path) -> Session:
         cursor.close()
 
     Base.metadata.create_all(engine)
+    _migrate_sqlite_schema(engine)
     SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     return SessionLocal()
+
+
+def _migrate_sqlite_schema(engine: Any) -> None:
+    """Add nullable columns introduced after the initial findings table."""
+    migrations = {
+        "findings": {
+            "url": "VARCHAR(1000)",
+            "confidence": "VARCHAR(20)",
+            "status": "VARCHAR(50)",
+            "vpr_score": "FLOAT",
+            "vpr_priority": "VARCHAR(20)",
+            "verification": "TEXT",
+        },
+    }
+    with engine.begin() as conn:
+        for table, columns in migrations.items():
+            existing = {
+                row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+            }
+            for column, ddl in columns.items():
+                if column not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def save_finding(session: Session, finding_dict: dict[str, Any], run_id: str | None = None) -> None:
@@ -154,6 +183,7 @@ def save_finding(session: Session, finding_dict: dict[str, Any], run_id: str | N
         title                = finding_dict["title"],
         severity             = finding_dict["severity"],
         target               = finding_dict["target"],
+        url                  = finding_dict.get("url"),
         port                 = finding_dict.get("port"),
         service              = finding_dict.get("service"),
         module               = finding_dict["module"],
@@ -173,6 +203,11 @@ def save_finding(session: Session, finding_dict: dict[str, Any], run_id: str | N
         pcap_path            = ev.get("pcap_path"),
         operator_confirmed   = finding_dict.get("operator_confirmed", False),
         tags                 = json.dumps(finding_dict.get("tags", [])),
+        confidence           = finding_dict.get("confidence", "UNVERIFIED"),
+        status               = finding_dict.get("status", "open"),
+        vpr_score            = finding_dict.get("vpr_score"),
+        vpr_priority         = finding_dict.get("vpr_priority") or finding_dict.get("vpr"),
+        verification         = json.dumps(finding_dict.get("verification") or {}),
     )
     session.merge(model)
     session.commit()

@@ -51,6 +51,14 @@ class Finding:
     service:             str | None              = None
     operator_confirmed:  bool                    = False
     tags:                list[str]               = field(default_factory=list)
+    # FP-reduction and triage fields
+    url:                 str | None              = None   # specific URL within the target
+    confidence:          str                     = "UNVERIFIED"  # HIGH/MEDIUM/LOW/UNVERIFIED
+    status:              str                     = "open"         # open/verified/false_positive/remediated
+    vpr_score:           float | None            = None
+    vpr_priority:        str | None              = None
+    vpr:                 str | None              = None   # CRITICAL/HIGH/MEDIUM/LOW/INFO
+    verification:        dict[str, Any] | None   = None   # VerificationResult.to_dict()
 
     def __post_init__(self) -> None:
         if self.cvss_v31_score is None and self.cvss_v31_vector:
@@ -65,6 +73,7 @@ class Finding:
             "title":               self.title,
             "severity":            self.severity.value,
             "target":              self.target,
+            "url":                 self.url,
             "port":                self.port,
             "service":             self.service,
             "module":              self.module,
@@ -80,6 +89,12 @@ class Finding:
             "discovered_at":       self.discovered_at.isoformat(),
             "operator_confirmed":  self.operator_confirmed,
             "tags":                self.tags,
+            "confidence":          self.confidence,
+            "status":              self.status,
+            "vpr_score":           self.vpr_score,
+            "vpr_priority":        self.vpr_priority or self.vpr,
+            "vpr":                 self.vpr,
+            "verification":        self.verification,
             "evidence": {
                 "request_raw":          self.evidence.request_raw,
                 "response_raw":         self.evidence.response_raw,

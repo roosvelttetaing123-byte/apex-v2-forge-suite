@@ -211,8 +211,8 @@ class SshAudit(BaseModule):
                 target=host, port=port, service="ssh",
             )
 
-        # CVE-2023-38408 — ssh-agent remote code execution (CVSS 9.8)
-        if ver < CVE_2023_38408_FIX or (ver == CVE_2023_38408_FIX and patch < 2):
+        # CVE-2023-38408 — ssh-agent RCE. Only report for >= 8.5 (below that, generic outdated covers it)
+        if ver >= CVE_2024_6387_MIN and (ver < CVE_2023_38408_FIX or (ver == CVE_2023_38408_FIX and patch < 2)):
             self.new_finding(
                 title=f"CVE-2023-38408 ssh-agent RCE Risk — OpenSSH {version_str} on {host}:{port}",
                 severity=Severity.HIGH,

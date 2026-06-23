@@ -6,12 +6,13 @@ from typing import Callable
 
 PHASES: list[tuple[int, str, list[str]]] = [
     (1,  "Reconnaissance",    ["tech_detect","cms_detect","dir_fuzzer","vhost_enum","js_analyzer",
-                               "link_crawler","robots_sitemap","api_discover","param_discover","subdomain_takeover"]),
+                               "link_crawler","robots_sitemap","api_discover","param_discover",
+                               "subdomain_takeover","git_exposure"]),
     (2,  "SSL/TLS Audit",     ["ssl_audit","cert_inspect","hsts_check"]),
     (3,  "Security Headers",  ["header_audit","cors_check","csp_audit","cookie_audit","sri_check","clickjacking"]),
     (4,  "Injection",         ["sqli_scanner","xss_scanner","xxe_scanner","ssti_scanner","cmd_inject",
                                "ldap_inject","nosql_inject","jsonp_inject","host_header_inject",
-                               "crlf_inject","parameter_pollution"]),
+                               "crlf_inject","parameter_pollution","log4shell_scanner"]),
     (5,  "Authentication",    ["session_audit","password_policy","jwt_audit","oauth_check",
                                "login_brute","mfa_bypass","totp_bypass"]),
     (6,  "Access Control",    ["idor_scanner","priv_esc","path_traversal","forced_browse",

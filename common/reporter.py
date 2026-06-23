@@ -5,9 +5,12 @@ import base64
 import csv
 import json
 import logging
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from common.confidence_policy import normalise_finding
 
 try:
     from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -35,7 +38,13 @@ class BaseReporter:
         framework: str = "forge",
         formats: list[str] | None = None,
     ) -> None:
-        self.findings     = sorted(findings, key=lambda f: SEVERITY_ORDER.get(f.get("severity", ""), 99))
+        self.findings     = sorted(
+            [normalise_finding(f) for f in findings],
+            key=lambda f: (
+                -(float(f.get("vpr_score") or f.get("cvss_v31_score") or 0.0)),
+                SEVERITY_ORDER.get(f.get("severity", ""), 99),
+            ),
+        )
         self.results_dir  = results_dir
         self.engagement   = engagement
         self.target       = target
@@ -62,7 +71,33 @@ class BaseReporter:
                         log.info("Report generated: %s → %s", fmt, path)
             except Exception as exc:
                 log.error("Report generation failed for %s: %s", fmt, exc)
+
+        try:
+            from common.reporting.compliance_engine import ComplianceEngine
+            c_reports = ComplianceEngine.evaluate_all(self.findings)
+            compliance_path = self.results_dir / "compliance_report.json"
+            compliance_path.write_text(
+                json.dumps({k: v.to_dict() for k, v in c_reports.items()}, indent=2),
+                encoding="utf-8",
+            )
+            paths["compliance"] = str(compliance_path)
+            log.info("Compliance report generated: %s", compliance_path)
+        except Exception as exc:
+            log.warning("Compliance report generation failed: %s", exc)
+
         return paths
+
+    def _professional_report_config(self, formats: list[str]) -> Any:
+        """Build the richer report-engine config lazily to avoid import cycles."""
+        from common.reporting.report_engine import ReportConfig
+        return ReportConfig(
+            engagement=self.engagement,
+            target=self.target,
+            tester=self.tester,
+            output_dir=str(self.results_dir),
+            formats=formats,
+            include_unverified=False,
+        )
 
     def generate_json(self) -> str:
         """Generate JSON findings export."""
@@ -80,6 +115,35 @@ class BaseReporter:
         path.write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
         return str(path)
 
+    def generate_docx(self) -> str | None:
+        """Generate editable Word report when python-docx is installed."""
+        try:
+            from docx import Document
+        except ImportError:
+            log.warning("python-docx not installed — DOCX generation skipped")
+            return None
+
+        doc = Document()
+        doc.add_heading(f"{self.framework} Penetration Test Report", 0)
+        doc.add_paragraph(f"Engagement: {self.engagement}")
+        doc.add_paragraph(f"Target: {self.target}")
+        doc.add_paragraph(f"Tester: {self.tester}")
+        doc.add_paragraph(f"Generated: {self.generated_at}")
+        doc.add_heading("Findings", level=1)
+        for finding in self.findings:
+            doc.add_heading(finding.get("title", "Untitled Finding"), level=2)
+            doc.add_paragraph(f"Severity: {finding.get('severity', '')}")
+            doc.add_paragraph(f"Confidence: {finding.get('confidence', '')}")
+            doc.add_paragraph(f"VPR: {finding.get('vpr_score', '')} {finding.get('vpr_priority', '')}")
+            doc.add_paragraph(f"Target: {finding.get('url') or finding.get('target', '')}")
+            doc.add_paragraph(finding.get("description", ""))
+            if finding.get("remediation"):
+                doc.add_heading("Remediation", level=3)
+                doc.add_paragraph(finding["remediation"])
+        path = self.results_dir / "report.docx"
+        doc.save(str(path))
+        return str(path)
+
     def generate_csv(self) -> str:
         """Generate CSV findings export."""
         path = self.results_dir / "findings.csv"
@@ -93,6 +157,14 @@ class BaseReporter:
 
     def generate_html(self) -> str:
         """Generate a self-contained HTML report via Jinja2 template (falls back to inline)."""
+        try:
+            from common.reporting.report_engine import ReportEngine
+            config = self._professional_report_config(["html"])
+            paths = asyncio.run(ReportEngine(self.findings, config).generate())
+            if paths.get("html"):
+                return paths["html"]
+        except Exception as exc:
+            log.debug("Professional report engine unavailable, using fallback HTML: %s", exc)
         path = self.results_dir / "report.html"
         html = self._build_html_jinja2() if _JINJA2_AVAILABLE else self._build_html_inline()
         path.write_text(html, encoding="utf-8")
@@ -100,6 +172,14 @@ class BaseReporter:
 
     def generate_pdf(self) -> str | None:
         """Generate PDF report from HTML via WeasyPrint."""
+        try:
+            from common.reporting.report_engine import ReportEngine
+            config = self._professional_report_config(["html", "pdf"])
+            paths = asyncio.run(ReportEngine(self.findings, config).generate())
+            if paths.get("pdf"):
+                return paths["pdf"]
+        except Exception as exc:
+            log.debug("Professional PDF generation unavailable, using fallback: %s", exc)
         try:
             from weasyprint import HTML as WeasyprintHTML
             html_path = self.results_dir / "report.html"

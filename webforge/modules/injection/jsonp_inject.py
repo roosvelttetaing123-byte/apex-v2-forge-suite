@@ -116,7 +116,7 @@ class JsonpInject(BaseModule):
                                 "sensitive_data": sensitive,
                             },
                         )
-                        ev.screenshot_path = await self.capture_screenshot(
+                        ev.screenshot_path = self.capture_screenshot(
                             test_url, finding_id=f"jsonp_{cb_param}"
                         )
                         self.new_finding(

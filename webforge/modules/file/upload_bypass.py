@@ -153,7 +153,7 @@ class UploadBypass(BaseModule):
                         )
 
                         if executed:
-                            ev.screenshot_path = await self.capture_screenshot(
+                            ev.screenshot_path = self.capture_screenshot(
                                 file_url, finding_id="upload_rce"
                             )
 

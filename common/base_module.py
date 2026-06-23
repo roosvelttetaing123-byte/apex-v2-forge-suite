@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import re
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -17,7 +19,7 @@ from common.config import BaseForgeConfig
 from common.confirm_gate import confirm
 from common.db import Session, save_finding
 from common.evidence import Evidence
-from common.finding import Finding, Severity
+from common.finding import Finding, Severity, cvss31_score
 from common.scope import Scope, ScopeViolation
 
 
@@ -135,7 +137,7 @@ class BaseModule(ABC):
         (e.g. testing 4 evil origins against the same URL, all returning wildcard
         CORS) without requiring every module to track dedup state manually.
         """
-        _url = getattr(finding, "url", None) or finding.target or ""
+        _url = finding.url or finding.target or ""
         _dedup_key = f"{self.NAME}\x00{finding.title}\x00{_url}"
         if _dedup_key in self._seen_finding_keys:
             self._seen_finding_keys[_dedup_key] += 1
@@ -168,11 +170,17 @@ class BaseModule(ABC):
             module=self.NAME,
             target=finding.target,
             cvss_score=finding.cvss_v31_score,
-            url=getattr(finding, 'url', ''),
+            url=finding.url or "",
             port=finding.port,
             service=finding.service,
             description=finding.description,
             mitre_attack=finding.mitre_attack,
+            confidence=finding.confidence,
+            status=finding.status,
+            vpr_score=finding.vpr_score,
+            vpr_priority=finding.vpr_priority or finding.vpr,
+            verification=finding.verification or {},
+            evidence=finding.evidence.to_dict(),
         )
 
         # Start auto-analysis in background
@@ -227,8 +235,23 @@ class BaseModule(ABC):
         service: str | None = None,
         target: str | None = None,
         url: str | None = None,
+        confidence: str = "UNVERIFIED",
+        verification: "dict[str, Any] | None" = None,
     ) -> Finding:
         """Create a new finding, add it, and return it."""
+        evidence = evidence or Evidence()
+        verification = verification or self._verification_from_evidence(evidence)
+        confidence = self._normalise_confidence(
+            confidence,
+            verification=verification,
+            evidence=evidence,
+        )
+        cvss_score = cvss31_score(cvss_v31_vector) if cvss_v31_vector else 0.0
+        vpr_score, vpr_priority = self._calculate_vpr(cvss_score, title)
+        status = "verified" if confidence in {"HIGH", "MEDIUM"} else "open"
+        if verification:
+            verification.setdefault("confidence", confidence)
+
         f = Finding(
             title=title,
             severity=severity,
@@ -238,15 +261,162 @@ class BaseModule(ABC):
             reproduction_steps=reproduction_steps,
             remediation=remediation,
             references=references,
-            evidence=evidence or Evidence(),
+            evidence=evidence,
             cvss_v31_vector=cvss_v31_vector,
             cvss_v40_vector=cvss_v40_vector,
             mitre_attack=mitre_attack or [],
             port=port,
             service=service,
+            url=url,
+            confidence=confidence,
+            status=status,
+            vpr_score=vpr_score,
+            vpr_priority=vpr_priority,
+            vpr=vpr_priority,
+            verification=verification or None,
         )
         self.add_finding(f)
         return f
+
+    def _normalise_confidence(
+        self,
+        confidence: str,
+        verification: dict[str, Any] | None = None,
+        evidence: Evidence | None = None,
+    ) -> str:
+        """Return canonical finding confidence."""
+        raw = confidence
+        if raw == "UNVERIFIED" and verification:
+            raw = str(verification.get("confidence") or raw)
+        if raw == "UNVERIFIED" and evidence:
+            raw = str(evidence.extra.get("fp_confidence") or raw)
+        raw = raw.upper().replace(" ", "_")
+        return raw if raw in {"HIGH", "MEDIUM", "LOW", "UNVERIFIED"} else "UNVERIFIED"
+
+    def _verification_from_evidence(self, evidence: Evidence) -> dict[str, Any]:
+        """Promote FPReducer evidence extras into the first-class verification field."""
+        extra = evidence.extra or {}
+        if not any(k in extra for k in ("fp_confidence", "fp_evidence", "fp_probe_count", "fp_probe_hits")):
+            return {}
+        return {
+            "confidence": extra.get("fp_confidence", "UNVERIFIED"),
+            "evidence": extra.get("fp_evidence", []),
+            "probe_count": extra.get("fp_probe_count", 0),
+            "probe_hits": extra.get("fp_probe_hits", 0),
+        }
+
+    def _is_waf_placeholder(
+        self,
+        body: str,
+        status: int | None = None,
+        headers: Any | None = None,
+    ) -> bool:
+        """Return True for generic WAF/firewall block pages, not app content."""
+        haystack = body[:2000].lower()
+        patterns = (
+            "request rejected",
+            "the requested url was rejected",
+            "please consult with your administrator",
+            "your support id is",
+            "access denied",
+            "blocked by",
+            "web application firewall",
+            "mod_security",
+            "modsecurity",
+            "forbidden by rule",
+        )
+        if any(p in haystack for p in patterns):
+            return True
+        header_text = " ".join(f"{k}: {v}" for k, v in dict(headers or {}).items()).lower()
+        return status in {403, 406, 429} and any(
+            p in header_text for p in ("waf", "firewall", "akamai", "cloudflare", "imperva", "f5")
+        )
+
+    async def _soft_404_fingerprints(self, target: str, probes: int = 2) -> set[str]:
+        """Fingerprint unknown-path responses used by SPAs, CDNs, and firewalls."""
+        _cache_key = f"_soft404_fp_cache\x00{target}"
+        if _cache_key in self.config.extra:
+            return set(self.config.extra[_cache_key] or [])
+
+        import aiohttp
+        fps: set[str] = set()
+        try:
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False)
+            ) as session:
+                for _ in range(max(1, probes)):
+                    canary = f"{target}/_forge_missing_{uuid.uuid4().hex[:12]}"
+                    async with session.get(
+                        canary, allow_redirects=True,
+                        timeout=aiohttp.ClientTimeout(total=5),
+                    ) as resp:
+                        body = await resp.text(errors="ignore")
+                        if resp.status in {200, 401, 403, 404, 406, 429}:
+                            fps.add(self._response_fingerprint(body, resp.status))
+        except Exception:
+            pass
+
+        self.config.extra[_cache_key] = sorted(fps)
+        return fps
+
+    def _response_fingerprint(self, body: str, status: int | None = None) -> str:
+        """Stable fingerprint with volatile support/request IDs stripped."""
+        normalized = re.sub(
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+            "<uuid>",
+            body[:4096],
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(r"\b[0-9a-f]{16,}\b", "<hex>", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r"\b\d{6,}\b", "<num>", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        digest = hashlib.md5(normalized.encode(errors="ignore")).hexdigest()
+        return f"{status or 0}:{digest}:{len(normalized)}"
+
+    def _is_soft_404_body(self, body: str, status: int, fingerprints: set[str] | None) -> bool:
+        """Return True when a response matches unknown-path baseline fingerprints."""
+        if not fingerprints:
+            return False
+        return self._response_fingerprint(body, status) in fingerprints
+
+    def _calculate_vpr(self, cvss_score: float, title: str) -> tuple[float | None, str | None]:
+        """Calculate a lightweight VPR score when CVSS is available."""
+        try:
+            if cvss_score <= 0:
+                return None, None
+            from common.vpr import calculate_vpr
+            score = calculate_vpr(cvss_score, vuln_type=self._infer_vuln_type(title))
+            return round(score.vpr, 2), score.priority
+        except Exception:
+            if cvss_score >= 9.0:
+                return cvss_score, "Critical"
+            if cvss_score >= 7.0:
+                return cvss_score, "High"
+            if cvss_score >= 4.0:
+                return cvss_score, "Medium"
+            if cvss_score > 0:
+                return cvss_score, "Low"
+            return None, None
+
+    def _infer_vuln_type(self, title: str) -> str:
+        """Infer a VPR vuln type from the module name and title."""
+        haystack = f"{self.NAME} {title}".lower()
+        mappings = {
+            "sqli": ("sqli", "sql injection"),
+            "xss": ("xss", "cross-site scripting"),
+            "ssti": ("ssti", "template injection"),
+            "cmdi": ("cmdi", "command injection", "cmd injection"),
+            "ssrf": ("ssrf",),
+            "lfi": ("lfi", "local file inclusion"),
+            "xxe": ("xxe",),
+            "idor": ("idor",),
+            "auth_bypass": ("auth bypass", "authentication bypass"),
+            "rce": ("rce", "remote code execution"),
+        }
+        for vuln_type, needles in mappings.items():
+            if any(needle in haystack for needle in needles):
+                return vuln_type
+        return ""
 
     def confirm_action(
         self,
@@ -336,7 +506,6 @@ class BaseModule(ABC):
         if _cache_key in self.config.extra:
             return self.config.extra[_cache_key]
 
-        import hashlib
         import aiohttp
         canary = f"{target}/_forge_probe_{uuid.uuid4().hex[:8]}"
         result: str | None = None
@@ -361,7 +530,6 @@ class BaseModule(ABC):
         """Return True when body matches the SPA catch-all fingerprint."""
         if spa_fp is None:
             return False
-        import hashlib
         return hashlib.md5(body.encode()).hexdigest() == spa_fp
 
 

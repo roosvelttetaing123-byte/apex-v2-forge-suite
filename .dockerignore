@@ -1,0 +1,25 @@
+# forge-suite — Docker ignore
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.vscode/
+.idea/
+*.md
+!README.md
+*.zip
+*.tar.gz
+webforge/results/
+netforge/results/
+adforge/results/
+aiforge/results/
+*.db
+*.sqlite
+*.log
+.env
+.env.*
+test_*.db
+Dockerfile
+docker-compose.yml
+.dockerignore

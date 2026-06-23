@@ -137,7 +137,7 @@ class PathTraversal(BaseModule):
                                         response_raw=body[:500],
                                         extra={"param": param_name, "payload": payload},
                                     )
-                                    ev.screenshot_path = await self.capture_screenshot(
+                                    ev.screenshot_path = self.capture_screenshot(
                                         test_url, finding_id=f"traversal_{param_name}"
                                     )
                                     self.new_finding(

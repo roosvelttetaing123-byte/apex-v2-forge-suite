@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 # Engine-specific probes: (payload, expected_output_contains, engine_name)
 SSTI_PROBES: list[tuple[str, str, str]] = [
@@ -46,6 +47,10 @@ class SstiScanner(BaseModule):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
         self.log.info("Starting SSTI scan on %s", target)
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         from webforge.core.session import ForgeSession
         async with ForgeSession(
@@ -71,6 +76,16 @@ class SstiScanner(BaseModule):
                     resp = await session.get(test_url)
                     body = await resp.text()
                     if expected.lower() in body.lower():
+                        # FPReducer: math-proof 2/2 variant check before reporting
+                        fp_result = await self._fp.verify(
+                            "ssti", url, param_name, method="GET"
+                        )
+                        if not self._fp.should_report(fp_result):
+                            self.log.debug(
+                                "SSTI suppressed by FPReducer (%s): %s[%s]",
+                                fp_result.confidence.value, url, param_name,
+                            )
+                            continue
                         ss = self.capture_screenshot(
                             test_url, f"ssti_{param_name}",
                             highlight_js=(
@@ -83,8 +98,12 @@ class SstiScanner(BaseModule):
                             request_raw=f"GET {test_url}",
                             response_raw=body[:3000],
                             screenshot_path=ss,
-                            extra={"payload": payload, "param": param_name,
-                                   "expected": expected, "engine": engine},
+                            extra={
+                                "payload": payload, "param": param_name,
+                                "expected": expected, "engine": engine,
+                                "fp_confidence": fp_result.confidence.value,
+                                "fp_evidence": fp_result.evidence,
+                            },
                         )
                         self.new_finding(
                             title=f"Server-Side Template Injection ({engine}) — Parameter '{param_name}'",

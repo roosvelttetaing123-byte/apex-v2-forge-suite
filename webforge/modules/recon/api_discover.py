@@ -78,7 +78,7 @@ class ApiDiscover(BaseModule):
                         "endpoints": endpoints[:20],
                     },
                 )
-                ev.screenshot_path = await self.capture_screenshot(
+                ev.screenshot_path = self.capture_screenshot(
                     f"{target}{path}", finding_id=f"swagger_{path.replace('/', '_')}"
                 )
                 self.new_finding(
@@ -137,7 +137,7 @@ class ApiDiscover(BaseModule):
                                         "introspection_enabled": introspection_enabled,
                                     },
                                 )
-                                ev.screenshot_path = await self.capture_screenshot(
+                                ev.screenshot_path = self.capture_screenshot(
                                     f"{target}{path}", finding_id="graphql_endpoint"
                                 )
                                 self.new_finding(

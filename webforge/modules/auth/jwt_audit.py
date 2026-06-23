@@ -334,7 +334,7 @@ class JwtAudit(BaseModule):
                 public_exponent=65537, key_size=2048, backend=default_backend()
             )
             pub_key = priv_key.public_key()
-            pub_numbers = pub_key.public_key().public_numbers() if hasattr(pub_key, "public_key") else pub_key.public_numbers()
+            pub_numbers = pub_key.public_numbers()
 
             import base64 as _b64
             def _int_to_b64url(n: int) -> str:

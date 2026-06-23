@@ -15,12 +15,12 @@ const ForgeControls = (() => {
         if (abortBtn) abortBtn.addEventListener('click', abort);
     }
 
-    async function apiPost(endpoint) {
+    async function postJson(path) {
         const token = localStorage.getItem('forge_token');
         const headers = { 'Content-Type': 'application/json' };
         if (token) headers['Authorization'] = `Bearer ${token}`;
         try {
-            const res = await fetch(`${API_BASE}/api/v1/control/${endpoint}`, {
+            const res = await fetch(`${API_BASE}${path}`, {
                 method: 'POST', headers,
             });
             return await res.json();
@@ -28,6 +28,10 @@ const ForgeControls = (() => {
             console.error(`Control ${endpoint} failed:`, e);
             return null;
         }
+    }
+
+    async function apiPost(endpoint) {
+        return postJson(`/api/v1/control/${endpoint}`);
     }
 
     async function pause() {
@@ -52,7 +56,7 @@ const ForgeControls = (() => {
 
     async function abort() {
         if (!confirm('Are you sure you want to abort the scan? This cannot be undone.')) return;
-        const result = await apiPost('abort');
+        const result = await postJson('/api/v1/scans/stop');
         if (result) {
             updateScanStatus('failed', 'ABORTED');
             ForgeNotify.show({ title: 'Scan Aborted', type: 'critical', icon: '⏹' });

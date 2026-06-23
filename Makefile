@@ -1,12 +1,23 @@
-.PHONY: install test lint clean update-cve-db intel-sync dashboard c2 docker docker-up docker-down help
+.PHONY: install test test-short compile coverage lint clean update-cve-db intel-sync dashboard c2 docker docker-up docker-down help
 
 # ── Install ───────────────────────────────────────────────────────────
 install:
 	bash install.sh
 
 # ── Testing ───────────────────────────────────────────────────────────
+# Exit code is preserved — do NOT pipe through tail or any filter.
 test:
-	python3 -m pytest webforge/ netforge/ adforge/ aiforge/ common/ forge_c2/ -v --tb=short 2>&1 | tail -60
+	python3 -m pytest webforge/ netforge/ adforge/ aiforge/ common/ forge_c2/ tests/ -v --tb=short
+
+test-short:
+	python3 -m pytest common/ tests/ -v --tb=short -x
+
+compile:
+	python3 -m py_compile common/finding.py common/base_module.py common/fp_reducer.py \
+	    common/evidence.py common/reporting/report_engine.py && echo "All files compile OK"
+
+coverage:
+	python3 -m pytest common/ tests/ --cov=common --cov-report=term-missing --tb=short
 
 lint:
 	python3 -m bandit -r webforge/ netforge/ adforge/ aiforge/ common/ forge_c2/ -ll -q
@@ -52,7 +63,10 @@ help:
 	@echo "  ═══════════════════════════════════════"
 	@echo ""
 	@echo "  install        Install all dependencies"
-	@echo "  test           Run test suite"
+	@echo "  test           Run full test suite (exit code reflects pass/fail)"
+	@echo "  test-short     Run common/ + tests/ only, stop on first failure"
+	@echo "  compile        Syntax-check core modules with py_compile"
+	@echo "  coverage       Run common/ + tests/ with coverage report"
 	@echo "  lint           Run bandit security linter"
 	@echo "  intel-sync     Sync all intel sources (NVD, ExploitDB, Nuclei, ATT&CK)"
 	@echo "  update-cve-db  Sync CVE database only"

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_RCE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
 CVSS40_RCE = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H"
@@ -51,6 +52,12 @@ class CmdInject(BaseModule):
         target = self.config.target.rstrip("/")
         if not self.check_scope(target):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
+
+        # Initialise FPReducer — uses OOB callback (ForgeCollab) for highest confidence
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         # Gather test parameters from crawler
         crawled = self.config.extra.get("crawled_urls", [target])
@@ -127,14 +134,32 @@ class CmdInject(BaseModule):
                     body = await resp.text(errors="ignore")
 
             if is_time_based and elapsed >= SLEEP_SECONDS * 0.9:
-                self._report_injection(url, param, label, "time-based", elapsed, "", target)
+                # FPReducer: OOB or output-based CMDi confirmation before reporting
+                fp_result = await self._fp.verify("cmdi", url, param, method="GET")
+                if not self._fp.should_report(fp_result):
+                    self.log.debug(
+                        "CMDi time-based suppressed by FPReducer (%s): %s[%s]",
+                        fp_result.confidence.value, url, param,
+                    )
+                    return False
+                self._report_injection(url, param, label, "time-based", elapsed, "", target, fp_result)
                 return True
             elif not is_time_based and any(ind in body for ind in OUTPUT_INDICATORS):
-                self._report_injection(url, param, label, "output-based", 0, body, target)
+                fp_result = await self._fp.verify("cmdi", url, param, method="GET")
+                if not self._fp.should_report(fp_result):
+                    self.log.debug(
+                        "CMDi output-based suppressed by FPReducer (%s): %s[%s]",
+                        fp_result.confidence.value, url, param,
+                    )
+                    return False
+                self._report_injection(url, param, label, "output-based", 0, body, target, fp_result)
                 return True
         except asyncio.TimeoutError:
             if is_time_based:
-                self._report_injection(url, param, label, "time-based (timeout)", SLEEP_SECONDS, "", target)
+                fp_result = await self._fp.verify("cmdi", url, param, method="GET")
+                if not self._fp.should_report(fp_result):
+                    return False
+                self._report_injection(url, param, label, "time-based (timeout)", SLEEP_SECONDS, "", target, fp_result)
                 return True
         except Exception:
             pass
@@ -156,14 +181,23 @@ class CmdInject(BaseModule):
                     body = await resp.text(errors="ignore")
 
             if is_time_based and elapsed >= SLEEP_SECONDS * 0.9:
-                self._report_injection(url, param, label, "time-based", elapsed, "", target)
+                fp_result = await self._fp.verify("cmdi", url, param, method="POST")
+                if not self._fp.should_report(fp_result):
+                    return False
+                self._report_injection(url, param, label, "time-based", elapsed, "", target, fp_result)
                 return True
             elif not is_time_based and any(ind in body for ind in OUTPUT_INDICATORS):
-                self._report_injection(url, param, label, "output-based", 0, body, target)
+                fp_result = await self._fp.verify("cmdi", url, param, method="POST")
+                if not self._fp.should_report(fp_result):
+                    return False
+                self._report_injection(url, param, label, "output-based", 0, body, target, fp_result)
                 return True
         except asyncio.TimeoutError:
             if is_time_based:
-                self._report_injection(url, param, label, "time-based (timeout)", SLEEP_SECONDS, "", target)
+                fp_result = await self._fp.verify("cmdi", url, param, method="POST")
+                if not self._fp.should_report(fp_result):
+                    return False
+                self._report_injection(url, param, label, "time-based (timeout)", SLEEP_SECONDS, "", target, fp_result)
                 return True
         except Exception:
             pass
@@ -171,7 +205,8 @@ class CmdInject(BaseModule):
 
     def _report_injection(
         self, url: str, param: str, label: str,
-        detection_method: str, elapsed: float, body: str, target: str
+        detection_method: str, elapsed: float, body: str, target: str,
+        fp_result: "Any | None" = None,
     ) -> None:
         ev = Evidence(
             request_raw=f"URL: {url}\nParam: {param}\nPayload: {label}",
@@ -179,6 +214,8 @@ class CmdInject(BaseModule):
             extra={
                 "url": url, "param": param, "payload": label,
                 "detection": detection_method, "elapsed": elapsed,
+                "fp_confidence": fp_result.confidence.value if fp_result else "UNVERIFIED",
+                "fp_evidence": fp_result.evidence if fp_result else [],
             },
         )
         self.new_finding(
