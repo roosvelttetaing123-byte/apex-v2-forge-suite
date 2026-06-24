@@ -59,15 +59,15 @@ jobs:
           # Install only the packages needed by the test suite
           # (avoids heavy optional deps like WeasyPrint, Playwright, Scapy)
           pip install \
-            pydantic[email]>=2.5.0 \
-            pyyaml>=6.0.1 \
-            aiohttp>=3.9.0 \
-            jinja2>=3.1.2 \
-            sqlalchemy>=2.0.0 \
-            networkx>=3.2.0 \
-            pytest>=7.4.0 \
-            pytest-asyncio>=0.23.0 \
-            pytest-timeout>=2.2.0
+            'pydantic[email]>=2.5.0' \
+            'pyyaml>=6.0.1' \
+            'aiohttp>=3.9.0' \
+            'jinja2>=3.1.2' \
+            'sqlalchemy>=2.0.0' \
+            'networkx>=3.2.0' \
+            'pytest>=7.4.0' \
+            'pytest-asyncio>=0.23.0' \
+            'pytest-timeout>=2.2.0'
 
       - name: Run test suite
         run: |
@@ -106,7 +106,7 @@ jobs:
           cache: pip
 
       - name: Install bandit
-        run: pip install bandit>=1.7.6
+        run: pip install 'bandit>=1.7.6'
 
       - name: Run bandit
         run: |
@@ -162,16 +162,16 @@ jobs:
       - name: Install dependencies + coverage
         run: |
           pip install \
-            pydantic[email]>=2.5.0 \
-            pyyaml>=6.0.1 \
-            aiohttp>=3.9.0 \
-            jinja2>=3.1.2 \
-            sqlalchemy>=2.0.0 \
-            networkx>=3.2.0 \
-            pytest>=7.4.0 \
-            pytest-asyncio>=0.23.0 \
-            pytest-timeout>=2.2.0 \
-            pytest-cov>=4.1.0
+            'pydantic[email]>=2.5.0' \
+            'pyyaml>=6.0.1' \
+            'aiohttp>=3.9.0' \
+            'jinja2>=3.1.2' \
+            'sqlalchemy>=2.0.0' \
+            'networkx>=3.2.0' \
+            'pytest>=7.4.0' \
+            'pytest-asyncio>=0.23.0' \
+            'pytest-timeout>=2.2.0' \
+            'pytest-cov>=4.1.0'
 
       - name: Run coverage
         run: |
