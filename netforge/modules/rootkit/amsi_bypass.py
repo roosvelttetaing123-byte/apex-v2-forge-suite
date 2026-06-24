@@ -78,7 +78,7 @@ class AMSIBypass(BaseModule):
 
     NAME        = "amsi_bypass"
     DESCRIPTION = "Evasion: AMSI Bypass — disable Antimalware Scan Interface"
-    PHASE       = 10
+    PHASE       = 10  # Evasion phase
     TAGS        = [
         "post-exploit", "evasion", "amsi", "bypass",
         "defense-evasion", "antivirus-bypass",

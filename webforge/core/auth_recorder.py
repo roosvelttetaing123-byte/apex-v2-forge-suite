@@ -350,14 +350,14 @@ class AuthRecorder:
                 value = ls.get("value", "")
                 if not value:
                     continue
-                if any(tk in key_lower for tk in token_keys):
+                if any(ck in key_lower for ck in csrf_keys):
+                    tokens["csrf"] = value
+                elif any(tk in key_lower for tk in token_keys):
                     # Detect if it's a JWT
                     if value.count(".") == 2 and value.startswith("eyJ"):
                         tokens["jwt"] = value
                     else:
                         tokens["bearer"] = value
-                elif any(ck in key_lower for ck in csrf_keys):
-                    tokens["csrf"] = value
 
         # Cookie-based tokens
         csrf_cookie_names = {"xsrf-token", "csrf_token", "csrftoken", "_csrf"}

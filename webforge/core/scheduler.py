@@ -4,8 +4,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine
+from dataclasses import dataclass
+from typing import Any, Coroutine
 
 log = logging.getLogger(__name__)
 
@@ -74,7 +74,13 @@ class PhaseScheduler:
 
         if parallel:
             coros = [self.run_module(name, coro) for name, coro in tasks]
-            phase_results = list(await asyncio.gather(*coros, return_exceptions=False))
+            raw = await asyncio.gather(*coros, return_exceptions=True)
+            phase_results = []
+            for r in raw:
+                if isinstance(r, BaseException):
+                    log.error("Unexpected scheduler error in phase %s: %s", phase_name, r)
+                else:
+                    phase_results.append(r)
         else:
             for name, coro in tasks:
                 result = await self.run_module(name, coro)
@@ -111,3 +117,31 @@ class TestScheduler:
         result = asyncio.run(sched.run_module("failing", fail()))
         assert result.success is False
         assert "intentional" in (result.error or "")
+
+    def test_parallel_exception_does_not_kill_other_tasks(self) -> None:
+        """A BaseException from one parallel task must not cancel the rest."""
+        completed: list[str] = []
+
+        async def good(name: str) -> str:
+            completed.append(name)
+            return name
+
+        async def bad() -> None:
+            raise asyncio.CancelledError()
+
+        async def run() -> list[TaskResult]:
+            sched = PhaseScheduler()
+            tasks = [
+                ("good_a", good("a")),
+                ("bad",    bad()),
+                ("good_b", good("b")),
+            ]
+            return await sched.run_phase("test_parallel", tasks, parallel=True)
+
+        results = asyncio.run(run())
+        # Both good tasks must have completed
+        assert "a" in completed
+        assert "b" in completed
+        # Only the two successful TaskResults are in phase_results
+        assert len(results) == 2
+        assert all(r.success for r in results)

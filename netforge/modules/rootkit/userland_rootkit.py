@@ -88,7 +88,7 @@ class UserlandRootkit(RootkitBase):
 
     NAME        = "userland_rootkit"
     DESCRIPTION = "Rootkit: Userland — API hook process/file/network hiding"
-    PHASE       = 10
+    PHASE       = 11  # Persistence phase
     TAGS        = [
         "post-exploit", "rootkit", "userland", "api-hooking",
         "dll-injection", "process-hiding",

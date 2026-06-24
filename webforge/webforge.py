@@ -335,6 +335,8 @@ def parse_args() -> argparse.Namespace:
                         help="Render target with Playwright before scanning to discover SPA routes, forms, and XHR endpoints")
     parser.add_argument("--login-url",     default=None,
                         help="Login URL for browser-based authenticated scanning")
+    parser.add_argument("--login-script",  default=None,
+                        help="YAML/JSON Playwright login sequence for complex SSO/form flows")
     parser.add_argument("--auth-type",     default=None,
                         choices=["form", "bearer", "cookie"],
                         help="Authentication type (set by dashboard for greybox/whitebox scans)")
@@ -342,6 +344,10 @@ def parse_args() -> argparse.Namespace:
                         help="Custom header name for bearer token auth (default: Authorization)")
     parser.add_argument("--auth-state",    default=None,
                         help="Playwright storage-state JSON to reuse authenticated browser session")
+    parser.add_argument("--api-schema",    default=None,
+                        help="OpenAPI/Swagger/Postman/GraphQL introspection JSON or YAML file")
+    parser.add_argument("--graphql-schema-url", default=None,
+                        help="Live GraphQL endpoint URL to introspect and add to API test surface")
     parser.add_argument("--no-screenshot", action="store_true",     help="Disable screenshot capture")
     parser.add_argument("--list-modules",  action="store_true",     help="List all available modules and exit")
     parser.add_argument("--profile",       default=None,
@@ -390,7 +396,12 @@ async def prepare_browser_context(
     results_dir: Path,
 ) -> None:
     """Populate cfg.extra with browser-discovered auth/session artifacts."""
-    if not (args.browser_render or args.login_url or args.auth_state):
+    if not (
+        args.browser_render
+        or args.login_url
+        or args.auth_state
+        or getattr(args, "login_script", None)
+    ):
         return
 
     browser_name = args.browser or "chromium"
@@ -398,12 +409,25 @@ async def prepare_browser_context(
     if args.auth_state:
         from webforge.core.auth_recorder import AuthRecorder
         auth = AuthRecorder(results_dir, proxy=cfg.proxy).import_storage_state(Path(args.auth_state))
-        cfg.extra["browser_storage_state"] = auth.storage_state_path
-        if auth.headers:
-            cfg.extra["session_headers"] = {**cfg.extra.get("session_headers", {}), **auth.headers}
-        if auth.cookies:
-            cfg.extra["session_cookies"] = auth.cookies
+        _merge_auth_result(cfg, auth)
         log.info("Loaded browser auth state from %s", args.auth_state)
+
+    if getattr(args, "login_script", None):
+        from webforge.core.auth_recorder import AuthRecorder, parse_login_script
+        raw_steps = _load_structured_file(Path(args.login_script))
+        if not isinstance(raw_steps, list):
+            log.warning("Login script must be a list of steps: %s", args.login_script)
+        else:
+            auth = await AuthRecorder(results_dir, proxy=cfg.proxy).replay_script(
+                parse_login_script(raw_steps),
+                browser=browser_name,
+            )
+            cfg.extra["browser_auth"] = auth.to_dict()
+            _merge_auth_result(cfg, auth)
+            if auth.error:
+                log.warning("Login script did not complete cleanly: %s", auth.error)
+            else:
+                log.info("Login script completed; storage state exported")
 
     if args.login_url:
         from webforge.core.auth_recorder import AuthRecorder
@@ -414,12 +438,7 @@ async def prepare_browser_context(
             browser=browser_name,
         )
         cfg.extra["browser_auth"] = auth.to_dict()
-        if auth.storage_state_path:
-            cfg.extra["browser_storage_state"] = auth.storage_state_path
-        if auth.headers:
-            cfg.extra["session_headers"] = {**cfg.extra.get("session_headers", {}), **auth.headers}
-        if auth.cookies:
-            cfg.extra["session_cookies"] = auth.cookies
+        _merge_auth_result(cfg, auth)
         if auth.error:
             log.warning("Browser login did not complete cleanly: %s", auth.error)
         else:
@@ -465,6 +484,71 @@ async def prepare_browser_context(
             log.warning("Browser render discovery unavailable: %s", exc)
 
 
+def _merge_auth_result(cfg: BaseForgeConfig, auth: Any) -> None:
+    """Merge AuthReplayResult into the HTTP scanner context."""
+    if getattr(auth, "storage_state_path", ""):
+        cfg.extra["browser_storage_state"] = auth.storage_state_path
+    if getattr(auth, "headers", None):
+        cfg.extra["session_headers"] = {
+            **(cfg.extra.get("session_headers", {}) or {}),
+            **(auth.headers or {}),
+        }
+    if getattr(auth, "cookies", None):
+        cfg.extra["session_cookies"] = {
+            **(cfg.extra.get("session_cookies", {}) or {}),
+            **(auth.cookies or {}),
+        }
+    tokens = getattr(auth, "tokens", {}) or {}
+    if tokens.get("jwt"):
+        cfg.extra["jwt_token"] = tokens["jwt"]
+        cfg.extra.setdefault("token", tokens["jwt"])
+        cfg.extra.setdefault("session_headers", {})["Authorization"] = f"Bearer {tokens['jwt']}"
+    elif tokens.get("bearer"):
+        cfg.extra.setdefault("token", tokens["bearer"])
+        cfg.extra.setdefault("session_headers", {})["Authorization"] = f"Bearer {tokens['bearer']}"
+    if tokens.get("csrf"):
+        cfg.extra.setdefault("session_headers", {})["X-CSRF-Token"] = tokens["csrf"]
+        cfg.extra.setdefault("session_headers", {})["X-XSRF-Token"] = tokens["csrf"]
+
+
+def _apply_captured_session(cfg: BaseForgeConfig, session_data: dict[str, Any]) -> None:
+    """Apply session_capture.py output to the HTTP scanner context."""
+    cookies = {
+        c.get("name", ""): c.get("value", "")
+        for c in session_data.get("cookies", [])
+        if c.get("name")
+    }
+    if cookies:
+        cfg.extra["session_cookies"] = {
+            **(cfg.extra.get("session_cookies", {}) or {}),
+            **cookies,
+        }
+        cfg.extra.setdefault("session_headers", {})["Cookie"] = "; ".join(
+            f"{name}={value}" for name, value in cookies.items()
+        )
+
+    tokens = session_data.get("detected_tokens", {}) or {}
+    if tokens.get("bearer"):
+        cfg.extra["token"] = tokens["bearer"]
+        cfg.extra.setdefault("session_headers", {})["Authorization"] = f"Bearer {tokens['bearer']}"
+    elif tokens.get("jwt"):
+        cfg.extra["token"] = tokens["jwt"]
+        cfg.extra["jwt_token"] = tokens["jwt"]
+        cfg.extra.setdefault("session_headers", {})["Authorization"] = f"Bearer {tokens['jwt']}"
+    if tokens.get("csrf"):
+        cfg.extra.setdefault("session_headers", {})["X-CSRF-Token"] = tokens["csrf"]
+        cfg.extra.setdefault("session_headers", {})["X-XSRF-Token"] = tokens["csrf"]
+
+
+def _load_structured_file(path: Path) -> Any:
+    """Load JSON or YAML config data."""
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        import yaml
+        return yaml.safe_load(text)
+    return json.loads(text)
+
+
 def _merge_unique_forms(existing: list[dict], discovered: list[dict]) -> list[dict]:
     seen: set[tuple[str, str, tuple[str, ...]]] = set()
     merged: list[dict] = []
@@ -477,6 +561,77 @@ def _merge_unique_forms(existing: list[dict], discovered: list[dict]) -> list[di
         if key not in seen:
             seen.add(key)
             merged.append(form)
+    return merged
+
+
+async def prepare_api_schema_context(cfg: BaseForgeConfig, args: argparse.Namespace) -> None:
+    """Populate cfg.extra with endpoints/forms parsed from API schemas."""
+    schema_path = getattr(args, "api_schema", None)
+    graphql_url = getattr(args, "graphql_schema_url", None)
+    if not schema_path and not graphql_url:
+        return
+
+    results = []
+    if schema_path:
+        from webforge.modules.api.schema_import import SchemaImporter
+        path = Path(schema_path)
+        if not path.exists():
+            log.warning("API schema file not found: %s", schema_path)
+        else:
+            result = SchemaImporter(base_url=cfg.target.rstrip("/")).import_file(path)
+            results.append(result)
+
+    if graphql_url:
+        from webforge.modules.api.schema_import import fetch_graphql_schema
+        result = await fetch_graphql_schema(
+            graphql_url,
+            headers=cfg.extra.get("session_headers", {}),
+        )
+        results.append(result)
+
+    for result in results:
+        if result.errors:
+            log.warning(
+                "API schema import (%s) had errors: %s",
+                result.format,
+                "; ".join(result.errors),
+            )
+            continue
+        _merge_schema_result(cfg, result)
+        log.info(
+            "API schema imported: format=%s title=%s endpoints=%d auth_schemes=%d",
+            result.format,
+            result.title or "untitled",
+            len(result.endpoints),
+            len(result.auth_schemes),
+        )
+
+
+def _merge_schema_result(cfg: BaseForgeConfig, result: Any) -> None:
+    """Merge SchemaImportResult into existing WebForge discovery context."""
+    cfg.extra["api_schema"] = result.to_dict()
+    cfg.extra["api_endpoints"] = _merge_unique_strings(
+        cfg.extra.get("api_endpoints", []),
+        result.api_urls,
+    )
+    cfg.extra["found_forms"] = _merge_unique_forms(
+        cfg.extra.get("found_forms", []),
+        result.forms,
+    )
+    cfg.extra["api_schema_endpoints"] = [
+        ep.to_dict() for ep in result.endpoints
+    ]
+    if result.auth_schemes:
+        cfg.extra["api_auth_schemes"] = result.auth_schemes
+
+
+def _merge_unique_strings(existing: list[str], discovered: list[str]) -> list[str]:
+    seen: set[str] = set()
+    merged: list[str] = []
+    for item in existing + discovered:
+        if item and item not in seen:
+            seen.add(item)
+            merged.append(item)
     return merged
 
 
@@ -529,8 +684,11 @@ async def run_scan(
     skip    = [m.strip() for m in args.skip_modules.split(",")] if args.skip_modules else None
     has_session = bool(
         args.username or args.token or args.session or args.sso
+        or getattr(args, "auth_state", None) or getattr(args, "login_script", None)
         or cfg.extra.get("password") or cfg.extra.get("token")
         or cfg.extra.get("cookie") or cfg.extra.get("auth_type")
+        or cfg.extra.get("session_headers") or cfg.extra.get("session_cookies")
+        or cfg.extra.get("browser_storage_state")
     )
     phases  = get_phases(args.mode, include_modules=include, skip_modules=skip,
                          has_session=has_session)
@@ -782,6 +940,7 @@ async def run_for_target(
         cfg.extra["browser_storage_state"] = args.auth_state
 
     await prepare_browser_context(cfg, args, results_dir)
+    await prepare_api_schema_context(cfg, args)
     return await run_scan(cfg, args, results_dir, event_bus, scan_control)
 
 
@@ -915,6 +1074,8 @@ async def main() -> None:
         if args.workers == 10:
             cfg.workers = _profile.max_workers
         cfg.verify_findings = _profile.verify_findings
+        if _profile.browser_render:
+            args.browser_render = True
         log.info(
             "Profile '%s' active (%d modules, rate=%.1f req/s, verify=%s)",
             _profile.name, len(_profile.modules),
@@ -928,14 +1089,10 @@ async def main() -> None:
         if sess_data:
             cfg.extra["session_data"] = sess_data
             log.info("Loaded pre-captured session from %s", args.session)
-            tokens = sess_data.get("detected_tokens", {})
-            if tokens.get("bearer"):
-                cfg.extra["token"] = tokens["bearer"]
-            elif tokens.get("jwt"):
-                cfg.extra["token"] = tokens["jwt"]
-                cfg.extra["jwt_token"] = tokens["jwt"]
+            _apply_captured_session(cfg, sess_data)
 
     await prepare_browser_context(cfg, args, results_dir)
+    await prepare_api_schema_context(cfg, args)
 
     # Wire EventBus — remote when dashboard URL given, local otherwise
     event_bus = None

@@ -26,7 +26,7 @@ EVIL_URLS = [
     f"htTpS://{EVIL_DOMAIN}",
     f"javascript:alert(1)",
     f"data:text/html,<h1>test</h1>",
-    f"http://0x{int('169.254.169.254'.replace('.','')[:8], 16):x}/",  # hex IP
+    "http://0xa9fea9fe/latest/meta-data/",   # 169.254.169.254 as hex uint32
 ]
 
 REDIRECT_PARAMS = [
@@ -98,29 +98,29 @@ class OpenRedirect(BaseModule):
                 )
 
                 try:
-                    import aiohttp
-                    async with aiohttp.ClientSession(
-                        connector=aiohttp.TCPConnector(ssl=False)
-                    ) as session:
+                    async with self.http_session(timeout=8) as session:
                         async with session.get(
                             test_url,
                             allow_redirects=False,
-                            timeout=aiohttp.ClientTimeout(total=8),
                         ) as resp:
                             location = resp.headers.get("Location", "")
+                            status   = resp.status
 
-                    if resp.status in (301, 302, 303, 307, 308) and \
-                       EVIL_DOMAIN in location or (
-                           evil_url.startswith("javascript:") and location.startswith("javascript:")
-                       ):
+                    if status in (301, 302, 303, 307, 308) and (
+                        EVIL_DOMAIN in location
+                        or (
+                            evil_url.startswith("javascript:")
+                            and location.startswith("javascript:")
+                        )
+                    ):
                         ev = Evidence(
                             request_raw=f"GET {test_url}",
-                            response_raw=f"HTTP {resp.status}\nLocation: {location}",
+                            response_raw=f"HTTP {status}\nLocation: {location}",
                             extra={
                                 "param":     param_name,
                                 "evil_url":  evil_url,
                                 "location":  location,
-                                "status":    resp.status,
+                                "status":    status,
                             },
                         )
                         self.new_finding(
@@ -165,3 +165,35 @@ class TestOpenRedirect:
 
     def test_evil_domain_in_urls(self) -> None:
         assert any(EVIL_DOMAIN in u for u in EVIL_URLS)
+
+    def test_hex_ip_correct(self) -> None:
+        """Hex IP must encode 169.254.169.254 as 0xa9fea9fe (correct uint32)."""
+        assert any("0xa9fea9fe" in u for u in EVIL_URLS), (
+            "EVIL_URLS must contain the correct hex encoding of 169.254.169.254 "
+            "(0xa9fea9fe), not a broken f-string computation"
+        )
+
+    def test_no_name_error_on_session_exception(self) -> None:
+        """If session.get() raises, must not propagate NameError for undefined resp."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mod = OpenRedirect.__new__(OpenRedirect)
+        mod.config = MagicMock()
+        mod.config.target = "http://example.com"
+        mod.config.extra = {}
+        mod.log = MagicMock()
+        mod._seen_finding_keys = {}
+
+        mock_session_cm = MagicMock()
+        mock_session_cm.__aenter__ = AsyncMock(side_effect=RuntimeError("connection refused"))
+        mock_session_cm.__aexit__ = AsyncMock(return_value=False)
+
+        sem = asyncio.Semaphore(1)
+        url = "http://example.com/login?redirect=https://example.com"
+
+        with patch.object(mod, "check_scope", return_value=True), \
+             patch.object(mod, "rate_limit", return_value=asyncio.sleep(0)), \
+             patch.object(mod, "http_session", return_value=mock_session_cm):
+            # Must complete without raising NameError or any other exception
+            asyncio.run(mod._test_redirect(url, "redirect", "http://example.com", sem))

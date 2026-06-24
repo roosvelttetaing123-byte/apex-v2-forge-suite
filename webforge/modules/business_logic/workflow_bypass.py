@@ -56,10 +56,23 @@ class WorkflowBypass(BaseModule):
         if not self.check_scope(target):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=False),
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as session:
+        confirmed = self.confirm_action(
+            module=self.NAME,
+            action=(
+                "Skip checkout workflow steps and POST forged payment callback payloads "
+                "to detect workflow bypass and payment callback forgery"
+            ),
+            target=target,
+            risk=(
+                "Sends POST requests directly to final checkout steps and forged payment "
+                "success notifications — may trigger real order completion or payment "
+                "processing side-effects. Run only on test/staging environments."
+            ),
+        )
+        if not confirmed:
+            return self._make_result(start, skipped=True, skip_reason="operator declined")
+
+        async with self.http_session(timeout=10) as session:
             bypasses = []
 
             for workflow in CHECKOUT_STEPS:
@@ -157,6 +170,7 @@ class WorkflowBypass(BaseModule):
                         url,
                         data=payload,
                         headers={
+                            **self.auth_headers(),
                             "Origin":       "https://gateway.attacker.com",
                             "Referer":      "https://gateway.attacker.com/3ds/result",
                             "Content-Type": "application/x-www-form-urlencoded",
@@ -227,3 +241,61 @@ class TestWorkflowBypass:
         assert any("resultCode" in p for p in FORGED_CALLBACK_PAYLOADS)
         assert any("status" in p for p in FORGED_CALLBACK_PAYLOADS)
         assert any("payment_status" in p for p in FORGED_CALLBACK_PAYLOADS)
+
+    def test_confirm_gate_declined(self) -> None:
+        """Operator declining confirmation must skip the module."""
+        import asyncio
+        from unittest.mock import MagicMock, patch
+
+        mod = WorkflowBypass.__new__(WorkflowBypass)
+        mod.config = MagicMock()
+        mod.config.target = "http://example.com"
+        mod.config.extra = {}
+        mod.log = MagicMock()
+        mod._seen_finding_keys = {}
+        mod._event_bus = None
+        mod.findings = []
+
+        with patch.object(mod, "check_scope", return_value=True), \
+             patch.object(mod, "confirm_action", return_value=False):
+            result = asyncio.run(mod.run())
+
+        assert result.skipped is True
+        assert result.skip_reason == "operator declined"
+
+    def test_confirm_gate_accepted(self) -> None:
+        """Operator accepting confirmation must not skip (http calls are mocked)."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mod = WorkflowBypass.__new__(WorkflowBypass)
+        mod.config = MagicMock()
+        mod.config.target = "http://example.com"
+        mod.config.extra = {}
+        mod.log = MagicMock()
+        mod._seen_finding_keys = {}
+        mod._event_bus = None
+        mod.findings = []
+
+        mock_resp = MagicMock()
+        mock_resp.status = 404
+        mock_resp.text = AsyncMock(return_value="not found")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_resp)
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.head = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(mod, "check_scope", return_value=True), \
+             patch.object(mod, "confirm_action", return_value=True), \
+             patch.object(mod, "rate_limit", new=AsyncMock()), \
+             patch.object(mod, "http_session", return_value=mock_session), \
+             patch.object(mod, "_make_result", return_value=MagicMock(skipped=False)) as mr:
+            asyncio.run(mod.run())
+            mr.assert_called_once()
+            call_kwargs = mr.call_args
+            assert call_kwargs[1].get("skipped", False) is False or len(call_kwargs[0]) == 1

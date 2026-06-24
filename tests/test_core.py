@@ -151,6 +151,36 @@ class TestBaseModule:
         assert f.status == "open"
         session.close()
 
+    def test_new_finding_operator_confirmed_and_tags(self, tmp_path):
+        from common.finding import Severity
+        mod, session = _make_module(tmp_path)
+        f = mod.new_finding(
+            title="Confirmed risky probe",
+            severity=Severity.HIGH,
+            description="d",
+            reproduction_steps=[],
+            remediation="r",
+            references=[],
+            operator_confirmed=True,
+            tags=["business-logic"],
+        )
+        assert f.operator_confirmed is True
+        assert f.tags == ["business-logic"]
+        session.close()
+
+    def test_auth_headers_merge_token_cookie_and_overrides(self, tmp_path):
+        mod, session = _make_module(tmp_path)
+        mod.config.extra["token"] = "tok123"
+        mod.config.extra["cookie"] = "Cookie: session=abc; Path=/; theme=dark"
+        mod.config.extra["session_headers"] = {"X-CSRF-Token": "csrf"}
+        headers = mod.auth_headers({"Authorization": "ApiKey override"})
+        cookies = mod.auth_cookies()
+        assert headers["Authorization"] == "ApiKey override"
+        assert headers["X-CSRF-Token"] == "csrf"
+        assert headers["Cookie"].startswith("session=abc")
+        assert cookies == {"session": "abc", "theme": "dark"}
+        session.close()
+
     def test_dedup_suppresses_duplicate(self, tmp_path):
         from common.finding import Severity
         mod, session = _make_module(tmp_path)

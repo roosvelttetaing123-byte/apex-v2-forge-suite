@@ -4,7 +4,7 @@ import {
   Activity, Search, Shield, Target, Calendar,
   FileText, AlertTriangle, FileCheck, Bell,
   Layers, Users, Clock, Server,
-  Smartphone, Crosshair, Terminal, Settings2
+  Smartphone, Crosshair, Terminal, Settings2, Key
 } from 'lucide-react';
 
 const Sidebar = () => {
@@ -16,6 +16,7 @@ const Sidebar = () => {
         { path: '/red-teaming', icon: Crosshair, label: 'Red Teaming' },
         { path: '/c2-console', icon: Terminal, label: 'C2 Console' },
         { path: '/mobile', icon: Smartphone, label: 'Mobile Pentest' },
+        { path: '/credential-analysis', icon: Key, label: 'Credential Analysis' },
       ]
     },
     {

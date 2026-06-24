@@ -172,17 +172,13 @@ class MassAssignment(BaseModule):
         self, url: str, method: str, data: dict
     ) -> tuple[int, str] | None:
         try:
-            import aiohttp
-            async with aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(ssl=False)
-            ) as session:
+            async with self.http_session(timeout=8) as session:
                 req_method = getattr(session, method.lower(), None)
                 if not req_method:
                     return None
                 async with req_method(
                     url,
                     json=data,
-                    timeout=aiohttp.ClientTimeout(total=8),
                     allow_redirects=False,
                 ) as resp:
                     return resp.status, await resp.text(errors="ignore")

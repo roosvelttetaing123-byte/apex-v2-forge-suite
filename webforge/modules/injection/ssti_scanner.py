@@ -53,10 +53,7 @@ class SstiScanner(BaseModule):
         )
 
         from webforge.core.session import ForgeSession
-        async with ForgeSession(
-            rate=self.config.rate.requests_per_second,
-            proxy=self.config.extra.get("proxy"),
-        ) as session:
+        async with ForgeSession.from_config(self.config) as session:
             await self._test_params(session, target)
 
         return self._make_result(start)

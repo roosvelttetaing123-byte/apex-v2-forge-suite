@@ -9,7 +9,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
-from common.confirm_gate import confirm
 from common.evidence import Evidence
 from common.finding import Severity
 
@@ -98,31 +97,30 @@ class RaceCondition(BaseModule):
         """Send concurrent requests and look for race condition indicators."""
         self.log.info("Testing race condition on %s (%s)", url, desc)
 
-        # Prepare simultaneous requests
+        # Single rate_limit() counts the entire blast as one logical action
+        await self.rate_limit()
+
+        # Prepare simultaneous requests using one shared session
         results: list[tuple[int, str]] = []
 
-        async def _single_request():
+        async def _single_request(session) -> tuple[int, str]:
             try:
-                import aiohttp
-                async with aiohttp.ClientSession(
-                    connector=aiohttp.TCPConnector(ssl=False)
-                ) as session:
-                    req = getattr(session, method.lower(), session.post)
-                    async with req(
-                        url,
-                        data={"amount": "1", "code": "TEST10", "quantity": "1"},
-                        json={"amount": 1, "code": "TEST10", "quantity": 1},
-                        timeout=aiohttp.ClientTimeout(total=RACE_TIMEOUT),
-                    ) as resp:
-                        body = await resp.text(errors="ignore")
-                        return resp.status, body
+                req = getattr(session, method.lower(), session.post)
+                async with req(
+                    url,
+                    data={"amount": "1", "code": "TEST10", "quantity": "1"},
+                    json={"amount": 1, "code": "TEST10", "quantity": 1},
+                ) as resp:
+                    body = await resp.text(errors="ignore")
+                    return resp.status, body
             except Exception:
                 return 0, ""
 
-        # Launch all at once
-        tasks = [_single_request() for _ in range(RACE_THREADS)]
-        start_time = time.monotonic()
-        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Launch all at once from one shared session to reduce connection overhead
+        async with self.http_session(timeout=RACE_TIMEOUT) as session:
+            tasks = [_single_request(session) for _ in range(RACE_THREADS)]
+            start_time = time.monotonic()
+            raw_results = await asyncio.gather(*tasks, return_exceptions=True)
         elapsed = time.monotonic() - start_time
 
         for r in raw_results:
@@ -182,3 +180,42 @@ class TestRaceCondition:
 
     def test_race_threads_positive(self) -> None:
         assert RACE_THREADS > 5
+
+    def test_rate_limit_called_once_before_blast(self) -> None:
+        """rate_limit() must be called exactly once per endpoint, not per thread."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mod = RaceCondition.__new__(RaceCondition)
+        mod.config = MagicMock()
+        mod.config.target = "http://example.com"
+        mod.config.extra = {}
+        mod.log = MagicMock()
+        mod._seen_finding_keys = {}
+
+        rate_limit_calls: list[int] = []
+
+        async def fake_rate_limit():
+            rate_limit_calls.append(1)
+
+        mock_resp = MagicMock()
+        mock_resp.status = 404
+        mock_resp.text = AsyncMock(return_value="not found")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(mod, "rate_limit", side_effect=fake_rate_limit), \
+             patch.object(mod, "http_session", return_value=mock_session):
+            asyncio.run(mod._test_race(
+                "http://example.com/api/redeem", "POST", "coupon redemption", "http://example.com"
+            ))
+
+        assert len(rate_limit_calls) == 1, (
+            f"rate_limit() must be called exactly once per endpoint blast, "
+            f"got {len(rate_limit_calls)}"
+        )

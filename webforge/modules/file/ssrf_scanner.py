@@ -241,6 +241,9 @@ class SsrfScanner(BaseModule):
             for input_name in form.get("inputs", []):
                 if re.search("|".join(URL_PARAMS), input_name, re.IGNORECASE):
                     action = form.get("action", target)
+                    if not self.check_scope(action):
+                        self.log.debug("ssrf_scanner: skipping out-of-scope form action: %s", action)
+                        continue
                     for ssrf_url in list(SSRF_TARGETS.values())[:2]:
                         await self.rate_limit()
                         data = {i: "test" for i in form.get("inputs", [])}
@@ -283,9 +286,12 @@ class SsrfScanner(BaseModule):
         if not collab_domain:
             return
 
-        collab = CollabClient(domain=collab_domain)
+        collab = CollabClient(collab_domain=collab_domain)
 
         for url, param in test_targets[:5]:
+            if not self.check_scope(url):
+                self.log.debug("ssrf_scanner: skipping out-of-scope OOB target: %s", url)
+                continue
             await self.rate_limit()
             try:
                 token = collab.register("ssrf_scanner", "blind_ssrf", url, param)
@@ -386,3 +392,62 @@ class TestSsrfScanner:
 
     def test_aws_imds_url(self) -> None:
         assert "169.254.169.254" in SSRF_TARGETS.get("AWS IMDS v1", "")
+
+    def test_post_forms_skips_out_of_scope_action(self) -> None:
+        """_post_forms_for_ssrf must not POST to out-of-scope form actions."""
+        import asyncio
+        from unittest.mock import MagicMock, patch
+
+        mod = SsrfScanner.__new__(SsrfScanner)
+        mod.config = MagicMock()
+        mod.config.target = "http://in-scope.example.com"
+        mod.config.extra = {}
+        mod.log = MagicMock()
+        mod._seen_finding_keys = {}
+
+        forms = [{"inputs": ["url"], "action": "http://out-of-scope.evil.com/submit"}]
+        posted_urls = []
+
+        async def fake_post(url, **kwargs):
+            posted_urls.append(url)
+            return MagicMock(__aenter__=MagicMock(), __aexit__=MagicMock())
+
+        with patch.object(mod, "check_scope", side_effect=lambda u: "in-scope.example.com" in u), \
+             patch.object(mod, "rate_limit", return_value=asyncio.sleep(0)):
+            asyncio.run(mod._post_forms_for_ssrf(forms, "http://in-scope.example.com"))
+
+        assert not any("out-of-scope.evil.com" in u for u in posted_urls), \
+            "Must not POST to out-of-scope form action"
+
+    def test_oob_skips_out_of_scope_url(self) -> None:
+        """_test_blind_ssrf_oob must not fire requests for out-of-scope URLs."""
+        import asyncio
+        import sys
+        from unittest.mock import MagicMock, patch
+
+        mod = SsrfScanner.__new__(SsrfScanner)
+        mod.config = MagicMock()
+        mod.config.target = "http://in-scope.example.com"
+        mod.config.extra = {"collab_domain": "collab.forge.local"}
+        mod.log = MagicMock()
+        mod._seen_finding_keys = {}
+
+        test_targets = [("http://out-of-scope.evil.com/?url=x", "url")]
+        rate_limit_called = []
+
+        async def fake_rate_limit():
+            rate_limit_called.append(True)
+
+        # Mock forge_collab so CollabClient instantiation doesn't fail
+        mock_collab_client = MagicMock()
+        mock_forge_collab = MagicMock()
+        mock_forge_collab.server.CollabClient = MagicMock(return_value=mock_collab_client)
+
+        with patch.dict(sys.modules, {"forge_collab": mock_forge_collab,
+                                       "forge_collab.server": mock_forge_collab.server}), \
+             patch.object(mod, "check_scope", return_value=False), \
+             patch.object(mod, "rate_limit", side_effect=fake_rate_limit):
+            asyncio.run(mod._test_blind_ssrf_oob(test_targets, "http://in-scope.example.com"))
+
+        assert not rate_limit_called, "rate_limit() must not be called for out-of-scope OOB targets"
+        mock_collab_client.register.assert_not_called()

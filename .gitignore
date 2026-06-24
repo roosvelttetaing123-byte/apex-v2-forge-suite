@@ -17,6 +17,13 @@ env/
 # Engagement artefacts (target-specific — keep out of source control)
 *.json
 !requirements*.json
+engagements/
+extracted_images/
+*.html
+
+# Reports / presentations
+*.pptx
+*.docx
 
 # Logs and evidence output
 *.log

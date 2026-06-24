@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+ import { useState, useEffect, useRef, useCallback } from 'react';
 import { WS_URL, getAuthToken, NO_AUTH_TOKEN } from '../config/api';
 
 export const useWebSocket = (url = WS_URL, authToken = getAuthToken()) => {

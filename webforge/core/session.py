@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import ssl
 import time
 from typing import Any
 
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
+
+from common.config import BaseForgeConfig
 
 log = logging.getLogger(__name__)
 
@@ -119,6 +122,63 @@ class ForgeSession:
         self.base_cookies.update(cookies)
         if self._session:
             self._session.cookie_jar.update_cookies(cookies)
+
+    @classmethod
+    def from_config(
+        cls,
+        config: BaseForgeConfig,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        include_auth: bool = True,
+        timeout: int = 30,
+    ) -> "ForgeSession":
+        """Create a ForgeSession with proxy, rate, auth headers, and cookies."""
+        merged_headers: dict[str, str] = {}
+        merged_cookies: dict[str, str] = {}
+        if include_auth:
+            merged_headers.update(config.extra.get("session_headers", {}) or {})
+            token = config.extra.get("token") or config.extra.get("jwt_token")
+            if token and "Authorization" not in merged_headers:
+                merged_headers["Authorization"] = f"Bearer {token}"
+
+            cookie_header = (
+                config.extra.get("cookie")
+                or (config.extra.get("session_headers", {}) or {}).get("Cookie")
+            )
+            if cookie_header and "Cookie" not in merged_headers:
+                merged_headers["Cookie"] = _clean_cookie_header(str(cookie_header))
+            merged_cookies.update(config.extra.get("session_cookies", {}) or {})
+            if cookie_header:
+                merged_cookies.update(_parse_cookie_header(str(cookie_header)))
+
+        merged_headers.update(headers or {})
+        merged_cookies.update(cookies or {})
+        return cls(
+            rate=config.rate.requests_per_second,
+            proxy=config.extra.get("proxy") or config.proxy,
+            timeout=timeout,
+            headers=merged_headers,
+            cookies=merged_cookies,
+        )
+
+
+def _parse_cookie_header(value: str) -> dict[str, str]:
+    cleaned = _clean_cookie_header(value)
+    parsed: dict[str, str] = {}
+    for part in cleaned.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, cookie_value = part.split("=", 1)
+        name = name.strip()
+        if name.lower() in {"path", "domain", "expires", "max-age", "secure", "httponly", "samesite"}:
+            continue
+        parsed[name] = cookie_value.strip()
+    return parsed
+
+
+def _clean_cookie_header(value: str) -> str:
+    return re.sub(r"^cookie:\s*", "", value.strip(), flags=re.IGNORECASE)
 
 
 class TestForgeSession:

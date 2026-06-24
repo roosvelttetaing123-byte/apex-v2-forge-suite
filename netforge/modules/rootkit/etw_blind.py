@@ -95,7 +95,7 @@ class ETWBlind(BaseModule):
 
     NAME        = "etw_blind"
     DESCRIPTION = "Evasion: ETW Blind — patch ETW to blind EDR telemetry"
-    PHASE       = 10
+    PHASE       = 10  # Evasion phase
     TAGS        = [
         "post-exploit", "evasion", "etw", "bypass",
         "defense-evasion", "edr-bypass",

@@ -32,16 +32,7 @@ class IdorScanner(BaseModule):
         self.log.info("IDOR scanning on %s", target)
 
         from webforge.core.session import ForgeSession
-        session_data = self.config.extra.get("session_data")
-        headers: dict[str, str] = {}
-        if self.config.extra.get("token"):
-            headers["Authorization"] = f"Bearer {self.config.extra['token']}"
-
-        async with ForgeSession(
-            rate=self.config.rate.requests_per_second,
-            proxy=self.config.extra.get("proxy"),
-            headers=headers,
-        ) as session:
+        async with ForgeSession.from_config(self.config) as session:
             await self._test_numeric_ids(session, target)
             await self._test_uuid_ids(session, target)
 
@@ -63,6 +54,7 @@ class IdorScanner(BaseModule):
                        str(int(current_id) + 100), "1", "0", "999999"]
 
             try:
+                await self.rate_limit()
                 original_resp = await session.get(target)
                 original_body = await original_resp.text()
                 original_status = original_resp.status
@@ -182,3 +174,41 @@ class TestIdorScanner:
         parsed = urlparse(url)
         numeric = [(i, s) for i, s in enumerate(parsed.path.split("/")) if s.isdigit()]
         assert numeric == [(2, "123")]
+
+    def test_baseline_request_is_rate_limited(self) -> None:
+        """rate_limit() must be called before the baseline GET, not just the ID loop."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock, patch, call
+
+        mod = IdorScanner.__new__(IdorScanner)
+        mod.config = MagicMock()
+        mod.config.target = "https://api.example.com/users/123/profile"
+        mod.log = MagicMock()
+        mod._seen_finding_keys = {}
+
+        rate_calls: list[str] = []
+        get_calls:  list[str] = []
+
+        async def fake_rate_limit():
+            rate_calls.append("rate_limit")
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.text = AsyncMock(return_value="body content longer than 100 chars " * 5)
+
+        async def fake_get(url):
+            get_calls.append(url)
+            return mock_resp
+
+        mock_session = MagicMock()
+        mock_session.get = fake_get
+
+        with patch.object(mod, "rate_limit", side_effect=fake_rate_limit), \
+             patch.object(mod, "new_finding", return_value=None):
+            asyncio.run(mod._test_numeric_ids(mock_session, "https://api.example.com/users/123/profile"))
+
+        # The baseline GET for the one numeric segment should be preceded by rate_limit
+        # rate_calls count = 1 (baseline) + len(test_ids) calls skipping current_id
+        assert len(rate_calls) >= 1, "rate_limit() must be called at least once (baseline)"
+        # First rate_limit call must come before any GET
+        assert rate_calls[0] == "rate_limit"

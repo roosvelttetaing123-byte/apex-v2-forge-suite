@@ -6,7 +6,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
-import aiohttp
 
 CVSS = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N"
 CVSS40 = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -23,10 +22,19 @@ class PriceTamper(BaseModule):
         if not self.check_scope(target):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
-        async with aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=False),
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as session:
+        confirmed = self.confirm_action(
+            module=self.NAME,
+            action="POST modified price/quantity values (-1, 0) to cart/checkout endpoints",
+            target=target,
+            risk=(
+                "Sends POST requests with tampered price fields to checkout endpoints — "
+                "may affect cart state or trigger partial orders. Run on test/staging only."
+            ),
+        )
+        if not confirmed:
+            return self._make_result(start, skipped=True, skip_reason="operator declined")
+
+        async with self.http_session(timeout=10) as session:
             # Look for forms with price/amount/total/quantity fields
             cart_paths = ["/cart", "/checkout", "/basket", "/order", "/api/cart", "/api/orders"]
             price_fields = []
@@ -49,8 +57,8 @@ class PriceTamper(BaseModule):
                                 self._find_price_keys(data, path, price_fields)
                             except json.JSONDecodeError:
                                 pass
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.log.debug("price_tamper: GET %s%s error: %s", target, path, exc)
 
             if price_fields:
                 # Test: Try submitting modified prices
@@ -60,53 +68,88 @@ class PriceTamper(BaseModule):
                     field = field_info["field"]
                     orig_value = field_info["value"]
 
-                    # Try negative price
-                    await self.rate_limit()
-                    try:
-                        async with session.post(
-                            f"{target}{path}",
-                            data={field: "-1", "quantity": "1"},
-                        ) as resp:
-                            body = await resp.text(errors="ignore")
-                            if resp.status == 200 and "error" not in body.lower()[:200]:
+                    for tamper_value in ("-1", "0"):
+                        # Probe 1: POST the tampered value
+                        await self.rate_limit()
+                        try:
+                            async with session.post(
+                                f"{target}{path}",
+                                data={field: tamper_value, "quantity": "1"},
+                            ) as resp:
+                                body = await resp.text(errors="ignore")
+                                if resp.status != 200 or "error" in body.lower()[:200]:
+                                    continue
+
+                            # Probe 2: re-fetch the resource and check if tampered value persisted
+                            # Only flag HIGH if server reflects the tampered value back
+                            await self.rate_limit()
+                            async with session.get(f"{target}{path}") as confirm_resp:
+                                confirm_body = await confirm_resp.text(errors="ignore")
+
+                            # Look for the tampered value or zero-cost indicators in the re-fetched body
+                            price_keywords = [tamper_value, '"price":0', '"amount":0',
+                                              '"total":0', 'price=0', 'amount=0']
+                            confirmed_server = (
+                                any(kw in confirm_body for kw in price_keywords)
+                                or (tamper_value == "-1" and "-1" in confirm_body)
+                            )
+
+                            if confirmed_server:
                                 tamper_results.append({
                                     "field": field, "original": orig_value,
-                                    "tampered": "-1", "accepted": True})
-                    except Exception:
-                        pass
-
-                    # Try zero price
-                    await self.rate_limit()
-                    try:
-                        async with session.post(
-                            f"{target}{path}",
-                            data={field: "0", "quantity": "1"},
-                        ) as resp:
-                            body = await resp.text(errors="ignore")
-                            if resp.status == 200 and "error" not in body.lower()[:200]:
+                                    "tampered": tamper_value, "accepted": True,
+                                    "confirmed": True})
+                            else:
+                                # POST accepted (200, no "error") but not confirmed server-side
                                 tamper_results.append({
                                     "field": field, "original": orig_value,
-                                    "tampered": "0", "accepted": True})
-                    except Exception:
-                        pass
+                                    "tampered": tamper_value, "accepted": True,
+                                    "confirmed": False})
+                        except Exception as exc:
+                            self.log.debug("price_tamper: POST %s%s error: %s", target, path, exc)
 
-                if tamper_results:
-                    ev = Evidence(extra={"tamper_results": tamper_results[:10]})
+                confirmed_tampers = [t for t in tamper_results if t.get("confirmed")]
+                unconfirmed_tampers = [t for t in tamper_results if not t.get("confirmed")]
+
+                if confirmed_tampers:
+                    ev = Evidence(extra={"tamper_results": confirmed_tampers[:10]})
                     self.new_finding(
-                        title=f"Price Tampering — {len(tamper_results)} field(s) accept modified values",
+                        title=f"Price Tampering — {len(confirmed_tampers)} field(s) accept modified values (confirmed)",
                         severity=Severity.HIGH,
                         description=(
-                            f"Client-side price values accepted by server:\n"
+                            f"Client-side price values accepted and reflected back by server:\n"
                             + "\n".join(
-                                f"  {t['field']}: {t['original']} → {t['tampered']} (accepted)"
-                                for t in tamper_results[:5])
+                                f"  {t['field']}: {t['original']} → {t['tampered']} (server confirmed)"
+                                for t in confirmed_tampers[:5])
                         ),
-                        reproduction_steps=["Intercept POST, modify price field to 0 or -1"],
+                        reproduction_steps=["Intercept POST, modify price field to 0 or -1, re-fetch to confirm"],
                         remediation="Validate prices server-side. Never trust client-submitted price values.",
                         references=["CWE-472", "OWASP Business Logic"],
                         evidence=ev, cvss_v31_vector=CVSS, cvss_v40_vector=CVSS40,
                         target=target)
-                else:
+
+                if unconfirmed_tampers:
+                    ev = Evidence(extra={"tamper_results": unconfirmed_tampers[:10]})
+                    self.new_finding(
+                        title=f"Price Tampering — {len(unconfirmed_tampers)} field(s) accepted without error (manual verify)",
+                        severity=Severity.MEDIUM,
+                        description=(
+                            f"Server returned HTTP 200 without an error message for tampered price fields, "
+                            f"but the modified value was not confirmed in a follow-up GET. "
+                            f"Manual testing recommended to determine if server-side validation is present:\n"
+                            + "\n".join(
+                                f"  {t['field']}: {t['original']} → {t['tampered']} (unconfirmed)"
+                                for t in unconfirmed_tampers[:5])
+                        ),
+                        reproduction_steps=["Intercept POST, modify price field, manually inspect cart state"],
+                        remediation="Validate prices server-side. Never trust client-submitted price values.",
+                        references=["CWE-472", "OWASP Business Logic"],
+                        evidence=ev,
+                        cvss_v31_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N",
+                        cvss_v40_vector="CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:L/VA:N/SC:N/SI:N/SA:N",
+                        target=target)
+
+                if not tamper_results:
                     ev = Evidence(extra={"price_fields": price_fields[:10]})
                     self.new_finding(
                         title=f"Price Fields Detected — {len(price_fields)} client-side price fields",
@@ -136,3 +179,24 @@ class PriceTamper(BaseModule):
 
 class TestPriceTamper:
     def test_phase(self) -> None: assert PriceTamper.PHASE == 9
+
+    def test_confirm_gate_declined(self) -> None:
+        """Operator declining confirmation must skip the module."""
+        import asyncio
+        from unittest.mock import MagicMock, patch
+
+        mod = PriceTamper.__new__(PriceTamper)
+        mod.config = MagicMock()
+        mod.config.target = "http://example.com"
+        mod.config.extra = {}
+        mod.log = MagicMock()
+        mod._seen_finding_keys = {}
+        mod._event_bus = None
+        mod.findings = []
+
+        with patch.object(mod, "check_scope", return_value=True), \
+             patch.object(mod, "confirm_action", return_value=False):
+            result = asyncio.run(mod.run())
+
+        assert result.skipped is True
+        assert result.skip_reason == "operator declined"

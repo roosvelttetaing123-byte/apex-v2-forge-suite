@@ -34,7 +34,7 @@ log = logging.getLogger("forge.dashboard.server")
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
     from fastapi import HTTPException, Depends, Query
-    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, RedirectResponse
     from fastapi.staticfiles import StaticFiles
     from fastapi.templating import Jinja2Templates
     HAS_FASTAPI = True
@@ -45,6 +45,9 @@ from common.dashboard.event_bus import Event, EventBus, EventType
 from common.dashboard.state_store import StateStore
 from common.dashboard.auth import (
     generate_token, validate_token, require_role, Role, TokenPayload,
+    get_sso_config, configure_sso_from_discovery, build_sso_authorization_url,
+    consume_sso_state, role_from_sso_claims, issue_identity_token,
+    issue_sso_login_code, consume_sso_login_code,
 )
 
 # ── Paths ─────────────────────────────────────────────────────────────
@@ -130,6 +133,17 @@ def _resolve_modules(ui_ids: list[str]) -> tuple[list[str], list[str], list[str]
                 net.append(entry[1])
                 seen_net.add(entry[1])
     return web, net, bad
+
+
+def _decode_unverified_jwt(token: str) -> dict[str, Any]:
+    """Decode JWT payload without signature verification for post-exchange claim display."""
+    try:
+        import base64
+        payload = token.split(".")[1]
+        padded = payload + "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+    except Exception:
+        return {}
 
 
 class DashboardServer:
@@ -334,6 +348,7 @@ class DashboardServer:
         @app.get("/team", response_class=HTMLResponse)
         @app.get("/activity", response_class=HTMLResponse)
         @app.get("/agents", response_class=HTMLResponse)
+        @app.get("/credential-analysis", response_class=HTMLResponse)
         async def spa_page():
             """Serve React client-side routes on browser refresh/deep link."""
             index_path = _TEMPLATE_DIR / "index.html"
@@ -352,6 +367,134 @@ class DashboardServer:
                 raise HTTPException(status_code=401, detail="Invalid credentials")
             return {"token": token, "username": username}
 
+        @app.get("/api/v1/auth/sso/config")
+        async def api_sso_config():
+            """Return public SSO configuration for the login UI."""
+            cfg = get_sso_config()
+            return cfg.public_dict()
+
+        @app.get("/api/v1/auth/sso/start")
+        async def api_sso_start(request: Request, next: str = "/"):
+            """Start OIDC authorization-code login."""
+            cfg = get_sso_config()
+            if not cfg.enabled:
+                raise HTTPException(status_code=404, detail="SSO is not configured")
+            redirect_uri = cfg.redirect_uri or str(request.url_for("api_sso_callback"))
+            try:
+                url = build_sso_authorization_url(redirect_uri=redirect_uri, next_path=next)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            return RedirectResponse(url)
+
+        @app.get("/api/v1/auth/sso/callback")
+        async def api_sso_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
+            """Complete OIDC login, then redirect UI with a one-time exchange code."""
+            if error:
+                return RedirectResponse(f"/?sso_error={error}")
+            if not code or not state:
+                raise HTTPException(status_code=400, detail="Missing code or state")
+
+            state_data = consume_sso_state(state)
+            if not state_data:
+                raise HTTPException(status_code=400, detail="Invalid or expired SSO state")
+
+            cfg = get_sso_config()
+            redirect_uri = state_data.get("redirect_uri") or cfg.redirect_uri or str(request.url_for("api_sso_callback"))
+            token_payload = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": cfg.client_id,
+            }
+            if cfg.client_secret:
+                token_payload["client_secret"] = cfg.client_secret
+            if cfg.use_pkce and state_data.get("code_verifier"):
+                token_payload["code_verifier"] = state_data["code_verifier"]
+
+            try:
+                import aiohttp as _aiohttp
+                timeout = _aiohttp.ClientTimeout(total=15)
+                async with _aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(cfg.token_endpoint, data=token_payload) as resp:
+                        token_data = await resp.json(content_type=None)
+                        if resp.status >= 400:
+                            log.warning("SSO token exchange failed: HTTP %s %s", resp.status, token_data)
+                            raise HTTPException(status_code=401, detail="SSO token exchange failed")
+
+                    claims: dict[str, Any] = {}
+                    access_token = token_data.get("access_token", "")
+                    if cfg.userinfo_endpoint and access_token:
+                        async with session.get(
+                            cfg.userinfo_endpoint,
+                            headers={"Authorization": f"Bearer {access_token}"},
+                        ) as resp:
+                            if resp.status < 400:
+                                claims.update(await resp.json(content_type=None))
+                    if not claims and token_data.get("id_token"):
+                        claims.update(_decode_unverified_jwt(token_data["id_token"]))
+            except HTTPException:
+                raise
+            except Exception as exc:
+                log.warning("SSO callback failed: %s", exc)
+                raise HTTPException(status_code=401, detail="SSO callback failed")
+
+            username = (
+                claims.get("email")
+                or claims.get("preferred_username")
+                or claims.get("name")
+                or claims.get("sub")
+            )
+            if not username:
+                raise HTTPException(status_code=401, detail="SSO identity missing username/email claim")
+
+            role = role_from_sso_claims(claims, cfg)
+            dashboard_token = issue_identity_token(str(username), role, claims=claims)
+            exchange_code = issue_sso_login_code(dashboard_token)
+            next_path = state_data.get("next") or "/"
+            return RedirectResponse(f"{next_path}?sso_code={exchange_code}")
+
+        @app.post("/api/v1/auth/sso/exchange")
+        async def api_sso_exchange(request: Request):
+            """Exchange one-time SSO code for a dashboard bearer token."""
+            body = await request.json()
+            exchange_code = str(body.get("code", ""))
+            token = consume_sso_login_code(exchange_code)
+            if not token:
+                raise HTTPException(status_code=401, detail="Invalid or expired SSO exchange code")
+            payload = validate_token(token)
+            return {
+                "token": token,
+                "username": payload.username if payload else "",
+                "role": payload.role.value if payload else "",
+            }
+
+        @app.post("/api/v1/auth/sso/discover")
+        async def api_sso_discover(request: Request):
+            """Fetch OIDC discovery metadata for operator configuration."""
+            _require_auth(request, Role.ADMIN)
+            body = await request.json()
+            issuer = str(body.get("issuer", "")).strip().rstrip("/")
+            if not issuer.startswith(("https://", "http://")):
+                raise HTTPException(status_code=400, detail="issuer must be an http(s) URL")
+            try:
+                import aiohttp as _aiohttp
+                timeout = _aiohttp.ClientTimeout(total=10)
+                async with _aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(f"{issuer}/.well-known/openid-configuration") as resp:
+                        data = await resp.json(content_type=None)
+                        if resp.status >= 400:
+                            raise HTTPException(status_code=400, detail=f"Discovery failed with HTTP {resp.status}")
+                configure_sso_from_discovery(data)
+                public = {
+                    key: data.get(key, "")
+                    for key in ("issuer", "authorization_endpoint", "token_endpoint", "userinfo_endpoint", "jwks_uri")
+                }
+                return {"status": "ok", "metadata": public}
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Discovery failed: {exc}")
+
         @app.get("/api/v1/health")
         async def api_health(request: Request):
             """Dashboard connectivity status for UI preflight checks."""
@@ -360,6 +503,7 @@ class DashboardServer:
                 "host": server.host,
                 "port": server.port,
                 "auth_enabled": server.auth_enabled,
+                "sso": get_sso_config().public_dict(),
                 "dashboard_url": server._dashboard_public_url(request),
                 "active_processes": sum(
                     1 for info in server._active_scans.values()
@@ -429,6 +573,35 @@ class DashboardServer:
             _require_auth(request, Role.OPERATOR)
             snap = server.state_store.snapshot()
             return {"credentials": snap.get("credentials", [])}
+
+        @app.post("/api/v1/credentials/analyze")
+        async def api_credentials_analyze(request: Request):
+            """Analyze uploaded credential material without replaying secrets."""
+            _require_auth(request, Role.OPERATOR)
+            body = await request.json()
+            filename = str(body.get("filename", "upload.txt"))
+            content_base64 = str(body.get("content_base64", ""))
+            profile = str(body.get("profile", "defensive"))
+            if not content_base64:
+                raise HTTPException(status_code=400, detail="content_base64 is required")
+            try:
+                from common.dashboard.credential_analysis import analyze_uploaded_credential_file
+                result = analyze_uploaded_credential_file(filename, content_base64, profile=profile)
+                server.event_bus.emit_simple(
+                    EventType.CREDENTIAL_FOUND,
+                    source="credential_analysis",
+                    type="EXPOSURE_ANALYSIS",
+                    account=f"{result['summary']['exposures_found']} exposure(s)",
+                    secret="redacted",
+                    target=filename,
+                    discovered_by="dashboard_upload",
+                )
+                return result
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            except Exception as exc:
+                log.warning("Credential analysis failed: %s", exc)
+                raise HTTPException(status_code=400, detail=f"Analysis failed: {exc}")
 
         @app.get("/api/v1/sessions")
         async def api_sessions(request: Request):

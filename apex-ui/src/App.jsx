@@ -24,10 +24,39 @@ import TeamManagement from './pages/TeamManagement';
 import ActivityLogs from './pages/ActivityLogs';
 import Agents from './pages/Agents';
 import ScanDetail from './pages/ScanDetail';
+import CredentialAnalysis from './pages/CredentialAnalysis';
 
 function App() {
   const [token, setToken] = useState(getAuthToken());
   const [checkingAuthMode, setCheckingAuthMode] = useState(!getAuthToken());
+
+  // Handle SSO exchange code in URL on mount
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const ssoCode = params.get('sso_code');
+    if (ssoCode) {
+      // Clean URL immediately
+      window.history.replaceState({}, '', window.location.pathname);
+      fetch(`${API_BASE}/api/v1/auth/sso/exchange`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: ssoCode }),
+      })
+        .then(r => r.ok ? r.json() : Promise.reject('SSO exchange failed'))
+        .then(data => {
+          if (data.token) {
+            setAuthToken(data.token);
+            setToken(data.token);
+          }
+        })
+        .catch(() => {});
+      return;
+    }
+    const ssoError = params.get('sso_error');
+    if (ssoError) {
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, []);
 
   useEffect(() => {
     if (token) {
@@ -95,6 +124,7 @@ function App() {
           <Route path="/team" element={<TeamManagement />} />
           <Route path="/activity" element={<ActivityLogs />} />
           <Route path="/agents" element={<Agents />} />
+          <Route path="/credential-analysis" element={<CredentialAnalysis authToken={token} />} />
         </Routes>
       </main>
     </div>
@@ -106,6 +136,26 @@ function LoginScreen({ onLogin }) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [ssoConfig, setSsoConfig] = useState(null);
+  const [ssoLoading, setSsoLoading] = useState(false);
+
+  // Check if SSO is available
+  useEffect(() => {
+    fetch(`${API_BASE}/api/v1/auth/sso/config`)
+      .then(r => r.ok ? r.json() : null)
+      .then(data => { if (data?.enabled) setSsoConfig(data); })
+      .catch(() => {});
+  }, []);
+
+  // Check URL for SSO error
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const ssoError = params.get('sso_error');
+    if (ssoError) {
+      setError(`SSO error: ${ssoError}`);
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  }, []);
 
   const login = async () => {
     if (!username.trim() || !password) return;
@@ -131,6 +181,11 @@ function LoginScreen({ onLogin }) {
     }
   };
 
+  const startSSO = () => {
+    setSsoLoading(true);
+    window.location.href = `${API_BASE}/api/v1/auth/sso/start?next=${encodeURIComponent(window.location.pathname)}`;
+  };
+
   const continueWithoutAuth = () => {
     setAuthToken(NO_AUTH_TOKEN);
     onLogin(NO_AUTH_TOKEN);
@@ -147,6 +202,23 @@ function LoginScreen({ onLogin }) {
     }}>
       <Card title="Dashboard Login" style={{ width: '360px' }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          {/* SSO button — shown when configured */}
+          {ssoConfig && (
+            <>
+              <Button variant="primary" onClick={startSSO} disabled={ssoLoading} fullWidth>
+                {ssoLoading ? 'REDIRECTING…' : `SIGN IN WITH ${ssoConfig.provider_name || 'SSO'}`}
+              </Button>
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: '12px',
+                color: 'var(--text-very-dim)', fontSize: '11px', fontFamily: 'var(--font-mono)',
+              }}>
+                <div style={{ flex: 1, height: '1px', background: 'var(--border-color)' }} />
+                OR
+                <div style={{ flex: 1, height: '1px', background: 'var(--border-color)' }} />
+              </div>
+            </>
+          )}
+
           <label className="font-mono text-muted" style={{ fontSize: '11px', textTransform: 'uppercase' }}>Username</label>
           <input value={username} onChange={e => setUsername(e.target.value)} autoComplete="username" />
           <label className="font-mono text-muted" style={{ fontSize: '11px', textTransform: 'uppercase' }}>Password</label>

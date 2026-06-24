@@ -237,6 +237,8 @@ class BaseModule(ABC):
         url: str | None = None,
         confidence: str = "UNVERIFIED",
         verification: "dict[str, Any] | None" = None,
+        operator_confirmed: bool = False,
+        tags: list[str] | None = None,
     ) -> Finding:
         """Create a new finding, add it, and return it."""
         evidence = evidence or Evidence()
@@ -267,6 +269,8 @@ class BaseModule(ABC):
             mitre_attack=mitre_attack or [],
             port=port,
             service=service,
+            operator_confirmed=operator_confirmed,
+            tags=tags or [],
             url=url,
             confidence=confidence,
             status=status,
@@ -277,6 +281,83 @@ class BaseModule(ABC):
         )
         self.add_finding(f)
         return f
+
+    def auth_headers(
+        self,
+        headers: dict[str, str] | None = None,
+        include_auth: bool = True,
+    ) -> dict[str, str]:
+        """Build HTTP headers with the scan's authenticated context applied."""
+        merged: dict[str, str] = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) "
+                "Gecko/20100101 Firefox/120.0"
+            ),
+            "Accept-Encoding": "gzip, deflate",
+        }
+        if include_auth:
+            merged.update(self.config.extra.get("session_headers", {}) or {})
+            token = self.config.extra.get("token") or self.config.extra.get("jwt_token")
+            if token and "Authorization" not in merged:
+                merged["Authorization"] = f"Bearer {token}"
+            cookie_header = self.config.extra.get("cookie")
+            if cookie_header and "Cookie" not in merged:
+                merged["Cookie"] = self._clean_cookie_header(str(cookie_header))
+        merged.update(headers or {})
+        return merged
+
+    def auth_cookies(self, cookies: dict[str, str] | None = None) -> dict[str, str]:
+        """Return cookies captured from CLI, browser storage state, or SSO capture."""
+        merged: dict[str, str] = {}
+        merged.update(self.config.extra.get("session_cookies", {}) or {})
+
+        cookie_header = (
+            self.config.extra.get("cookie")
+            or (self.config.extra.get("session_headers", {}) or {}).get("Cookie")
+        )
+        if cookie_header:
+            merged.update(self._parse_cookie_header(str(cookie_header)))
+
+        merged.update(cookies or {})
+        return merged
+
+    def http_session(
+        self,
+        timeout: float = 10.0,
+        headers: dict[str, str] | None = None,
+        cookies: dict[str, str] | None = None,
+        include_auth: bool = True,
+        **kwargs: Any,
+    ) -> Any:
+        """Create an aiohttp ClientSession using proxy-safe auth headers/cookies."""
+        import aiohttp
+
+        connector = kwargs.pop("connector", None) or aiohttp.TCPConnector(ssl=False)
+        return aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+            headers=self.auth_headers(headers, include_auth=include_auth),
+            cookies=self.auth_cookies(cookies) if include_auth else (cookies or {}),
+            **kwargs,
+        )
+
+    def _parse_cookie_header(self, value: str) -> dict[str, str]:
+        """Parse a Cookie header into a dict without treating attributes as cookies."""
+        cleaned = self._clean_cookie_header(value)
+        parsed: dict[str, str] = {}
+        for part in cleaned.split(";"):
+            part = part.strip()
+            if not part or "=" not in part:
+                continue
+            name, cookie_value = part.split("=", 1)
+            name = name.strip()
+            if name.lower() in {"path", "domain", "expires", "max-age", "secure", "httponly", "samesite"}:
+                continue
+            parsed[name] = cookie_value.strip()
+        return parsed
+
+    def _clean_cookie_header(self, value: str) -> str:
+        return re.sub(r"^cookie:\s*", "", value.strip(), flags=re.IGNORECASE)
 
     def _normalise_confidence(
         self,
@@ -425,10 +506,11 @@ class BaseModule(ABC):
         risk: str,
         on_confirm: Any = None,
         on_skip: Any = None,
+        module: str | None = None,
     ) -> bool:
         """Require operator confirmation before executing a sensitive action."""
         return confirm(
-            module=self.NAME,
+            module=module or self.NAME,
             action=action,
             target=target,
             risk=risk,
