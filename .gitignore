@@ -31,11 +31,14 @@ results/
 evidence/
 screenshots/
 
-# Secrets / env
+# Secrets / env / TLS
 .env
 .env.*
 secrets.*
 credentials.*
+*.pem
+*.key
+.tls/
 
 # IDE
 .idea/
