@@ -66,7 +66,8 @@ jobs:
             sqlalchemy>=2.0.0 \
             networkx>=3.2.0 \
             pytest>=7.4.0 \
-            pytest-asyncio>=0.23.0
+            pytest-asyncio>=0.23.0 \
+            pytest-timeout>=2.2.0
 
       - name: Run test suite
         run: |
@@ -134,8 +135,8 @@ jobs:
       - name: Build Docker image (no push)
         uses: docker/build-push-action@v5
         with:
-          context: ./forge-suite
-          file: ./forge-suite/Dockerfile
+          context: .
+          file: ./Dockerfile
           push: false
           tags: forge-suite:ci-${{ github.sha }}
           cache-from: type=gha
@@ -169,6 +170,7 @@ jobs:
             networkx>=3.2.0 \
             pytest>=7.4.0 \
             pytest-asyncio>=0.23.0 \
+            pytest-timeout>=2.2.0 \
             pytest-cov>=4.1.0
 
       - name: Run coverage
