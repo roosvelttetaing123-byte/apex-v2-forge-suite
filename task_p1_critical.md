@@ -99,9 +99,9 @@
 - [x] ssrf_scanner.py — `_test_blind_ssrf_oob()` wired
 - [x] xxe_scanner.py — `_test_blind_xxe_oob()` wired
 - [ ] **blind_sqli / sqli_scanner.py** — xp_cmdshell DNS / LOAD_FILE via ForgeCollab
-- [ ] **Log4Shell module (Pillar 11)** — canonical JNDI:ldap://collab-domain/ callback
-- [ ] **blind_xss** — stored XSS fires OOB when admin views; ForgeCollab HTTP callback
-- [ ] **blind_cmdi / cmd_inject.py** — curl/ping/nslookup OOB via `_test_blind_cmdi_oob()`
+- [x] **Log4Shell module (Pillar 11)** — `netforge/modules/exploit/log4shell.py` ✅
+- [x] **blind_xss** — `webforge/modules/injection/blind_xss.py` ✅
+- [x] **blind_cmdi** — `webforge/modules/injection/blind_cmdi.py` ✅
 - [ ] CLI: --collab-server domain (sets FORGE_COLLAB_DOMAIN for all modules in one scan)
 
 ---
@@ -113,10 +113,10 @@
 # Critical CVEs that red teams actually hit. Pairs with ForgeCollab OOB.
 
 ### 11A: Web/App Exploits — netforge/modules/exploit/
-- [ ] **log4shell.py** — CVE-2021-44228 JNDI injection via User-Agent/X-Forwarded-For/all headers
-      → Use ForgeCollab DNS callback as OOB proof (canonical Log4Shell detection method)
-- [ ] proxyshell.py — CVE-2021-34473/34523/36942 Exchange 3-step chain
-- [ ] spring4shell.py — CVE-2022-22965 classLoader RCE
+- [x] **log4shell.py** — CVE-2021-44228 JNDI injection via 30+ headers + params + JSON + path
+      → ForgeCollab DNS/HTTP/LDAP OOB callbacks, 14 WAF bypass payloads ✅
+- [x] proxyshell.py — CVE-2021-34473/34523/31207 Exchange 3-step RCE chain ✅
+- [x] spring4shell.py — CVE-2022-22965 classLoader RCE via AccessLogValve ✅
 - [ ] moveit_sqli.py — CVE-2023-34362 MOVEit Transfer
 - [ ] connectwise_rce.py — CVE-2024-1709 auth bypass
 - [ ] fortinet_rce.py — CVE-2024-21762 OOB write

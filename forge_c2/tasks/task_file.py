@@ -85,7 +85,9 @@ class DownloadTask(BaseTask):
                     started_at=start,
                 )
 
-            file_size = path.stat().st_size
+            # Single stat call — avoid redundant I/O
+            file_stat = path.stat()
+            file_size = file_stat.st_size
             if file_size > MAX_FILE_SIZE:
                 return TaskResult(
                     task_id=self.task_id,
@@ -94,10 +96,8 @@ class DownloadTask(BaseTask):
                     started_at=start,
                 )
 
-            # Read the file
-            data = await asyncio.get_event_loop().run_in_executor(
-                None, path.read_bytes,
-            )
+            # Read the file in thread pool (non-blocking)
+            data = await asyncio.to_thread(path.read_bytes)
 
             # Calculate hash
             file_hash = hashlib.sha256(data).hexdigest()
@@ -114,7 +114,7 @@ class DownloadTask(BaseTask):
                     "filename": path.name,
                     "size": file_size,
                     "sha256": file_hash,
-                    "modified": path.stat().st_mtime,
+                    "modified": file_stat.st_mtime,
                 },
             )
 
@@ -202,14 +202,28 @@ class UploadTask(BaseTask):
 
             path = Path(dest_path)
 
+            # Path traversal guard — resolve to absolute and check
+            # for suspicious components
+            resolved = path.resolve()
+            if ".." in path.parts:
+                return TaskResult(
+                    task_id=self.task_id,
+                    status=TaskStatus.FAILED,
+                    error=f"Path traversal detected: {dest_path}",
+                    started_at=start,
+                )
+
             # Create parent directories if needed
             path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Write the file
-            mode = "ab" if append else "wb"
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: path.open(mode).write(file_data),
-            )
+            # Write the file — properly close handle via with-statement
+            write_mode = "ab" if append else "wb"
+
+            def _write_file() -> None:
+                with path.open(write_mode) as fh:
+                    fh.write(file_data)
+
+            await asyncio.to_thread(_write_file)
 
             return TaskResult(
                 task_id=self.task_id,
@@ -218,7 +232,7 @@ class UploadTask(BaseTask):
                 started_at=start,
                 completed_at=time.time(),
                 metadata={
-                    "path": str(path.absolute()),
+                    "path": str(resolved),
                     "size": len(file_data),
                     "sha256": file_hash,
                     "append": append,

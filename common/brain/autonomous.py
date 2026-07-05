@@ -231,6 +231,54 @@ _PHASE_MODULES: dict[str, dict[str, list[str]]] = {
 }
 
 
+
+# ══════════════════════════════════════════════════════════════════════
+# MITRE ATT&CK TECHNIQUE MAPPINGS PER MODULE
+# ══════════════════════════════════════════════════════════════════════
+
+MODULE_ATTACK_TECHNIQUES: dict[str, list[str]] = {
+    "sqli_scanner":       ["T1190", "T1005"],
+    "xss_scanner":        ["T1059.007"],
+    "link_crawler":       ["T1590.005"],
+    "jwt_audit":          ["T1528"],
+    "cors_check":         ["T1539"],
+    "ssrf_scanner":       ["T1190", "T1552.005"],
+    "graphql_audit":      ["T1590.005", "T1213"],
+    "idor_scanner":       ["T1565.001", "T1213"],
+    "upload_bypass":      ["T1190", "T1059"],
+    "oauth_check":        ["T1528", "T1078"],
+    "header_audit":       ["T1190"],
+    "cookie_audit":       ["T1539"],
+    "cmd_inject":         ["T1059", "T1190"],
+    "ssti_scanner":       ["T1059.007", "T1190"],
+    "xxe_scanner":        ["T1190", "T1005"],
+    "lfi_rfi":            ["T1005", "T1190"],
+    "path_traversal":     ["T1005", "T1190"],
+    "nosql_inject":       ["T1190", "T1005"],
+    "default_creds":      ["T1078.001"],
+    "login_brute":        ["T1110.001"],
+    "password_policy":    ["T1201"],
+    "session_audit":      ["T1539"],
+    "http_smuggling":     ["T1190"],
+    "cache_poison":       ["T1190"],
+    "websocket_audit":    ["T1190"],
+    "prototype_poll":     ["T1059.007"],
+    "deserialization":    ["T1190"],
+    "dir_fuzzer":         ["T1083"],
+    "backup_file_check":  ["T1083", "T1005"],
+    "git_exposure":       ["T1552.001"],
+    "api_key_leak":       ["T1552.001"],
+    "info_disclosure":    ["T1590"],
+    "tech_detect":        ["T1590.002"],
+    "cms_detect":         ["T1590.002"],
+    "port_scanner":       ["T1046"],
+    "kerberoast":         ["T1558.003"],
+    "asrep_roast":        ["T1558.004"],
+    "acl_scanner":        ["T1222"],
+    "github_scanner":     ["T1552.001"],
+}
+
+
 # ══════════════════════════════════════════════════════════════════════
 # AUTONOMOUS ENGINE
 # ══════════════════════════════════════════════════════════════════════
@@ -301,6 +349,7 @@ class AutonomousEngine:
         self._running = False
         self._aborted = False
         self._start_time = 0.0
+        self._adaptive_queued: set[str] = set()
 
         # Subscribe to bus so findings_count stays current
         if engagement_bus:
@@ -326,8 +375,13 @@ class AutonomousEngine:
         log.warning("Autonomous engagement abort requested")
 
     def _on_finding_published(self, framework: str, finding: dict[str, Any]) -> None:
-        """Increment findings_count when the bus receives a new finding."""
+        """Increment findings_count and trigger adaptive follow-ups."""
         self._progress.findings_count += 1
+        # Queue adaptive follow-up modules based on the finding
+        try:
+            self._queue_adaptive_modules(finding)
+        except Exception as exc:
+            log.debug("Adaptive queue failed for finding: %s", exc)
 
     async def run_engagement(
         self, config: EngagementConfig
@@ -669,11 +723,11 @@ class AutonomousEngine:
         module: str,
         config: EngagementConfig,
     ) -> None:
-        """Execute a single module.
+        """Execute a single module via framework orchestrator.
 
-        This is the integration point where the autonomous engine
-        hooks into the actual framework orchestrators. Currently
-        logs the execution — actual wiring happens in 9G.
+        Attempts to load the module from the framework's registry and
+        run it against the target. Falls back to logging when the
+        framework orchestrator isn't wired up yet.
         """
         log.info("Executing: %s/%s → %s", framework, module, config.target)
 
@@ -684,7 +738,7 @@ class AutonomousEngine:
             "target": config.target,
             "phase": self._progress.phase.value,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "result": "executed",
+            "result": "pending",
         })
 
         self._emit_progress("module_execute", {
@@ -694,7 +748,43 @@ class AutonomousEngine:
             "phase": self._progress.phase.value,
         })
 
-        # Apply opsec jitter
+        # Attempt real module execution via framework orchestrator
+        executed = False
+        try:
+            orchestrator = self._get_framework_orchestrator(framework)
+            if orchestrator and hasattr(orchestrator, "run_module"):
+                module_timeout = 120.0  # 2 min per module max
+                if config.opsec_level == OpsecLevel.STEALTH:
+                    module_timeout = 300.0  # 5 min in stealth
+                try:
+                    await asyncio.wait_for(
+                        orchestrator.run_module(module, config.target, config),
+                        timeout=module_timeout,
+                    )
+                    executed = True
+                    self._chain_log[-1]["result"] = "success"
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "Module %s/%s timed out after %.0fs",
+                        framework, module, module_timeout,
+                    )
+                    self._progress.errors += 1
+                    self._chain_log[-1]["result"] = "timeout"
+                except Exception as exc:
+                    log.warning(
+                        "Module %s/%s execution error: %s",
+                        framework, module, exc,
+                    )
+                    self._progress.errors += 1
+                    self._chain_log[-1]["result"] = f"error:{exc}"
+        except Exception as exc:
+            log.debug("Orchestrator load failed for %s: %s", framework, exc)
+
+        if not executed:
+            # Fallback: log-only mode (orchestrator not wired yet)
+            self._chain_log[-1]["result"] = "simulated"
+
+        # Apply opsec jitter between modules
         if config.opsec_level == OpsecLevel.STEALTH:
             import random
             jitter = random.uniform(1.0, 5.0)
@@ -704,6 +794,34 @@ class AutonomousEngine:
             jitter = random.uniform(0.2, 1.0)
             await asyncio.sleep(jitter)
         # NOISY: no jitter
+
+    def _get_framework_orchestrator(self, framework: str) -> Any:
+        """Attempt to load a framework's orchestrator for real module dispatch.
+
+        Returns the orchestrator instance or None if not available.
+        Graceful degradation: returns None without raising.
+        """
+        _ORCHESTRATOR_PATHS = {
+            "webforge":  "webforge.orchestrator",
+            "netforge":  "netforge.orchestrator",
+            "adforge":   "adforge.orchestrator",
+            "aiforge":   "aiforge.orchestrator",
+        }
+        module_path = _ORCHESTRATOR_PATHS.get(framework)
+        if not module_path:
+            return None
+        try:
+            import importlib
+            mod = importlib.import_module(module_path)
+            # Convention: orchestrator module exposes get_orchestrator()
+            if hasattr(mod, "get_orchestrator"):
+                return mod.get_orchestrator()
+            # Or a class named Orchestrator
+            if hasattr(mod, "Orchestrator"):
+                return mod.Orchestrator()
+        except (ImportError, AttributeError, Exception) as exc:
+            log.debug("Cannot load orchestrator for %s: %s", framework, exc)
+        return None
 
     async def _fn_sweep(self, config: EngagementConfig, phase: str) -> None:
         """Run false negative sweep after a phase.
@@ -834,6 +952,182 @@ class AutonomousEngine:
             "chains_triggered": self._progress.chains_triggered,
             "review_queue_size": len(self._review_queue),
         }
+
+
+    def _queue_adaptive_modules(self, finding: dict[str, Any]) -> None:
+        """Queue follow-up modules based on confirmed finding keywords.
+
+        Inspects finding title, description, and type for vulnerability
+        indicators and queues targeted follow-up modules that should be
+        run to exploit or further explore the confirmed finding.
+
+        Only queues a module once per engagement (tracked via _adaptive_queued).
+
+        Args:
+            finding: Finding dict containing at minimum 'title' or 'description'.
+        """
+        text = " ".join([
+            str(finding.get("title") or ""),
+            str(finding.get("description") or ""),
+            str(finding.get("type") or ""),
+            str(finding.get("vuln_type") or ""),
+        ]).lower()
+
+        target = str(finding.get("url") or finding.get("target") or "")
+        framework = str(finding.get("framework") or "webforge")
+        phase = self._progress.phase.value
+        trigger_title = str(finding.get("title") or "unknown")
+
+        follow_ups: list[str] = []
+
+        if any(kw in text for kw in ("sql injection", "sqli", "sql error", "database error")):
+            follow_ups += ["sqli_scanner", "sqli_exploit"]
+        if any(kw in text for kw in ("jwt", "json web token", "bearer token", "token forging")):
+            follow_ups += ["jwt_audit"]
+        if any(kw in text for kw in ("file upload", "upload bypass", "unrestricted upload", "multipart")):
+            follow_ups += ["upload_bypass"]
+        if any(kw in text for kw in ("graphql", "introspection query", "graphql schema")):
+            follow_ups += ["graphql_audit"]
+        if any(kw in text for kw in ("ssrf", "server-side request forgery", "request forgery", "internal service")):
+            follow_ups += ["ssrf_scanner"]
+        if any(kw in text for kw in ("admin panel", "admin page", "admin login", "administrator", "management console")):
+            follow_ups += ["login_brute", "default_creds"]
+        if any(kw in text for kw in ("xss", "cross-site scripting", "script injection")):
+            follow_ups += ["xss_scanner"]
+        if any(kw in text for kw in ("ssti", "template injection", "server-side template")):
+            follow_ups += ["ssti_scanner"]
+        if any(kw in text for kw in ("xxe", "xml external entity", "xml injection")):
+            follow_ups += ["xxe_scanner"]
+        if any(kw in text for kw in ("idor", "insecure direct object", "object reference")):
+            follow_ups += ["idor_scanner"]
+        if any(kw in text for kw in ("api key", "access key", "secret key", "api_key", "bearer", "token leak")):
+            follow_ups += ["api_key_leak", "git_exposure"]
+        if any(kw in text for kw in ("lfi", "local file inclusion", "path traversal", "directory traversal")):
+            follow_ups += ["lfi_rfi", "path_traversal"]
+        if any(kw in text for kw in ("command injection", "cmdi", "cmd injection", "rce", "remote code")):
+            follow_ups += ["cmd_inject"]
+        if any(kw in text for kw in ("cors", "cross-origin", "access-control-allow-origin")):
+            follow_ups += ["cors_check"]
+        if any(kw in text for kw in ("subdomain", "dangling", "cname", "takeover")):
+            follow_ups += ["subdomain_enum"]
+
+        for mod in follow_ups:
+            if mod in self._adaptive_queued:
+                continue
+            self._adaptive_queued.add(mod)
+            self._review_queue.append({
+                "framework": framework,
+                "module": mod,
+                "phase": phase,
+                "target": target,
+                "reason": f"Adaptive follow-up triggered by: {trigger_title}",
+                "adaptive": True,
+            })
+            log.debug("Adaptive module queued: %s (triggered by %s)", mod, trigger_title)
+
+    def compute_attack_surface_score(self) -> dict[str, Any]:
+        """Compute an attack surface risk score from current engagement state.
+
+        Aggregates injection points, technology risk, authentication exposure,
+        severity distribution, and WAF presence into a single 0-100 score.
+
+        Returns:
+            Dict with keys:
+                score:     Integer 0-100.
+                risk_band: "CRITICAL" / "HIGH" / "MEDIUM" / "LOW" / "MINIMAL".
+                factors:   List of human-readable contributing factor strings.
+        """
+        score = 0
+        factors: list[str] = []
+
+        findings: list[dict[str, Any]] = []
+        if self._eng_bus:
+            try:
+                findings = self._eng_bus.get_all_findings()
+            except Exception:
+                pass
+
+        injection_types = frozenset({
+            "sqli", "sqli_time", "sqli_error", "sqli_union", "sqli_boolean",
+            "xss", "xss_reflected", "xss_stored", "xss_dom",
+            "ssti", "template_injection", "ssrf", "blind_ssrf",
+            "cmd_injection", "cmdi", "lfi", "rfi", "xxe",
+            "nosql_inject", "graphql_injection", "deserialization",
+            "http_smuggling", "cache_poison",
+        })
+        injection_findings = [
+            f for f in findings
+            if str(f.get("type") or f.get("vuln_type") or "").lower() in injection_types
+        ]
+        if injection_findings:
+            inj_pts = min(35, len(injection_findings) * 7)
+            score += inj_pts
+            factors.append(f"{len(injection_findings)} injection-class findings (+{inj_pts}pts)")
+
+        risky_tech_keywords = (
+            "php", "struts", "coldfusion", "weblogic", "jboss", "jenkins",
+            "wordpress", "drupal", "joomla", "spring", "sharepoint", "exchange",
+            "tomcat", "iis/6", "iis/7", "apache/2.2",
+        )
+        tech_findings = [
+            f for f in findings
+            if any(kw in str(f.get("title") or f.get("description") or "").lower()
+                   for kw in risky_tech_keywords)
+        ]
+        if tech_findings:
+            tech_pts = min(20, len(tech_findings) * 5)
+            score += tech_pts
+            factors.append(f"High-risk technology stack detected (+{tech_pts}pts)")
+
+        auth_keywords = ("login", "authentication", "jwt", "session", "credential", "oauth", "saml", "sso")
+        auth_findings = [
+            f for f in findings
+            if any(kw in str(f.get("title") or f.get("description") or "").lower()
+                   for kw in auth_keywords)
+        ]
+        if auth_findings:
+            auth_pts = min(25, len(auth_findings) * 5)
+            score += auth_pts
+            factors.append(f"Auth surface exposure: {len(auth_findings)} findings (+{auth_pts}pts)")
+
+        crit_high = [
+            f for f in findings
+            if str(f.get("severity") or "").lower() in {"critical", "high"}
+        ]
+        if crit_high:
+            sev_pts = min(20, len(crit_high) * 4)
+            score += sev_pts
+            factors.append(f"{len(crit_high)} critical/high severity findings (+{sev_pts}pts)")
+
+        waf_detected = any(
+            "waf" in str(f.get("title") or "").lower()
+            or "web application firewall" in str(f.get("description") or "").lower()
+            for f in findings
+        )
+        if not waf_detected and findings:
+            score += 5
+            factors.append("No WAF detected — unfiltered attack surface (+5pts)")
+
+        if self._progress.modules_run > 0:
+            cov_pts = min(5, self._progress.modules_run // 5)
+            if cov_pts > 0:
+                score += cov_pts
+                factors.append(f"Scan coverage: {self._progress.modules_run} modules run (+{cov_pts}pts)")
+
+        score = min(100, score)
+
+        if score >= 75:
+            risk_band = "CRITICAL"
+        elif score >= 55:
+            risk_band = "HIGH"
+        elif score >= 35:
+            risk_band = "MEDIUM"
+        elif score >= 15:
+            risk_band = "LOW"
+        else:
+            risk_band = "MINIMAL"
+
+        return {"score": score, "risk_band": risk_band, "factors": factors}
 
     def _emit_progress(self, event_type: str, data: dict[str, Any]) -> None:
         """Emit a progress event to the dashboard."""
