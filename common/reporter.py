@@ -99,6 +99,21 @@ class BaseReporter:
             include_unverified=False,
         )
 
+    def _run_professional_report(self, formats: list[str]) -> dict[str, str]:
+        """Run the async report engine when no event loop is already active.
+
+        Framework orchestrators call ``generate_all`` from an async scan.  Calling
+        ``asyncio.run`` there raises and leaves an un-awaited coroutine behind, so
+        the synchronous fallback is selected explicitly in that context.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            from common.reporting.report_engine import ReportEngine
+            config = self._professional_report_config(formats)
+            return asyncio.run(ReportEngine(self.findings, config).generate())
+        return {}
+
     def generate_json(self) -> str:
         """Generate JSON findings export."""
         out = {
@@ -148,7 +163,7 @@ class BaseReporter:
         """Generate CSV findings export."""
         path = self.results_dir / "findings.csv"
         fields = ["id", "title", "severity", "cvss_v31_score", "target",
-                  "port", "service", "module", "discovered_at"]
+                  "port", "service", "module", "discovered_at", "confidence"]
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
@@ -158,9 +173,7 @@ class BaseReporter:
     def generate_html(self) -> str:
         """Generate a self-contained HTML report via Jinja2 template (falls back to inline)."""
         try:
-            from common.reporting.report_engine import ReportEngine
-            config = self._professional_report_config(["html"])
-            paths = asyncio.run(ReportEngine(self.findings, config).generate())
+            paths = self._run_professional_report(["html"])
             if paths.get("html"):
                 return paths["html"]
         except Exception as exc:
@@ -173,9 +186,7 @@ class BaseReporter:
     def generate_pdf(self) -> str | None:
         """Generate PDF report from HTML via WeasyPrint."""
         try:
-            from common.reporting.report_engine import ReportEngine
-            config = self._professional_report_config(["html", "pdf"])
-            paths = asyncio.run(ReportEngine(self.findings, config).generate())
+            paths = self._run_professional_report(["html", "pdf"])
             if paths.get("pdf"):
                 return paths["pdf"]
         except Exception as exc:
@@ -285,18 +296,20 @@ class BaseReporter:
             refs = ", ".join(f.get("references", []))
             mitre = ", ".join(f.get("mitre_attack", []))
             cvss = f.get("cvss_v31_score", "")
+            confidence = self._escape(f.get("confidence", "UNVERIFIED"))
             rows += f"""
             <tr>
               <td>{i}</td>
               <td><strong>{self._escape(f.get('title',''))}</strong></td>
               <td style="background:{color};color:{text_color};text-align:center;font-weight:bold">
                 {self._escape(sev)}</td>
+              <td><code>{confidence}</code></td>
               <td>{self._escape(str(cvss))}</td>
               <td>{self._escape(f.get('target',''))}</td>
               <td>{self._escape(str(f.get('port','') or ''))}</td>
               <td>{self._escape(f.get('module',''))}</td>
             </tr>
-            <tr><td colspan="7" style="background:#f9f9f9;padding:12px">
+            <tr><td colspan="8" style="background:#f9f9f9;padding:12px">
               <strong>Description:</strong> {self._escape(f.get('description',''))}<br>
               <strong>Reproduction:</strong><ol>{steps}</ol>
               <strong>Remediation:</strong> {self._escape(f.get('remediation',''))}<br>
@@ -347,7 +360,7 @@ class BaseReporter:
 <div class="summary">{summary_bars}</div>
 <table>
   <thead><tr>
-    <th>#</th><th>Vulnerability</th><th>Severity</th><th>CVSS</th>
+    <th>#</th><th>Vulnerability</th><th>Severity</th><th>Confidence</th><th>CVSS</th>
     <th>Target</th><th>Port</th><th>Module</th>
   </tr></thead>
   <tbody>{rows}</tbody>
@@ -378,6 +391,7 @@ class TestReporter:
             "remediation": "Use parameterized queries", "references": ["CWE-89"],
             "mitre_attack": ["TA0001/T1190"], "discovered_at": "2024-01-01T00:00:00Z",
             "evidence": {}, "operator_confirmed": False, "tags": [],
+            "confidence": "HIGH",
         }]
 
     def test_generate_json(self, tmp_path: Path) -> None:

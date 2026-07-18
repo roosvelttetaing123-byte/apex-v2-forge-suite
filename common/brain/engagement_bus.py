@@ -35,6 +35,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
+from common.confidence_policy import normalise_finding
+
 log = logging.getLogger("forge.brain.engagement_bus")
 
 
@@ -126,7 +128,7 @@ CREATE TABLE IF NOT EXISTS findings (
     module      TEXT NOT NULL DEFAULT '',
     description TEXT DEFAULT '',
     remediation TEXT DEFAULT '',
-    confidence  TEXT DEFAULT 'MEDIUM',
+    confidence  TEXT DEFAULT 'UNVERIFIED',
     data_json   TEXT DEFAULT '{}',
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     brain_verdict   TEXT DEFAULT '',
@@ -193,10 +195,14 @@ class _FindingStore:
 
     def store_finding(self, framework: str, finding: dict[str, Any]) -> str:
         """Store a finding and return its ID."""
+        normalised = normalise_finding(finding)
         finding_id = finding.get("id") or str(uuid.uuid4())
         data = {k: v for k, v in finding.items()
                 if k not in ("id", "framework", "title", "severity", "target",
                              "module", "description", "remediation", "confidence")}
+        if "evidence" in normalised:
+            data["evidence"] = normalised["evidence"]
+        data["verification"] = normalised["verification"]
 
         with self._lock:
             self._conn.execute(
@@ -213,7 +219,7 @@ class _FindingStore:
                     finding.get("module", ""),
                     finding.get("description", ""),
                     finding.get("remediation", ""),
-                    finding.get("confidence", "MEDIUM"),
+                    normalised["confidence"],
                     json.dumps(data, default=str),
                 ),
             )
@@ -365,6 +371,11 @@ class _FindingStore:
                 d.update(extra)
             except (json.JSONDecodeError, TypeError):
                 d.pop("data_json", None)
+        confidence_fields = normalise_finding(d)
+        d["confidence"] = confidence_fields["confidence"]
+        if "evidence" in confidence_fields:
+            d["evidence"] = confidence_fields["evidence"]
+        d["verification"] = confidence_fields["verification"]
         return d
 
 
@@ -663,6 +674,12 @@ class EngagementBus:
         Returns:
             The finding ID.
         """
+        confidence_fields = normalise_finding(finding)
+        finding["confidence"] = confidence_fields["confidence"]
+        if "evidence" in confidence_fields:
+            finding["evidence"] = confidence_fields["evidence"]
+        finding["verification"] = confidence_fields["verification"]
+
         # Store
         finding_id = self._store.store_finding(framework, finding)
         finding["id"] = finding_id
@@ -686,6 +703,7 @@ class EngagementBus:
             "title": finding.get("title", ""),
             "severity": finding.get("severity", ""),
             "target": finding.get("target", ""),
+            "confidence": finding["confidence"],
         })
 
         # Notify sync subscribers (lists already captured under lock above)

@@ -54,7 +54,7 @@
 <table>
   <thead>
     <tr>
-      <th>#</th><th>Vulnerability</th><th>Severity</th><th>CVSS</th>
+      <th>#</th><th>Vulnerability</th><th>Severity</th><th>Confidence</th><th>CVSS</th>
       <th>Target</th><th>Port</th><th>Module</th>
     </tr>
   </thead>
@@ -69,13 +69,14 @@
     <td style="background:{{ color }};color:{{ tc }};text-align:center;font-weight:bold">
       {{ sev | e }}
     </td>
+    <td><code>{{ f.confidence | default('UNVERIFIED') | e }}</code></td>
     <td>{{ f.cvss_v31_score | default('') }}</td>
     <td>{{ f.target | default('') | e }}</td>
     <td>{{ f.port | default('') }}</td>
     <td>{{ f.module | default('') | e }}</td>
   </tr>
   <tr>
-    <td colspan="7" class="detail">
+    <td colspan="8" class="detail">
       <strong>Description:</strong> {{ f.description | e }}<br>
       <strong>Reproduction:</strong>
       <ol>

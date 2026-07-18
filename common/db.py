@@ -1,6 +1,7 @@
 """SQLAlchemy 2.0 ORM base models for forge-suite findings storage."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,8 @@ from sqlalchemy import (
     event,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+from common.confidence_policy import normalise_finding
 
 
 class Base(DeclarativeBase):
@@ -177,7 +180,9 @@ def _migrate_sqlite_schema(engine: Any) -> None:
 
 def save_finding(session: Session, finding_dict: dict[str, Any], run_id: str | None = None) -> None:
     """Persist a Finding.to_dict() result to the database."""
-    ev = finding_dict.get("evidence", {})
+    normalised = normalise_finding(finding_dict)
+    ev_value = normalised.get("evidence")
+    ev = ev_value if isinstance(ev_value, Mapping) else {}
     model = FindingModel(
         id                   = finding_dict["id"],
         title                = finding_dict["title"],
@@ -203,11 +208,11 @@ def save_finding(session: Session, finding_dict: dict[str, Any], run_id: str | N
         pcap_path            = ev.get("pcap_path"),
         operator_confirmed   = finding_dict.get("operator_confirmed", False),
         tags                 = json.dumps(finding_dict.get("tags", [])),
-        confidence           = finding_dict.get("confidence", "UNVERIFIED"),
-        status               = finding_dict.get("status", "open"),
+        confidence           = normalised["confidence"],
+        status               = normalised.get("status", "open"),
         vpr_score            = finding_dict.get("vpr_score"),
         vpr_priority         = finding_dict.get("vpr_priority") or finding_dict.get("vpr"),
-        verification         = json.dumps(finding_dict.get("verification") or {}),
+        verification         = json.dumps(normalised.get("verification") or {}),
     )
     session.merge(model)
     session.commit()

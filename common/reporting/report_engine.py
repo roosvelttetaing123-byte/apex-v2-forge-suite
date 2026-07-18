@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from common.confidence_policy import normalise_finding, should_include_default
+
 log = logging.getLogger("forge.reporting.engine")
 
 # ── Severity ordering ────────────────────────────────────────────────────────
@@ -54,9 +56,6 @@ _CONFIDENCE_COLORS = {
 
 
 # ── Config dataclass ─────────────────────────────────────────────────────────
-
-_CONFIDENCE_SUPPRESS = {"LOW", "UNVERIFIED"}
-
 
 @dataclass
 class ReportConfig:
@@ -103,9 +102,9 @@ class ReportEngine:
         findings: list[dict[str, Any]],
         config: ReportConfig,
     ) -> None:
-        visible = findings if config.include_unverified else [
-            f for f in findings
-            if f.get("confidence", "UNVERIFIED") not in _CONFIDENCE_SUPPRESS
+        normalised = [normalise_finding(f) for f in findings]
+        visible = normalised if config.include_unverified else [
+            f for f in normalised if should_include_default(f)
         ]
         # Track suppressed counts for executive summary context
         self._suppressed_count = len(findings) - len(visible)

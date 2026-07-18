@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from common.confidence_policy import normalise_finding
 from common.evidence import Evidence  # noqa: F401 — re-exported for callers
 
 
@@ -61,6 +62,12 @@ class Finding:
     verification:        dict[str, Any] | None   = None   # VerificationResult.to_dict()
 
     def __post_init__(self) -> None:
+        confidence_fields = normalise_finding({
+            "confidence": self.confidence,
+            "verification": self.verification,
+        })
+        self.confidence = confidence_fields["confidence"]
+        self.verification = confidence_fields["verification"]
         if self.cvss_v31_score is None and self.cvss_v31_vector:
             self.cvss_v31_score = cvss31_score(self.cvss_v31_vector)
         if self.cvss_v40_score is None and self.cvss_v40_vector:
@@ -68,6 +75,10 @@ class Finding:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a plain dict for JSON export."""
+        confidence_fields = normalise_finding({
+            "confidence": self.confidence,
+            "verification": self.verification,
+        })
         return {
             "id":                  self.id,
             "title":               self.title,
@@ -89,12 +100,12 @@ class Finding:
             "discovered_at":       self.discovered_at.isoformat(),
             "operator_confirmed":  self.operator_confirmed,
             "tags":                self.tags,
-            "confidence":          self.confidence,
+            "confidence":          confidence_fields["confidence"],
             "status":              self.status,
             "vpr_score":           self.vpr_score,
             "vpr_priority":        self.vpr_priority or self.vpr,
             "vpr":                 self.vpr,
-            "verification":        self.verification,
+            "verification":        confidence_fields["verification"],
             "evidence": {
                 "request_raw":          self.evidence.request_raw,
                 "response_raw":         self.evidence.response_raw,

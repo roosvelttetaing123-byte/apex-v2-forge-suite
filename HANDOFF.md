@@ -1,130 +1,165 @@
-# FORGE-SUITE v5 APEX — Handoff
-# Updated: 2026-06-21 | 11/25 Pillars Done | DA-1/2/3 UI Wiring Done
+# Forge Suite v5 APEX - Engineering Handoff
 
----
+Updated: 2026-07-18
 
-## STATUS
+Current status: engineering prototype / alpha, enterprise readiness approximately 3.5/10.
 
-| # | Pillar | Status |
-|---|--------|--------|
-| 1 | C2 Framework | ✅ |
-| 2 | Live War Room Dashboard | ✅ |
-| 3 | Multi-Target Engine | ✅ |
-| 4 | Post-Exploit + Rootkit | ✅ |
-| 5 | Intel Pipeline | ✅ |
-| 6 | Payload Generation | ✅ |
-| 7 | Advanced Modules (legacy) | ❌ |
-| 8 | Packaging | ✅ |
-| 9 | ForgeBrain (AI) | 🟡 9G remaining: brain verdict panel in War Room |
-| 10 | FP/FN Reduction | 🟡 Engine done, scanner retrofit pending |
-| 11 | Modern CVE Coverage | ❌ |
-| 12 | Cross-Framework Chains | ✅ (engine+chains done, wiring to AutonomousEngine pending) |
-| 13 | Architecture Hardening | ❌ |
-| 14 | Observability | ❌ |
-| 15 | Dashboard UX | 🟡 DA-1/2/3 done, per-page polish pending |
-| 16 | Headless Browser + Auth | ❌ |
-| 17A | ForgeCollab OOB Server | ✅ |
-| 17B | Module OOB Wiring | 🟡 ssrf+xxe done; sqli/Log4Shell/cmdi/xss remain |
-| 18-25 | (Various) | ❌ |
+The weighted score gives the most credit to scanner accuracy/evidence (20%), control-plane integrity (15%), and identity/governance (10%). Architecture breadth is approximately 6/10, but scanner accuracy is 3/10, business-logic detection is approximately 2.5/10, Nessus-like maturity is 4/10, Acunetix-like maturity is 4/10, and C2/operator maturity is 2/10. New files or modules do not improve the score without passing end-to-end acceptance gates.
 
----
+## Authoritative Memory
 
-## WHAT WAS BUILT THIS SESSION (2026-06-21)
+- `ROADMAP.md` is the single source of truth for gaps, priorities, accuracy gates, phases, and release criteria.
+- `HANDOFF.md` is the concise current-state memory for future engineering sessions.
+- Older `task*.md`, `implementation_plan.md`, sprint documents, and enterprise review files are historical input only.
 
-### DA-1: ScanBuilder → Backend Launch
-- `ScanBuilder.jsx`: "Launch Scan" → `POST /api/v1/scans/launch` with full config (target, profile, modules[], intensity, threads, timeout, rateLimit, maxDepth, followRedirects, schedule)
-- On success: toast + navigate to `/` (Automated Scans) after 1.5s
-- On error: red error banner with dismiss
-- "Save Template" → modal → `POST /api/v1/scan/templates`; loads saved templates on mount via `GET /api/v1/scan/templates`
-- `server.py`: Added `POST /api/v1/scans/launch`, `GET/POST /api/v1/scan/templates`, `DELETE /api/v1/scan/templates/{id}`, CORS middleware for dev server
+Read these two files first. Then inspect only the code involved in the requested change.
 
-### DA-2: Automated Scans — Live WebSocket Feed
-- `AutomatedScans.jsx` was already fully wired (WebSocket subscriptions for scan_start/complete/failed, finding_new, brain_verdict, module_progress). No seeded demo data.
-- Added: notification beep via Web Audio API on scan_complete (double beep) and scan_failed/aborted (single low beep)
-- Added: `scan_failed` as explicit event handler
+## Verified Local Baseline
 
-### DA-3: Vulnerabilities — Finding Detail Slide-Out
-- `Vulnerabilities.jsx`: Complete rewrite with:
-  - 40%-width animated slide-out panel on row click (`slideInRight` CSS animation)
-  - Panel: severity/CVSS/VPR/confidence score boxes, description, repro steps, evidence, remediation, metadata
-  - Inline status editor: 4 buttons (Open/Fixed/Accepted/False Positive) → `PATCH /api/v1/findings/{id}/status` with optimistic UI
-  - Re-test button → `POST /api/v1/findings/{id}/retest` with spinner animation
-  - Escape key + outside-click closes panel
-  - Checkbox per row → bulk ops bar (Change Status dropdown, Export JSON, Clear Selection)
-  - Live `FINDING_NEW` / `FINDING_UPDATED` WebSocket subscriptions
-  - Fetches findings from `GET /api/v1/findings` on mount, falls back to rich seed data
-- `server.py`: Added `PATCH /api/v1/findings/{id}/status`, `POST /api/v1/findings/{id}/retest`
+Validation performed without scans, listeners, payload generation, or external network calls:
 
-### CSS Additions (index.css)
-- Added `@keyframes slideIn`, `slideInRight`, `spin`, `fadeIn` — used by toast, slide-out panel, loading spinners
-
----
-
-## ARCHITECTURE (unchanged — see skill.md for full details)
-
-```
-forge-suite/
-├── forge.py                     # Unified launcher
-├── apex-ui/                     # React UI (17 pages, Vite, port 5173)
-│   └── src/pages/               # ScanBuilder, AutomatedScans, Vulnerabilities all now wired
-├── common/dashboard/server.py   # FastAPI + WebSocket (port 1337) — now has CORS, templates, findings mgmt
-├── common/dashboard/event_bus.py # 25+ EventTypes
-├── common/brain/                # ForgeBrain AI
-└── [netforge|webforge|adforge|aiforge|forge_c2|forge_collab|forge_payload]
+```text
+python3 forge.py --help                                      PASS
+framework/dashboard imports                                 PASS
+pytest common webforge netforge adforge aiforge forge_c2 tests
+                                                           245 passed in 15.31s
+Python AST parse                                            497 files, 0 errors
 ```
 
-### Key Backend APIs (server.py)
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| POST | `/api/v1/scans/start` | Launch scan (simple) |
-| POST | `/api/v1/scans/launch` | Launch scan (ScanBuilder full config) |
-| GET | `/api/v1/scans/history` | Scan history |
-| GET/POST | `/api/v1/scan/templates` | Scan templates CRUD |
-| DELETE | `/api/v1/scan/templates/{id}` | Delete template |
-| GET | `/api/v1/findings` | Paginated findings |
-| PATCH | `/api/v1/findings/{id}/status` | Update finding status |
-| POST | `/api/v1/findings/{id}/retest` | Re-test a finding |
-| POST | `/api/v1/control/pause` | Pause scan |
-| POST | `/api/v1/control/resume` | Resume scan |
-| POST | `/api/v1/scans/stop` | Stop all scans |
-| WS | `/ws/dashboard` | Real-time events |
+The preferred `.claude/skills/run-forge-suite/smoke.py` driver is currently missing.
 
----
+## Product Inventory
 
-## NEXT PRIORITY — Pick from task_p1_critical.md
-
-### Remaining P1 tasks (in order):
-1. **9G**: Brain verdict panel in War Room dashboard — subscribe to BRAIN_VERDICT WS event, render verdict chips
-2. **10B**: Scanner retrofit — integrate FPReducer into sqli/xss/ssti/lfi/cmdi scanners
-3. **12 wiring**: Wire ChainEngine into AutonomousEngine.run_engagement() + EngagementBus.publish()
-4. **16A-D**: Headless browser engine (Playwright), login recorder, API schema import, scan profiles
-5. **17B remaining**: blind_sqli, Log4Shell, blind_xss, blind_cmdi OOB wiring
-
-### P2 tasks (task_p2_important.md):
-- Pillar 15F per-page feature completions
-- Pillar 20 Reporting
-
-### P3 tasks (task_p3_nicetohave.md):
-- Command palette, skeleton screens, ScanBuilder enhancements
-
----
-
-## DO NOT TOUCH
-- `index.css` design tokens (vars are stable)
-- `Sidebar.jsx` routes
-- `Card.jsx` / `Button.jsx` / `Badge.jsx` base components
-- `useWebSocket.js` hook (exponential backoff working)
-
----
-
-## HOW TO RUN
-```bash
-cd forge-suite/apex-ui && npm run dev   # UI at http://localhost:5173
-python forge.py dashboard              # Backend at https://localhost:1337
+```text
+forge.py                    unified CLI entry point
+common/                     finding, evidence, scope, FP reduction, DB,
+                            reporting, intel, brain, dashboard/event systems
+netforge/                   network discovery, service/vulnerability modules
+webforge/                   DAST, Playwright/auth, API/schema, logic modules
+adforge/                    Active Directory assessment/emulation modules
+aiforge/                    AI/LLM assessment modules
+forge_c2/                   C2 server/listener/transport/task prototypes
+forge_payload/              payload/build prototypes
+forge_collab/               OOB callback service
+apex-ui/                    React UI source; 19 pages
 ```
 
-## KEY ENV VARS
+Repository snapshot: 602 files, 147,276 Python lines, and 286 `BaseModule` implementation files.
+
+## What Is Real Today
+
+- CLI help and all four framework orchestrator imports work.
+- Python test suite currently collects and passes 245 tests.
+- Structured findings/evidence, SQLite models, reports, compliance maps, VPR, delta code, intel sync, event bus, scan controls, browser/auth helpers, schema import, and many scanner modules exist.
+- FM-P0-001 is fixture-validated: missing, null, blank, whitespace, and unknown finding confidence fail closed to `UNVERIFIED` at shared creation, persistence, dashboard, engagement-bus, and report boundaries.
+- Six WebForge detector files use `FPReducer`: SQLi, XSS, SSTI, LFI/RFI, CMDi, and blind CMDi.
+- Some dashboard scan, finding, credential-analysis, scan-library, and scan-detail paths use backend APIs.
+- High-risk C2/payload CLI paths require both `--red-team` and `FORGE_ENABLE_HIGH_RISK=1` at the outer launcher.
+
+## What Is Not Enterprise-Ready
+
+### Scanner Accuracy
+
+- 272 module files create findings; only 6 use `FPReducer`, only 12 set confidence explicitly, and no module passes structured `verification=` into `new_finding()`.
+- Historical `MEDIUM` rows created before confidence provenance was recorded cannot be automatically distinguished from explicitly verified `MEDIUM` rows.
+- Report formats can expose different finding sets.
+- Logic modules often infer impact from status, length, reflection, or keywords without proving authoritative state changes.
+- Compliance can treat missing findings as PASS instead of NOT_TESTED.
+
+Accuracy work is P0. See `ROADMAP.md` for the proof contract, detector-specific requirements, fixture strategy, and precision/recall gates.
+
+### Control Plane
+
+- `/api/v1/events/emit` is unauthenticated and remote event TLS verification is disabled.
+- Dashboard jobs are process handles in memory; history/templates are global JSON.
+- Shared dashboard state is cleared on `SCAN_START`, so concurrent scans collide.
+- Findings are not canonically owned by run/tenant/engagement.
+- Finding retest is random simulation.
+- Dashboard launch passes `--auto-confirm` and does not enforce an approved engagement scope.
+
+### Identity And Secrets
+
+- Dashboard defaults to `operator / forge2026` with unsalted SHA-256.
+- C2 defaults to `changeme` with fast SHA-256.
+- OIDC ID-token verification is incomplete.
+- UI bearer tokens use `localStorage`.
+- Browser storage-state artifacts may contain plaintext cookies/tokens.
+
+### Frontend And Product Truth
+
+- `apex-ui/package.json` and a lockfile are absent, so install/test/build is not reproducible.
+- 6 of 19 pages use APIs/WebSockets; 13 are static or seeded.
+- Several ScanBuilder controls are accepted but not applied to runtime behavior.
+- Product mode can display fabricated vulnerability/C2/team/agent/schedule data.
+
+### C2
+
+- `forge.py` imports nonexistent `C2Server`; implementation class is `TeamServer`.
+- Operator-shell construction/signature is mismatched; listener CLI is nonfunctional.
+- Operator control traffic is plaintext; auth/session lifecycle is development-grade.
+- Beacon handshake/encryption/result flow is not a coherent interoperable authenticated protocol.
+- Parallel listener, transport, task, and build implementations are not composed.
+- Dashboard C2/team/audit pages are UI-only.
+- Build paths can silently substitute another artifact type while retaining the requested extension.
+
+Do not add C2 stealth/evasion breadth. Fix containment, protocol correctness, identity, durable state, audit, and inert lab conformance first.
+
+### Deployment And QA
+
+- Docker/Compose ship weak default secrets.
+- Health checks call an authenticated endpoint without credentials.
+- Docker has no frontend build stage; result volume paths do not match all scanner output paths.
+- Dependencies and downloaded tooling are not reproducibly locked/signed.
+- CI runs a small suite, does not build/test the frontend, has no accuracy fixture corpus, and does not enforce a coverage or security threshold.
+
+## Red Team Sprint Memory
+
+The authoritative Sprint 0-11 disposition is in `ROADMAP.md`.
+
+- Active now: Sprint 2 integration correctness, Sprint 9 evidence/reporting, Sprint 10 safe connector contracts, and Sprint 11 scanner accuracy.
+- Resume after P0/P1: Sprint 0 passive leak-intel coverage and Sprint 1 bounded read-only cloud/container coverage.
+- Partial: Sprints 0, 1, 2, 6, 9, 10, and 11; none currently passes its full end-to-end acceptance contract.
+- Missing or mostly missing: Sprints 3, 4, 5, 7, and 8.
+- Deferred: offensive C2 task, evasion, supply-chain, macOS implant, transport, delivery, OPSEC, and exfiltration expansion until scope, identity, protocol, persistence, audit, and inert lab gates pass.
+
+Do not mark a sprint complete because files import or a UI exists. Require launcher/API wiring, authorization and scope enforcement, durable state, deterministic evidence, reporting, and automated acceptance tests.
+
+## Immediate Work Order
+
+`FM-P0-001` is fixture-validated. Continue with `FM-P0-002`, then process `FM-P0-003` through `FM-P0-014` in order.
+
+Current ordered accuracy/reporting work:
+
+1. Build one canonical report dataset shared by all formats.
+2. Quarantine weak logic findings from default reports.
+3. Add detector verification metadata and positive/negative fixtures.
+4. Authenticate event ingestion and enforce approved scope.
+
+## Latest Acceptance Evidence
+
+FM-P0-001 was fixture-validated on 2026-07-18 without network activity, scans, listeners, or payload generation:
+
+```text
+pytest -q -W error tests/test_confidence_policy.py
+55 passed in 2.64s under warnings-as-errors
+
+pytest -q common webforge netforge adforge aiforge forge_c2 tests
+245 passed in 15.31s
 ```
-ANTHROPIC_API_KEY, FORGE_BRAIN_MODEL=claude-opus-4-8, FORGE_COLLAB_DOMAIN
-FORGE_DASHBOARD_PASSWORD, FORGE_C2_ADMIN_PW
-```
+
+The acceptance matrix covers policy normalization, finding creation, module output, database persistence, dashboard snapshots, engagement-bus publication/storage, JSON, CSV, HTML, and the PDF HTML-source contract. Explicit canonical confidence remains unchanged. The score remains 3.5/10 because canonical cross-format parity, structured detector proof, measured precision/recall, and the remaining Phase 0 gates have not passed.
+
+## Safety Boundaries
+
+- Never scan targets without written authorization.
+- Do not start listeners, generate payloads, or perform active exploit validation during ordinary tests.
+- Use loopback/inert fixtures and local vulnerable applications for integration tests.
+- Enforce scope at every outbound hop, including redirects and resolved IPs.
+- Do not expose secrets in argv, logs, events, reports, UI state, screenshots, or test artifacts.
+- High-risk actions need explicit policy, scope, actor, approval, audit, and cleanup state.
+
+## Product Positioning
+
+Current approved label: `Engineering Prototype / Alpha`.
+
+Do not claim enterprise-grade status or parity with Nessus, Acunetix, or Cobalt Strike until the corresponding release gates in `ROADMAP.md` pass.

@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from common.confidence_policy import normalise_finding
 from common.dashboard.event_bus import Event, EventBus, EventType
 from common.dashboard.kill_chain import KillChainState
 from common.dashboard.metrics import MetricsCollector, MetricsSnapshot
@@ -47,16 +48,34 @@ class FindingEntry:
     vpr_priority: str = ""
     verification: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        confidence_fields = normalise_finding({
+            "confidence": self.confidence,
+            "verification": self.verification,
+            "evidence": self.evidence,
+        })
+        self.confidence = confidence_fields["confidence"]
+        self.verification = confidence_fields["verification"] or {}
+        self.evidence = confidence_fields.get("evidence") or {}
+
     def to_dict(self) -> dict[str, Any]:
+        confidence_fields = normalise_finding({
+            "confidence": self.confidence,
+            "verification": self.verification,
+            "evidence": self.evidence,
+        })
+        evidence = confidence_fields.get("evidence") or {}
         return {
             "id": self.id, "title": self.title, "severity": self.severity,
             "module": self.module, "target": self.target,
             "cvss_score": self.cvss_score, "timestamp": self.timestamp,
             "url": self.url, "port": self.port, "service": self.service,
             "description": self.description, "mitre": self.mitre,
-            "evidence": self.evidence, "confidence": self.confidence,
+            "evidence": evidence,
+            "confidence": confidence_fields["confidence"],
             "status": self.status, "vpr_score": self.vpr_score,
-            "vpr_priority": self.vpr_priority, "verification": self.verification,
+            "vpr_priority": self.vpr_priority,
+            "verification": confidence_fields["verification"] or {},
         }
 
 
@@ -353,6 +372,7 @@ class StateStore:
 
     def _on_finding(self, event: Event) -> None:
         d = event.data
+        normalised = normalise_finding(d)
         entry = FindingEntry(
             id=d.get("id", str(uuid.uuid4())[:8]),
             title=d.get("title", "Untitled"),
@@ -366,12 +386,12 @@ class StateStore:
             service=d.get("service", ""),
             description=d.get("description", ""),
             mitre=d.get("mitre_attack", []),
-            evidence=d.get("evidence", {}),
-            confidence=d.get("confidence", "UNVERIFIED"),
-            status=d.get("status", "open"),
+            evidence=normalised.get("evidence") or {},
+            confidence=normalised["confidence"],
+            status=normalised.get("status", "open"),
             vpr_score=d.get("vpr_score"),
             vpr_priority=d.get("vpr_priority", ""),
-            verification=d.get("verification", {}),
+            verification=normalised.get("verification") or {},
         )
         with self._lock:
             self.findings.append(entry)

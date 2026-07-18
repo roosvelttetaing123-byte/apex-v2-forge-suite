@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import hashlib
 import logging
 import re
@@ -16,11 +17,19 @@ if TYPE_CHECKING:
     from common.dashboard.event_bus import EventBus
 
 from common.config import BaseForgeConfig
+from common.confidence_policy import infer_confidence, normalise_confidence
 from common.confirm_gate import confirm
 from common.db import Session, save_finding
 from common.evidence import Evidence
 from common.finding import Finding, Severity, cvss31_score
 from common.scope import Scope, ScopeViolation
+
+
+class _UnsetConfidence:
+    pass
+
+
+_UNSET_CONFIDENCE = _UnsetConfidence()
 
 
 @dataclass
@@ -235,14 +244,17 @@ class BaseModule(ABC):
         service: str | None = None,
         target: str | None = None,
         url: str | None = None,
-        confidence: str = "UNVERIFIED",
+        confidence: str | None | _UnsetConfidence = _UNSET_CONFIDENCE,
         verification: "dict[str, Any] | None" = None,
         operator_confirmed: bool = False,
         tags: list[str] | None = None,
     ) -> Finding:
         """Create a new finding, add it, and return it."""
         evidence = evidence or Evidence()
-        verification = verification or self._verification_from_evidence(evidence)
+        verification_value = verification or self._verification_from_evidence(evidence)
+        verification = (
+            dict(verification_value) if isinstance(verification_value, Mapping) else {}
+        )
         confidence = self._normalise_confidence(
             confidence,
             verification=verification,
@@ -361,18 +373,17 @@ class BaseModule(ABC):
 
     def _normalise_confidence(
         self,
-        confidence: str,
+        confidence: str | None | _UnsetConfidence,
         verification: dict[str, Any] | None = None,
         evidence: Evidence | None = None,
     ) -> str:
         """Return canonical finding confidence."""
-        raw = confidence
-        if raw == "UNVERIFIED" and verification:
-            raw = str(verification.get("confidence") or raw)
-        if raw == "UNVERIFIED" and evidence:
-            raw = str(evidence.extra.get("fp_confidence") or raw)
-        raw = raw.upper().replace(" ", "_")
-        return raw if raw in {"HIGH", "MEDIUM", "LOW", "UNVERIFIED"} else "UNVERIFIED"
+        if confidence is not _UNSET_CONFIDENCE:
+            return normalise_confidence(confidence)
+        return infer_confidence({
+            "verification": verification,
+            "evidence": {"extra": (evidence.extra if evidence else {})},
+        })
 
     def _verification_from_evidence(self, evidence: Evidence) -> dict[str, Any]:
         """Promote FPReducer evidence extras into the first-class verification field."""
