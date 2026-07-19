@@ -23,6 +23,20 @@ from forge_c2.tasks.task_file import DownloadTask, UploadTask
 from forge_c2.tasks.task_screenshot import ScreenshotTask
 from forge_c2.tasks.task_socks import SocksTask, HashDumpTask
 
+# ── Sprint 3: C2 Task Expansion (12 new tasks) ────────────────────
+from forge_c2.tasks.task_assembly import AssemblyTask
+from forge_c2.tasks.task_keylogger import KeyloggerTask
+from forge_c2.tasks.task_browser_creds import BrowserCredsTask
+from forge_c2.tasks.task_clipboard import ClipboardTask
+from forge_c2.tasks.task_mimikatz import MimikatzTask
+from forge_c2.tasks.task_registry import RegistryTask
+from forge_c2.tasks.task_service import ServiceTask
+from forge_c2.tasks.task_wmi import WMITask
+from forge_c2.tasks.task_inject import InjectTask
+from forge_c2.tasks.task_token import TokenTask
+from forge_c2.tasks.task_portscan import PortScanTask
+from forge_c2.tasks.task_download_exec import DownloadExecTask
+
 __all__ = [
     # Base
     "BaseTask",
@@ -32,11 +46,24 @@ __all__ = [
     "get_task_class",
     "create_task",
     "list_task_types",
-    # Tasks
+    # Original Tasks
     "ShellTask",
     "DownloadTask",
     "UploadTask",
     "ScreenshotTask",
     "SocksTask",
     "HashDumpTask",
+    # Sprint 3 Tasks
+    "AssemblyTask",
+    "KeyloggerTask",
+    "BrowserCredsTask",
+    "ClipboardTask",
+    "MimikatzTask",
+    "RegistryTask",
+    "ServiceTask",
+    "WMITask",
+    "InjectTask",
+    "TokenTask",
+    "PortScanTask",
+    "DownloadExecTask",
 ]
