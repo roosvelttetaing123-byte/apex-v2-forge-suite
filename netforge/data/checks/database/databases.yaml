@@ -1,0 +1,597 @@
+id: redis-unauthenticated
+name: "Redis Server Unauthenticated Access"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [misconfig, redis, no-auth, rce]
+target_service: redis
+target_ports: [6379, 6380]
+description: |
+  Redis server accessible without authentication. Allows data theft,
+  modification, and RCE via CONFIG SET + module loading or
+  Lua script execution.
+detection:
+  - type: tcp_probe
+    ports: [6379, 6380]
+    send: "PING\r\n"
+    match:
+      - body_contains: "+PONG"
+  - type: tcp_probe
+    ports: [6379, 6380]
+    send: "INFO server\r\n"
+    match:
+      - body_contains: "redis_version"
+remediation: "Enable Redis AUTH. Bind to localhost. Use ACLs in Redis 6+."
+references:
+  - https://redis.io/topics/security
+---
+id: CVE-2022-0543-redis-lua-sandbox
+cve: CVE-2022-0543
+name: "Redis Lua Sandbox Escape RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, redis, cisa-kev, lua]
+target_service: redis
+target_ports: [6379]
+description: "Redis Lua sandbox escape in Debian/Ubuntu packages allowing arbitrary code execution."
+detection:
+  - type: tcp_probe
+    ports: [6379]
+    send: "INFO server\r\n"
+    match:
+      - body_regex: "redis_version:[0-6]\\."
+  - type: version
+    cpe_vendor: "redis"
+    cpe_product: "redis"
+    version_range: ">=2.6,<6.2.7"
+remediation: "Upgrade Redis to 6.2.7+ or 7.0.0+."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2022-0543
+---
+id: mongodb-unauthenticated
+name: "MongoDB Server Unauthenticated Access"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+tags: [misconfig, mongodb, no-auth]
+target_service: mongodb
+target_ports: [27017, 27018]
+description: |
+  MongoDB accessible without authentication. Allows full database
+  read/write access. Common target for ransomware.
+detection:
+  - type: tcp_probe
+    ports: [27017, 27018]
+    send: "\x41\x00\x00\x00\x3a\x30\x00\x00\xff\xff\xff\xff\xd4\x07\x00\x00\x00\x00\x00\x00\x61\x64\x6d\x69\x6e\x2e\x24\x63\x6d\x64\x00\x00\x00\x00\x00\x01\x00\x00\x00\x15\x00\x00\x00\x10\x69\x73\x6d\x61\x73\x74\x65\x72\x00\x01\x00\x00\x00\x00"
+    read_bytes: 4096
+    match:
+      - body_regex: "(?i)(ismaster|mongodb|maxBsonObjectSize)"
+    match_all: false
+remediation: "Enable MongoDB authentication. Bind to localhost. Use TLS."
+references:
+  - https://docs.mongodb.com/manual/security/
+---
+id: elasticsearch-unauthenticated
+name: "Elasticsearch Cluster Unauthenticated Access"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [misconfig, elasticsearch, no-auth]
+target_service: elasticsearch
+target_ports: [9200, 9300]
+description: |
+  Elasticsearch cluster accessible without authentication.
+  Allows full index read/write, node manipulation, and
+  script execution for RCE.
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - body_contains: "cluster_name"
+      - body_contains: "lucene_version"
+  - type: http
+    method: GET
+    path: "/_cat/indices"
+    match:
+      - status_code: 200
+    match_all: false
+remediation: "Enable X-Pack security. Use API keys. Bind to localhost."
+references:
+  - https://www.elastic.co/guide/en/elasticsearch/reference/current/security-minimal-setup.html
+---
+id: CVE-2015-1427-elasticsearch-rce
+cve: CVE-2015-1427
+name: "Elasticsearch Groovy Sandbox Bypass RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, elasticsearch, groovy]
+target_service: elasticsearch
+target_ports: [9200]
+description: "Elasticsearch before 1.4.3 allows RCE via Groovy sandbox bypass."
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - body_regex: "\"number\"\\s*:\\s*\"1\\.[0-3]\\."
+  - type: version
+    cpe_vendor: "elastic"
+    cpe_product: "elasticsearch"
+    version_range: ">=1.0,<1.4.3"
+remediation: "Upgrade Elasticsearch to 1.4.3+. Disable dynamic scripting."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2015-1427
+---
+id: mysql-no-password
+name: "MySQL Root Without Password"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [misconfig, mysql, no-auth, default-creds]
+target_service: mysql
+target_ports: [3306]
+description: "MySQL server allows root login without password."
+detection:
+  - type: banner
+    ports: [3306]
+    match:
+      - banner_regex: "(?i)(mysql|MariaDB)"
+    match_all: false
+remediation: "Set a strong root password. Restrict network access."
+references:
+  - https://dev.mysql.com/doc/refman/8.0/en/default-privileges.html
+---
+id: postgres-trust-auth
+name: "PostgreSQL Trust Authentication Enabled"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [misconfig, postgresql, trust-auth, no-auth]
+target_service: postgresql
+target_ports: [5432]
+description: "PostgreSQL using trust authentication allowing passwordless access."
+detection:
+  - type: banner
+    ports: [5432]
+    match:
+      - banner_regex: "(?i)(PostgreSQL|PGSQL)"
+    match_all: false
+remediation: "Change pg_hba.conf from 'trust' to 'md5' or 'scram-sha-256'."
+references:
+  - https://www.postgresql.org/docs/current/auth-trust.html
+---
+id: memcached-unauthenticated
+name: "Memcached Unauthenticated Access"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:L"
+tags: [misconfig, memcached, no-auth, amplification]
+target_service: memcached
+target_ports: [11211]
+description: |
+  Memcached accessible without authentication. Can be abused
+  for DDoS amplification attacks and data theft.
+detection:
+  - type: tcp_probe
+    ports: [11211]
+    send: "stats\r\n"
+    match:
+      - body_contains: "STAT pid"
+remediation: "Bind to localhost. Enable SASL authentication. Use firewall rules."
+references:
+  - https://github.com/memcached/memcached/wiki/SASLHowto
+---
+id: couchdb-unauthenticated
+name: "CouchDB Unauthenticated Admin Access"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [misconfig, couchdb, no-auth]
+target_service: couchdb
+target_ports: [5984, 6984]
+description: "CouchDB accessible without authentication in admin party mode."
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - body_contains: "couchdb"
+      - body_contains: "welcome"
+  - type: http
+    method: GET
+    path: "/_all_dbs"
+    match:
+      - status_code: 200
+      - body_regex: "\\["
+remediation: "Create admin user. Enable authentication in CouchDB config."
+references:
+  - https://docs.couchdb.org/en/stable/intro/security.html
+---
+id: etcd-unauthenticated
+name: "etcd Unauthenticated Access"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [misconfig, etcd, kubernetes, no-auth]
+target_service: etcd
+target_ports: [2379, 2380]
+description: |
+  etcd key-value store accessible without authentication.
+  In Kubernetes clusters, contains secrets, configs, and
+  service account tokens.
+detection:
+  - type: http
+    method: GET
+    path: "/version"
+    match:
+      - body_contains: "etcdserver"
+  - type: http
+    method: GET
+    path: "/v2/keys/"
+    match:
+      - status_code: 200
+      - body_contains: "node"
+remediation: "Enable TLS client authentication. Restrict access to control plane."
+references:
+  - https://etcd.io/docs/v3.5/op-guide/security/
+---
+id: CVE-2012-1823-php-cgi-rce
+cve: CVE-2012-1823
+name: "PHP-CGI Remote Code Execution via Query String Parameter Injection"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, php, cgi, cisa-kev, web, injection]
+target_service: http
+target_ports: [80, 443, 8080, 8443]
+description: |
+  PHP before 5.3.12 and 5.4.x before 5.4.2 when configured as a CGI script
+  processes certain query string parameters as command-line options.
+  An attacker can pass -s to view source code, or -d allow_url_include=1
+  combined with -d auto_prepend_file= to achieve RCE without authentication.
+  Still found on legacy LAMP stacks backing database-driven applications.
+  MITRE ATT&CK: T1190 (Exploit Public-Facing Application).
+detection:
+  - type: http
+    method: GET
+    path: "/index.php?-s"
+    match:
+      - status_code: 200
+      - body_regex: "<\\?php|<font color"
+  - type: http
+    method: GET
+    path: "/?-s"
+    match:
+      - status_code: 200
+      - body_contains: "<?php"
+  - type: version
+    cpe_vendor: "php"
+    cpe_product: "php"
+    version_range: ">=5.3.0,<5.3.12"
+remediation: |
+  Upgrade PHP immediately to 5.3.12+ or 5.4.2+. If upgrading is not possible,
+  use mod_rewrite rules to block requests containing PHP query string command flags.
+  Move away from CGI mode to PHP-FPM or mod_php.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2012-1823
+  - https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+  - https://www.exploit-db.com/exploits/18836
+---
+id: mssql-sa-no-password
+name: "MSSQL SA Account Without Password"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [misconfig, mssql, default-creds, no-auth, rce]
+target_service: mssql
+target_ports: [1433]
+description: |
+  Microsoft SQL Server system administrator (SA) account has no password set
+  or uses a blank password. This provides full database administrator access,
+  and via xp_cmdshell can achieve OS-level command execution. Common finding
+  on default SQL Server Express installations and legacy deployments.
+  MITRE ATT&CK: T1078.001 (Default Accounts), T1059.003 (Windows Command Shell via xp_cmdshell).
+detection:
+  - type: banner
+    ports: [1433]
+    match:
+      - banner_regex: "(?i)(MSSQL|Microsoft SQL Server)"
+  - type: tcp_probe
+    ports: [1433]
+    send: "\x12\x01\x00\x34\x00\x00\x00\x00\x00\x00\x15\x00\x06\x01\x00\x1b\x00\x01\x02\x00\x1c\x00\x0c\x03\x00\x28\x00\x04\xff\x08\x00\x01\x55\x00\x00\x00\x4d\x53\x53\x51\x4c\x53\x65\x72\x76\x65\x72\x00\xab\xcd"
+    read_bytes: 1024
+    match:
+      - banner_regex: "(?i)(MSSQL|Microsoft SQL|LoginAck)"
+    match_all: false
+remediation: |
+  Set a strong password for the SA account immediately: ALTER LOGIN [sa] WITH PASSWORD='<strong_password>'.
+  Disable the SA account if Windows Authentication is used: ALTER LOGIN [sa] DISABLE.
+  Enable SQL Server audit logging. Restrict port 1433 to trusted hosts only.
+references:
+  - https://docs.microsoft.com/en-us/sql/relational-databases/security/choose-an-authentication-mode
+  - https://www.cisa.gov/sites/default/files/publications/CISA_MS-ISAC_Ransomware%20Guide_S508C.pdf
+---
+id: postgresql-pg-hba-world-readable
+name: "PostgreSQL Accepting Connections — pg_hba World Access Indicator"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N"
+tags: [misconfig, postgresql, pg-hba, exposure, default-creds]
+target_service: postgresql
+target_ports: [5432]
+description: |
+  PostgreSQL server is accepting network connections, which may indicate
+  pg_hba.conf is configured with overly permissive access rules such as
+  'host all all 0.0.0.0/0 md5' or 'host all all 0.0.0.0/0 trust'.
+  Banner enumeration confirms the PostgreSQL version and network exposure.
+  Combined with default credentials (postgres/postgres) this commonly
+  leads to full database compromise.
+  MITRE ATT&CK: T1078.001 (Default Accounts), T1190.
+detection:
+  - type: banner
+    ports: [5432]
+    match:
+      - banner_regex: "(?i)(PostgreSQL|PGSQL|invalid startup packet)"
+  - type: tcp_probe
+    ports: [5432]
+    send: "\x00\x00\x00\x17\x00\x03\x00\x00user\x00postgres\x00\x00"
+    read_bytes: 1024
+    match:
+      - banner_regex: "(?i)(PostgreSQL|authentication|FATAL|password)"
+    match_all: false
+remediation: |
+  Audit /var/lib/postgresql/*/main/pg_hba.conf and restrict connection rules
+  to specific IP ranges. Use scram-sha-256 authentication (not trust or md5).
+  Change default postgres account password. Bind PostgreSQL to localhost unless
+  remote access is explicitly required. Deploy SSL/TLS for all remote connections.
+references:
+  - https://www.postgresql.org/docs/current/auth-pg-hba-conf.html
+  - https://cwe.mitre.org/data/definitions/1188.html
+---
+id: cassandra-unauthenticated
+name: "Apache Cassandra Unauthenticated Access"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+tags: [misconfig, cassandra, no-auth, database]
+target_service: cassandra
+target_ports: [9042, 9160]
+description: |
+  Apache Cassandra CQL native transport port (9042) is accessible without
+  authentication. Default Cassandra installations use AllowAllAuthenticator,
+  meaning any client can connect and query all keyspaces without credentials.
+  Attackers can read, modify, or delete all data without authentication.
+  MITRE ATT&CK: T1078.001 (Default Accounts), T1005 (Data from Local System).
+detection:
+  - type: tcp_probe
+    ports: [9042]
+    send: "\x04\x00\x00\x01\x05\x00\x00\x00\x00"
+    read_bytes: 1024
+    match:
+      - banner_regex: "(?i)(cassandra|CQL|READY|cluster_name)"
+    match_all: false
+  - type: banner
+    ports: [9042]
+    match:
+      - banner_regex: "(?i)(cassandra|CQL native)"
+    match_all: false
+remediation: |
+  Enable authentication in cassandra.yaml: set authenticator: PasswordAuthenticator
+  and authorizer: CassandraAuthorizer. Change default cassandra/cassandra credentials.
+  Bind native transport to specific interfaces. Use TLS for client-node encryption.
+references:
+  - https://cassandra.apache.org/doc/latest/cassandra/operating/security.html
+  - https://cwe.mitre.org/data/definitions/306.html
+---
+id: influxdb-unauthenticated
+name: "InfluxDB Unauthenticated Access"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+tags: [misconfig, influxdb, no-auth, timeseries, metrics]
+target_service: influxdb
+target_ports: [8086]
+description: |
+  InfluxDB HTTP API is accessible without authentication. Default installations
+  of InfluxDB 1.x have authentication disabled. Attackers can enumerate all
+  databases, read time-series data (which often contains security metrics,
+  infrastructure telemetry, or operational data), and write malicious data.
+  MITRE ATT&CK: T1005, T1078.001.
+detection:
+  - type: http
+    method: GET
+    path: "/ping"
+    match:
+      - status_code: 204
+      - header_contains: "X-Influxdb-Version"
+  - type: http
+    method: GET
+    path: "/query?q=SHOW+DATABASES"
+    match:
+      - status_code: 200
+      - body_contains: "results"
+      - body_contains: "databases"
+    match_all: false
+remediation: |
+  Enable authentication in influxdb.conf: set auth-enabled = true in [http] section.
+  Create admin user before enabling auth: CREATE USER admin WITH PASSWORD '<password>' WITH ALL PRIVILEGES.
+  Use InfluxDB 2.x with built-in token-based authentication. Restrict port 8086 access.
+references:
+  - https://docs.influxdata.com/influxdb/v1.8/administration/authentication_and_authorization/
+  - https://cwe.mitre.org/data/definitions/306.html
+---
+id: neo4j-unauthenticated-browser
+name: "Neo4j Browser Unauthenticated Access"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+tags: [misconfig, neo4j, no-auth, graph-database, browser]
+target_service: neo4j
+target_ports: [7474, 7687]
+description: |
+  Neo4j database browser interface on port 7474 (HTTP) and Bolt protocol
+  on port 7687 are accessible. Earlier Neo4j versions ship with auth disabled
+  by default. Attackers can access the Cypher shell, enumerate all graph
+  data, and execute arbitrary Cypher queries including procedures that
+  may allow Java code execution (apoc.cypher.runFile, dbms.security.*).
+  MITRE ATT&CK: T1078.001, T1005.
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - body_contains: "Neo4j"
+      - status_code: 200
+  - type: http
+    method: GET
+    path: "/db/data/"
+    match:
+      - status_code: 200
+      - body_contains: "neo4j_version"
+    match_all: false
+remediation: |
+  Enable authentication in neo4j.conf: set dbms.security.auth_enabled=true.
+  Change the default neo4j/neo4j password on first login.
+  Bind to localhost unless remote access required. Disable the browser UI in production.
+references:
+  - https://neo4j.com/docs/operations-manual/current/authentication-authorization/
+  - https://cwe.mitre.org/data/definitions/306.html
+---
+id: rabbitmq-management-unauthenticated
+name: "RabbitMQ Management Interface Default Credentials"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L"
+tags: [misconfig, rabbitmq, default-creds, message-queue]
+target_service: rabbitmq
+target_ports: [15672, 15671]
+description: |
+  RabbitMQ management plugin web interface is accessible with default
+  credentials (guest/guest). The guest account is restricted to localhost
+  by default in RabbitMQ 3.3+, but many deployments override this.
+  Full access allows: reading queued messages, publishing malicious messages,
+  modifying exchanges/queues, and in some configurations achieving SSRF.
+  MITRE ATT&CK: T1078.001 (Default Accounts), T1530.
+detection:
+  - type: http
+    method: GET
+    path: "/api/overview"
+    headers:
+      Authorization: "Basic Z3Vlc3Q6Z3Vlc3Q="
+    match:
+      - status_code: 200
+      - body_contains: "rabbitmq_version"
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - status_code: 200
+      - body_contains: "RabbitMQ Management"
+    match_all: false
+remediation: |
+  Change or disable the guest account: rabbitmqctl delete_user guest.
+  Create named admin users with strong passwords. Restrict management
+  interface to trusted networks. Enable TLS for AMQP and management API.
+references:
+  - https://www.rabbitmq.com/access-control.html
+  - https://cwe.mitre.org/data/definitions/1188.html
+---
+id: CVE-2021-25646-druid-rce
+cve: CVE-2021-25646
+name: "Apache Druid Remote Code Execution via Server Request"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, druid, apache, cisa-kev, analytics]
+target_service: druid
+target_ports: [8888, 8082, 8083, 8081, 8090]
+description: |
+  Apache Druid includes the ability to execute user-provided JavaScript code
+  embedded in various types of requests. CVE-2021-25646 allows authenticated
+  users (and in default configs, unauthenticated users) to execute arbitrary
+  code by submitting a crafted request to the /druid/indexer/v1/sampler endpoint
+  with a malicious transform expression or JavaScript aggregator.
+  MITRE ATT&CK: T1190, T1059.007 (JavaScript).
+detection:
+  - type: http
+    method: GET
+    path: "/status"
+    match:
+      - status_code: 200
+      - body_contains: "version"
+      - body_contains: "druid"
+  - type: http
+    method: GET
+    path: "/druid/coordinator/v1/config"
+    match:
+      - status_code: [200, 404, 401]
+      - body_regex: "(?i)(druid|coordinator)"
+    match_all: false
+  - type: version
+    cpe_vendor: "apache"
+    cpe_product: "druid"
+    version_range: ">=0.20.0,<0.21.1"
+remediation: |
+  Upgrade Apache Druid to 0.21.1 or later. As a workaround, set
+  druid.javascript.enabled=false in runtime.properties. Require authentication
+  for all Druid API endpoints. Restrict Druid ports to internal networks.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-25646
+  - https://lists.apache.org/thread.html/r685b420f94b0281b5b3e2bd9f89e7b1fa10a97cf0c42fa9b5f1f75f1@%3Cdev.druid.apache.org%3E
+---
+id: oracle-tns-listener-exposure
+name: "Oracle TNS Listener Exposed — Poison/SID Enumeration Risk"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:L"
+tags: [exposure, oracle, tns, listener, sid-enum, database]
+target_service: oracle
+target_ports: [1521, 1526, 1527, 1528]
+description: |
+  Oracle TNS Listener is exposed on port 1521. Unauthenticated remote attackers
+  can query the listener to enumerate Oracle SIDs, service names, and listener
+  version. In older Oracle versions (<10g), the listener accepts remote
+  configuration commands (TNS Listener Poisoning). Valid SIDs enable brute-force
+  authentication attacks against Oracle accounts (SYS, SYSTEM, DBSNMP).
+  MITRE ATT&CK: T1046 (Network Service Scanning), T1110 (Brute Force).
+detection:
+  - type: tcp_probe
+    ports: [1521, 1526]
+    send: "\x00\x57\x00\x00\x01\x00\x00\x00\x01\x36\x01\x2c\x00\x00\x08\x00\x7f\xff\x86\x0e\x00\x00\x00\x01\x00\x00\x30\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    read_bytes: 1024
+    match:
+      - banner_regex: "(?i)(TNSLSNR|Oracle|VSNNUM|TNS)"
+    match_all: false
+remediation: |
+  Require password authentication for Oracle TNS Listener (set PASSWORDS_LISTENER
+  in listener.ora). Disable TNSLSNR remote configuration (set ADMIN_RESTRICTIONS=ON).
+  Restrict port 1521 to application server IPs only. Upgrade to Oracle 12c+ with
+  valid listener password and TCPS for encryption.
+references:
+  - https://www.tenable.com/plugins/nessus/12085
+  - https://orasec.blogspot.com/2009/01/oracle-tns-listener-poisoning.html
+  - https://cwe.mitre.org/data/definitions/306.html
+---
+id: CVE-2019-12384-jackson-deserialization
+cve: CVE-2019-12384
+name: "Jackson Deserialization RCE — FasterXML jackson-databind"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, deserialization, jackson, java, cisa-kev, injection]
+target_service: http
+target_ports: [80, 443, 8080, 8443, 8090]
+description: |
+  FasterXML jackson-databind 2.x before 2.9.9.2 contains a deserialization
+  vulnerability via a gadget chain involving logback-core JNDI lookup.
+  When polymorphic type handling is enabled (defaultTyping or @JsonTypeInfo),
+  a crafted JSON payload can trigger JNDI lookup to an attacker-controlled
+  server, leading to remote code execution. Common in Java applications with
+  database backends (Spring Boot + JPA, Hibernate, MyBatis applications).
+  MITRE ATT&CK: T1190, T1059.007.
+detection:
+  - type: http
+    method: POST
+    path: "/api/login"
+    headers:
+      Content-Type: "application/json"
+    body: "{\"username\":\"test\",\"password\":\"test\"}"
+    match:
+      - body_regex: "(?i)(jackson|ObjectMapper|JsonMappingException|com\\.fasterxml)"
+    match_all: false
+  - type: version
+    cpe_vendor: "fasterxml"
+    cpe_product: "jackson-databind"
+    version_range: ">=2.0.0,<2.9.9.2"
+remediation: |
+  Upgrade jackson-databind to 2.9.9.2+, 2.10.x, or 2.11.x.
+  Disable global default typing: mapper.deactivateDefaultTyping().
+  Use allowlist-based polymorphic type validation.
+  Apply virtual patching via WAF rules blocking @class, @type JSON keys.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2019-12384
+  - https://github.com/FasterXML/jackson-databind/issues/2341
+  - https://www.cisa.gov/known-exploited-vulnerabilities-catalog

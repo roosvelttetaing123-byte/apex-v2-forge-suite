@@ -538,20 +538,20 @@ class TestTokenTask:
     def test_whoami(self) -> None:
         import asyncio
         task = TokenTask(task_id="tk3", action="whoami")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.COMPLETED
         assert "User:" in result.output
 
     def test_list(self) -> None:
         import asyncio
         task = TokenTask(task_id="tk4", action="list")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.COMPLETED
 
     def test_invalid_action(self) -> None:
         import asyncio
         task = TokenTask(task_id="tk5", action="bogus")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_steal_no_pid(self) -> None:
@@ -559,7 +559,7 @@ class TestTokenTask:
         from unittest.mock import patch
         with patch("common.confirm_gate.confirm", return_value=True):
             task = TokenTask(task_id="tk6", action="steal")
-            result = asyncio.get_event_loop().run_until_complete(task.execute())
+            result = asyncio.run(task.execute())
             assert result.status == TaskStatus.FAILED
 
     def test_token_info_to_dict(self) -> None:

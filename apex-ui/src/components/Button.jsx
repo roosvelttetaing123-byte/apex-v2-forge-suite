@@ -1,6 +1,15 @@
 import React from 'react';
 
-const Button = ({ children, variant = 'primary', onClick, className = '', style, fullWidth, disabled = false }) => {
+const Button = ({
+  children,
+  variant = 'primary',
+  onClick = undefined,
+  className = '',
+  style = {},
+  fullWidth = false,
+  disabled = false,
+  title = undefined,
+}) => {
   const baseStyle = {
     padding: '8px 16px',
     borderRadius: '4px',
@@ -46,6 +55,7 @@ const Button = ({ children, variant = 'primary', onClick, className = '', style,
         style={{ ...baseStyle, ...variants[variant] }}
         onClick={disabled ? undefined : onClick}
         disabled={disabled}
+        title={title}
       >
         {children}
       </button>

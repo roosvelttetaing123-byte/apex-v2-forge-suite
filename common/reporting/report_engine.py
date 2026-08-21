@@ -1,4 +1,4 @@
-"""Forge Suite v5 APEX — Report Engine.
+"""Forge Suite — Report Engine.
 
 Generates professional penetration test reports in PDF and HTML from a
 list of Finding dicts (as returned by Finding.to_dict()).
@@ -17,7 +17,8 @@ FOR AUTHORIZED PENETRATION TESTING AND RED TEAM OPERATIONS ONLY.
 from __future__ import annotations
 
 import asyncio
-import base64
+import io
+import importlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -25,7 +26,37 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from common.artifact_io import (
+    ArtifactBoundaryError,
+    absolute_lexical_path,
+    atomic_write_bytes,
+    ensure_private_directory,
+    read_verified_regular_file,
+)
+from common.redaction import redact_text, redact_value, redacted_json_dumps
+from common.verification_policy import normalise_finding_truth
+from common.version import PRODUCT_LABEL, VERSION
+
 log = logging.getLogger("forge.reporting.engine")
+
+
+def _ensure_report_directory(path: Path) -> None:
+    """Validate/create a no-follow private directory chain."""
+    try:
+        ensure_private_directory(path)
+    except ArtifactBoundaryError as exc:
+        if str(exc) == "artifact directory must be a real directory":
+            raise ValueError("report directory must be a real directory") from None
+        raise ValueError("report directory is unavailable") from None
+
+
+def _write_private_bytes(path: Path, content: bytes) -> None:
+    """Atomically replace a report through a pinned no-follow parent."""
+    atomic_write_bytes(path, content, mode=0o600)
+
+
+def _write_private_text(path: Path, content: str) -> None:
+    _write_private_bytes(path, content.encode("utf-8"))
 
 # ── Severity ordering ────────────────────────────────────────────────────────
 
@@ -63,7 +94,7 @@ class ReportConfig:
     """Configuration for a single report generation run."""
     engagement:     str         = "Untitled Engagement"
     target:         str         = ""
-    tester:         str         = "Forge Suite v5 APEX"
+    tester:         str         = PRODUCT_LABEL
     client:         str         = ""
     classification: str         = "CONFIDENTIAL — FOR AUTHORIZED USE ONLY"
     scope:          list[str]   = field(default_factory=list)
@@ -75,6 +106,9 @@ class ReportConfig:
     include_mitre_appendix: bool = True
     include_unverified: bool    = False  # if False, LOW/UNVERIFIED suppressed from default report
     logo_path:      str | None  = None
+    include_compliance: bool     = True   # Auto-evaluate PCI DSS / OWASP / ISO 27001
+    compliance_collection: Any   = None   # Explicit CollectionEvidence; absent means not tested
+    compliance_authority: Any    = None   # Out-of-band signed execution authority
 
     def __post_init__(self) -> None:
         if not self.methodology:
@@ -103,8 +137,9 @@ class ReportEngine:
         findings: list[dict[str, Any]],
         config: ReportConfig,
     ) -> None:
-        visible = findings if config.include_unverified else [
-            f for f in findings
+        safe_findings = [redact_value(finding) for finding in findings]
+        visible = safe_findings if config.include_unverified else [
+            f for f in safe_findings
             if f.get("confidence", "UNVERIFIED") not in _CONFIDENCE_SUPPRESS
         ]
         # Track suppressed counts for executive summary context
@@ -118,7 +153,7 @@ class ReportEngine:
         )
         self.config     = config
         self.output_dir = Path(config.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_report_directory(self.output_dir)
         self.generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     async def generate(self) -> dict[str, str]:
@@ -132,7 +167,7 @@ class ReportEngine:
         # Generate executive summary via ForgeBrain narrator (optional)
         exec_summary = ""
         if self.config.include_exec_summary:
-            exec_summary = await self._generate_exec_summary()
+            exec_summary = redact_text(await self._generate_exec_summary())
 
         # Build enriched findings (embed screenshots as b64)
         enriched = self._enrich_findings()
@@ -146,17 +181,20 @@ class ReportEngine:
         # MITRE ATT&CK TTP appendix
         mitre_ttps = self._collect_mitre_ttps(enriched) if self.config.include_mitre_appendix else []
 
-        # Logo base64 (if provided)
+        # Caller-supplied binary branding is not embedded in an ordinary
+        # report.  Work Package 102 owns validated redacted derivatives.
         logo_b64 = self._load_logo()
 
         context = {
-            "engagement":        self.config.engagement,
-            "target":            self.config.target,
-            "tester":            self.config.tester,
-            "client":            self.config.client,
-            "classification":    self.config.classification,
-            "scope":             self.config.scope,
-            "methodology":       self.config.methodology,
+            "product_label":     PRODUCT_LABEL,
+            "product_version":   VERSION,
+            "engagement":        redact_text(self.config.engagement),
+            "target":            redact_text(self.config.target),
+            "tester":            redact_text(self.config.tester),
+            "client":            redact_text(self.config.client),
+            "classification":    redact_text(self.config.classification),
+            "scope":             redact_value(self.config.scope),
+            "methodology":       redact_value(self.config.methodology),
             "generated_at":      self.generated_at,
             "findings":          enriched,
             "summary":           summary,
@@ -167,7 +205,39 @@ class ReportEngine:
             "logo_b64":          logo_b64,
             "total_findings":    len(enriched),
             "suppressed_count":  self._suppressed_count,
+            "compliance_reports": [],
         }
+
+        # ── Compliance framework evaluation ──────────────────────────────
+        if self.config.include_compliance:
+            try:
+                from common.reporting.compliance_engine import (
+                    ComplianceEngine, ComplianceFramework, ComplianceStatus,
+                )
+                finding_dicts = [f for f in enriched]  # already dict
+                c_reports = ComplianceEngine.evaluate_all(
+                    finding_dicts,
+                    self.config.compliance_collection,
+                    self.config.compliance_authority,
+                )
+                compliance_data = []
+                for fw_name, report in c_reports.items():
+                    compliance_data.append({
+                        "framework": fw_name,
+                        "compliance_pct": report.compliance_pct,
+                        "coverage_pct": report.coverage_pct,
+                        "pass": report.pass_count,
+                        "fail": report.fail_count,
+                        "partial": report.partial_count,
+                        "not_applicable": report.not_applicable_count,
+                        "not_tested": report.not_tested_count,
+                        "collection_error": report.collection_error_count,
+                        "summary": report.summary(),
+                        "rules": [r.to_dict() for r in report.results],
+                    })
+                context["compliance_reports"] = compliance_data
+            except Exception:
+                log.warning("Compliance evaluation failed")
 
         if "html" in self.config.formats:
             html_path = self._generate_html(context)
@@ -206,35 +276,46 @@ class ReportEngine:
         except ImportError:
             log.warning("Jinja2 not available — using inline HTML builder")
             html = _build_html_inline(ctx)
-        except Exception as exc:
-            log.error("HTML template render failed: %s", exc)
+        except Exception:
+            log.error("HTML template render failed")
             html = _build_html_inline(ctx)
 
         path = self.output_dir / "report.html"
-        path.write_text(html, encoding="utf-8")
+        _write_private_text(path, redact_text(html))
         return str(path)
 
     # ── PDF generation ────────────────────────────────────────────────────────
 
     def _generate_pdf(self, html_path: str | None) -> str | None:
-        """Render PDF via WeasyPrint from the HTML file."""
-        if not html_path or not Path(html_path).exists():
-            log.warning("PDF skipped — no HTML source at %s", html_path)
+        """Render PDF from pinned HTML bytes without a filename reopen race."""
+        if not html_path:
+            log.warning("PDF skipped — no HTML source")
             return None
         try:
-            from weasyprint import HTML as WP_HTML, CSS as WP_CSS
+            expected = absolute_lexical_path(self.output_dir / "report.html")
+            selected = absolute_lexical_path(html_path)
+            if selected != expected:
+                log.warning("PDF skipped — HTML source is outside the report boundary")
+                return None
+            html_content = read_verified_regular_file(selected)
+            weasyprint = importlib.import_module("weasyprint")
             pdf_path = self.output_dir / "report.pdf"
-            WP_HTML(filename=html_path).write_pdf(
-                str(pdf_path),
-                stylesheets=[WP_CSS(string=_PDF_CSS_OVERRIDE)],
-            )
+            with io.BytesIO() as artifact:
+                weasyprint.HTML(
+                    string=html_content.decode("utf-8", errors="replace")
+                ).write_pdf(
+                    artifact,
+                    stylesheets=[weasyprint.CSS(string=_PDF_CSS_OVERRIDE)],
+                )
+                content = artifact.getvalue()
+            _write_private_bytes(pdf_path, content)
             return str(pdf_path)
         except ImportError:
             log.warning("WeasyPrint not installed — PDF generation skipped. "
                         "Install with: pip install weasyprint")
             return None
-        except Exception as exc:
-            log.error("PDF generation failed: %s", exc)
+        except Exception:
+            log.error("PDF generation failed")
             return None
 
     # ── JSON export ───────────────────────────────────────────────────────────
@@ -242,6 +323,8 @@ class ReportEngine:
     def _generate_json(self, ctx: dict[str, Any]) -> str | None:
         """Export structured JSON report."""
         out = {
+            "product":        ctx["product_label"],
+            "product_version": ctx["product_version"],
             "generated_at":   ctx["generated_at"],
             "engagement":     ctx["engagement"],
             "target":         ctx["target"],
@@ -258,7 +341,7 @@ class ReportEngine:
             "mitre_ttps":     ctx["mitre_ttps"],
         }
         path = self.output_dir / "report.json"
-        path.write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
+        _write_private_text(path, redacted_json_dumps(out, indent=2, default=str))
         return str(path)
 
     # ── Support helpers ────────────────────────────────────────────────────────
@@ -268,18 +351,16 @@ class ReportEngine:
         enriched: list[dict[str, Any]] = []
         for i, f in enumerate(self.findings, 1):
             row = dict(f)
+            row.update(normalise_finding_truth(row))
             row["_index"] = i
             ev = dict(f.get("evidence") or {})
             extra = dict(ev.get("extra") or {})
-            sp = ev.get("screenshot_path")
-            if sp and Path(sp).exists():
-                try:
-                    data = base64.b64encode(Path(sp).read_bytes()).decode()
-                    row["screenshot_b64"] = f"data:image/png;base64,{data}"
-                except Exception:
-                    row["screenshot_b64"] = None
-            else:
-                row["screenshot_b64"] = None
+            # Ordinary reports omit protected-original binary evidence.  Task
+            # 102 owns explicit custody and redacted derivative generation.
+            row["screenshot_b64"] = None
+            ev["screenshot_path"] = None
+            ev["console_capture_path"] = None
+            ev["pcap_path"] = None
             row["evidence"] = ev
 
             # Severity colour lookup
@@ -293,15 +374,8 @@ class ReportEngine:
             row["_vpr_label"] = row["vpr_priority"]
 
             # Normalise new first-class fields with safe defaults
-            row["confidence"]   = (
-                f.get("confidence")
-                or (f.get("verification") or {}).get("confidence")
-                or extra.get("fp_confidence")
-                or "UNVERIFIED"
-            )
-            row["status"]       = f.get("status", "open")
             row["url"]          = f.get("url") or f.get("target", "")
-            row["verification"] = f.get("verification") or {
+            row["verification"] = row.get("verification") or {
                 "confidence": row["confidence"],
                 "evidence": extra.get("fp_evidence", []),
             }
@@ -357,31 +431,22 @@ class ReportEngine:
     async def _generate_exec_summary(self) -> str:
         """Auto-generate executive summary via ForgeBrain narrator."""
         try:
-            from common.brain.narrator import Narrator
-            narrator = Narrator()
+            from common.brain.narrator import ReportNarrator
+            narrator = ReportNarrator()
             if not narrator.brain.available:
                 return _default_exec_summary(self.findings, self.config)
-            summary = await narrator.summarise_engagement(
+            summary = await narrator.executive_summary(
                 findings=self.findings,
                 engagement=self.config.engagement,
                 target=self.config.target,
             )
             return summary or _default_exec_summary(self.findings, self.config)
-        except Exception as exc:
-            log.debug("ForgeBrain narrator unavailable: %s", exc)
+        except Exception:
+            log.debug("ForgeBrain narrator unavailable")
             return _default_exec_summary(self.findings, self.config)
 
     def _load_logo(self) -> str | None:
-        """Load logo PNG as base64 data URI if path is configured."""
-        if not self.config.logo_path:
-            return None
-        try:
-            p = Path(self.config.logo_path)
-            if p.exists():
-                data = base64.b64encode(p.read_bytes()).decode()
-                return f"data:image/png;base64,{data}"
-        except Exception:
-            pass
+        """Keep unvalidated binary files outside ordinary report artifacts."""
         return None
 
 
@@ -596,6 +661,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
           <th>VPR</th>
           <th>CVSS 4.0</th>
           <th>Confidence</th>
+          <th>Verification / Proof</th>
           <th>Status</th>
           <th>Target / URL</th>
           <th>Module</th>
@@ -627,6 +693,9 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
               {{ f.confidence | e }}
             </span>
           </td>
+          <td>
+            <small>{{ f.verification_state | e }}<br>{{ f.proof_type | e }} / {{ f.maturity | e }}</small>
+          </td>
           <td><small>{{ f.status | e }}</small></td>
           <td>
             <code style="word-break:break-all">{{ f.url | e }}</code>
@@ -635,7 +704,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
           <td><code>{{ f.module | e }}</code></td>
         </tr>
         <tr class="detail-row">
-          <td colspan="10">
+          <td colspan="11">
             <div class="detail-block">
               <strong>Description</strong>
               <p>{{ f.description | e }}</p>
@@ -757,13 +826,119 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   {% endif %}
 
   <div class="footer">
-    Generated by Forge Suite v5 APEX — FOR AUTHORIZED PENETRATION TESTING USE ONLY<br>
+    Generated by {{ product_label | e }} — FOR AUTHORIZED PENETRATION TESTING USE ONLY<br>
     {{ generated_at }} &nbsp;|&nbsp; {{ classification | e }}
   </div>
 
 </div>
 </body>
 </html>"""
+
+
+def _build_compliance_html(compliance_reports: list[dict]) -> str:
+    """Build HTML section for compliance framework evaluation results."""
+    if not compliance_reports:
+        return ""
+
+    _STATUS_ICONS = {
+        "pass": ("✅", "#27ae60", "#e8f5e9"),
+        "fail": ("❌", "#e74c3c", "#fce4ec"),
+        "partial": ("⚠️", "#f39c12", "#fff8e1"),
+        "not_applicable": ("➖", "#607d8b", "#eceff1"),
+        "not_tested": ("⬜", "#95a5a6", "#f5f5f5"),
+        "collection_error": ("⛔", "#c0392b", "#fdecea"),
+    }
+
+    sections = []
+    for report in compliance_reports:
+        fw_name = _escape(report.get("framework", ""))
+        pct = report.get("compliance_pct", 0)
+        pass_c = report.get("pass", 0)
+        fail_c = report.get("fail", 0)
+        partial_c = report.get("partial", 0)
+        na_c = report.get("not_applicable", 0)
+        nt_c = report.get("not_tested", 0)
+        error_c = report.get("collection_error", 0)
+        coverage_pct = report.get("coverage_pct", 0)
+
+        # Gauge color
+        if pct >= 80:
+            gauge_color = "#27ae60"
+        elif pct >= 50:
+            gauge_color = "#f39c12"
+        else:
+            gauge_color = "#e74c3c"
+
+        rules_html = ""
+        for rule in report.get("rules", []):
+            status = str(rule.get("status", "not_tested")).lower()
+            icon, color, bg = _STATUS_ICONS.get(status, ("?", "#999", "#f5f5f5"))
+            finding_count = rule.get("finding_count", 0)
+            finding_titles = ", ".join(rule.get("finding_titles", [])[:3])
+            collection = rule.get("collection") or {}
+            collection_status = collection.get("status", "not_recorded")
+            collector = (
+                f"{collection.get('collector_id', 'unknown')}@"
+                f"{collection.get('collector_version', 'unknown')}"
+            )
+            check = (
+                f"{collection.get('check_id', 'unknown')}@"
+                f"{collection.get('check_version', 'unknown')}"
+            )
+            reason = rule.get("reason", "")
+            proof_type = rule.get("proof_type", "unknown")
+            rules_html += f"""
+            <tr style="background:{bg}">
+                <td style="font-family:monospace;font-weight:700">{_escape(rule.get('rule_id', ''))}</td>
+                <td>{_escape(rule.get('title', ''))}</td>
+                <td style="text-align:center;font-size:16px">{icon}</td>
+                <td style="color:{color};font-weight:700">{status}</td>
+                <td>{finding_count}</td>
+                <td style="font-size:11px">{_escape(finding_titles)}</td>
+                <td style="font-size:11px">{_escape(reason)}</td>
+                <td style="font-size:11px">{_escape(str(collection_status))}<br>{_escape(collector)}<br>{_escape(check)}</td>
+                <td style="font-size:11px">{_escape(str(proof_type))}</td>
+                <td style="font-size:11px">{_escape(rule.get('remediation', ''))[:100]}</td>
+            </tr>"""
+
+        sections.append(f"""
+        <div style="margin-bottom:30px;border:1px solid #ddd;border-radius:8px;overflow:hidden">
+            <div style="background:#2c3e50;color:#fff;padding:12px 16px;display:flex;justify-content:space-between;align-items:center">
+                <h3 style="margin:0">{fw_name}</h3>
+                <div style="display:flex;gap:12px;align-items:center">
+                    <span style="background:{gauge_color};color:#fff;padding:4px 12px;border-radius:12px;font-weight:700;font-size:16px">Compliance {pct}% / Coverage {coverage_pct}%</span>
+                    <span>✅ {pass_c} &nbsp; ❌ {fail_c} &nbsp; ⚠️ {partial_c} &nbsp; ➖ {na_c} &nbsp; ⬜ {nt_c} &nbsp; ⛔ {error_c}</span>
+                </div>
+            </div>
+            <table style="width:100%;border-collapse:collapse">
+                <thead>
+                    <tr style="background:#ecf0f1">
+                        <th style="padding:8px;text-align:left">Rule ID</th>
+                        <th style="padding:8px;text-align:left">Requirement</th>
+                        <th style="padding:8px;text-align:center">Status</th>
+                        <th style="padding:8px;text-align:left">Result</th>
+                        <th style="padding:8px;text-align:left">Findings</th>
+                        <th style="padding:8px;text-align:left">Matched</th>
+                        <th style="padding:8px;text-align:left">Reason</th>
+                        <th style="padding:8px;text-align:left">Collection</th>
+                        <th style="padding:8px;text-align:left">Proof</th>
+                        <th style="padding:8px;text-align:left">Remediation</th>
+                    </tr>
+                </thead>
+                <tbody>{rules_html}</tbody>
+            </table>
+        </div>""")
+
+    return f"""
+    <h2 style="border-bottom:2px solid #2c3e50;padding-bottom:8px;margin-top:40px">
+        Compliance Assessment
+    </h2>
+    <p style="color:#666;margin-bottom:20px">
+        Evidence-state mapping for assessment review; this is not an attestation.
+        A pass requires versioned applicability, successful collection, and supported proof.
+    </p>
+    {"".join(sections)}
+    """
 
 
 # ── PDF CSS override (WeasyPrint page sizing) ─────────────────────────────────
@@ -815,6 +990,9 @@ def _build_html_inline(ctx: dict[str, Any]) -> str:
         vpr = f"{ f.get('vpr_score', 0.0):.1f}" if f.get("vpr_score") else "—"
         confidence = _escape(f.get("confidence", "UNVERIFIED"))
         status = _escape(f.get("status", "open"))
+        verification_state = _escape(f.get("verification_state", "unknown"))
+        proof_type = _escape(f.get("proof_type", "unknown"))
+        maturity = _escape(f.get("maturity", "experimental"))
         steps  = "".join(f"<li>{_escape(s)}</li>" for s in f.get("reproduction_steps", []))
         refs   = _escape(", ".join(f.get("references", [])))
         mitre  = " ".join(
@@ -837,11 +1015,13 @@ def _build_html_inline(ctx: dict[str, Any]) -> str:
           <td style="font-family:monospace">{cvss31}</td>
           <td style="font-family:monospace">{vpr}<br><small>{_escape(f.get('vpr_priority',''))}</small></td>
           <td style="font-family:monospace">{cvss40}</td>
-          <td><code>{confidence}</code><br><small>{status}</small></td>
+          <td><code>{confidence}</code></td>
+          <td><code>{verification_state}</code><br><small>{proof_type} / {maturity}</small></td>
+          <td><small>{status}</small></td>
           <td><code>{_escape(f.get('url') or f.get('target',''))}</code></td>
           <td><code>{_escape(f.get('module',''))}</code></td>
         </tr>
-        <tr><td colspan="10" style="background:#f9f9f9;padding:14px">
+        <tr><td colspan="11" style="background:#f9f9f9;padding:14px">
           <strong>Description:</strong> {_escape(f.get('description',''))}<br><br>
           <strong>Reproduction:</strong><ol>{steps}</ol>
           <strong>Remediation:</strong> {_escape(f.get('remediation',''))}<br>
@@ -864,9 +1044,10 @@ tr:hover td{{background:#f0f0f0}}pre{{background:#1e1e1e;color:#d4d4d4;padding:8
 <p><strong>Target:</strong> {_escape(ctx['target'])} | <strong>Tester:</strong> {_escape(ctx['tester'])} | <strong>Generated:</strong> {_escape(ctx['generated_at'])}</p>
 <div style="margin:16px 0">{sev_bars}</div>
 <h2 style="border-bottom:2px solid #e74c3c;padding-bottom:8px">Findings</h2>
-<table><thead><tr><th>#</th><th>Vulnerability</th><th>Severity</th><th>CVSS 3.1</th><th>VPR</th><th>CVSS 4.0</th><th>Confidence</th><th>Target</th><th>Module</th></tr></thead>
+<table><thead><tr><th>#</th><th>Vulnerability</th><th>Severity</th><th>CVSS 3.1</th><th>VPR</th><th>CVSS 4.0</th><th>Confidence</th><th>Verification / Proof</th><th>Status</th><th>Target</th><th>Module</th></tr></thead>
 <tbody>{rows_html}</tbody></table>
-<p style="color:#999;font-size:11px;margin-top:20px">Generated by Forge Suite v5 APEX — FOR AUTHORIZED USE ONLY</p>
+<p style="color:#999;font-size:11px;margin-top:20px">Generated by {_escape(ctx['product_label'])} — FOR AUTHORIZED USE ONLY</p>
+{_build_compliance_html(ctx.get('compliance_reports', []))}
 </body></html>"""
 
 
@@ -890,7 +1071,9 @@ class TestReportEngine:
                 "discovered_at": "2026-06-20T00:00:00Z",
                 "evidence": {"request_raw": "POST /login", "response_raw": "error"},
                 "operator_confirmed": False, "tags": [],
-                "confidence": "HIGH", "status": "verified", "vpr": "CRITICAL",
+                "confidence": "HIGH", "status": "open", "vpr": "CRITICAL",
+                "verification_state": "unknown", "proof_type": "unknown",
+                "maturity": "experimental",
                 "url": "https://example.com/login", "verification": None,
             },
             {

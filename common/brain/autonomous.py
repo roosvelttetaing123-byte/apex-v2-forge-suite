@@ -26,6 +26,58 @@ from typing import Any
 log = logging.getLogger("forge.brain.autonomous")
 
 
+def _infer_chain_finding_type(finding: dict[str, Any]) -> str:
+    """Infer a ChainEngine finding type from common finding fields."""
+    haystack = " ".join(
+        str(finding.get(key, ""))
+        for key in ("type", "vuln_type", "category", "module", "title")
+    ).lower()
+    mappings = (
+        ("sqli", ("sqli", "sql injection")),
+        ("xss", ("xss", "cross-site scripting")),
+        ("ssti", ("ssti", "template injection")),
+        ("ssrf", ("ssrf",)),
+        ("cmd_injection", ("cmd injection", "command injection", "cmd_inject")),
+        ("lfi", ("lfi", "file inclusion")),
+        ("xxe", ("xxe", "xml external entity")),
+        ("default_creds", ("default credential", "weak credential")),
+        ("file_upload", ("file upload", "upload bypass")),
+    )
+    for finding_type, needles in mappings:
+        if any(needle in haystack for needle in needles):
+            return finding_type
+    return str(finding.get("type") or finding.get("vuln_type") or finding.get("category") or "")
+
+
+class _EngagementBusChainAdapter:
+    """String-event adapter used to connect ChainEngine to EngagementBus findings."""
+
+    def __init__(self, engagement_bus: Any) -> None:
+        self._handlers: dict[str, list[Any]] = {}
+        self._engagement_bus = engagement_bus
+        self.emitted: list[dict[str, Any]] = []
+        engagement_bus.subscribe(self._on_finding)
+
+    def subscribe(self, event: str, handler: Any) -> None:
+        self._handlers.setdefault(event, []).append(handler)
+
+    def emit(self, event: str, payload: dict[str, Any]) -> None:
+        self.emitted.append({"event": event, **payload})
+
+    def _on_finding(self, framework: str, finding: dict[str, Any]) -> None:
+        if str(finding.get("verification_state") or "").lower() != "verified":
+            return
+        payload = dict(finding)
+        payload.setdefault("type", _infer_chain_finding_type(finding))
+        payload.setdefault("target", finding.get("target") or finding.get("url") or "")
+        payload.setdefault("framework", framework)
+        for handler in list(self._handlers.get("finding.confirmed", [])):
+            try:
+                handler(payload)
+            except Exception as exc:
+                log.debug("Chain adapter handler failed: %s", exc)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # DATA MODELS
 # ══════════════════════════════════════════════════════════════════════
@@ -68,6 +120,7 @@ class EngagementProgress:
     findings_count:     int             = 0
     credentials_count:  int             = 0
     modules_run:        int             = 0
+    modules_simulated:  int             = 0
     modules_total:      int             = 0
     current_module:     str             = ""
     current_target:     str             = ""
@@ -298,6 +351,8 @@ class AutonomousEngine:
         self._progress = EngagementProgress()
         self._chain_log: list[dict[str, Any]] = []
         self._review_queue: list[dict[str, Any]] = []
+        self._chain_engine: Any | None = None
+        self._chain_adapter: _EngagementBusChainAdapter | None = None
         self._running = False
         self._aborted = False
         self._start_time = 0.0
@@ -360,6 +415,7 @@ class AutonomousEngine:
             engagement_id, config.target,
             ",".join(config.frameworks), config.opsec_level.value,
         )
+        self._wire_chain_engine(config)
 
         self._emit_progress("engagement_start", {
             "engagement_id": engagement_id,
@@ -432,10 +488,10 @@ class AutonomousEngine:
                         )
                         continue
 
-                    # Execute module (simulated — actual execution hooks
-                    # into framework orchestrators)
+                    # Record an advisory simulation.  No framework module is
+                    # invoked by this prototype path.
                     await self._execute_module(fw, mod, config)
-                    self._progress.modules_run += 1
+                    self._progress.modules_simulated += 1
 
                 # FN sweep after each phase
                 if config.fn_sweep_enabled and not self._aborted:
@@ -509,6 +565,28 @@ class AutonomousEngine:
     # ══════════════════════════════════════════════════════════════════
     # INTERNAL METHODS
     # ══════════════════════════════════════════════════════════════════
+
+    def _wire_chain_engine(self, config: EngagementConfig) -> None:
+        """Attach the ChainEngine to the autonomous engagement bus when possible."""
+        if not self._eng_bus or self._chain_engine:
+            return
+        try:
+            from common.attack_chains import ChainEngine
+            auto_trigger = config.auto_confirm_safe and config.opsec_level == OpsecLevel.NOISY
+            self._chain_adapter = _EngagementBusChainAdapter(self._eng_bus)
+            self._chain_engine = ChainEngine(
+                bus=self._chain_adapter,
+                auto_trigger=auto_trigger,
+                opsec_level=config.opsec_level.value.upper(),
+            )
+            self._chain_engine.register_all()
+            log.info(
+                "ChainEngine wired into AutonomousEngine (auto_trigger=%s, opsec=%s)",
+                auto_trigger,
+                config.opsec_level.value,
+            )
+        except Exception as exc:
+            log.debug("ChainEngine wiring skipped: %s", exc)
 
     def _check_stop_conditions(self, config: EngagementConfig) -> StopReason | None:
         """Check if any stop condition has been met."""
@@ -669,41 +747,29 @@ class AutonomousEngine:
         module: str,
         config: EngagementConfig,
     ) -> None:
-        """Execute a single module.
-
-        This is the integration point where the autonomous engine
-        hooks into the actual framework orchestrators. Currently
-        logs the execution — actual wiring happens in 9G.
-        """
-        log.info("Executing: %s/%s → %s", framework, module, config.target)
+        """Record an inert module simulation without execution claims."""
+        log.info("Simulating proposal: %s/%s → %s", framework, module, config.target)
 
         self._chain_log.append({
-            "action": f"Execute {module}",
+            "action": f"Simulate {module}",
             "framework": framework,
             "module": module,
             "target": config.target,
             "phase": self._progress.phase.value,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "result": "executed",
+            "result": "simulation",
+            "verification_state": "simulation",
+            "proof_type": "simulation",
+            "maturity": "simulation",
         })
 
-        self._emit_progress("module_execute", {
+        self._emit_progress("module_simulation", {
             "framework": framework,
             "module": module,
             "target": config.target,
             "phase": self._progress.phase.value,
+            "verification_state": "simulation",
         })
-
-        # Apply opsec jitter
-        if config.opsec_level == OpsecLevel.STEALTH:
-            import random
-            jitter = random.uniform(1.0, 5.0)
-            await asyncio.sleep(jitter)
-        elif config.opsec_level == OpsecLevel.STANDARD:
-            import random
-            jitter = random.uniform(0.2, 1.0)
-            await asyncio.sleep(jitter)
-        # NOISY: no jitter
 
     async def _fn_sweep(self, config: EngagementConfig, phase: str) -> None:
         """Run false negative sweep after a phase.
@@ -740,7 +806,7 @@ class AutonomousEngine:
                     and self._should_auto_execute(hint.suggested_module, phase, config)
                 ):
                     await self._execute_module("auto", hint.suggested_module, config)
-                    self._progress.modules_run += 1
+                    self._progress.modules_simulated += 1
                 else:
                     self._review_queue.append({
                         "framework": "auto",

@@ -222,7 +222,17 @@ class DirFuzzer(BaseModule):
         severity = Severity.HIGH
         description = f"Sensitive file/path accessible at {target}{path} (HTTP {status})."
 
-        if ".env" in path:
+        # Standard web files are NOT sensitive — downgrade
+        if path in ("/robots.txt", "/sitemap.xml", "/crossdomain.xml",
+                     "/clientaccesspolicy.xml", "/favicon.ico"):
+            severity = Severity.INFORMATIONAL
+            description = f"Standard web file found at {target}{path} (HTTP {status})."
+            if path == "/robots.txt" and any(
+                kw in body.lower() for kw in ("admin", "internal", "secret", "private", "api/v")
+            ):
+                severity = Severity.LOW
+                description += " robots.txt leaks potentially sensitive paths."
+        elif ".env" in path:
             severity = Severity.CRITICAL
             description += " .env files often contain database credentials, API keys, and secrets."
         elif ".git" in path:

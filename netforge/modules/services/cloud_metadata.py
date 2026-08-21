@@ -82,6 +82,16 @@ class CloudMetadata(BaseModule):
         if not self.check_scope(target):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
+        # Scanner-host metadata and target-triggered metadata fetches are
+        # distinct delegated destinations.  No ordinary module.execute
+        # envelope authorizes them, so remain fail-closed until an exact
+        # resource/mode authorization is supplied by the launcher.
+        return self._make_result(
+            start,
+            skipped=True,
+            skip_reason="metadata_destination_not_authorized",
+        )
+
         self.log.info("Testing cloud metadata SSRF on %s", target)
 
         import aiohttp

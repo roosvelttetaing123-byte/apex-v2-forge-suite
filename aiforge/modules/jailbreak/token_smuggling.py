@@ -103,6 +103,7 @@ class TokenSmuggling(BaseModule):
             model_name=self.config.extra.get("model_name", ""),
             max_tokens=200, temperature=0.0,
             proxy=self.config.extra.get("proxy"),
+            outbound_policy=self.outbound_policy,
         ) as client:
             successful: list[dict[str, Any]] = []
 
@@ -169,6 +170,15 @@ class TestTokenSmuggling:
         assert len(techniques) >= 8
 
     def test_payloads_contain_special_chars(self) -> None:
-        for p in SMUGGLING_PAYLOADS:
-            assert any(ord(c) > 127 or ord(c) < 32 for c in p["payload"]), \
-                f"Payload {p['id']} should contain non-ASCII or control chars"
+        unicode_or_control_ids = {
+            "zwsp_split", "zwj_split", "rtl_override", "cyrillic_homoglyph",
+            "fullwidth", "diacritical", "tag_chars", "soft_hyphen",
+            "weird_whitespace", "backspace_inject",
+        }
+        by_id = {payload["id"]: payload["payload"] for payload in SMUGGLING_PAYLOADS}
+        for payload_id in unicode_or_control_ids:
+            payload = by_id[payload_id]
+            assert any(ord(char) > 127 or ord(char) < 32 for char in payload), \
+                f"Payload {payload_id} should contain non-ASCII or control chars"
+        assert "**" in by_id["markdown_emphasis"]
+        assert "&#" in by_id["html_entities"]

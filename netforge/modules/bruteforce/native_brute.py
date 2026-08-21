@@ -32,13 +32,16 @@ import struct
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
+from common.action_authorization import protected_credential_reference
 from common.evidence import Evidence
 from common.finding import Severity
+from common.outbound_policy import OutboundDenied, OutboundReason
+from common.redaction import redact_secret_fragments
 
 CVSS_BRUTE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
 CVSS40_BRUTE = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -51,6 +54,11 @@ DEFAULT_PASSWORDS = [
 ]
 
 log = logging.getLogger("forge.netforge.native_brute")
+
+
+def _deny_unmigrated_credential_effect() -> NoReturn:
+    """Keep legacy credential transports inert pending protected adapters."""
+    raise OutboundDenied(OutboundReason.OUTBOUND_POLICY_UNSUPPORTED)
 
 
 class NativeBrute(BaseModule):
@@ -190,6 +198,7 @@ class NativeBrute(BaseModule):
         self, proto: str, host: str, port: int, username: str, password: str
     ) -> bool:
         """Dispatch to protocol-specific auth handler."""
+        _deny_unmigrated_credential_effect()
         handlers = {
             "ssh":      self._auth_ssh,
             "ftp":      self._auth_ftp,
@@ -214,15 +223,26 @@ class NativeBrute(BaseModule):
         except asyncio.TimeoutError:
             return False
         except Exception as exc:
-            log.debug("Auth %s@%s:%d/%s failed: %s", username, host, port, proto, exc)
+            safe_username = redact_secret_fragments(username, (password,))
+            safe_host = redact_secret_fragments(host, (password,))
+            log.debug(
+                "Auth %s@%s:%d/%s failed (%s)",
+                safe_username,
+                safe_host,
+                port,
+                proto,
+                type(exc).__name__,
+            )
             return False
 
     async def _auth_ssh(self, host: str, port: int, user: str, pw: str) -> bool:
         """SSH auth via paramiko."""
+        _deny_unmigrated_credential_effect()
         try:
             import paramiko
             client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.load_system_host_keys()
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
@@ -241,6 +261,7 @@ class NativeBrute(BaseModule):
 
     async def _auth_ftp(self, host: str, port: int, user: str, pw: str) -> bool:
         """FTP auth via raw protocol commands."""
+        _deny_unmigrated_credential_effect()
         try:
             reader, writer = await asyncio.open_connection(host, port)
             banner = await asyncio.wait_for(reader.readline(), timeout=5)
@@ -263,6 +284,7 @@ class NativeBrute(BaseModule):
 
     async def _auth_mysql(self, host: str, port: int, user: str, pw: str) -> bool:
         """MySQL native protocol authentication."""
+        _deny_unmigrated_credential_effect()
         try:
             reader, writer = await asyncio.open_connection(host, port)
             # Read server greeting
@@ -334,6 +356,7 @@ class NativeBrute(BaseModule):
 
     async def _auth_postgres(self, host: str, port: int, user: str, pw: str) -> bool:
         """PostgreSQL native protocol authentication."""
+        _deny_unmigrated_credential_effect()
         try:
             reader, writer = await asyncio.open_connection(host, port)
 
@@ -385,6 +408,7 @@ class NativeBrute(BaseModule):
 
     async def _auth_redis(self, host: str, port: int, user: str, pw: str) -> bool:
         """Redis AUTH via raw protocol."""
+        _deny_unmigrated_credential_effect()
         try:
             reader, writer = await asyncio.open_connection(host, port)
             # Try AUTH with password
@@ -398,6 +422,7 @@ class NativeBrute(BaseModule):
 
     async def _auth_mongodb(self, host: str, port: int, user: str, pw: str) -> bool:
         """MongoDB wire protocol auth (SCRAM-SHA-1)."""
+        _deny_unmigrated_credential_effect()
         try:
             # Try pymongo if available
             import pymongo
@@ -414,6 +439,7 @@ class NativeBrute(BaseModule):
 
     def _mongo_sync(self, host: str, port: int, user: str, pw: str) -> bool:
         """Synchronous MongoDB auth attempt."""
+        _deny_unmigrated_credential_effect()
         import pymongo
         try:
             client = pymongo.MongoClient(
@@ -428,6 +454,7 @@ class NativeBrute(BaseModule):
 
     async def _auth_smb(self, host: str, port: int, user: str, pw: str) -> bool:
         """SMB auth via impacket."""
+        _deny_unmigrated_credential_effect()
         try:
             from impacket.smbconnection import SMBConnection
             loop = asyncio.get_event_loop()
@@ -441,6 +468,7 @@ class NativeBrute(BaseModule):
 
     def _smb_sync(self, host: str, port: int, user: str, pw: str) -> bool:
         """Synchronous SMB auth."""
+        _deny_unmigrated_credential_effect()
         try:
             from impacket.smbconnection import SMBConnection
             conn = SMBConnection(host, host, timeout=5)
@@ -452,6 +480,7 @@ class NativeBrute(BaseModule):
 
     async def _auth_http(self, host: str, port: int, user: str, pw: str) -> bool:
         """HTTP Basic auth."""
+        _deny_unmigrated_credential_effect()
         try:
             import aiohttp
             scheme = "https" if port == 443 else "http"
@@ -465,6 +494,7 @@ class NativeBrute(BaseModule):
 
     async def _auth_vnc(self, host: str, port: int, user: str, pw: str) -> bool:
         """VNC RFB handshake + DES challenge-response auth."""
+        _deny_unmigrated_credential_effect()
         try:
             reader, writer = await asyncio.open_connection(host, port)
             # Read server version
@@ -538,6 +568,7 @@ class NativeBrute(BaseModule):
         but we can detect if the RDP service is up and accepting connections.
         Full RDP brute requires xfreerdp or rdesktop.
         """
+        _deny_unmigrated_credential_effect()
         try:
             reader, writer = await asyncio.open_connection(host, port)
             # X.224 Connection Request with CredSSP
@@ -566,32 +597,54 @@ class NativeBrute(BaseModule):
         self, host: str, port: int, proto: str, user: str, pw: str
     ) -> None:
         """Report successful auth and feed into CredEngine."""
+        secret_values = (pw,)
+        safe_host = redact_secret_fragments(host, secret_values)
+        safe_proto = redact_secret_fragments(proto, secret_values)
+        safe_user = redact_secret_fragments(user, secret_values)
+        reference = protected_credential_reference(
+            {
+                "host": safe_host,
+                "service": safe_proto,
+                "username": safe_user,
+                "source": self.NAME,
+            }
+        )
         # Feed into CredEngine
         cred_engine = self.config.extra.get("cred_engine")
         if cred_engine:
-            cred_engine.add(host, proto, user, password=pw, source="native_brute")
+            stored = cred_engine.add(
+                safe_host,
+                safe_proto,
+                safe_user,
+                password=pw,
+                source="native_brute",
+            )
+            safe = stored.to_dict()
+            reference = str(safe.get("credential_reference") or reference)
 
         ev = Evidence(
             extra={
-                "host": host, "port": port, "protocol": proto,
-                "username": user, "method": "native_brute",
+                "host": safe_host, "port": port, "protocol": safe_proto,
+                "username": safe_user, "method": "native_brute",
+                "credential_reference": reference,
             }
         )
         self.new_finding(
-            title=f"Valid Credentials Found — {user}@{host}:{port}/{proto}",
+            title=(
+                f"Valid Credentials Found — "
+                f"{safe_user}@{safe_host}:{port}/{safe_proto}"
+            ),
             severity=Severity.CRITICAL,
             description=(
                 f"Native brute force discovered valid credentials:\n"
-                f"  Host: {host}:{port}\n"
-                f"  Protocol: {proto}\n"
-                f"  Username: {user}\n"
-                f"  Password: [stored in encrypted CredEngine]\n\n"
-                f"These credentials were automatically stored in the encrypted "
-                f"credential engine for use by subsequent modules."
+                f"  Host: {safe_host}:{port}\n"
+                f"  Protocol: {safe_proto}\n"
+                f"  Username: {safe_user}\n"
+                f"  Credential reference: {reference}\n\n"
+                "Credential material remains behind the protected reference."
             ),
             reproduction_steps=[
-                f"# {proto} login: {user}@{host}:{port}",
-                f"# Credentials available via: cred_engine.get('{host}', '{proto}', '{user}')",
+                f"Use the protected credential reference for retest: {reference}",
             ],
             remediation=(
                 "1. Change the compromised password immediately\n"
@@ -605,7 +658,7 @@ class NativeBrute(BaseModule):
             cvss_v31_vector=CVSS_BRUTE,
             cvss_v40_vector=CVSS40_BRUTE,
             mitre_attack=["TA0006/T1110.001"],
-            port=port, service=proto, target=host,
+            port=port, service=safe_proto, target=safe_host,
         )
 
 

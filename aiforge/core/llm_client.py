@@ -15,6 +15,14 @@ from typing import Any
 
 import aiohttp
 
+from common.outbound_policy import (
+    OutboundPolicy,
+    OutboundDenied,
+    OutboundReason,
+    PolicyHttpClient,
+    _normalized_proxy_origin,
+)
+
 log = logging.getLogger("forge.aiforge.llm_client")
 
 
@@ -82,6 +90,7 @@ class LLMClient:
         timeout: int = 30,
         proxy: str | None = None,
         system_prompt: str | None = None,
+        outbound_policy: OutboundPolicy | None = None,
     ) -> None:
         self.api_type = api_type
         self.endpoint = endpoint.rstrip("/")
@@ -92,15 +101,22 @@ class LLMClient:
         self.timeout = timeout
         self.proxy = proxy
         self.system_prompt = system_prompt
-        self._session: aiohttp.ClientSession | None = None
+        self.outbound_policy = outbound_policy
+        self._session: PolicyHttpClient | None = None
         self._conversation: list[ConversationTurn] = []
         self._request_count = 0
         self._total_tokens = 0
 
     async def __aenter__(self) -> "LLMClient":
-        connector = aiohttp.TCPConnector(ssl=False, limit=5)
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
-        self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        if self.outbound_policy is None:
+            raise OutboundDenied("authorization_invalid")
+        if self.proxy:
+            route = self.outbound_policy.context.route
+            if route is None:
+                raise OutboundDenied(OutboundReason.ROUTE_REQUIRED)
+            if _normalized_proxy_origin(self.proxy) != route.proxy_url:
+                raise OutboundDenied(OutboundReason.ROUTE_BINDING_MISMATCH)
+        self._session = PolicyHttpClient(self.outbound_policy)
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -161,6 +177,8 @@ class LLMClient:
             )
         except asyncio.TimeoutError:
             response = LLMResponse(error="Request timed out", status_code=408)
+        except OutboundDenied:
+            raise
         except aiohttp.ClientError as exc:
             response = LLMResponse(error=str(exc), status_code=0)
         except Exception as exc:
@@ -206,7 +224,7 @@ class LLMClient:
             **(extra_params or {}),
         }
 
-        async with self._session.post(url, json=body, headers=headers, proxy=self.proxy) as resp:
+        async with self._session.post(url, json=body, headers=headers) as resp:
             status = resp.status
             resp_headers = {k: v for k, v in resp.headers.items()}
             raw = await resp.json(content_type=None)
@@ -268,7 +286,7 @@ class LLMClient:
         if system:
             body["system"] = system
 
-        async with self._session.post(url, json=body, headers=headers, proxy=self.proxy) as resp:
+        async with self._session.post(url, json=body, headers=headers) as resp:
             status = resp.status
             resp_headers = {k: v for k, v in resp.headers.items()}
             raw = await resp.json(content_type=None)
@@ -305,7 +323,7 @@ class LLMClient:
         }
         body = {"inputs": prompt, "parameters": {"max_new_tokens": self.max_tokens, "temperature": self.temperature}}
 
-        async with self._session.post(url, json=body, headers=headers, proxy=self.proxy) as resp:
+        async with self._session.post(url, json=body, headers=headers) as resp:
             raw = await resp.json(content_type=None)
             if isinstance(raw, list) and raw:
                 text = raw[0].get("generated_text", str(raw))
@@ -329,7 +347,7 @@ class LLMClient:
 
         body = {"model": self.model_name or "llama3", "messages": messages, "stream": False}
 
-        async with self._session.post(url, json=body, proxy=self.proxy) as resp:
+        async with self._session.post(url, json=body) as resp:
             raw = await resp.json(content_type=None)
             text = raw.get("message", {}).get("content", "")
             return LLMResponse(text=text, raw_response=raw, model=raw.get("model", ""),
@@ -356,7 +374,7 @@ class LLMClient:
         if system:
             body["system"] = system
 
-        async with self._session.post(self.endpoint, json=body, headers=headers, proxy=self.proxy) as resp:
+        async with self._session.post(self.endpoint, json=body, headers=headers) as resp:
             raw_text = await resp.text()
             try:
                 raw = json.loads(raw_text)
@@ -383,7 +401,7 @@ class LLMClient:
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         data = {"message": prompt, "prompt": prompt, "input": prompt}
 
-        async with self._session.post(self.endpoint, data=data, headers=headers, proxy=self.proxy) as resp:
+        async with self._session.post(self.endpoint, data=data, headers=headers) as resp:
             text = await resp.text()
             return LLMResponse(text=text, raw_response={"html": text[:5000]},
                              status_code=resp.status, headers={k: v for k, v in resp.headers.items()})

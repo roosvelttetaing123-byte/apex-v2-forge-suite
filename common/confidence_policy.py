@@ -3,23 +3,23 @@ from __future__ import annotations
 
 from typing import Any
 
+from common.verification_policy import normalise_finding_truth
+
 
 CANONICAL_CONFIDENCE = {"HIGH", "MEDIUM", "LOW", "UNVERIFIED"}
 SUPPRESSED_BY_DEFAULT = {"LOW", "UNVERIFIED"}
 
 
-def normalise_confidence(value: Any, default: str = "MEDIUM") -> str:
-    """Return a canonical confidence value.
-
-    Legacy modules predate FPReducer and often omit confidence entirely. Those
-    findings default to MEDIUM so default reports do not go empty. Explicit
-    LOW/UNVERIFIED values from FPReducer stay low-confidence and are suppressible.
-    """
-    raw = str(value or default).upper().replace(" ", "_")
-    return raw if raw in CANONICAL_CONFIDENCE else default
+def normalise_confidence(value: Any, default: str = "UNVERIFIED") -> str:
+    """Return a canonical confidence value without optimistic legacy defaults."""
+    fallback = str(default or "UNVERIFIED").upper().replace(" ", "_")
+    if fallback not in CANONICAL_CONFIDENCE:
+        fallback = "UNVERIFIED"
+    raw = str(value or fallback).upper().replace(" ", "_")
+    return raw if raw in CANONICAL_CONFIDENCE else fallback
 
 
-def infer_confidence(finding: dict[str, Any], default: str = "MEDIUM") -> str:
+def infer_confidence(finding: dict[str, Any], default: str = "UNVERIFIED") -> str:
     """Infer confidence from first-class fields, verification, or evidence extras."""
     verification = finding.get("verification") or {}
     evidence = finding.get("evidence") or {}
@@ -32,17 +32,16 @@ def infer_confidence(finding: dict[str, Any], default: str = "MEDIUM") -> str:
     )
 
 
-def normalise_finding(finding: dict[str, Any], legacy_default: str = "MEDIUM") -> dict[str, Any]:
-    """Return a copy with confidence/status/VPR fields consistently populated."""
+def normalise_finding(finding: dict[str, Any], legacy_default: str = "UNVERIFIED") -> dict[str, Any]:
+    """Return a copy with confidence, truth, and VPR fields populated safely."""
     row = dict(finding)
     confidence = infer_confidence(row, default=legacy_default)
     row["confidence"] = confidence
-    row.setdefault("status", "verified" if confidence in {"HIGH", "MEDIUM"} else "open")
 
     cvss = row.get("cvss_v31_score") or row.get("cvss_score") or 0.0
     row.setdefault("vpr_score", cvss or 0.0)
-    if not row.get("vpr_priority") and not row.get("vpr"):
-        row["vpr_priority"] = _priority_from_score(float(row.get("vpr_score") or 0.0))
+    if not row.get("vpr_priority") and not row.get("vpr") and float(row.get("vpr_score") or 0.0) > 0:
+        row["vpr_priority"] = _priority_from_score(float(row["vpr_score"]))
         row["vpr"] = row["vpr_priority"]
 
     verification = row.get("verification") or {}
@@ -57,6 +56,7 @@ def normalise_finding(finding: dict[str, Any], legacy_default: str = "MEDIUM") -
                 "probe_hits": extra.get("fp_probe_hits", 0),
             }
     row["verification"] = verification or None
+    row.update(normalise_finding_truth(row))
     return row
 
 

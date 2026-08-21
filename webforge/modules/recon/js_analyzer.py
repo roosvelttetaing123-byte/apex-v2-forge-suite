@@ -6,7 +6,6 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
@@ -60,6 +59,14 @@ SECRET_PATTERNS: list[tuple[str, str, Severity]] = [
     (r"""[=:]\s*["'][0-9a-fA-F]{64}["']""",
      "Hardcoded HMAC/Signing Secret (hex-64)", Severity.CRITICAL),
     # Custom auth header name patterns — reveals proprietary auth schemes in JS
+    # Credentials leaked via alert() or console.log() — debug code left in production.
+    # Matches: alert('Default password is: Abc123') or console.log('pass:', 'secret')
+    (r"""(?:alert|confirm|console\.(?:log|warn|error|debug|info))\s*\([^)]*(?:password|passwd|default.pass|secret|credential)[^)]*["']([^"']{4,80})["']""",
+     "Credential Leaked via alert()/console.log()", Severity.CRITICAL),
+    # Supabase project URL paired with anon key — both must be present for full bypass.
+    # Captured separately by the JWT pattern above; this pattern catches the URL.
+    (r"""supabaseUrl\s*[=:]\s*["'](https://[a-z0-9]+\.supabase\.co)["']""",
+     "Supabase Project URL", Severity.HIGH),
     (r"""["'](X-[A-Z][A-Z0-9\-]{3,30}-(?:KEY|TOKEN|SECRET|HASH|SIG|TS))["']""",
      "Custom Authentication Header Name", Severity.INFORMATIONAL),
     # reCAPTCHA Enterprise / v3 site keys (starts with 6L, 38–50 chars)
@@ -158,10 +165,13 @@ class JsAnalyzer(BaseModule):
                         else:
                             js_urls.append(f"{target.rstrip('/')}/{src.lstrip('/')}")
 
-                    # Common JS paths
+                    # Common JS paths — includes Flutter compiled bundle (main.dart.js)
+                    # which can be 20-30 MB and often contains full app config, HMAC
+                    # signing keys, API base URLs, and basic auth credentials as Dart constants.
                     for path in ["/js/app.js", "/js/main.js", "/app.js", "/bundle.js",
                                  "/static/js/main.js", "/assets/js/app.js", "/dist/bundle.js",
-                                 "/js/vendor.js", "/static/chunk.js"]:
+                                 "/js/vendor.js", "/static/chunk.js",
+                                 "/main.dart.js", "/flutter.js", "/flutter_service_worker.js"]:
                         js_urls.append(f"{target}{path}")
         except Exception as exc:
             self.log.debug("JS discovery failed: %s", exc)
@@ -187,6 +197,7 @@ class JsAnalyzer(BaseModule):
                 self._check_secrets(js_content, url, target)
                 self._extract_endpoints(js_content, url, target)
                 self._discover_backend_urls(js_content, url, target)
+                await self._check_supabase_rls(js_content, url, target)
             except Exception as exc:
                 self.log.debug("JS analysis failed for %s: %s", url, exc)
 
@@ -314,6 +325,94 @@ class JsAnalyzer(BaseModule):
             evidence=ev,
             cvss_v31_vector=CVSS_ENDPOINT,
             cvss_v40_vector=CVSS40_ENDPOINT,
+            target=target,
+            url=js_url,
+        )
+
+    async def _check_supabase_rls(
+        self, content: str, js_url: str, target: str
+    ) -> None:
+        """Detect Supabase anon key + test for disabled Row-Level Security.
+
+        When a Supabase project URL and anon key are both present in the JS bundle,
+        we can directly query the REST API as an unauthenticated user. If RLS is
+        disabled on any table, the anon key provides full read access to the database.
+        """
+        url_m = re.search(
+            r"""supabaseUrl\s*[=:,]\s*["'](https://[a-z0-9]+\.supabase\.co)["']""",
+            content,
+        )
+        key_m = re.search(
+            r"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_\-]{50,}",
+            content,
+        )
+        if not (url_m and key_m):
+            return
+
+        supabase_url = url_m.group(1)
+        anon_key     = key_m.group()
+
+        try:
+            import aiohttp as _aio
+            api_url = f"{supabase_url}/rest/v1/"
+            headers = {
+                "apikey":        anon_key,
+                "Authorization": f"Bearer {anon_key}",
+                "Accept":        "application/json",
+            }
+            await self.rate_limit()
+            async with _aio.ClientSession(connector=_aio.TCPConnector(ssl=False)) as sess:
+                async with sess.get(api_url, headers=headers, timeout=_aio.ClientTimeout(total=10)) as resp:
+                    body = await resp.text(errors="ignore")
+                    rls_bypassed = resp.status == 200 and ('"hint"' in body or '"path"' in body or "[]" in body)
+        except Exception:
+            rls_bypassed = False
+
+        severity = Severity.CRITICAL if rls_bypassed else Severity.HIGH
+        title = (
+            "Supabase Anon Key Exposed + RLS Disabled — Unauthenticated DB Access"
+            if rls_bypassed
+            else "Supabase Anon Key Exposed in JavaScript Bundle"
+        )
+        desc = (
+            f"The Supabase project URL and anon key are hardcoded in {js_url}.\n"
+            f"Project: {supabase_url}\n"
+        )
+        if rls_bypassed:
+            desc += (
+                "Row-Level Security is NOT enforced — the anon key provides direct "
+                "unauthenticated read access to the database via the REST API. "
+                "Enumerate all tables: GET /rest/v1/ with the anon key header."
+            )
+        else:
+            desc += (
+                "Row-Level Security status could not be confirmed via probe. "
+                "Manually verify: GET /rest/v1/<table>?select=* with the anon key. "
+                "If RLS is disabled, all table data is readable without authentication."
+            )
+        ev = Evidence(
+            request_raw=f"GET {supabase_url}/rest/v1/",
+            response_raw=f"Anon key detected in {js_url}",
+            extra={"supabase_url": supabase_url, "rls_bypassed": rls_bypassed},
+        )
+        self.new_finding(
+            title=title,
+            severity=severity,
+            description=desc,
+            reproduction_steps=[
+                f"curl {supabase_url}/rest/v1/ -H 'apikey: <anon_key>' -H 'Authorization: Bearer <anon_key>'",
+                "Enumerate tables, then: GET /rest/v1/<table>?select=*",
+            ],
+            remediation=(
+                "Never embed Supabase keys in frontend code — use server-side API proxying. "
+                "Enable Row-Level Security (RLS) on ALL Supabase tables. "
+                "Rotate the exposed anon key immediately."
+            ),
+            references=["CWE-798", "CWE-200", "OWASP A02:2021"],
+            evidence=ev,
+            cvss_v31_vector=CVSS_SECRET,
+            cvss_v40_vector=CVSS40_SECRET,
+            mitre_attack=["TA0006/T1552.001", "TA0001/T1078"],
             target=target,
             url=js_url,
         )

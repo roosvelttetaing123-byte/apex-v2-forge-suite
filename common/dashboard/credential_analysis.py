@@ -4,6 +4,7 @@ Parses operator-supplied files and produces redacted exposure findings,
 attack-path simulations, and remediation guidance. This module never
 authenticates with supplied credentials and never returns raw secrets.
 """
+
 from __future__ import annotations
 
 import base64
@@ -15,12 +16,19 @@ import re
 import zipfile
 from dataclasses import dataclass, field
 from html import unescape
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
-from xml.etree import ElementTree
+
+from defusedxml import ElementTree
 
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 MAX_RECORDS = 2000
+MAX_OFFICE_ARCHIVE_MEMBERS = 2048
+MAX_OFFICE_XML_MEMBERS = 260
+MAX_OFFICE_XML_MEMBER_BYTES = 4 * 1024 * 1024
+MAX_OFFICE_XML_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_OFFICE_XML_ELEMENTS = 100_000
+MAX_OFFICE_XML_DEPTH = 128
 
 SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("AWS Access Key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
@@ -30,7 +38,12 @@ SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("JWT", re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\b")),
     ("NTLM Hash", re.compile(r"\b[a-fA-F0-9]{32}\b")),
     ("Private Key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
-    ("Password Assignment", re.compile(r"(?i)\b(?:pass(?:word)?|pwd|secret|token|api[_ -]?key)\b\s*[:=]\s*([^\s,;]{4,})")),
+    (
+        "Password Assignment",
+        re.compile(
+            r"(?i)\b(?:pass(?:word)?|pwd|secret|token|api[_ -]?key)\b\s*[:=]\s*([^\s,;]{4,})"
+        ),
+    ),
 )
 
 EMAIL_RE = re.compile(r"\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b", re.IGNORECASE)
@@ -38,14 +51,30 @@ DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]+\\[A-Za-z0-9_.-]+)\b")
 URL_RE = re.compile(r"\bhttps?://[^\s,;)\]]+", re.IGNORECASE)
 
 ADMIN_WORDS = {
-    "admin", "administrator", "root", "domain admin", "enterprise admin",
-    "svc-admin", "da-", "breakglass", "privileged",
+    "admin",
+    "administrator",
+    "root",
+    "domain admin",
+    "enterprise admin",
+    "svc-admin",
+    "da-",
+    "breakglass",
+    "privileged",
 }
 SERVICE_WORDS = {"svc", "service", "app", "jenkins", "sql", "backup", "deploy", "ci", "automation"}
 PROD_WORDS = {"prod", "production", "live", "dc", "domain controller", "vpn", "jump", "bastion"}
 LOUD_ATTACK_WORDS = {
-    "mimikatz", "psexec", "secretsdump", "dcsync", "golden ticket", "silver ticket",
-    "pass-the-hash", "pass the hash", "lateral", "privilege escalation", "domain admin",
+    "mimikatz",
+    "psexec",
+    "secretsdump",
+    "dcsync",
+    "golden ticket",
+    "silver ticket",
+    "pass-the-hash",
+    "pass the hash",
+    "lateral",
+    "privilege escalation",
+    "domain admin",
 }
 
 
@@ -121,12 +150,14 @@ def extract_records(filename: str, raw: bytes) -> tuple[list[dict[str, str]], li
         if suffix == ".xlsx":
             return _extract_xlsx(raw), notes
         if suffix in {".doc", ".xls"}:
-            notes.append("Legacy binary Office files are scanned as best-effort text only; export to .docx/.xlsx for full structure.")
+            notes.append(
+                "Legacy binary Office files are scanned as best-effort text only; export to .docx/.xlsx for full structure."
+            )
             return _extract_text(raw), notes
     except zipfile.BadZipFile:
         notes.append("Office container could not be opened; scanned as text fallback.")
-    except Exception as exc:
-        notes.append(f"Structured parse failed: {exc}; scanned as text fallback.")
+    except Exception:
+        notes.append("Structured parse failed; scanned as text fallback.")
     return _extract_text(raw), notes
 
 
@@ -152,7 +183,9 @@ def analyze_records(rows: list[dict[str, str]]) -> list[CredentialExposure]:
 
         paired_secret = _secret_from_columns(normalized)
         if paired_secret:
-            exposure = _make_exposure("Credential Pair", account, paired_secret, source, joined, normalized)
+            exposure = _make_exposure(
+                "Credential Pair", account, paired_secret, source, joined, normalized
+            )
             key = (exposure.kind, exposure.account, exposure.secret_fingerprint)
             if key not in seen:
                 seen.add(key)
@@ -162,60 +195,82 @@ def analyze_records(rows: list[dict[str, str]]) -> list[CredentialExposure]:
     return exposures
 
 
-def build_simulated_paths(exposures: list[CredentialExposure], profile: str = "defensive") -> list[dict[str, Any]]:
+def build_simulated_paths(
+    exposures: list[CredentialExposure], profile: str = "defensive"
+) -> list[dict[str, Any]]:
     """Return non-executing attack-path simulations from exposure metadata."""
     paths: list[dict[str, Any]] = []
     for exposure in exposures[:50]:
         indicators = set(exposure.indicators)
         if {"privileged_account", "prod_context"} & indicators:
-            paths.append({
-                "type": "vertical_privilege_risk",
-                "severity": exposure.risk,
-                "source_account": exposure.account or "unknown account",
-                "starting_material": exposure.kind,
-                "simulation": [
-                    "Use exposed credential only in an approved validation harness",
-                    "Check effective group membership and privileged role assignments",
-                    "Review admin surfaces reachable by this account",
-                    "Confirm whether privilege boundaries allow elevation",
-                ],
-                "likely_controls_to_validate": [
-                    "MFA enforcement", "least privilege", "privileged access management",
-                    "conditional access", "admin role review",
-                ],
-            })
+            paths.append(
+                {
+                    "type": "vertical_privilege_risk",
+                    "severity": exposure.risk,
+                    "source_account": exposure.account or "unknown account",
+                    "starting_material": exposure.kind,
+                    "simulation": [
+                        "Use exposed credential only in an approved validation harness",
+                        "Check effective group membership and privileged role assignments",
+                        "Review admin surfaces reachable by this account",
+                        "Confirm whether privilege boundaries allow elevation",
+                    ],
+                    "likely_controls_to_validate": [
+                        "MFA enforcement",
+                        "least privilege",
+                        "privileged access management",
+                        "conditional access",
+                        "admin role review",
+                    ],
+                }
+            )
         if {"service_account", "host_or_url_context"} & indicators:
-            paths.append({
-                "type": "lateral_movement_risk",
-                "severity": exposure.risk,
-                "source_account": exposure.account or "unknown account",
-                "starting_material": exposure.kind,
-                "simulation": [
-                    "Map systems referenced near the credential",
-                    "Check where the account is permitted to log on without replaying the secret",
-                    "Validate service account reuse and local-admin grants",
-                    "Correlate with endpoint and identity logs for historical use",
-                ],
-                "likely_controls_to_validate": [
-                    "service account tiering", "credential rotation",
-                    "logon restrictions", "EDR alert coverage",
-                ],
-            })
-        if exposure.kind in {"AWS Access Key", "Google API Key", "GitHub Token", "Slack Token", "JWT"}:
-            paths.append({
-                "type": "token_abuse_risk",
-                "severity": exposure.risk,
-                "source_account": exposure.account or "token principal unknown",
-                "starting_material": exposure.kind,
-                "simulation": [
-                    "Identify token owner and scope from asset inventory or provider console",
-                    "Check expiry, permissions, and recent use from provider audit logs",
-                    "Rotate the token and search repositories/storage for duplicates",
-                ],
-                "likely_controls_to_validate": [
-                    "token scoping", "secret scanning", "short token lifetime", "audit logging",
-                ],
-            })
+            paths.append(
+                {
+                    "type": "lateral_movement_risk",
+                    "severity": exposure.risk,
+                    "source_account": exposure.account or "unknown account",
+                    "starting_material": exposure.kind,
+                    "simulation": [
+                        "Map systems referenced near the credential",
+                        "Check where the account is permitted to log on without replaying the secret",
+                        "Validate service account reuse and local-admin grants",
+                        "Correlate with endpoint and identity logs for historical use",
+                    ],
+                    "likely_controls_to_validate": [
+                        "service account tiering",
+                        "credential rotation",
+                        "logon restrictions",
+                        "EDR alert coverage",
+                    ],
+                }
+            )
+        if exposure.kind in {
+            "AWS Access Key",
+            "Google API Key",
+            "GitHub Token",
+            "Slack Token",
+            "JWT",
+        }:
+            paths.append(
+                {
+                    "type": "token_abuse_risk",
+                    "severity": exposure.risk,
+                    "source_account": exposure.account or "token principal unknown",
+                    "starting_material": exposure.kind,
+                    "simulation": [
+                        "Identify token owner and scope from asset inventory or provider console",
+                        "Check expiry, permissions, and recent use from provider audit logs",
+                        "Rotate the token and search repositories/storage for duplicates",
+                    ],
+                    "likely_controls_to_validate": [
+                        "token scoping",
+                        "secret scanning",
+                        "short token lifetime",
+                        "audit logging",
+                    ],
+                }
+            )
 
     deduped: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
@@ -227,7 +282,9 @@ def build_simulated_paths(exposures: list[CredentialExposure], profile: str = "d
     return deduped[:25]
 
 
-def summarize(exposures: list[CredentialExposure], rows: list[dict[str, str]], filename: str) -> dict[str, Any]:
+def summarize(
+    exposures: list[CredentialExposure], rows: list[dict[str, str]], filename: str
+) -> dict[str, Any]:
     counts: dict[str, int] = {}
     risk_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0}
     for item in exposures:
@@ -245,7 +302,9 @@ def summarize(exposures: list[CredentialExposure], rows: list[dict[str, str]], f
 
 def remediation_plan(exposures: list[CredentialExposure]) -> list[str]:
     if not exposures:
-        return ["No credential-like material was detected. Continue scanning source and collaboration stores routinely."]
+        return [
+            "No credential-like material was detected. Continue scanning source and collaboration stores routinely."
+        ]
     steps = [
         "Quarantine the source file and restrict access while triage runs.",
         "Rotate or revoke every exposed credential; prioritize critical and high items first.",
@@ -254,9 +313,15 @@ def remediation_plan(exposures: list[CredentialExposure]) -> list[str]:
         "Replace long-lived shared credentials with vault-backed short-lived secrets.",
     ]
     if any("privileged_account" in item.indicators for item in exposures):
-        steps.insert(2, "Review privileged group membership and force fresh MFA/session sign-in for affected accounts.")
+        steps.insert(
+            2,
+            "Review privileged group membership and force fresh MFA/session sign-in for affected accounts.",
+        )
     if any("service_account" in item.indicators for item in exposures):
-        steps.insert(3, "Inventory service account dependencies before rotation, then apply logon restrictions and least privilege.")
+        steps.insert(
+            3,
+            "Inventory service account dependencies before rotation, then apply logon restrictions and least privilege.",
+        )
     return steps
 
 
@@ -315,21 +380,27 @@ def _extract_json(raw: bytes) -> list[dict[str, str]]:
 def _extract_docx(raw: bytes) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     with zipfile.ZipFile(io.BytesIO(raw)) as doc:
-        xml = doc.read("word/document.xml")
-    root = ElementTree.fromstring(xml)
+        _validate_office_archive(doc)
+        budget = _OfficeXmlBudget()
+        xml = _read_office_xml(doc, "word/document.xml", budget)
+    root = _parse_office_xml(xml)
     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
     for idx, para in enumerate(root.findall(".//w:p", ns), start=1):
         text = "".join(node.text or "" for node in para.findall(".//w:t", ns)).strip()
         if text:
             rows.append({"_source": f"paragraph {idx}", "text": unescape(text)})
+            if len(rows) >= MAX_RECORDS:
+                break
     return rows
 
 
 def _extract_xlsx(raw: bytes) -> list[dict[str, str]]:
     with zipfile.ZipFile(io.BytesIO(raw)) as book:
-        shared_strings = _xlsx_shared_strings(book)
-        workbook = ElementTree.fromstring(book.read("xl/workbook.xml"))
-        rels = ElementTree.fromstring(book.read("xl/_rels/workbook.xml.rels"))
+        _validate_office_archive(book)
+        budget = _OfficeXmlBudget()
+        shared_strings = _xlsx_shared_strings(book, budget)
+        workbook = _parse_office_xml(_read_office_xml(book, "xl/workbook.xml", budget))
+        rels = _parse_office_xml(_read_office_xml(book, "xl/_rels/workbook.xml.rels", budget))
         rel_map = {
             rel.attrib["Id"]: rel.attrib["Target"]
             for rel in rels
@@ -342,28 +413,128 @@ def _extract_xlsx(raw: bytes) -> list[dict[str, str]]:
         rows: list[dict[str, str]] = []
         for sheet in workbook.findall(".//main:sheet", ns):
             name = sheet.attrib.get("name", "sheet")
-            rel_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id", "")
+            rel_id = sheet.attrib.get(
+                "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id", ""
+            )
             target = rel_map.get(rel_id, "")
             if not target:
                 continue
-            sheet_path = "xl/" + target.lstrip("/")
-            sheet_xml = ElementTree.fromstring(book.read(sheet_path))
+            sheet_path = _xlsx_sheet_path(target)
+            sheet_xml = _parse_office_xml(_read_office_xml(book, sheet_path, budget))
             for row in sheet_xml.findall(".//main:row", ns):
-                cells = [_xlsx_cell_value(cell, shared_strings, ns) for cell in row.findall("main:c", ns)]
+                cells = [
+                    _xlsx_cell_value(cell, shared_strings, ns) for cell in row.findall("main:c", ns)
+                ]
                 if any(cells):
-                    rows.append({
-                        "_source": f"{name}!row {row.attrib.get('r', '?')}",
-                        "text": " ".join(cell for cell in cells if cell),
-                    })
+                    rows.append(
+                        {
+                            "_source": f"{name}!row {row.attrib.get('r', '?')}",
+                            "text": " ".join(cell for cell in cells if cell),
+                        }
+                    )
+                    if len(rows) >= MAX_RECORDS:
+                        return rows
         return rows
 
 
-def _xlsx_shared_strings(book: zipfile.ZipFile) -> list[str]:
+@dataclass
+class _OfficeXmlBudget:
+    remaining_bytes: int = MAX_OFFICE_XML_TOTAL_BYTES
+    members_read: set[str] = field(default_factory=set)
+
+
+def _validate_office_archive(archive: zipfile.ZipFile) -> None:
+    infos = archive.infolist()
+    if len(infos) > MAX_OFFICE_ARCHIVE_MEMBERS:
+        raise ValueError("Office archive has too many members")
+    names = [info.filename for info in infos]
+    if len(names) != len(set(names)):
+        raise ValueError("Office archive has duplicate member names")
+
+
+def _read_office_xml(
+    archive: zipfile.ZipFile,
+    member_name: str,
+    budget: _OfficeXmlBudget,
+) -> bytes:
+    if member_name in budget.members_read:
+        raise ValueError("Office XML member was referenced more than once")
+    if len(budget.members_read) >= MAX_OFFICE_XML_MEMBERS:
+        raise ValueError("Office archive has too many XML members")
+
+    info = archive.getinfo(member_name)
+    if info.is_dir() or info.flag_bits & 0x1:
+        raise ValueError("Office XML member is not a readable regular member")
+    member_limit = min(MAX_OFFICE_XML_MEMBER_BYTES, budget.remaining_bytes)
+    if member_limit < 0 or info.file_size > member_limit:
+        raise ValueError("Office XML decompression limit exceeded")
+
+    with archive.open(info, "r") as source:
+        content = source.read(member_limit + 1)
+    if len(content) > member_limit or len(content) != info.file_size:
+        raise ValueError("Office XML decompression limit exceeded")
+
+    budget.members_read.add(member_name)
+    budget.remaining_bytes -= len(content)
+    return content
+
+
+def _parse_office_xml(content: bytes) -> Any:
+    if len(content) > MAX_OFFICE_XML_MEMBER_BYTES:
+        raise ValueError("Office XML parser byte limit exceeded")
+    root = ElementTree.fromstring(
+        content,
+        forbid_dtd=True,
+        forbid_entities=True,
+        forbid_external=True,
+    )
+    count = 0
+    stack = [(root, 1)]
+    while stack:
+        element, depth = stack.pop()
+        count += 1
+        if count > MAX_OFFICE_XML_ELEMENTS:
+            raise ValueError("Office XML parser element limit exceeded")
+        if depth > MAX_OFFICE_XML_DEPTH:
+            raise ValueError("Office XML parser depth limit exceeded")
+        stack.extend((child, depth + 1) for child in reversed(element))
+    return root
+
+
+def _xlsx_sheet_path(target: str) -> str:
+    if "\\" in target:
+        raise ValueError("Invalid spreadsheet relationship target")
+    candidate = PurePosixPath(target)
+    if candidate.is_absolute():
+        candidate = PurePosixPath(*candidate.parts[1:])
+    else:
+        candidate = PurePosixPath("xl") / candidate
+
+    normalized_parts: list[str] = []
+    for part in candidate.parts:
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not normalized_parts:
+                raise ValueError("Invalid spreadsheet relationship target")
+            normalized_parts.pop()
+            continue
+        normalized_parts.append(part)
+    normalized = PurePosixPath(*normalized_parts)
+    if normalized.parent != PurePosixPath("xl/worksheets") or normalized.suffix != ".xml":
+        raise ValueError("Spreadsheet relationship target is outside worksheets")
+    return normalized.as_posix()
+
+
+def _xlsx_shared_strings(
+    book: zipfile.ZipFile,
+    budget: _OfficeXmlBudget,
+) -> list[str]:
     try:
-        xml = book.read("xl/sharedStrings.xml")
+        xml = _read_office_xml(book, "xl/sharedStrings.xml", budget)
     except KeyError:
         return []
-    root = ElementTree.fromstring(xml)
+    root = _parse_office_xml(xml)
     ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     values: list[str] = []
     for si in root.findall(".//main:si", ns):
@@ -371,7 +542,7 @@ def _xlsx_shared_strings(book: zipfile.ZipFile) -> list[str]:
     return values
 
 
-def _xlsx_cell_value(cell: ElementTree.Element, shared_strings: list[str], ns: dict[str, str]) -> str:
+def _xlsx_cell_value(cell: Any, shared_strings: list[str], ns: dict[str, str]) -> str:
     value = cell.find("main:v", ns)
     if value is None or value.text is None:
         return ""
@@ -422,7 +593,12 @@ def _redact_context(context: str, secret: str) -> str:
     if secret:
         result = result.replace(secret, mask_secret(secret))
     for _, pattern in SECRET_PATTERNS:
-        result = pattern.sub(lambda m: m.group(0).replace(m.group(1), mask_secret(m.group(1))) if m.lastindex else mask_secret(m.group(0)), result)
+        result = pattern.sub(
+            lambda m: m.group(0).replace(m.group(1), mask_secret(m.group(1)))
+            if m.lastindex
+            else mask_secret(m.group(0)),
+            result,
+        )
     return result
 
 
@@ -443,7 +619,10 @@ def _secret_from_columns(row: dict[str, str]) -> str:
     for key, value in row.items():
         if not value:
             continue
-        if any(hint in key for hint in ("password", "passwd", "pwd", "secret", "token", "api_key", "apikey")):
+        if any(
+            hint in key
+            for hint in ("password", "passwd", "pwd", "secret", "token", "api_key", "apikey")
+        ):
             if len(value) >= 4 and value.lower() not in {"password", "secret", "token"}:
                 return value
     return ""
@@ -451,7 +630,20 @@ def _secret_from_columns(row: dict[str, str]) -> str:
 
 def _field_hint(key: Any) -> bool:
     lowered = str(key).lower()
-    return any(hint in lowered for hint in ("user", "account", "email", "password", "secret", "token", "key", "url", "host"))
+    return any(
+        hint in lowered
+        for hint in (
+            "user",
+            "account",
+            "email",
+            "password",
+            "secret",
+            "token",
+            "key",
+            "url",
+            "host",
+        )
+    )
 
 
 def _stringify(value: Any) -> str:

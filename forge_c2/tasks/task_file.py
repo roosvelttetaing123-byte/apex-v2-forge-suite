@@ -259,13 +259,13 @@ class TestDownloadTask:
     def test_no_path(self) -> None:
         import asyncio
         task = DownloadTask(task_id="d2")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_file_not_found(self) -> None:
         import asyncio
         task = DownloadTask(task_id="d3", path="/nonexistent/ghost/file.txt")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
         assert "not found" in result.error.lower()
 
@@ -281,11 +281,11 @@ class TestUploadTask:
     def test_no_path(self) -> None:
         import asyncio
         task = UploadTask(task_id="u2", data="aGVsbG8=")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_no_data(self) -> None:
         import asyncio
         task = UploadTask(task_id="u3", path="/tmp/test.txt")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED

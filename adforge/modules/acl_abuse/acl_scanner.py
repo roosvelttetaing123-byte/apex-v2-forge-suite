@@ -157,7 +157,7 @@ class AclScanner(BaseModule):
 
         for entry in entries:
             dn = entry.get("dn", base_dn)
-            sd = entry.get("nTSecurityDescriptor", "")
+            sd = entry.get("nTSecurityDescriptor_raw") or entry.get("nTSecurityDescriptor", "")
             if not sd:
                 continue
 

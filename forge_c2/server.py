@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -61,8 +62,44 @@ from forge_c2.beacon.beacon_core import (
     Beacon, BeaconMetadata, BeaconRegistry, BeaconState, BeaconTask,
 )
 from forge_c2.beacon.beacon_crypto import BeaconCrypto
+from forge_c2.emulation import (
+    P2PTopology,
+    build_process_injection_emulation_plan,
+    list_process_injection_techniques,
+)
 
 log = logging.getLogger("forge.c2.server")
+
+_OPERATOR_HASH_ALGORITHM = "pbkdf2_sha256"
+_OPERATOR_HASH_ITERATIONS = 260_000
+
+
+def _hash_operator_password(password: str, salt: str | None = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("ascii"),
+        _OPERATOR_HASH_ITERATIONS,
+    ).hex()
+    return f"{_OPERATOR_HASH_ALGORITHM}${_OPERATOR_HASH_ITERATIONS}${salt}${digest}"
+
+
+def _verify_operator_password(password: str, password_hash: str) -> bool:
+    if not password_hash.startswith(f"{_OPERATOR_HASH_ALGORITHM}$"):
+        return False
+    try:
+        _, iterations_raw, salt, expected = password_hash.split("$", 3)
+        iterations = int(iterations_raw)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("ascii"),
+            iterations,
+        ).hex()
+        return hmac.compare_digest(digest, expected)
+    except (ValueError, TypeError):
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -103,7 +140,7 @@ class OperatorManager:
     """Manages operator authentication, sessions, and permissions.
 
     Supports:
-    - Password-based authentication (bcrypt-hashed)
+    - Password-based authentication (salted PBKDF2-HMAC)
     - Session token management
     - Role-based access control (ADMIN, OPERATOR, VIEWER)
     - Multi-operator awareness (who's tasking what)
@@ -130,9 +167,9 @@ class OperatorManager:
         Returns:
             Operator dataclass.
         """
-        pw_hash = hashlib.sha256(
-            (password + username + "forge_c2_salt").encode()
-        ).hexdigest()
+        if not username or not password:
+            raise ValueError("username and password are required")
+        pw_hash = _hash_operator_password(password)
         self._credentials[username] = pw_hash
 
         operator = Operator(username=username, role=role, password_hash=pw_hash)
@@ -156,11 +193,7 @@ class OperatorManager:
             log.warning("AUTH FAIL: unknown user '%s' from %s", username, ip)
             return None
 
-        attempt_hash = hashlib.sha256(
-            (password + username + "forge_c2_salt").encode()
-        ).hexdigest()
-
-        if not secrets.compare_digest(stored_hash, attempt_hash):
+        if not _verify_operator_password(password, stored_hash):
             log.warning("AUTH FAIL: bad password for '%s' from %s", username, ip)
             return None
 
@@ -344,16 +377,13 @@ class ListenerManager:
                     self._run_tcp_listener(config),
                     name=f"listener_{config.listener_id}",
                 )
-            elif config.listener_type == ListenerType.DNS:
-                task = asyncio.create_task(
-                    self._run_dns_listener(config),
-                    name=f"listener_{config.listener_id}",
+            elif config.listener_type in {ListenerType.DNS, ListenerType.SMB}:
+                config.state = ListenerState.ERROR
+                log.error(
+                    "%s listener is not implemented; refusing to report it as running",
+                    config.listener_type.value.upper(),
                 )
-            elif config.listener_type == ListenerType.SMB:
-                task = asyncio.create_task(
-                    self._run_smb_listener(config),
-                    name=f"listener_{config.listener_id}",
-                )
+                return False
             else:
                 config.state = ListenerState.ERROR
                 return False
@@ -535,26 +565,14 @@ class ListenerManager:
             await server.serve_forever()
 
     async def _run_dns_listener(self, config: ListenerConfig) -> None:
-        """DNS listener — encodes C2 traffic in DNS queries.
-
-        Uses TXT records for data exfil, A records for tasking.
-        Placeholder — real implementation in transport/dns_transport.py.
-        """
-        log.info("DNS listener configured for domain %s on port %d",
-                 config.dns_domain or "c2.local", config.bind_port)
-        # DNS C2 requires raw socket or dnspython — defer to transport module
-        while True:
-            await asyncio.sleep(3600)  # Placeholder loop
+        """DNS listener placeholder intentionally fails closed."""
+        config.state = ListenerState.ERROR
+        raise NotImplementedError("DNS listener transport is not implemented")
 
     async def _run_smb_listener(self, config: ListenerConfig) -> None:
-        """SMB Named Pipe listener — for lateral movement C2.
-
-        Uses named pipes for communication (Windows-native, blends with SMB traffic).
-        Placeholder — real implementation in transport/smb_transport.py.
-        """
-        log.info("SMB listener configured for pipe %s", config.pipe_name)
-        while True:
-            await asyncio.sleep(3600)  # Placeholder loop
+        """SMB listener placeholder intentionally fails closed."""
+        config.state = ListenerState.ERROR
+        raise NotImplementedError("SMB listener transport is not implemented")
 
     # ── Protocol handlers ─────────────────────────────────────────────
 
@@ -823,6 +841,8 @@ class TeamServer:
         self.listeners = ListenerManager(registry=self.registry, crypto=self.crypto)
         self.operators = OperatorManager()
         self.router = TaskRouter(registry=self.registry, event_bus=event_bus)
+        self.p2p_topology = P2PTopology(self.registry)
+        self._emulation_log: list[dict[str, Any]] = []
 
         # State
         self._running = False
@@ -831,8 +851,10 @@ class TeamServer:
         self._dead_check_task: asyncio.Task | None = None
         self._operator_api_task: asyncio.Task | None = None
 
-        # Create default admin
-        admin_password = os.environ.get("FORGE_C2_ADMIN_PW", "changeme")
+        # Create admin from environment only; never ship a usable default.
+        admin_password = os.environ.get("FORGE_C2_ADMIN_PW")
+        if not admin_password:
+            raise RuntimeError("FORGE_C2_ADMIN_PW must be set before starting Forge C2")
         self.operators.add_operator("admin", admin_password, OperatorRole.ADMIN)
 
     async def start(self) -> None:
@@ -862,7 +884,7 @@ class TeamServer:
         )
 
         log.info("═══ FORGE C2 TEAM SERVER ONLINE ═══")
-        log.info("Default login: admin / <FORGE_C2_ADMIN_PW or 'changeme'>")
+        log.info("Default login: admin / <FORGE_C2_ADMIN_PW>")
 
         # Wait for both tasks
         try:
@@ -929,6 +951,11 @@ class TeamServer:
             listener_create — Create listener
             listener_start  — Start listener
             listener_stop   — Stop listener
+            process_injection_techniques — List inert injection emulations
+            process_injection_plan       — Record dry-run injection validation plan
+            p2p_tree        — Show emulated relay tree
+            p2p_link        — Link beacons in emulated relay topology
+            p2p_unlink      — Remove emulated relay link
             operators       — List operators
             status          — Server status
         """
@@ -1036,9 +1063,58 @@ class TeamServer:
         if command == "task_history":
             return {"status": "ok", "data": self.router.task_history[-100:]}
 
+        if command == "emulation_history":
+            return {"status": "ok", "data": self._emulation_log[-100:]}
+
+        if command == "process_injection_techniques":
+            return {"status": "ok", "data": list_process_injection_techniques()}
+
+        if command == "p2p_tree":
+            return {"status": "ok", "data": self.p2p_topology.tree()}
+
         # ── Write commands (operator + admin) ─────────────────────────
         if operator.role == OperatorRole.VIEWER:
             return {"status": "error", "message": "Insufficient permissions (viewer)"}
+
+        if command == "process_injection_plan":
+            try:
+                beacon_id = str(request.get("beacon_id", ""))
+                if beacon_id and not self.registry.get(beacon_id):
+                    return {"status": "error", "message": f"Beacon {beacon_id} not found"}
+                plan = build_process_injection_emulation_plan(
+                    str(request.get("technique_id", "")),
+                    beacon_id=beacon_id,
+                    target_process=str(request.get("target_process", "")),
+                    operator=operator.username,
+                    dry_run=bool(request.get("dry_run", True)),
+                )
+                self._record_emulation_event(plan)
+                return {"status": "ok", "data": plan}
+            except ValueError as exc:
+                return {"status": "error", "message": str(exc)}
+
+        if command == "p2p_link":
+            try:
+                link = self.p2p_topology.link(
+                    str(request.get("parent", "")),
+                    str(request.get("child", "")),
+                    transport=str(request.get("transport", "tcp")),
+                    operator=operator.username,
+                )
+                event = {"kind": "p2p_link_emulation", **link.to_dict()}
+                self._record_emulation_event(event)
+                return {"status": "ok", "data": link.to_dict()}
+            except ValueError as exc:
+                return {"status": "error", "message": str(exc)}
+
+        if command == "p2p_unlink":
+            try:
+                result = self.p2p_topology.unlink(str(request.get("child", "")))
+                event = {"kind": "p2p_unlink_emulation", **result, "operator": operator.username}
+                self._record_emulation_event(event)
+                return {"status": "ok", "data": result}
+            except ValueError as exc:
+                return {"status": "error", "message": str(exc)}
 
         if command == "task":
             task = self.router.task_beacon(
@@ -1119,6 +1195,8 @@ class TeamServer:
             "listeners": self.listeners.summary(),
             "operators": self.operators.summary(),
             "tasks_total": len(self.router.task_history),
+            "emulation_events_total": len(self._emulation_log),
+            "p2p_topology": self.p2p_topology.tree(),
         }
 
     def _persist_state(self) -> None:
@@ -1129,6 +1207,7 @@ class TeamServer:
                 "beacons": self.registry.summary(),
                 "listeners": self.listeners.summary(),
                 "task_log": self.router.task_history[-500:],
+                "emulation_log": self._emulation_log[-500:],
             }
             state_file = self.data_dir / "server_state.json"
             with open(state_file, "w") as f:
@@ -1150,6 +1229,22 @@ class TeamServer:
             ))
         except Exception:
             pass
+
+    def _record_emulation_event(self, event: dict[str, Any]) -> None:
+        """Record a non-executing C2 emulation event."""
+        stored = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **event,
+            "safety_mode": event.get("safety_mode", "dry_run_emulation"),
+        }
+        self._emulation_log.append(stored)
+        self._emit(
+            "control_command",
+            command=stored.get("kind", "c2_emulation"),
+            task_id=stored.get("id", ""),
+            safety_mode=stored.get("safety_mode"),
+            emulated=True,
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1246,17 +1341,44 @@ class TestTaskRouter:
 class TestTeamServer:
     """Tests for team server init."""
 
+    @staticmethod
+    def _with_admin_password() -> str | None:
+        old = os.environ.get("FORGE_C2_ADMIN_PW")
+        os.environ["FORGE_C2_ADMIN_PW"] = "unit-test-admin-secret"
+        return old
+
+    @staticmethod
+    def _restore_admin_password(old: str | None) -> None:
+        if old is None:
+            os.environ.pop("FORGE_C2_ADMIN_PW", None)
+        else:
+            os.environ["FORGE_C2_ADMIN_PW"] = old
+
     def test_init(self) -> None:
-        server = TeamServer(port=0, data_dir=Path("/tmp/forge_c2_test"))
-        assert server.registry is not None
-        assert server.crypto is not None
-        assert server.operators is not None
-        assert server.listeners is not None
-        assert server.router is not None
+        import tempfile
+
+        old = self._with_admin_password()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                server = TeamServer(port=0, data_dir=Path(tmp))
+            assert server.registry is not None
+            assert server.crypto is not None
+            assert server.operators is not None
+            assert server.listeners is not None
+            assert server.router is not None
+        finally:
+            self._restore_admin_password(old)
 
     def test_status(self) -> None:
-        server = TeamServer(port=0)
-        status = server.status()
-        assert "beacons" in status
-        assert "listeners" in status
-        assert "operators" in status
+        import tempfile
+
+        old = self._with_admin_password()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                server = TeamServer(port=0, data_dir=Path(tmp))
+                status = server.status()
+            assert "beacons" in status
+            assert "listeners" in status
+            assert "operators" in status
+        finally:
+            self._restore_admin_password(old)

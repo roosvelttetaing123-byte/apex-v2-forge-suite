@@ -519,7 +519,7 @@ class TestMimikatzTask:
     def test_emulation_logonpasswords(self) -> None:
         import asyncio
         engine = MimikatzEngine(mode=MimikatzMode.EMULATION)
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             engine.execute("logonpasswords")
         )
         assert result.success
@@ -529,7 +529,7 @@ class TestMimikatzTask:
     def test_emulation_sam(self) -> None:
         import asyncio
         engine = MimikatzEngine(mode=MimikatzMode.EMULATION)
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             engine.execute("sam")
         )
         assert result.success
@@ -538,7 +538,7 @@ class TestMimikatzTask:
     def test_emulation_dcsync(self) -> None:
         import asyncio
         engine = MimikatzEngine(mode=MimikatzMode.EMULATION)
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             engine.execute("dcsync", target="FORGE\\krbtgt")
         )
         assert result.success

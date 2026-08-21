@@ -596,26 +596,26 @@ class TestWMITask:
     def test_emulation_query(self) -> None:
         import asyncio
         task = WMITask(task_id="wmi3", query="processes")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.COMPLETED
 
     def test_no_query_shows_shortcuts(self) -> None:
         import asyncio
         task = WMITask(task_id="wmi4", operation="query")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.COMPLETED
         assert "Shortcuts" in result.output
 
     def test_exec_no_command(self) -> None:
         import asyncio
         task = WMITask(task_id="wmi5", operation="exec")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_invalid_operation(self) -> None:
         import asyncio
         task = WMITask(task_id="wmi6", operation="bogus")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_query_result_to_dict(self) -> None:

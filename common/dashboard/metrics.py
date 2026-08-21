@@ -10,6 +10,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from collections.abc import Sequence
 from typing import Any
 
 log = logging.getLogger("forge.dashboard.metrics")
@@ -278,7 +279,7 @@ class MetricsCollector:
 SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
 
 
-def sparkline(values: list[float], width: int = 20) -> str:
+def sparkline(values: Sequence[float], width: int = 20) -> str:
     """Render a list of floats as a Unicode sparkline string.
 
     Args:

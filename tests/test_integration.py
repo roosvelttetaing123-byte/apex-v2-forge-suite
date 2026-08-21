@@ -307,7 +307,7 @@ class TestModuleToReporterPipeline:
             DESCRIPTION = "SQL injection scanner"
             PHASE = 4
 
-            async def run(self) -> ModuleResult:
+            async def fixture_run(self) -> ModuleResult:
                 start = time.monotonic()
                 self.new_finding(
                     title="SQL Injection",
@@ -321,6 +321,9 @@ class TestModuleToReporterPipeline:
                 )
                 return self._make_result(start)
 
+            async def run(self) -> ModuleResult:
+                return await self.fixture_run()
+
         cfg = BaseForgeConfig(target="https://demo.forge.local")
         scope = Scope(["demo.forge.local"])
         session = create_db(tmp_path / "test.db")
@@ -328,7 +331,7 @@ class TestModuleToReporterPipeline:
 
     def test_module_finding_flows_into_reporter(self, tmp_path):
         module, session = self._make_module(tmp_path)
-        result = asyncio.run(module.run())
+        result = asyncio.run(module.fixture_run())
         session.close()
 
         assert len(result.findings) == 1
@@ -359,7 +362,7 @@ class TestModuleToReporterPipeline:
             DESCRIPTION = "test"
             PHASE = 1
 
-            async def run(self) -> ModuleResult:
+            async def fixture_run(self) -> ModuleResult:
                 start = time.monotonic()
                 for _ in range(3):
                     self.new_finding(
@@ -373,18 +376,21 @@ class TestModuleToReporterPipeline:
                     )
                 return self._make_result(start)
 
+            async def run(self) -> ModuleResult:
+                return await self.fixture_run()
+
         cfg = BaseForgeConfig(target="https://example.com")
         scope = Scope(["example.com"])
         session = create_db(tmp_path / "test.db")
         mod = DupModule(cfg, scope, session, tmp_path)
-        result = asyncio.run(mod.run())
+        result = asyncio.run(mod.fixture_run())
         session.close()
 
         assert len(result.findings) == 1
 
     def test_full_pipeline_with_compliance(self, tmp_path):
         module, session = self._make_module(tmp_path)
-        result = asyncio.run(module.run())
+        result = asyncio.run(module.fixture_run())
         session.close()
 
         finding_dicts = [f.to_dict() for f in result.findings]

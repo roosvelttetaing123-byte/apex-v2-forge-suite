@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.framework_params import is_framework_param
 
 CVSS_HPP = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N"
 CVSS40_HPP = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N"
@@ -47,6 +48,7 @@ class ParameterPollution(BaseModule):
 
         # Test form params
         for form in forms[:10]:
+            if is_framework_param(form): continue
             if form.get("inputs"):
                 tasks.append(self._test_form(form, target, sem))
 
@@ -61,6 +63,7 @@ class ParameterPollution(BaseModule):
                 return
 
             for param_name, values in params.items():
+                if is_framework_param(param_name): continue
                 await self.rate_limit()
                 if not self.check_scope(url):
                     continue

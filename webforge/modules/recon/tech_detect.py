@@ -35,7 +35,7 @@ TECH_SIGNATURES: dict[str, dict[str, Any]] = {
     "Drupal": {
         "headers": {"x-generator": r"Drupal ([\d.]+)"},
         "body": [r"Drupal\.settings", r"/sites/default/"],
-        "cookies": ["SESS"],
+        "cookies": ["^SESS[a-f0-9]+$"],
         "version_re": r"Drupal ([\d.]+)",
     },
     "Laravel": {
@@ -47,7 +47,7 @@ TECH_SIGNATURES: dict[str, dict[str, Any]] = {
     "Django": {
         "headers": {},
         "body": [],
-        "cookies": ["csrftoken", "sessionid"],
+        "cookies": ["^csrftoken$", "^sessionid$"],
         "meta": [],
     },
     "Ruby on Rails": {
@@ -59,7 +59,7 @@ TECH_SIGNATURES: dict[str, dict[str, Any]] = {
     "PHP": {
         "headers": {"x-powered-by": r"PHP/([\d.]+)"},
         "body": [],
-        "cookies": ["PHPSESSID"],
+        "cookies": ["^PHPSESSID$"],
         "meta": [],
         "version_re_header": "x-powered-by",
         "version_re": r"PHP/([\d.]+)",
@@ -208,10 +208,7 @@ class TechDetect(BaseModule):
         self.log.info("Detecting technologies on %s", target)
 
         from webforge.core.session import ForgeSession
-        async with ForgeSession(
-            rate=self.config.rate.requests_per_second,
-            proxy=self.config.extra.get("proxy"),
-        ) as session:
+        async with ForgeSession.from_config(self.config) as session:
             try:
                 await self.rate_limit()
                 resp = await session.get(target)
@@ -267,7 +264,12 @@ class TechDetect(BaseModule):
                     matches.append(f"meta:{meta_pattern[:30]}")
 
             if matches:
-                detected[tech] = matches
+                # Require 2+ signals unless header-based (headers are high confidence)
+                has_header_match = any(m.startswith("header:") for m in matches)
+                if has_header_match or len(matches) >= 2:
+                    detected[tech] = matches
+                else:
+                    self.log.debug("Skipping %s — only 1 weak signal: %s", tech, matches)
 
         if detected:
             self.log.info("Technologies detected: %s", list(detected.keys()))

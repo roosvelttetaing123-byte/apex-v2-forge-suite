@@ -29,6 +29,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from forge_c2.tasks.base_task import (
@@ -599,14 +600,14 @@ class TestKeyloggerTask:
     def test_invalid_action(self) -> None:
         import asyncio
         task = KeyloggerTask(task_id="kl3", action="invalid")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
         assert "Unknown action" in result.error
 
     def test_dump_no_logger(self) -> None:
         import asyncio
         task = KeyloggerTask(task_id="kl4", action="dump", logger_id="nonexistent")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_buffer_operations(self) -> None:

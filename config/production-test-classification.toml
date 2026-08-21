@@ -1,0 +1,13 @@
+schema_version = 2
+
+[execution]
+collector = "tests/test_production_embedded_regressions.py"
+ci_command = "python -m pytest tests/"
+minimum_regressions = 1444
+maximum_unsafe_exceptions = 0
+owner = "Core Security Engineering Lead"
+reason = "Production Test* classes contain genuine unit regressions and are collected through deterministic aliases by the normal pytest suite."
+
+# A safety exception, if ever required, must be one exact source node and carry
+# all of: node_id, owner, reason, risk, and expires. Broad path/class patterns
+# are intentionally unsupported. Task 008 qualifies with zero exceptions.

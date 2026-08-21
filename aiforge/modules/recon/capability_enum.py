@@ -55,6 +55,7 @@ class CapabilityEnum(BaseModule):
             max_tokens=1000,
             temperature=0.0,
             proxy=self.config.extra.get("proxy"),
+            outbound_policy=self.outbound_policy,
         ) as client:
             capabilities: dict[str, Any] = {}
 

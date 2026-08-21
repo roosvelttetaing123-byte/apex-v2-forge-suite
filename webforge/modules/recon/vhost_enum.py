@@ -54,6 +54,7 @@ class VhostEnum(BaseModule):
             return self._make_result(start)
 
         self.log.info("Testing %d vhost candidates for %s", len(DEFAULT_SUBDOMAINS), base_domain)
+        self._discovered_vhosts: list[dict] = []  # Collect, don't spam
 
         sem = asyncio.Semaphore(5)
         tasks = [
@@ -61,6 +62,33 @@ class VhostEnum(BaseModule):
             for sub in DEFAULT_SUBDOMAINS
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Emit ONE consolidated finding instead of N individual ones
+        if self._discovered_vhosts:
+            vhost_list = [v["vhost"] for v in self._discovered_vhosts]
+            vhost_summary = ", ".join(vhost_list[:20])
+            if len(vhost_list) > 20:
+                vhost_summary += f" ... and {len(vhost_list) - 20} more"
+            self.new_finding(
+                title=f"Virtual Hosts Discovered — {len(vhost_list)} found",
+                severity=Severity.LOW,
+                description=(
+                    f"Discovered {len(vhost_list)} virtual host(s) responding differently "
+                    f"from the baseline: {vhost_summary}. "
+                    "These may be hidden development, staging, or internal environments."
+                ),
+                reproduction_steps=[
+                    f"curl -H 'Host: {vhost_list[0]}' {target}"
+                ] + [f"Also try: {v}" for v in vhost_list[1:5]],
+                remediation=(
+                    "Ensure development/staging vhosts are not accessible from the internet. "
+                    "Remove or restrict non-production environments."
+                ),
+                references=["CWE-200", "OWASP A05:2021"],
+                cvss_v31_vector=CVSS_VHOST,
+                cvss_v40_vector=CVSS40_VHOST,
+                target=target,
+            )
 
         return self._make_result(start)
 
@@ -109,41 +137,14 @@ class VhostEnum(BaseModule):
                             status in (200, 301, 302, 401, 403)
                             and status != baseline["status"]
                         ) or (status == 200 and diff > 200 and title != baseline["title"]):
-                            ev = Evidence(
-                                request_raw=f"GET / HTTP/1.1\nHost: {vhost}",
-                                response_raw=body[:500],
-                                extra={
-                                    "vhost": vhost,
-                                    "status": status,
-                                    "length": length,
-                                    "title": title,
-                                    "baseline_status": baseline["status"],
-                                    "baseline_length": baseline["length"],
-                                },
-                            )
-                            self.new_finding(
-                                title=f"Virtual Host Discovered — {vhost}",
-                                severity=Severity.LOW,
-                                description=(
-                                    f"Virtual host '{vhost}' responds differently than the baseline "
-                                    f"(status {status}, length {length}, title '{title}'). "
-                                    "This may be a hidden development or staging environment."
-                                ),
-                                reproduction_steps=[
-                                    f"curl -H 'Host: {vhost}' {target}",
-                                    f"Add '{target.split('//')[1]} {vhost}' to /etc/hosts",
-                                ],
-                                remediation=(
-                                    "Ensure development/staging vhosts are not accessible from the internet. "
-                                    "Remove or restrict non-production environments."
-                                ),
-                                references=["CWE-200", "OWASP A05:2021"],
-                                evidence=ev,
-                                cvss_v31_vector=CVSS_VHOST,
-                                cvss_v40_vector=CVSS40_VHOST,
-                                target=target,
-                                url=f"{target}/ [Host: {vhost}]",
-                            )
+                            # Collect instead of emitting individual findings
+                            self._discovered_vhosts.append({
+                                "vhost": vhost,
+                                "status": status,
+                                "length": length,
+                                "title": title,
+                            })
+                            self.log.debug("Vhost found: %s (status=%d len=%d)", vhost, status, length)
             except Exception:
                 pass
 

@@ -26,7 +26,7 @@ const SCAN_TEMPLATES = [
   { name: 'Mobile Application',   desc: 'APK/IPA static + dynamic',          type: 'web' },
 ];
 
-const ScansLibrary = () => {
+const ScansLibrary = ({ authToken: _authToken = '' }) => {
   const navigate = useNavigate();
   const [selectedTemplate, setSelectedTemplate] = useState(SCAN_TEMPLATES[0].name);
   const [scanHistory, setScanHistory]           = useState([]);

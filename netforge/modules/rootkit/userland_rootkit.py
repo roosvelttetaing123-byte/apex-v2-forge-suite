@@ -553,7 +553,7 @@ class TestUserlandRootkit:
     """Tests for UserlandRootkit module."""
 
     def test_phase(self) -> None:
-        assert UserlandRootkit.PHASE == 10
+        assert UserlandRootkit.PHASE == 11
 
     def test_type(self) -> None:
         assert UserlandRootkit.ROOTKIT_TYPE == RootkitType.USERLAND

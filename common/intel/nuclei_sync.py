@@ -41,7 +41,10 @@ import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
+
+from common.outbound_policy import OutboundDenied, OutboundReason
+from common.version import PRODUCT_USER_AGENT
 
 log = logging.getLogger("forge.intel.nuclei")
 
@@ -92,6 +95,12 @@ BATCH_SIZE = 500
 # GitHub rate limit spacing
 GITHUB_RATE_DELAY = 1.0  # seconds between API calls (unauthenticated: 60/hr)
 GITHUB_RATE_DELAY_AUTH = 0.25  # with token: 5000/hr
+NUCLEI_SYNC_USER_AGENT = f"{PRODUCT_USER_AGENT} IntelPipeline (NucleiSync)"
+
+
+def _deny_unmigrated_nuclei_update() -> NoReturn:
+    """Keep remote template updates inert until their policy adapter exists."""
+    raise OutboundDenied(OutboundReason.OUTBOUND_POLICY_UNSUPPORTED)
 
 
 # ── YAML mini-parser ─────────────────────────────────────────────
@@ -212,13 +221,14 @@ async def _github_api(
     Returns:
         Parsed JSON response.
     """
+    _deny_unmigrated_nuclei_update()
     import urllib.request
     import urllib.error
 
     url = f"{GITHUB_API_BASE}{endpoint}"
     headers = {
         "Accept": "application/vnd.github.v3+json",
-        "User-Agent": "Forge-Suite/5.0 IntelPipeline (NucleiSync)",
+        "User-Agent": NUCLEI_SYNC_USER_AGENT,
     }
     if token:
         headers["Authorization"] = f"token {token}"
@@ -246,12 +256,13 @@ async def _github_api(
 
 async def _fetch_raw_content(url: str, token: str | None = None) -> str:
     """Fetch raw file content from GitHub."""
+    _deny_unmigrated_nuclei_update()
     import urllib.request
     import urllib.error
 
     headers = {
         "Accept": "application/vnd.github.v3.raw",
-        "User-Agent": "Forge-Suite/5.0 IntelPipeline (NucleiSync)",
+        "User-Agent": NUCLEI_SYNC_USER_AGENT,
     }
     if token:
         headers["Authorization"] = f"token {token}"
@@ -323,6 +334,7 @@ class NucleiSync:
         Returns:
             Dict with records_new, records_updated, records_total counts.
         """
+        _deny_unmigrated_nuclei_update()
         log.info("Nuclei sync starting (since=%s, local=%s)",
                  since, self.templates_dir or "none")
 
@@ -394,6 +406,7 @@ class NucleiSync:
         all file paths in one call, then selectively fetch templates
         from directories we care about.
         """
+        _deny_unmigrated_nuclei_update()
         from common.intel.intel_engine import IntelRecord
 
         records: list[IntelRecord] = []
@@ -684,7 +697,7 @@ class NucleiSync:
 
     def _classify_path(self, path: str) -> str:
         """Classify a template by its directory path."""
-        path_lower = path.lower()
+        path_lower = f"/{path.lower().lstrip('/')}"
         if "/cves/" in path_lower:
             return "cve-detection"
         elif "/vulnerabilities/" in path_lower:

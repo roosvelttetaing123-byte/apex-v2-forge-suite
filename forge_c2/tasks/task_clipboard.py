@@ -498,13 +498,13 @@ class TestClipboardTask:
     def test_invalid_action(self) -> None:
         import asyncio
         task = ClipboardTask(task_id="cb3", action="invalid")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_dump_no_monitor(self) -> None:
         import asyncio
         task = ClipboardTask(task_id="cb4", action="dump", monitor_id="ghost")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_classify_url(self) -> None:

@@ -611,14 +611,14 @@ class TestRegistryTask:
     def test_no_key_path(self) -> None:
         import asyncio
         task = RegistryTask(task_id="r3", operation="query")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_invalid_operation(self) -> None:
         import asyncio
         task = RegistryTask(task_id="r4", operation="bogus",
                             key_path="HKLM\\SOFTWARE")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_parse_key_path(self) -> None:

@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_CORS_CRED   = "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N"
 CVSS40_CORS_CRED = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:P/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -46,6 +47,10 @@ class CorsCheck(BaseModule):
         if not self.check_scope(target):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
         # Detect SPA catch-all routing — all probe paths on a Vercel/Netlify SPA
         # will return the same index.html with the platform-level CORS wildcard.
         # We still test them, but group into ONE finding instead of one per path.

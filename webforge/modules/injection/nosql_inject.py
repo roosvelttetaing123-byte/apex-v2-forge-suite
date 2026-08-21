@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
+from common.framework_params import is_framework_param
 
 CVSS_NOSQL = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
 CVSS40_NOSQL = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -61,6 +63,10 @@ class NoSqlInject(BaseModule):
         if not self.check_scope(target):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
         forms   = self.config.extra.get("found_forms", [])
         crawled = self.config.extra.get("crawled_urls", [target])
 

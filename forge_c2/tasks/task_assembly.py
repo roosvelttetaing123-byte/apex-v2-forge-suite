@@ -520,14 +520,14 @@ class TestAssemblyTask:
     def test_no_assembly(self) -> None:
         import asyncio
         task = AssemblyTask(task_id="asm3")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
         assert "No assembly" in result.error
 
     def test_file_not_found(self) -> None:
         import asyncio
         task = AssemblyTask(task_id="asm4", path="/nonexistent/ghost.exe")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
         assert "not found" in result.error.lower()
 
@@ -535,7 +535,7 @@ class TestAssemblyTask:
         import asyncio
         bad_data = base64.b64encode(b"not a PE file at all").decode()
         task = AssemblyTask(task_id="asm5", data=bad_data)
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
         assert "MZ" in result.error
 
@@ -546,7 +546,7 @@ class TestAssemblyTask:
         mz_stub = b"MZ" + b"\x00" * 62
         b64 = base64.b64encode(mz_stub).decode()
         task = AssemblyTask(task_id="asm6", data=b64, arguments=["--test"])
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         # On Linux CI, CLR won't be available but shouldn't crash
         assert result.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
 

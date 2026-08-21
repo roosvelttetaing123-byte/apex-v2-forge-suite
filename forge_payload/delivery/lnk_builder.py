@@ -1,4 +1,4 @@
-"""LNK (Windows Shortcut) payload builder.
+r"""LNK (Windows Shortcut) payload builder.
 
 Windows .lnk files execute arbitrary commands when opened.
 Used for initial access via phishing (T1566.001, T1204.002).

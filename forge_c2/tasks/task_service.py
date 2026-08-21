@@ -552,19 +552,19 @@ class TestServiceTask:
     def test_invalid_operation(self) -> None:
         import asyncio
         task = ServiceTask(task_id="svc3", operation="bogus")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_create_missing_params(self) -> None:
         import asyncio
         task = ServiceTask(task_id="svc4", operation="create")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_emulation_query(self) -> None:
         import asyncio
         task = ServiceTask(task_id="svc5", operation="query")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.COMPLETED
 
     def test_service_info_to_dict(self) -> None:

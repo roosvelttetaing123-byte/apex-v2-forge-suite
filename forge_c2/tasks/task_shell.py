@@ -172,5 +172,5 @@ class TestShellTask:
     def test_no_command(self) -> None:
         import asyncio
         task = ShellTask(task_id="t3")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED

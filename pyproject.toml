@@ -1,0 +1,82 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = [
+  "apex-ui",
+  "engagements",
+  "extracted_images",
+  "tmp",
+]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.13"
+files = ["common", "forge.py"]
+ignore_missing_imports = true
+follow_imports = "silent"
+incremental = false
+show_error_codes = true
+pretty = false
+warn_unused_configs = true
+
+[tool.bandit]
+exclude_dirs = ["tests", "apex-ui", "engagements", "extracted_images", "tmp"]
+severity = "medium"
+confidence = "medium"
+
+[tool.coverage.run]
+branch = true
+relative_files = true
+source = ["common", "webforge/core", "netforge/data"]
+omit = [
+  "*/tests/*",
+  "*/__pycache__/*",
+]
+
+[tool.coverage.report]
+fail_under = 35
+show_missing = true
+skip_covered = false
+precision = 1
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-config", "--strict-markers"]
+required_plugins = [
+  "pytest-asyncio==1.4.0",
+  "pytest-cov==7.1.0",
+  "pytest-timeout==2.4.0",
+]
+markers = [
+  "integration: isolated integration fixture",
+  "lab_integration: opt-in local lab reachability fixture",
+]
+filterwarnings = [
+  "error",
+  'ignore:^The\ default\ datetime\ adapter\ is\ deprecated\ as\ of\ Python\ 3\.12:DeprecationWarning:^sqlalchemy\.engine\.default$',
+  'ignore:^tagMap\ is\ deprecated\.\ Please\ use\ TAG_MAP\ instead\.:DeprecationWarning:^ldap3\.utils\.asn1$',
+  'ignore:^typeMap\ is\ deprecated\.\ Please\ use\ TYPE_MAP\ instead\.:DeprecationWarning:^ldap3\.utils\.asn1$',
+]
+
+[tool.forge.qualification]
+python = "3.13.9"
+node = "20.19.5"
+coverage_total = 35.0
+expected_collection_minimum = 2862
+expected_collection_sha256 = "cade6737ce4f0c5ce026f0d0f6574c71e512adba62aed27c29df51cc3e968ced"
+allowed_skip_node_ids = [
+  "tests/test_lab_integration_opt_in.py::test_opt_in_web_lab_is_reachable[dvwa-]",
+  "tests/test_lab_integration_opt_in.py::test_opt_in_web_lab_is_reachable[webgoat-]",
+  "tests/test_lab_integration_opt_in.py::test_opt_in_metasploitable_host_is_reachable",
+]
+warning_allowlist = "config/warning-allowlist.toml"
+security_review = "config/security-review.toml"
+
+[tool.forge.qualification.coverage_targets]
+"common/action_authorization.py" = 80.0
+"common/credential_boundary.py" = 80.0
+"common/outbound_policy.py" = 80.0
+"common/run_truth.py" = 80.0
+"common/evidence.py" = 45.0

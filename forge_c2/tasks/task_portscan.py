@@ -541,7 +541,7 @@ class TestPortScanTask:
     def test_no_targets(self) -> None:
         import asyncio
         task = PortScanTask(task_id="ps3", ports="80")
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_expand_cidr(self) -> None:

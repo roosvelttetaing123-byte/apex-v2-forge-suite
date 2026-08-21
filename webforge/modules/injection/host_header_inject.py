@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_HOST_INJECT = "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N"
 CVSS40_HOST_INJECT = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:P/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -42,11 +43,21 @@ class HostHeaderInject(BaseModule):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
         self.log.info("Testing host header injection on %s", target)
-
-        await asyncio.gather(
-            self._test_host_reflection(target),
-            self._test_password_reset_poisoning(target),
+        # Initialise FPReducer for false-positive verification
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
         )
+
+        # Test all crawled URLs, not just target
+        urls_to_test = self.config.extra.get("crawled_urls", [target])[:10]
+        if target not in urls_to_test:
+            urls_to_test.insert(0, target)
+        tasks = []
+        for url in urls_to_test:
+            tasks.append(self._test_host_reflection(url))
+        tasks.append(self._test_password_reset_poisoning(target))
+        await asyncio.gather(*tasks, return_exceptions=True)
         return self._make_result(start)
 
     async def _test_host_reflection(self, target: str) -> None:

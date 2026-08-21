@@ -1,0 +1,201 @@
+id: CVE-2023-4966-citrix-bleed
+cve: CVE-2023-4966
+name: "Citrix Bleed — NetScaler Information Disclosure"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+tags: [info-disclosure, citrix, cisa-kev, session-hijack]
+target_ports: [443, 8443]
+description: |
+  Citrix NetScaler ADC and Gateway buffer overflow allowing
+  unauthenticated session token extraction. Actively exploited
+  by ransomware groups including LockBit.
+detection:
+  - type: http
+    method: GET
+    path: "/oauth/idp/.well-known/openid-configuration"
+    match:
+      - status_code: 200
+      - body_contains: "issuer"
+  - type: http
+    method: POST
+    path: "/oauth/idp/.well-known/openid-configuration"
+    headers:
+      Host: "a]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"
+    match:
+      - body_regex: "(?i)(ns_vpn|netscaler|citrix)"
+    match_all: false
+remediation: "Apply Citrix security update CTX579459. Rotate all session tokens."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-4966
+  - https://support.citrix.com/article/CTX579459
+---
+id: CVE-2024-21762-fortios-rce
+cve: CVE-2024-21762
+name: "FortiOS SSL VPN Out-of-Bounds Write RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, fortinet, cisa-kev, vpn]
+target_ports: [443, 10443, 8443]
+description: |
+  FortiOS SSL VPN out-of-bounds write vulnerability allowing
+  unauthenticated remote code execution via specially crafted HTTP requests.
+  Exploited in the wild by state-sponsored APT groups.
+detection:
+  - type: http
+    method: GET
+    path: "/remote/logincheck"
+    match:
+      - body_regex: "(?i)(fortinet|fortigate|FortiOS)"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/remote/fgt_lang?lang=/../../../..//////////dev/cmdb/sslvpn_websession"
+    match:
+      - status_code: [200, 403]
+      - body_regex: "(?i)(var |fgt_lang|ssl)"
+    match_all: false
+  - type: version
+    cpe_vendor: "fortinet"
+    cpe_product: "fortios"
+    version_range: ">=7.2.0,<7.2.7"
+remediation: "Upgrade FortiOS to 7.2.7+, 7.4.3+, or 7.6.0+."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2024-21762
+  - https://www.fortiguard.com/psirt/FG-IR-24-015
+---
+id: CVE-2022-22965-spring4shell
+cve: CVE-2022-22965
+name: "Spring Framework RCE (Spring4Shell)"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, java, spring, cisa-kev]
+description: |
+  Spring Framework <=5.3.17 RCE via data binding to Class.classLoader
+  when running on JDK 9+ with Apache Tomcat as WAR deployment.
+detection:
+  - type: http
+    method: POST
+    path: "/"
+    headers:
+      Content-Type: "application/x-www-form-urlencoded"
+    body: "class.module.classLoader.DefaultAssertionStatus=nonsense"
+    match:
+      - status_code: [400, 500]
+      - body_regex: "(?i)(spring|whitelabel|error)"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/actuator/env"
+    match:
+      - status_code: 200
+      - body_contains: "spring"
+  - type: version
+    cpe_vendor: "vmware"
+    cpe_product: "spring_framework"
+    version_range: ">=5.3.0,<5.3.18"
+remediation: "Upgrade Spring Framework to 5.3.18+ or 5.2.20+."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2022-22965
+  - https://spring.io/blog/2022/03/31/spring-framework-rce-early-announcement
+---
+id: CVE-2023-34362-moveit-sqli
+cve: CVE-2023-34362
+name: "MOVEit Transfer SQL Injection"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [sqli, moveit, cisa-kev, ransomware]
+target_ports: [443, 8443]
+description: |
+  Progress MOVEit Transfer SQL injection allowing unauthenticated
+  access to the database. Massively exploited by Cl0p ransomware
+  in 2023, affecting 2,500+ organizations.
+detection:
+  - type: http
+    method: GET
+    path: "/moveitisapi/moveitisapi.dll?action=m2"
+    match:
+      - status_code: [200, 302, 401]
+      - body_regex: "(?i)(moveit|MOVEit)"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/human.aspx"
+    match:
+      - body_regex: "(?i)(moveit|silogin)"
+    match_all: false
+  - type: http
+    method: POST
+    path: "/guestaccess.aspx"
+    match:
+      - body_regex: "(?i)(moveit|guestaccess)"
+    match_all: false
+remediation: "Upgrade MOVEit Transfer to patched version. Apply Progress advisory."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-34362
+  - https://community.progress.com/s/article/MOVEit-Transfer-Critical-Vulnerability
+---
+id: CVE-2019-0708-bluekeep
+cve: CVE-2019-0708
+name: "BlueKeep — RDP Remote Code Execution"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, rdp, windows, cisa-kev, wormable]
+target_ports: [3389]
+description: |
+  Windows Remote Desktop Services (RDP) use-after-free allowing
+  unauthenticated remote code execution. Wormable — can spread
+  without user interaction like WannaCry.
+detection:
+  - type: banner
+    port: 3389
+    send: "\x03\x00\x00\x13\x0e\xe0\x00\x00\x00\x00\x00\x01\x00\x08\x00\x03\x00\x00\x00"
+    read_bytes: 1024
+    match:
+      - banner_regex: "\\x03\\x00"
+    match_all: false
+remediation: "Apply Microsoft security update KB4499175. Enable NLA. Disable RDP if not needed."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2019-0708
+  - https://portal.msrc.microsoft.com/en-US/security-guidance/advisory/CVE-2019-0708
+---
+id: CVE-2021-26855-proxylogon
+cve: CVE-2021-26855
+cves:
+  - CVE-2021-26855
+  - CVE-2021-26857
+  - CVE-2021-26858
+  - CVE-2021-27065
+name: "Microsoft Exchange ProxyLogon RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, exchange, cisa-kev, proxylogon, apt]
+target_ports: [443, 8443]
+description: |
+  Microsoft Exchange Server SSRF leading to pre-auth RCE.
+  Exploited by HAFNIUM APT group targeting US entities.
+  Full chain: SSRF → auth bypass → arbitrary file write → webshell.
+detection:
+  - type: http
+    method: GET
+    path: "/owa/auth/x.js"
+    match:
+      - status_code: [200, 302, 401]
+      - header_regex: "(?i)x-owa-version"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/ecp/default.flt"
+    match:
+      - status_code: [200, 302]
+    match_all: false
+  - type: http
+    method: GET
+    path: "/owa/"
+    match:
+      - body_regex: "(?i)(Exchange|OWA)"
+      - header_regex: "(?i)x-owa-version: 15\\."
+    match_all: false
+remediation: "Apply Microsoft Exchange cumulative updates. Check for webshells."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-26855
+  - https://msrc-blog.microsoft.com/2021/03/02/multiple-security-updates-released-for-exchange-server/

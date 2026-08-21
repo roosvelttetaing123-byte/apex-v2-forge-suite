@@ -11,8 +11,8 @@ const colors = {
   default: { bg: 'rgba(122,141,176,0.12)', border: 'rgba(122,141,176,0.25)', text: '#7a8db0' }
 };
 
-const Badge = ({ children, severity = 'default', style }) => {
-  const colorKey = severity.toLowerCase();
+const Badge = ({ children, severity = 'default', variant = undefined, style = {} }) => {
+  const colorKey = (variant || severity).toLowerCase();
   const theme = colors[colorKey] || colors.default;
 
   return (

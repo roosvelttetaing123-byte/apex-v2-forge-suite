@@ -107,6 +107,7 @@ class DataExfil(BaseModule):
             model_name=self.config.extra.get("model_name", ""),
             max_tokens=500, temperature=0.0,
             proxy=self.config.extra.get("proxy"),
+            outbound_policy=self.outbound_policy,
         ) as client:
             successful: list[dict[str, Any]] = []
 

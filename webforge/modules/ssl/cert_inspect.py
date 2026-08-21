@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_CERT_EXPIRED  = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
 CVSS40_CERT_EXPIRED = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -43,6 +44,10 @@ class CertInspect(BaseModule):
         port   = int(parsed.port or 443)
 
         self.log.info("Inspecting certificate for %s:%d", host, port)
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         loop = asyncio.get_event_loop()
         cert_info = await loop.run_in_executor(None, self._fetch_cert_info, host, port)

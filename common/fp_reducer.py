@@ -154,29 +154,12 @@ async def _http_get(
     timeout: float = 15.0,
     session: Any = None,
 ) -> tuple[int, str, float]:
-    """Make an async HTTP GET. Returns (status, body, elapsed_seconds).
+    """Legacy verifier transport is intentionally inert.
 
-    Uses aiohttp if available, falls back to urllib.
+    FP verification must be migrated to the canonical policy client before it
+    can make requests again; raw urllib fallback would bypass Task 003.
     """
-    import urllib.request
-    import urllib.parse
-
-    start = time.monotonic()
-    try:
-        if params:
-            qs = urllib.parse.urlencode(params)
-            url = f"{url}?{qs}" if "?" not in url else f"{url}&{qs}"
-
-        req = urllib.request.Request(url, headers=headers or {})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read(65536).decode("utf-8", errors="replace")
-            status = resp.status
-    except Exception as exc:
-        elapsed = time.monotonic() - start
-        return 0, str(exc), elapsed
-
-    elapsed = time.monotonic() - start
-    return status, body, elapsed
+    return 0, "outbound_policy_unsupported", 0.0
 
 
 async def _http_post(
@@ -185,33 +168,8 @@ async def _http_post(
     headers: dict[str, str] | None = None,
     timeout: float = 15.0,
 ) -> tuple[int, str, float]:
-    """Make an async HTTP POST. Returns (status, body, elapsed_seconds)."""
-    import urllib.request
-    import urllib.parse
-
-    start = time.monotonic()
-    try:
-        if isinstance(data, dict):
-            post_data = urllib.parse.urlencode(data).encode()
-        elif isinstance(data, str):
-            post_data = data.encode()
-        else:
-            post_data = b""
-
-        hdrs = headers or {}
-        if "Content-Type" not in hdrs:
-            hdrs["Content-Type"] = "application/x-www-form-urlencoded"
-
-        req = urllib.request.Request(url, data=post_data, headers=hdrs, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read(65536).decode("utf-8", errors="replace")
-            status = resp.status
-    except Exception as exc:
-        elapsed = time.monotonic() - start
-        return 0, str(exc), elapsed
-
-    elapsed = time.monotonic() - start
-    return status, body, elapsed
+    """Legacy verifier transport is intentionally inert; see ``_http_get``."""
+    return 0, "outbound_policy_unsupported", 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -536,6 +494,7 @@ async def verify_ssrf(
     method: str = "GET",
     headers: dict[str, str] | None = None,
     collab_client: Any = None,
+    outbound_policy: Any = None,
 ) -> VerificationResult:
     """Verify SSRF via OOB callback or strong internal response differential.
 
@@ -543,6 +502,12 @@ async def verify_ssrf(
     Without OOB: strong internal response = MEDIUM (higher FP risk).
     """
     result = VerificationResult(confidence=Confidence.UNVERIFIED)
+
+    if outbound_policy is None:
+        result.evidence.append(
+            "SSRF delegated destination not authorized; active verification not run"
+        )
+        return result
 
     try:
         method = _normalise_method(method)
@@ -875,12 +840,14 @@ class FPReducer:
         time_delay: float = 5.0,
         baseline_n: int = 3,
         verify_timeout: float = 15.0,
+        outbound_policy: Any = None,
     ) -> None:
         self._collab = collab_client
         self._headers = headers or {}
         self._time_delay = time_delay
         self._baseline_n = baseline_n
         self._verify_timeout = verify_timeout
+        self._outbound_policy = outbound_policy
 
     async def verify(
         self,
@@ -905,6 +872,35 @@ class FPReducer:
             VerificationResult with confidence and evidence.
         """
         vt = vuln_type.lower().replace("-", "_")
+
+        supported_types = {
+            "sqli_time",
+            "sqli_error",
+            "xss",
+            "xss_reflected",
+            "ssti",
+            "ssrf",
+            "lfi",
+            "rfi",
+            "cmdi",
+            "cmd_inject",
+            "xxe",
+        }
+        if vt not in supported_types:
+            return VerificationResult(
+                confidence=Confidence.UNVERIFIED,
+                error=f"No verifier implemented for {vuln_type!r}",
+            )
+
+        # The former urllib verifier bypassed destination, DNS, redirect, TLS,
+        # route, and audit policy.  Keep the public helper visibly inert until
+        # each probe is migrated to PolicyHttpClient with a delegated-action
+        # contract where applicable.
+        return VerificationResult(
+            confidence=Confidence.UNVERIFIED,
+            error="outbound_policy_unsupported",
+            evidence=["not_tested:outbound_policy_unsupported"],
+        )
 
         verifiers = {
             "sqli_time": lambda: verify_sqli_time(
@@ -958,9 +954,13 @@ class FPReducer:
             )
 
         log.debug("FPReducer: verifying %s at %s[%s]", vuln_type, url, param)
+        # Adaptive timeout: time-based checks need more time
+        effective_timeout = self._verify_timeout
+        if vt in ("sqli_time", "cmdi", "cmd_inject"):
+            effective_timeout = max(self._verify_timeout, self._time_delay * 8)
         try:
             return await asyncio.wait_for(
-                verifier_fn(), timeout=self._verify_timeout,
+                verifier_fn(), timeout=effective_timeout,
             )
         except asyncio.TimeoutError:
             log.warning(

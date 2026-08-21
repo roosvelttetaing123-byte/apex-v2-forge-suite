@@ -14,6 +14,7 @@ from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
 from common.fp_reducer import FPReducer, Confidence
+from common.framework_params import is_framework_param
 
 # Polyglot payloads — work across multiple XSS contexts
 PAYLOADS_REFLECTED = [
@@ -128,6 +129,7 @@ class XssScanner(BaseModule):
             return
 
         for field_name in inputs:
+            if is_framework_param(field_name): continue
             for payload in PAYLOADS_REFLECTED[:10]:
                 await self.rate_limit()
                 canary = f"{CANARY_PREFIX}{hashlib.md5(payload.encode()).hexdigest()[:8]}"
@@ -180,6 +182,7 @@ class XssScanner(BaseModule):
             return
 
         for param_name in params:
+            if is_framework_param(param_name): continue
             for payload in PAYLOADS_REFLECTED:
                 await self.rate_limit()
                 canary = f"{CANARY_PREFIX}{hashlib.md5(payload.encode()).hexdigest()[:8]}"
@@ -319,61 +322,150 @@ class XssScanner(BaseModule):
             )
 
     async def _test_dom_xss(self, url: str) -> None:
-        """Check for DOM-based XSS using browser evaluation."""
-        from webforge.core.browser_detect import get_browser_config, build_driver
-        cfg = get_browser_config()
-        if cfg is None:
+        """Check for DOM-based XSS using Playwright taint tracking.
+
+        Instruments all dangerous sinks (innerHTML, eval, document.write,
+        setTimeout/setInterval with strings, insertAdjacentHTML) and traces
+        whether attacker-controllable sources (location.hash, location.search,
+        document.referrer, window.name, etc.) flow into them.
+
+        This is far more accurate than old alert()-based detection:
+        - Catches non-alert payloads (e.g., innerHTML XSS, eval injection)
+        - Detects source-to-sink flows even when the payload is sanitized
+        - Uses DOM mutation observers for dynamically inserted XSS elements
+        """
+        from webforge.core.browser_engine import (
+            BrowserEngine, dom_xss_taint_scan, DOMTaintResult,
+        )
+
+        if not BrowserEngine.available():
+            self.log.debug("Playwright not available — skipping DOM XSS taint scan")
             return
 
-        for payload in PAYLOADS_DOM:
-            test_url = url.rstrip("/") + payload
-            driver = None
-            try:
-                driver = build_driver(cfg, headless=True)
-                await asyncio.to_thread(driver.get, test_url)
-                await asyncio.sleep(1)
-                # Check for alert dialog (indicates XSS execution)
-                try:
-                    alert = driver.switch_to.alert
-                    alert_text = alert.text
-                    alert.dismiss()
-                    ss_path = str(self._screenshot_dir / f"dom_xss_{hash(payload)}.png")
-                    ev = Evidence(
-                        request_raw=f"GET {test_url}",
-                        screenshot_path=ss_path,
-                        extra={"payload": payload, "alert_text": alert_text},
-                    )
-                    self.new_finding(
-                        title="DOM-Based XSS — Alert Executed",
-                        severity=Severity.HIGH,
-                        description=(
-                            f"DOM-based XSS detected via URL fragment/parameter. "
-                            f"Payload {payload!r} triggered JavaScript execution (alert: {alert_text!r}). "
-                            "This executes entirely in the browser without server involvement."
-                        ),
-                        reproduction_steps=[
-                            f"Navigate to: {test_url}",
-                            "Observe JavaScript alert execution",
-                        ],
-                        remediation=(
-                            "Sanitise data from URL fragments/parameters before using in DOM operations. "
-                            "Avoid dangerous sinks: innerHTML, document.write, eval, setTimeout with string."
-                        ),
-                        references=["CWE-79", "OWASP A03:2021"],
-                        evidence=ev,
-                        cvss_v31_vector=CVSS_XSS_DOM,
-                        cvss_v40_vector=CVSS40_XSS_DOM,
-                        mitre_attack=["TA0004/T1059.007"],
-                    )
-                    break
-                except Exception:
-                    pass  # No alert = no DOM XSS for this payload
-            except Exception as exc:
-                self.log.debug("DOM XSS test failed: %s", exc)
-            finally:
-                if driver:
-                    try: driver.quit()
-                    except Exception: pass
+        try:
+            engine = BrowserEngine(
+                results_dir=self._screenshot_dir.parent,
+                headless=True,
+                timeout_ms=15000,
+                proxy=self.config.proxy or None,
+                storage_state=self.config.extra.get("browser_storage_state"),
+                outbound_policy=self.outbound_policy,
+            )
+            async with engine:
+                result = await dom_xss_taint_scan(engine, url)
+
+            # Report canary executions as HIGH severity (confirmed XSS)
+            seen_sinks: set[str] = set()
+            for cex in result.canary_executions:
+                sink = cex.get("sink", "")
+                if sink in seen_sinks:
+                    continue
+                seen_sinks.add(sink)
+                ev = Evidence(
+                    request_raw=f"DOM XSS canary executed in sink: {sink}",
+                    extra={
+                        "sink": sink,
+                        "canary": cex.get("canary", ""),
+                        "payload_desc": cex.get("payload_desc", ""),
+                    },
+                )
+                self.new_finding(
+                    title=f"DOM-Based XSS — Canary Executed via {sink}",
+                    severity=Severity.HIGH,
+                    confidence="HIGH",
+                    description=(
+                        f"DOM-based XSS confirmed: attacker-controlled data reached "
+                        f"the '{sink}' sink and triggered canary execution. "
+                        f"This executes entirely in the browser without server involvement."
+                    ),
+                    reproduction_steps=[
+                        f"Navigate to the target URL with the payload in the URL",
+                        f"Observe canary execution in the '{sink}' sink",
+                    ],
+                    remediation=(
+                        "Avoid dangerous DOM sinks with user-controlled data. "
+                        "Use textContent/setAttribute instead of innerHTML. "
+                        "Sanitize data with DOMPurify before DOM insertion."
+                    ),
+                    references=["CWE-79", "OWASP A03:2021"],
+                    evidence=ev,
+                    cvss_v31_vector=CVSS_XSS_DOM,
+                    cvss_v40_vector=CVSS40_XSS_DOM,
+                    mitre_attack=["TA0004/T1059.007"],
+                )
+
+            # Report taint flows as MEDIUM severity (source-to-sink detected)
+            seen_flows: set[tuple[str, str]] = set()
+            for flow in result.flows:
+                key = (flow.get("source", ""), flow.get("sink", ""))
+                if key in seen_flows:
+                    continue
+                seen_flows.add(key)
+                ev = Evidence(
+                    extra={
+                        "source": flow.get("source", ""),
+                        "source_value": flow.get("source_value", "")[:200],
+                        "sink": flow.get("sink", ""),
+                        "sink_data": flow.get("sink_data", "")[:200],
+                        "element": flow.get("element", ""),
+                        "payload_desc": flow.get("payload_desc", ""),
+                    },
+                )
+                self.new_finding(
+                    title=f"DOM XSS Taint Flow — {flow['source']} → {flow['sink']}",
+                    severity=Severity.MEDIUM,
+                    description=(
+                        f"Taint tracking detected data flowing from attacker-controllable "
+                        f"source '{flow['source']}' to dangerous sink '{flow['sink']}'. "
+                        f"Element: {flow.get('element', 'unknown')}. "
+                        f"This may be exploitable for DOM-based XSS depending on sanitization."
+                    ),
+                    reproduction_steps=[
+                        f"Navigate with payload in {flow['source']}",
+                        f"Data flows to {flow['sink']} on element {flow.get('element', '?')}",
+                        "Check if data is sanitized before reaching the sink",
+                    ],
+                    remediation=(
+                        "Sanitize all user-controllable data before passing to DOM sinks. "
+                        "Use DOMPurify.sanitize() for HTML context or textContent for text."
+                    ),
+                    references=["CWE-79", "OWASP A03:2021"],
+                    evidence=ev,
+                    cvss_v31_vector=CVSS_XSS_DOM,
+                    cvss_v40_vector=CVSS40_XSS_DOM,
+                    mitre_attack=["TA0004/T1059.007"],
+                )
+
+            # Report DOM mutations with source content as LOW/INFO
+            for mut in result.mutations[:5]:
+                ev = Evidence(
+                    extra={
+                        "source": mut.get("source", ""),
+                        "element": mut.get("element", ""),
+                        "html": mut.get("html", "")[:200],
+                    },
+                )
+                self.new_finding(
+                    title=f"DOM Mutation — {mut.get('element', '?')} from {mut.get('source', '?')}",
+                    severity=Severity.LOW,
+                    description=(
+                        f"A dangerous element ({mut.get('element', '?')}) was dynamically "
+                        f"inserted into the DOM containing data from {mut.get('source', '?')}. "
+                        f"HTML: {mut.get('html', '')[:100]}"
+                    ),
+                    remediation="Review dynamic element insertion and sanitize source data.",
+                    references=["CWE-79"],
+                    evidence=ev,
+                    cvss_v31_vector=CVSS_XSS_DOM,
+                    mitre_attack=["TA0004/T1059.007"],
+                )
+
+            if result.errors:
+                self.log.debug("DOM XSS taint scan had %d errors", len(result.errors))
+
+        except Exception as exc:
+            self.log.debug("DOM XSS taint scan failed: %s", exc)
+
 
     def _inject_param(self, url: str, param: str, payload: str) -> str:
         from urllib.parse import urlparse, parse_qs, urlencode, urlunparse

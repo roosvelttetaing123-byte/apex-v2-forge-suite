@@ -553,19 +553,19 @@ class TestInjectTask:
     def test_no_pid(self) -> None:
         import asyncio
         task = InjectTask(task_id="inj3", shellcode=base64.b64encode(b"\xcc").decode())
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_no_shellcode(self) -> None:
         import asyncio
         task = InjectTask(task_id="inj4", pid=1234)
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.FAILED
 
     def test_list_techniques(self) -> None:
         import asyncio
         task = InjectTask(task_id="inj5", list_techniques=True)
-        result = asyncio.get_event_loop().run_until_complete(task.execute())
+        result = asyncio.run(task.execute())
         assert result.status == TaskStatus.COMPLETED
         assert "CreateRemoteThread" in result.output
 

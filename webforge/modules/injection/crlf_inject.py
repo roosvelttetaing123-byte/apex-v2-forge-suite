@@ -13,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
+from common.framework_params import is_framework_param
 
 CVSS_CRLF = "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N"
 CVSS40_CRLF = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:P/VC:L/VI:L/VA:N/SC:L/SI:L/SA:N"
@@ -55,6 +57,11 @@ class CrlfInject(BaseModule):
                 test_urls.append(url)
 
         self.log.info("Testing %d URL(s) for CRLF injection", len(test_urls))
+        # Initialise FPReducer for false-positive verification
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         sem = asyncio.Semaphore(3)
         tasks = [self._test_url(url, target, sem) for url in test_urls[:30]]
@@ -82,6 +89,7 @@ class CrlfInject(BaseModule):
                 return
 
             for param_name, values in params.items():
+                if is_framework_param(param_name): continue
                 original = values[0] if values else ""
                 for payload in CRLF_PAYLOADS:
                     test_params = {k: v[0] for k, v in params.items()}

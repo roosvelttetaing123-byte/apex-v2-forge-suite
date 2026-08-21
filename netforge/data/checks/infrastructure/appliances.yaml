@@ -1,0 +1,246 @@
+id: CVE-2024-23113-fortios-fmtstr
+cve: CVE-2024-23113
+name: "FortiOS fgfmd Format String RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, fortinet, cisa-kev, format-string]
+target_ports: [541, 443]
+description: |
+  FortiOS fgfmd daemon format string vulnerability allowing
+  unauthenticated remote code execution. Affects FortiOS 7.0-7.4,
+  FortiProxy, FortiPAM, FortiSwitchManager.
+detection:
+  - type: version
+    cpe_vendor: "fortinet"
+    cpe_product: "fortios"
+    version_range: ">=7.0.0,<7.0.14"
+  - type: http
+    method: GET
+    path: "/login"
+    match:
+      - body_regex: "(?i)(fortinet|fortigate|FortiWeb)"
+    match_all: false
+remediation: "Upgrade FortiOS to 7.0.14+, 7.2.7+, or 7.4.3+."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2024-23113
+---
+id: CVE-2023-27997-fortios-heap
+cve: CVE-2023-27997
+name: "FortiOS SSL-VPN Heap Buffer Overflow RCE (XORtigate)"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, fortinet, cisa-kev, vpn, heap-overflow]
+target_ports: [443, 10443, 8443]
+description: |
+  FortiOS SSL-VPN heap buffer overflow allowing pre-auth RCE.
+  Nicknamed XORtigate. Affects all FortiOS with SSL-VPN enabled.
+detection:
+  - type: http
+    method: GET
+    path: "/remote/logincheck"
+    match:
+      - body_regex: "(?i)(fortinet|FortiOS|fgt_lang)"
+    match_all: false
+  - type: version
+    cpe_vendor: "fortinet"
+    cpe_product: "fortios"
+    version_range: ">=6.0.0,<7.2.5"
+remediation: "Upgrade FortiOS to 7.2.5+ or 7.4.0+. Disable SSL-VPN if not needed."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-27997
+---
+id: CVE-2023-46805-ivanti-auth-bypass
+cve: CVE-2023-46805
+cves:
+  - CVE-2023-46805
+  - CVE-2024-21887
+name: "Ivanti Connect Secure Auth Bypass + RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, ivanti, vpn, cisa-kev, auth-bypass]
+target_ports: [443, 8443]
+description: |
+  Ivanti Connect Secure (Pulse Secure) authentication bypass
+  chained with command injection for unauthenticated RCE.
+  Massively exploited starting January 2024.
+detection:
+  - type: http
+    method: GET
+    path: "/api/v1/totp/user-backup-code/../../system/maintenance/archiving/cloud-server-test-connection"
+    match:
+      - status_code: [200, 403]
+    match_all: false
+  - type: http
+    method: GET
+    path: "/dana-na/auth/url_default/welcome.cgi"
+    match:
+      - body_regex: "(?i)(pulse|ivanti|connect secure|welcome)"
+    match_all: false
+remediation: "Apply Ivanti patches. Factory reset compromised appliances."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-46805
+---
+id: CVE-2022-42475-fortios-sslvpn-heap
+cve: CVE-2022-42475
+name: "FortiOS SSL-VPN Heap Overflow (Pre-Auth)"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, fortinet, cisa-kev, vpn]
+target_ports: [443, 10443]
+description: "FortiOS SSL-VPN heap overflow allowing pre-auth RCE. Exploited by Chinese APT."
+detection:
+  - type: http
+    method: GET
+    path: "/remote/logincheck"
+    match:
+      - body_regex: "(?i)(fortinet|FortiOS)"
+    match_all: false
+  - type: version
+    cpe_vendor: "fortinet"
+    cpe_product: "fortios"
+    version_range: ">=7.0.0,<7.0.9"
+remediation: "Upgrade FortiOS to 7.0.9+ or 7.2.3+."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2022-42475
+---
+id: CVE-2021-22986-f5-bigip-rce
+cve: CVE-2021-22986
+name: "F5 BIG-IP iControl REST Unauthenticated RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, f5, bigip, cisa-kev]
+target_ports: [443, 8443]
+description: "F5 BIG-IP iControl REST interface allows unauthenticated RCE."
+detection:
+  - type: http
+    method: GET
+    path: "/mgmt/tm/util/bash"
+    match:
+      - status_code: [200, 401]
+      - body_regex: "(?i)(BIG-IP|f5|iControl)"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/tmui/login.jsp"
+    match:
+      - body_regex: "(?i)(BIG-IP|F5 Networks|tmui)"
+    match_all: false
+remediation: "Apply F5 security advisory K02566623."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-22986
+---
+id: CVE-2023-22515-confluence-rce
+cve: CVE-2023-22515
+name: "Atlassian Confluence Data Center Broken Access Control"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, confluence, atlassian, cisa-kev]
+target_ports: [443, 8443, 8090]
+description: |
+  Atlassian Confluence Data Center privilege escalation allowing
+  unauthenticated admin account creation and RCE.
+detection:
+  - type: http
+    method: GET
+    path: "/server-info.action"
+    match:
+      - body_regex: "(?i)(confluence|atlassian)"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/setup/setupadministrator.action"
+    match:
+      - status_code: [200, 302]
+    match_all: false
+remediation: "Upgrade Confluence to 8.3.3+, 8.4.3+, or 8.5.2+."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-22515
+---
+id: CVE-2022-26134-confluence-ognl
+cve: CVE-2022-26134
+name: "Atlassian Confluence OGNL Injection RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, confluence, atlassian, cisa-kev, ognl]
+target_ports: [443, 8443, 8090]
+description: "Atlassian Confluence Server OGNL injection via URI allowing unauthenticated RCE."
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - body_regex: "(?i)(confluence|atlassian)"
+    match_all: false
+remediation: "Upgrade Confluence immediately. Apply WAF rules."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2022-26134
+---
+id: vmware-vcenter-exposed
+name: "VMware vCenter Server Management Interface Exposed"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [misconfig, vmware, vcenter, admin-panel]
+target_ports: [443, 9443]
+description: "VMware vCenter management interface exposed to network."
+detection:
+  - type: http
+    method: GET
+    paths:
+      - "/ui/"
+      - "/websso/SAML2/SSOService"
+    match:
+      - body_regex: "(?i)(vmware|vsphere|vcenter)"
+    match_all: false
+remediation: "Restrict vCenter access to management VLAN. Apply latest patches."
+references:
+  - https://www.vmware.com/security/advisories.html
+---
+id: jenkins-unauthenticated
+name: "Jenkins Dashboard Unauthenticated Access"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [misconfig, jenkins, ci-cd, admin-panel]
+target_ports: [8080, 8443, 443, 80]
+description: |
+  Jenkins CI/CD dashboard accessible without authentication.
+  Allows job creation, script console access, and credential theft.
+detection:
+  - type: http
+    method: GET
+    path: "/script"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(script console|groovy|jenkins)"
+  - type: http
+    method: GET
+    path: "/api/json"
+    match:
+      - status_code: 200
+      - body_contains: "\"_class\""
+remediation: "Enable Jenkins security. Configure authentication and authorization."
+references:
+  - https://www.jenkins.io/doc/book/security/
+---
+id: gitlab-ce-exposed
+name: "GitLab Exposed Instance Detection"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [info-disclosure, gitlab, ci-cd]
+target_ports: [443, 80, 8443]
+description: "GitLab instance detected. Check for public registration and known CVEs."
+detection:
+  - type: http
+    method: GET
+    path: "/users/sign_in"
+    match:
+      - body_regex: "(?i)(gitlab|sign.in.*gitlab)"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/explore"
+    match:
+      - body_regex: "(?i)(gitlab|explore.*projects)"
+    match_all: false
+remediation: "Disable public registration. Restrict access. Keep GitLab updated."
+references:
+  - https://docs.gitlab.com/ee/security/

@@ -1,0 +1,23 @@
+{
+  "schema_version": "forge-npm-audit-exceptions-v1",
+  "exceptions": [
+    {
+      "id": "FORGE-NPM-EXC-2026-001",
+      "disposition": "NON_APPLICABLE",
+      "package": "react-router",
+      "installed_version": "7.18.2",
+      "affected_dependent": "react-router-dom",
+      "affected_dependent_version": "7.18.2",
+      "advisory": "GHSA-qwww-vcr4-c8h2",
+      "advisory_source_id": 1124282,
+      "advisory_url": "https://github.com/advisories/GHSA-qwww-vcr4-c8h2",
+      "advisory_range": ">=7.12.0 <8.3.0",
+      "severity": "high",
+      "fixed_version": "8.3.0",
+      "owner": "Core Security Engineering Lead",
+      "reviewed_on": "2026-08-03",
+      "expires_on": "2026-09-03",
+      "reason": "The advisory applies only to React Router's unstable RSC action transport. Apex UI is a client-only Vite SPA in declarative BrowserRouter library mode and uses no RSC, server, or React Router framework APIs or packages."
+    }
+  ]
+}

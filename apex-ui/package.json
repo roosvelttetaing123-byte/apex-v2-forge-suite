@@ -1,0 +1,43 @@
+{
+  "name": "apex-ui",
+  "version": "5.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@10.8.2",
+  "engines": {
+    "node": "20.19.5",
+    "npm": "10.8.2"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "audit:ci": "node scripts/verify-npm-audit.mjs",
+    "contracts:generate": "python ../scripts/generate_frontend_contracts.py",
+    "contracts:check": "python ../scripts/generate_frontend_contracts.py --check"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "6.9.1",
+    "@testing-library/react": "16.3.2",
+    "@testing-library/user-event": "14.6.1",
+    "@types/jsdom": "28.0.3",
+    "@types/node": "20.19.43",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "@vitejs/plugin-react": "6.0.5",
+    "esbuild": "0.28.1",
+    "jsdom": "28.1.0",
+    "typescript": "7.0.2",
+    "vite": "8.2.0",
+    "vitest": "4.1.10"
+  },
+  "dependencies": {
+    "lucide-react": "1.21.0",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "react-router-dom": "7.18.2"
+  }
+}

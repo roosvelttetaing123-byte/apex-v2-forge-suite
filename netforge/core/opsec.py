@@ -21,7 +21,6 @@ import asyncio
 import logging
 import os
 import random
-import socket
 import struct
 import time
 from dataclasses import dataclass, field
@@ -128,32 +127,18 @@ class OpSecProfile:
     # ------------------------------------------------------------------
 
     async def maybe_inject_decoy(self, target_network: str = "") -> None:
-        """Probabilistically inject a benign DNS query to blend traffic.
+        """Keep legacy decoy mode inert until each destination is authorized.
 
-        Decoy queries look like normal workstation activity — resolving
-        common domains that any Windows/Linux box would hit. This makes
-        our assessment traffic blend into the baseline noise.
+        Public cover traffic is not part of the inspected target and therefore
+        cannot inherit a scan authorization.  The method deliberately performs
+        no resolver or socket call.
         """
-        if not self.inject_decoys:
-            return
-        if random.random() > self.decoy_ratio:
-            return
-
-        decoy_domains = [
-            "time.windows.com", "www.msftconnecttest.com",
-            "dns.msftncsi.com", "login.microsoftonline.com",
-            "connectivity-check.ubuntu.com", "detectportal.firefox.com",
-            "clients3.google.com", "ocsp.digicert.com",
-            "crl.microsoft.com", "www.google.com",
-            "update.googleapis.com", "ntp.ubuntu.com",
-        ]
-        domain = random.choice(decoy_domains)
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, socket.gethostbyname, domain)
-            self._decoy_count += 1
-        except Exception:
-            pass  # Decoy failure is irrelevant
+        del target_network
+        if self.inject_decoys:
+            log.warning(
+                "Decoy traffic disabled: each destination requires separate scope and authorization"
+            )
+        return
 
     # ------------------------------------------------------------------
     # Module ordering

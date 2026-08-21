@@ -909,7 +909,7 @@ class TestAttackPlanner:
         """Test plan_next() runs with rule-based fallback."""
         import asyncio
         planner = AttackPlanner()
-        intel = {"findings": [], "credentials": []}
+        intel: dict[str, Any] = {"findings": [], "credentials": []}
         context = {"target": "https://example.com"}
         plan = asyncio.run(planner.plan_next(intel, context))
         assert isinstance(plan, AttackPlan)

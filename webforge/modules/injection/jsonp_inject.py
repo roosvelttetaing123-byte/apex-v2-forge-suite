@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_JSONP = "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:H/I:N/A:N"
 CVSS40_JSONP = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:P/VC:H/VI:N/VA:N/SC:H/SI:N/SA:N"
@@ -65,6 +66,11 @@ class JsonpInject(BaseModule):
             test_urls.append(f"{target}{path}")
 
         self.log.info("Testing %d URLs for JSONP endpoints", len(test_urls))
+        # Initialise FPReducer for false-positive verification
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         sem = asyncio.Semaphore(3)
         seen: set[str] = set()

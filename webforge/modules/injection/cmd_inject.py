@@ -6,6 +6,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
@@ -13,6 +14,7 @@ from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
 from common.fp_reducer import FPReducer, Confidence
+from common.framework_params import is_framework_param
 
 CVSS_RCE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
 CVSS40_RCE = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H"
@@ -73,6 +75,7 @@ class CmdInject(BaseModule):
 
         # Test forms
         for form in forms[:10]:
+            if is_framework_param(form): continue
             if form.get("method") == "POST" and form.get("inputs"):
                 tasks.append(self._test_form(form, target, sem))
 
@@ -85,6 +88,7 @@ class CmdInject(BaseModule):
         params = parse_qs(parsed.query, keep_blank_values=True)
 
         for param_name in params:
+            if is_framework_param(param_name): continue
             original_val = params[param_name][0] if params[param_name] else ""
             for payload, label in INJECT_PAYLOADS[:6]:  # Test first 6 payloads
                 async with sem:
@@ -108,6 +112,7 @@ class CmdInject(BaseModule):
             return
 
         for input_name in form.get("inputs", []):
+            if is_framework_param(input_name): continue
             for payload, label in INJECT_PAYLOADS[:6]:
                 async with sem:
                     await self.rate_limit()

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_CACHE_POISON = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:L/I:H/A:N"
 CVSS40_CACHE_POISON = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:H/VA:N/SC:L/SI:H/SA:N"
@@ -46,6 +47,10 @@ class CachePoison(BaseModule):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
         self.log.info("Testing cache poisoning on %s", target)
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         await asyncio.gather(
             self._test_unkeyed_headers(target),

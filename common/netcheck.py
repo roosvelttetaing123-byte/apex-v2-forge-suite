@@ -1,11 +1,13 @@
-"""Internet connectivity check — asks operator before any online resource use."""
+"""Offline-by-default network update gate.
+
+Connectivity probing itself is outbound traffic, so scan-time callers must not
+probe public DNS or web endpoints merely to decide whether networking exists.
+Explicit update workflows use the Task 003 policy with a pinned endpoint.
+"""
 from __future__ import annotations
 
-import socket
 import sys
-import urllib.request
 import logging
-from functools import lru_cache
 
 from rich.console import Console
 from rich.panel import Panel
@@ -17,16 +19,8 @@ log = logging.getLogger(__name__)
 _internet_available: bool | None = None
 _internet_allowed:   bool | None = None
 
-_CHECK_HOSTS = [
-    ("8.8.8.8",    53),   # Google DNS
-    ("1.1.1.1",    53),   # Cloudflare DNS
-    ("208.67.222.222", 53), # OpenDNS
-]
-_CHECK_URL = "https://clients3.google.com/generate_204"
-
-
 def check_internet(timeout: float = 3.0) -> bool:
-    """Detect whether internet is reachable via TCP probe.
+    """Return offline without creating any socket or HTTP request.
 
     Args:
         timeout: Seconds to wait per probe.
@@ -34,30 +28,10 @@ def check_internet(timeout: float = 3.0) -> bool:
     Returns:
         True if internet is available.
     """
+    del timeout
     global _internet_available
-    if _internet_available is not None:
-        return _internet_available
-
-    for host, port in _CHECK_HOSTS:
-        try:
-            sock = socket.create_connection((host, port), timeout=timeout)
-            sock.close()
-            _internet_available = True
-            log.debug("Internet check: reachable via %s:%d", host, port)
-            return True
-        except OSError:
-            continue
-
-    # HTTP fallback
-    try:
-        urllib.request.urlopen(_CHECK_URL, timeout=timeout)
-        _internet_available = True
-        return True
-    except Exception:
-        pass
-
     _internet_available = False
-    log.debug("Internet check: not reachable")
+    log.debug("Internet probe suppressed by outbound policy; offline mode")
     return False
 
 

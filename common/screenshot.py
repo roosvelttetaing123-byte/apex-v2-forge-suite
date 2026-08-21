@@ -62,9 +62,6 @@ def _build_chrome_driver(config: BrowserConfig, headless: bool = True):
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-web-security")
-    opts.add_argument("--allow-running-insecure-content")
-    opts.add_argument("--ignore-certificate-errors")
     # Suppress c-ares inotify watch exhaustion spam on Linux
     opts.add_argument("--disable-background-networking")
     opts.add_argument("--dns-prefetch-disable")
@@ -120,6 +117,7 @@ def capture(
     cookies: list[dict] | None = None,
     finding_id: str | None = None,
     headless: bool = True,
+    outbound_policy: object | None = None,
 ) -> str | None:
     """Capture a screenshot of a URL as PNG evidence.
 
@@ -136,6 +134,13 @@ def capture(
     Returns:
         Path to the saved PNG file, or None on failure.
     """
+    # Selenium cannot consume the pinned connection permit used by the
+    # canonical HTTP adapter.  Keep screenshots disabled until it is routed
+    # through the same approved loopback enforcement proxy as Playwright.
+    del outbound_policy
+    log.warning("Screenshot capture disabled: policy-aware browser route is unavailable")
+    return None
+
     fid = finding_id or str(uuid.uuid4())
     output_dir.mkdir(parents=True, exist_ok=True)
     png_path = output_dir / f"finding_{fid}.png"

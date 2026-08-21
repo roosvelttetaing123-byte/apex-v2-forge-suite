@@ -121,6 +121,7 @@ class GuardrailProbe(BaseModule):
             max_tokens=500,
             temperature=0.0,
             proxy=self.config.extra.get("proxy"),
+            outbound_policy=self.outbound_policy,
         ) as client:
             results: list[dict[str, Any]] = []
             for probe in PROBE_TAXONOMY:

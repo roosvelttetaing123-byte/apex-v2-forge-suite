@@ -222,6 +222,7 @@ class SystemPromptExtract(BaseModule):
             max_tokens=self.config.extra.get("max_tokens", 2000),
             temperature=0.0,
             proxy=self.config.extra.get("proxy"),
+            outbound_policy=self.outbound_policy,
         ) as client:
             all_leaks: list[dict[str, Any]] = []
             best_leak = ""

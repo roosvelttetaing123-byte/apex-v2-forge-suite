@@ -25,6 +25,7 @@ from forge_c2.implant.implant_config import (
     ImplantArch,
     ImplantConfig,
     ImplantFormat,
+    ImplantOS,
     ObfuscationLevel,
 )
 from forge_c2.implant.implant_builder import BuildArtifact, StringEncryptor, EvasionGenerator
@@ -787,8 +788,6 @@ class TestLinuxImplant:
             output_format=ImplantFormat.ELF,
             c2_host="10.0.0.1",
         )
-        # Avoid circular import issue — use the class directly
-        from forge_c2.implant.implant_config import ImplantOS
         builder = LinuxImplant(
             config, Path(tempfile.mkdtemp()),
             StringEncryptor(), EvasionGenerator(),

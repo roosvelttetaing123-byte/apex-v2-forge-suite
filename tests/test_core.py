@@ -37,7 +37,11 @@ class TestFindingSchema:
         assert f.confidence == "UNVERIFIED"
         assert f.status == "open"
         assert f.vpr is None
-        assert f.verification is None
+        assert f.verification["state"] == "unknown"
+        assert f.verification["verified"] is False
+        assert f.proof_type == "unknown"
+        assert f.maturity == "experimental"
+        assert f.verification_state == "unknown"
 
     def test_url_field_accepted(self):
         f = _make_finding(url="https://example.com/search?q=1")
@@ -47,9 +51,11 @@ class TestFindingSchema:
         f = _make_finding(confidence="HIGH")
         assert f.confidence == "HIGH"
 
-    def test_status_field_accepted(self):
+    def test_unsupported_verified_status_is_downgraded(self):
         f = _make_finding(status="verified")
-        assert f.status == "verified"
+        assert f.status == "open"
+        assert f.verification_state == "unknown"
+        assert f.verification["legacy_status"] == "verified"
 
     def test_verification_field_accepted(self):
         vr = {"confidence": "HIGH", "probe_hits": 2, "probe_count": 2}
@@ -68,9 +74,14 @@ class TestFindingSchema:
         d = f.to_dict()
         assert d["url"] == "https://example.com/path"
         assert d["confidence"] == "MEDIUM"
-        assert d["status"] == "verified"
+        assert d["status"] == "open"
         assert d["vpr"] == "HIGH"
-        assert d["verification"] == vr
+        assert d["verification"]["confidence"] == "MEDIUM"
+        assert d["verification"]["evidence"] == ["matched pattern"]
+        assert d["verification"]["legacy_status"] == "verified"
+        assert d["verification_state"] == "unknown"
+        assert d["proof_type"] == "unknown"
+        assert d["maturity"] == "experimental"
 
     def test_to_dict_evidence_preserved(self):
         from common.evidence import Evidence
@@ -99,9 +110,12 @@ def _make_module(tmp_path: Path):
         DESCRIPTION = "test"
         PHASE = 1
 
-        async def run(self) -> ModuleResult:
+        async def fixture_run(self) -> ModuleResult:
             start = time.monotonic()
             return self._make_result(start)
+
+        async def run(self) -> ModuleResult:
+            return await self.fixture_run()
 
     cfg = BaseForgeConfig(target="https://example.com")
     scope = Scope(["example.com"])
@@ -112,7 +126,7 @@ def _make_module(tmp_path: Path):
 class TestBaseModule:
     def test_run_returns_result(self, tmp_path):
         mod, session = _make_module(tmp_path)
-        result = asyncio.run(mod.run())
+        result = asyncio.run(mod.fixture_run())
         assert result.module_name == "dummy"
         assert result.findings == []
         assert result.duration_s >= 0
@@ -133,7 +147,8 @@ class TestBaseModule:
         )
         assert f.url == "https://example.com/search?q=xss"
         assert f.confidence == "HIGH"
-        assert f.status == "verified"
+        assert f.status == "open"
+        assert f.verification_state == "unknown"
         session.close()
 
     def test_new_finding_unverified_stays_open(self, tmp_path):
@@ -332,7 +347,10 @@ class TestReportEngine:
             engine = ReportEngine(_sample_findings(), config)
             enriched = engine._enrich_findings()
             assert enriched[0]["confidence"] == "HIGH"
-            assert enriched[0]["status"] == "verified"
+            # A legacy status claim has no registered proof lineage and is
+            # therefore normalized to an ordinary workflow status.
+            assert enriched[0]["status"] == "open"
+            assert enriched[0]["verification_state"] == "unknown"
             assert enriched[0]["url"] == "https://example.com/login"
 
     def test_enrich_conf_color_set(self):
@@ -352,7 +370,7 @@ class TestReportEngine:
             html = Path(paths["html"]).read_text()
             assert "Confidence" in html
             assert "HIGH" in html
-            assert "verified" in html
+            assert "unknown" in html
 
     def test_generate_html_shows_verification_block(self):
         from common.reporting.report_engine import ReportEngine, ReportConfig

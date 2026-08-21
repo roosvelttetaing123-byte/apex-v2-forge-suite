@@ -1,35 +1,35 @@
-"""Credential Engine — encrypted storage with memory protection.
+"""Credential Engine — encrypted storage with bounded secret lifetimes.
 
 Stores discovered credentials in memory with at-rest encryption.
 Passwords are encrypted using a session-scoped Fernet key that
 only exists in process memory. On export, all sensitive fields
-are encrypted. Memory is wiped (zeroed) after credential use.
+are represented by protected references. Owned transient buffers
+are cleared after credential intake.
 
 Security features:
   - Fernet symmetric encryption for passwords/hashes at rest
-  - ctypes.memset memory wiping after credential use
+  - Owned mutable plaintext buffers cleared immediately after encryption
   - Masked repr/to_dict by default — never accidentally leak
   - Session-scoped key — dies with the process, never persisted
-  - Encrypted JSON export — ciphertext on disk
+  - Protected-reference JSON export — no secret material on disk
 
 Usage:
     engine = CredEngine()
     engine.add("10.0.0.1", "ssh", "root", password="toor")
-    engine.export_json(path)  # encrypted on disk
+    engine.export_json(path)  # protected references only
     cred = engine.get("10.0.0.1", "ssh", "root")
     plaintext = cred.get_password(engine.session_key)  # decrypt
-    cred.wipe()  # zero memory
+    cred.wipe()  # release stored ciphertext references
 """
 from __future__ import annotations
 
 import base64
-import ctypes
 import json
 import os
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+
+from common.artifact_io import atomic_write_bytes, ensure_private_directory
 
 
 # Fernet is preferred but we provide a fallback
@@ -52,18 +52,54 @@ def _generate_session_key() -> bytes:
     return base64.urlsafe_b64encode(os.urandom(32))
 
 
-def _encrypt_field(value: str, key: bytes) -> str:
-    """Encrypt a credential field."""
+def _owned_plaintext_buffer(value: str | None) -> bytearray:
+    """Copy one plaintext input into memory this module can deterministically clear."""
+    if value is None:
+        return bytearray()
+    if not isinstance(value, str):
+        raise TypeError("credential fields must be strings")
+    return bytearray(value, "utf-8")
+
+
+def _wipe_buffer(value: bytearray) -> None:
+    """Overwrite and release an owned mutable buffer without touching ``str`` memory."""
+    if not isinstance(value, bytearray):
+        raise TypeError("only owned bytearray buffers may be wiped")
+    if value:
+        value[:] = b"\x00" * len(value)
+        value.clear()
+
+
+def _encrypt_field(value: bytearray | str, key: bytes) -> str:
+    """Encrypt a credential field from an owned mutable plaintext buffer."""
+    # Keep the historical private helper callable by direct integrations while
+    # ensuring even that path obtains and clears its own mutable copy.
+    if isinstance(value, str):
+        owned = _owned_plaintext_buffer(value)
+        try:
+            return _encrypt_field(owned, key)
+        finally:
+            _wipe_buffer(owned)
     if not value:
         return ""
+    if not isinstance(value, bytearray):
+        raise TypeError("credential plaintext must use an owned bytearray")
     if _HAS_CRYPTO:
         f = Fernet(key)
-        return f.encrypt(value.encode("utf-8")).decode("ascii")
+        # Fernet currently requires ``bytes``. Keep the unavoidable immutable
+        # conversion inside this call while retaining and clearing our owned
+        # input buffer in ``CredEngine.add``'s finally block.
+        return f.encrypt(bytes(value)).decode("ascii")
     # XOR fallback
-    raw_key = base64.urlsafe_b64decode(key)
-    data = value.encode("utf-8")
-    xored = bytes(b ^ raw_key[i % len(raw_key)] for i, b in enumerate(data))
-    return "XOR:" + base64.b64encode(xored).decode("ascii")
+    raw_key = bytearray(base64.urlsafe_b64decode(key))
+    xored = bytearray(len(value))
+    try:
+        for index, octet in enumerate(value):
+            xored[index] = octet ^ raw_key[index % len(raw_key)]
+        return "XOR:" + base64.b64encode(xored).decode("ascii")
+    finally:
+        _wipe_buffer(xored)
+        _wipe_buffer(raw_key)
 
 
 def _decrypt_field(encrypted: str, key: bytes) -> str:
@@ -82,24 +118,25 @@ def _decrypt_field(encrypted: str, key: bytes) -> str:
     return decrypted.decode("utf-8")
 
 
-def _wipe_string(s: str) -> None:
-    """Attempt to zero out a string's memory buffer.
+def _wipe_string(value: str) -> None:
+    """Compatibility shim that deliberately leaves immutable strings untouched.
 
-    CPython strings are immutable and interned, so this is best-effort.
-    We overwrite the internal buffer via ctypes. Not guaranteed on all
-    interpreters, but it's better than leaving passwords in memory
-    until garbage collection eventually runs.
+    Callers should pass plaintext through :func:`_owned_plaintext_buffer` and
+    :func:`_wipe_buffer`; this legacy name remains available without unsafe
+    raw memory writes into CPython string storage.
     """
-    if not s or not isinstance(s, str):
+    if not isinstance(value, str):
         return
-    try:
-        # Get the internal buffer address
-        # CPython: str objects have their data at a known offset
-        buf_addr = id(s) + sys.getsizeof("") - 1
-        buf_len = len(s.encode("utf-8"))
-        ctypes.memset(buf_addr, 0, buf_len)
-    except Exception:
-        pass  # Non-CPython or protected memory — can't wipe
+
+
+def _ensure_owner_only_directory(directory: Path) -> None:
+    """Validate/create a no-follow owner-only directory chain."""
+    ensure_private_directory(directory)
+
+
+def _atomic_owner_only_write(path: Path, payload: bytes) -> None:
+    """Atomically replace one path through a pinned no-follow parent."""
+    atomic_write_bytes(path, payload, mode=0o600)
 
 
 @dataclass
@@ -156,14 +193,12 @@ class Credential:
     # ------------------------------------------------------------------
 
     def wipe(self) -> None:
-        """Zero out all sensitive fields from memory.
+        """Release all ciphertext references and make the credential unusable.
 
-        Call this after you're done using the credential.
-        Best-effort on CPython — the GC might have copies.
+        Python strings are immutable, so this method deliberately never writes
+        through their object addresses. Plaintext encryption intake is instead
+        handled through owned mutable buffers that are cleared in ``add``.
         """
-        _wipe_string(self._enc_password)
-        _wipe_string(self._enc_nt_hash)
-        _wipe_string(self._enc_lm_hash)
         self._enc_password = ""
         self._enc_nt_hash = ""
         self._enc_lm_hash = ""
@@ -174,13 +209,14 @@ class Credential:
     # ------------------------------------------------------------------
 
     def to_dict(self, include_encrypted: bool = False) -> dict:
-        """Serialize to dict — passwords are MASKED by default.
+        """Serialize only non-secret metadata and an opaque reference.
 
-        Args:
-            include_encrypted: If True, include encrypted ciphertext.
-                               Still not plaintext — needs session key to decrypt.
+        ``include_encrypted`` is retained for call compatibility but ciphertext
+        is no longer allowed across an ordinary JSON/event/report boundary.
         """
-        d: dict[str, Any] = {
+        from common.action_authorization import protected_credential_reference
+
+        return {
             "host": self.host,
             "service": self.service,
             "username": self.username,
@@ -188,16 +224,10 @@ class Credential:
             "has_password": self.has_password(),
             "has_nt_hash": self.has_nt_hash(),
             "wiped": self._wiped,
+            "credential_reference": protected_credential_reference(
+                {"credential_key": self.key(), "source": self.source}
+            ),
         }
-        if include_encrypted:
-            d["enc_password"] = self._enc_password
-            d["enc_nt_hash"] = self._enc_nt_hash
-            d["enc_lm_hash"] = self._enc_lm_hash
-        else:
-            d["password"] = "****" if self.has_password() else ""
-            d["nt_hash"] = "****" if self.has_nt_hash() else ""
-            d["lm_hash"] = "****" if bool(self._enc_lm_hash) else ""
-        return d
 
     def __repr__(self) -> str:
         """Never show passwords in repr."""
@@ -223,32 +253,57 @@ class CredEngine:
         source: str = "",
     ) -> Credential:
         """Add or update a credential — encrypts sensitive fields immediately."""
-        # Encrypt before storing
-        enc_password = _encrypt_field(password, self.session_key) if password else ""
-        enc_nt_hash = _encrypt_field(nt_hash, self.session_key) if nt_hash else ""
-        enc_lm_hash = _encrypt_field(lm_hash, self.session_key) if lm_hash else ""
+        plaintext_buffers: list[bytearray] = []
+        try:
+            # ``str`` is caller-owned and immutable. Copy each value into a
+            # mutable buffer under this method's ownership before encryption.
+            for value in (password, nt_hash, lm_hash):
+                plaintext_buffers.append(_owned_plaintext_buffer(value))
+            password_buffer, nt_hash_buffer, lm_hash_buffer = plaintext_buffers
 
-        cred = Credential(
-            host=host, service=service, username=username,
-            _enc_password=enc_password, _enc_nt_hash=enc_nt_hash,
-            _enc_lm_hash=enc_lm_hash, source=source,
-        )
-        existing = self._creds.get(cred.key())
-        if existing:
-            # Merge — fill in missing fields
-            if enc_password and not existing.has_password():
-                existing._enc_password = enc_password
-            if enc_nt_hash and not existing.has_nt_hash():
-                existing._enc_nt_hash = enc_nt_hash
-            return existing
-        self._creds[cred.key()] = cred
+            enc_password = (
+                _encrypt_field(password_buffer, self.session_key)
+                if password_buffer
+                else ""
+            )
+            enc_nt_hash = (
+                _encrypt_field(nt_hash_buffer, self.session_key)
+                if nt_hash_buffer
+                else ""
+            )
+            enc_lm_hash = (
+                _encrypt_field(lm_hash_buffer, self.session_key)
+                if lm_hash_buffer
+                else ""
+            )
 
-        # Wipe the plaintext inputs from our stack frame (best effort)
-        _wipe_string(password)
-        _wipe_string(nt_hash)
-        _wipe_string(lm_hash)
+            credential_key = f"{host}:{service}:{username}"
+            existing = self._creds.get(credential_key)
+            if existing:
+                # Merge only fields not already present. The finally block runs
+                # for both merged and ignored duplicate inputs.
+                if enc_password and not existing.has_password():
+                    existing._enc_password = enc_password
+                if enc_nt_hash and not existing.has_nt_hash():
+                    existing._enc_nt_hash = enc_nt_hash
+                if enc_lm_hash and not existing._enc_lm_hash:
+                    existing._enc_lm_hash = enc_lm_hash
+                return existing
 
-        return cred
+            cred = Credential(
+                host=host,
+                service=service,
+                username=username,
+                _enc_password=enc_password,
+                _enc_nt_hash=enc_nt_hash,
+                _enc_lm_hash=enc_lm_hash,
+                source=source,
+            )
+            self._creds[credential_key] = cred
+            return cred
+        finally:
+            for plaintext_buffer in plaintext_buffers:
+                _wipe_buffer(plaintext_buffer)
 
     def get(self, host: str, service: str, username: str) -> Credential | None:
         """Look up a credential by host:service:username."""
@@ -264,45 +319,21 @@ class CredEngine:
         return list(self._creds.values())
 
     def export_json(self, path: Path | None = None) -> str:
-        """Export credentials as JSON — encrypted fields, never plaintext.
-
-        The output contains ciphertext that requires the session key
-        to decrypt. Safe to write to disk.
-        """
+        """Return protected references and metadata, never secret material."""
         data = json.dumps(
-            [c.to_dict(include_encrypted=True) for c in self._creds.values()],
+            [credential.to_dict() for credential in self._creds.values()],
             indent=2,
         )
         if path:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(data)
+            _atomic_owner_only_write(path, data.encode("utf-8"))
         return data
 
     def export_plaintext(self, path: Path) -> str:
-        """Export credentials with decrypted passwords — USE WITH CAUTION.
-
-        This writes plaintext passwords to disk. Only use for operator
-        review in controlled environments.
-        """
-        records = []
-        for c in self._creds.values():
-            records.append({
-                "host": c.host,
-                "service": c.service,
-                "username": c.username,
-                "password": c.get_password(self.session_key),
-                "nt_hash": c.get_nt_hash(self.session_key),
-                "lm_hash": c.get_lm_hash(self.session_key),
-                "source": c.source,
-            })
-        data = json.dumps(records, indent=2)
-        if path:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(data)
-        return data
+        """Plaintext credential export is intentionally disabled."""
+        raise RuntimeError("plaintext credential export is disabled")
 
     def wipe_all(self) -> None:
-        """Wipe all stored credentials from memory. Call at scan end."""
+        """Release every stored ciphertext field. Call at scan end."""
         for cred in self._creds.values():
             cred.wipe()
 
@@ -332,6 +363,7 @@ class TestCredEngine:
         engine = CredEngine()
         engine.add("10.0.0.1", "ssh", "admin", password="secret123")
         cred = engine.get("10.0.0.1", "ssh", "admin")
+        assert cred is not None
         # The internal field should NOT be the plaintext
         assert cred._enc_password != "secret123"
         assert cred._enc_password != ""
@@ -340,12 +372,14 @@ class TestCredEngine:
         engine = CredEngine()
         engine.add("10.0.0.1", "ssh", "root", password="P@ssw0rd!")
         cred = engine.get("10.0.0.1", "ssh", "root")
+        assert cred is not None
         assert cred.get_password(engine.session_key) == "P@ssw0rd!"
 
     def test_masked_repr(self) -> None:
         engine = CredEngine()
         engine.add("10.0.0.1", "ssh", "root", password="secret")
         cred = engine.get("10.0.0.1", "ssh", "root")
+        assert cred is not None
         r = repr(cred)
         assert "secret" not in r
         assert "****" in r
@@ -354,14 +388,18 @@ class TestCredEngine:
         engine = CredEngine()
         engine.add("10.0.0.1", "ssh", "root", password="secret")
         cred = engine.get("10.0.0.1", "ssh", "root")
+        assert cred is not None
         d = cred.to_dict()
-        assert d["password"] == "****"
+        assert "password" not in d
+        assert "enc_password" not in d
+        assert d["credential_reference"].startswith("cred:sha256:")
         assert "secret" not in str(d)
 
     def test_wipe(self) -> None:
         engine = CredEngine()
         engine.add("10.0.0.1", "ssh", "root", password="wipe_me")
         cred = engine.get("10.0.0.1", "ssh", "root")
+        assert cred is not None
         cred.wipe()
         assert cred.get_password(engine.session_key) == "[WIPED]"
         assert cred._wiped is True
@@ -371,7 +409,8 @@ class TestCredEngine:
         engine.add("10.0.0.1", "ssh", "root", password="secret")
         data = engine.export_json(tmp_path / "creds.json")
         assert "secret" not in data
-        assert "enc_password" in data
+        assert "credential_reference" in data
+        assert "enc_password" not in data
 
     def test_dedup(self) -> None:
         engine = CredEngine()
@@ -384,6 +423,7 @@ class TestCredEngine:
         engine.add("10.0.0.1", "ssh", "root")  # No password
         engine.add("10.0.0.1", "ssh", "root", password="found_later")
         cred = engine.get("10.0.0.1", "ssh", "root")
+        assert cred is not None
         assert cred.has_password()
         assert cred.get_password(engine.session_key) == "found_later"
 

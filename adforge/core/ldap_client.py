@@ -100,6 +100,12 @@ class LdapClient:
                     try:
                         val = getattr(entry, attr, None)
                         if val is not None:
+                            raw_values = getattr(val, "raw_values", None)
+                            if raw_values:
+                                row[f"{attr}_raw"] = raw_values[0] if len(raw_values) == 1 else list(raw_values)
+                                if attr == "nTSecurityDescriptor":
+                                    row[attr] = row[f"{attr}_raw"]
+                                    continue
                             row[attr] = val.value if hasattr(val, "value") else str(val)
                     except Exception:
                         pass

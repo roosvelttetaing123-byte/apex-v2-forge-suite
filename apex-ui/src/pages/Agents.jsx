@@ -4,13 +4,7 @@ import Card from '../components/Card';
 import Button from '../components/Button';
 import Badge from '../components/Badge';
 
-const agents = [
-  { name: 'GHOST-01', os: 'Windows 10 x64', ip: '192.168.1.45', ver: 'v2.1.4', sleep: '45s', type: 'HTTP Beacon', op: 'Op_Carter', status: 'ONLINE', statusColor: '#00c853' },
-  { name: 'SPECTER-02', os: 'Windows Server 2019', ip: '10.0.1.12', ver: 'v2.1.4', sleep: '2m', type: 'HTTPS Beacon', op: 'Op_Torres', status: 'ONLINE', statusColor: '#00c853' },
-  { name: 'WRAITH-03', os: 'Ubuntu 22.04 LTS', ip: '172.16.8.3', ver: 'v2.1.3', sleep: '5m', type: 'DNS Beacon', op: 'Op_Carter', status: 'IDLE', statusColor: '#ffc400' },
-  { name: 'SHADE-04', os: 'macOS 14.2 Sonoma', ip: '192.168.1.201', ver: 'v2.1.4', sleep: '60s', type: 'HTTP Beacon', op: 'Op_Reeves', status: 'ONLINE', statusColor: '#00c853' },
-  { name: 'PHANTOM-05', os: 'Android 14', ip: '10.10.5.22', ver: 'v2.0.8', sleep: '10m', type: 'Mobile Agent', op: 'Op_Chen', status: 'ONLINE', statusColor: '#00c853' },
-];
+const agents = [];
 
 const platforms = ['Windows', 'Linux', 'macOS', 'Android', 'iOS'];
 const beaconTypes = ['HTTP', 'HTTPS', 'DNS', 'SMB'];
@@ -27,10 +21,10 @@ const Agents = () => {
         {/* ROW 1: Stat Cards */}
         <div style={{ display: 'flex', gap: '14px' }}>
           {[
-            { label: 'ONLINE', value: 4, color: '#00c853' },
-            { label: 'IDLE', value: 1, color: '#ffc400' },
+            { label: 'ONLINE', value: 0, color: '#00c853' },
+            { label: 'IDLE', value: 0, color: '#ffc400' },
             { label: 'OFFLINE', value: 0, color: 'var(--text-dimmed)' },
-            { label: 'PLATFORMS', value: 5, color: '#2979ff' },
+            { label: 'PLATFORMS', value: 0, color: '#2979ff' },
           ].map(s => (
             <Card key={s.label} style={{ flex: 1 }}>
               <div style={{ fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '1px' }}>{s.label}</div>
@@ -57,7 +51,13 @@ const Agents = () => {
                 </tr>
               </thead>
               <tbody>
-                {agents.map(a => (
+                {agents.length === 0 ? (
+                  <tr>
+                    <td colSpan={8} style={{ textAlign: 'center', padding: '48px 0', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', fontSize: '12px' }}>
+                      No agents deployed — generate a payload to begin
+                    </td>
+                  </tr>
+                ) : agents.map(a => (
                   <tr key={a.name}>
                     <td style={{ fontFamily: 'var(--font-mono)', fontSize: '13px', fontWeight: 600, color: 'var(--color-brand-red)' }}>{a.name}</td>
                     <td style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>{a.os}</td>
@@ -128,7 +128,7 @@ const Agents = () => {
               {/* Fields */}
               <div>
                 <div style={{ fontSize: '11px', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '6px' }}>Sleep Interval</div>
-                <input type="text" defaultValue="60s ± 15s jitter" style={{ width: '100%', height: '36px' }} />
+                <input type="text" defaultValue="" style={{ width: '100%', height: '36px' }} />
               </div>
 
               <div>
@@ -143,25 +143,11 @@ const Agents = () => {
               <div>
                 <div style={{ fontSize: '11px', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', textTransform: 'uppercase', letterSpacing: '1px', marginBottom: '6px' }}>Campaign</div>
                 <select style={{ width: '100%', height: '36px' }}>
-                  <option>PHANTOM REACH</option>
-                  <option>SILVER FOX</option>
-                  <option>IRON VEIL</option>
+                  <option value="">Select campaign...</option>
                 </select>
               </div>
 
               <Button variant="primary" fullWidth>Generate Payload</Button>
-
-              {/* Output Box */}
-              <div style={{
-                backgroundColor: 'var(--bg-app)', border: '1px solid var(--border-color)',
-                borderRadius: '4px', padding: '12px',
-                fontFamily: 'var(--font-mono)', fontSize: '12px',
-                color: '#00c853', lineHeight: 1.8
-              }}>
-                <div>Payload: apex_agent_{platform.toLowerCase()}64.exe</div>
-                <div>Size: 842 KB (packed)</div>
-                <div style={{ color: 'var(--text-muted)' }}>SHA256: 8f4a2b91d3e7...</div>
-              </div>
             </div>
           </Card>
         </div>

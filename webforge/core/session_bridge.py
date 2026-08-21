@@ -29,6 +29,7 @@ def capture_session(
     wait_url: str | None = None,
     timeout_s: int = 300,
     headless: bool = False,
+    outbound_policy: Any = None,
 ) -> dict[str, Any] | None:
     """Open a visible browser, wait for manual login, capture session.
 
@@ -42,6 +43,12 @@ def capture_session(
     Returns:
         Session dict with cookies, localStorage tokens, and auth headers.
     """
+    # Selenium cannot consume the resolved-IP permit or enforce target-bound
+    # TLS per navigation.  Keep this direct helper inert instead of allowing a
+    # caller to bypass the WebForge launcher gate.
+    log.error("Session capture disabled: outbound_policy_unsupported")
+    return None
+
     from webforge.core.browser_detect import build_driver, get_browser_config
 
     cfg = get_browser_config()
@@ -202,20 +209,39 @@ def load_session(session_path: Path) -> dict[str, Any] | None:
         return None
 
 
-def apply_session_to_forge(session_data: dict[str, Any], forge_session: Any) -> None:
-    """Apply captured session cookies/tokens to a ForgeSession instance."""
-    # Apply cookies
-    cookies = {c["name"]: c["value"] for c in session_data.get("cookies", [])}
-    if cookies:
-        forge_session.update_cookies(cookies)
+def apply_session_to_forge(
+    session_data: dict[str, Any],
+    forge_session: Any,
+    *,
+    target_url: str = "",
+) -> None:
+    """Apply only revalidated target-bound capture state to ForgeSession."""
+    from webforge.core.auth_recorder import filter_captured_session_credentials
 
-    # Apply auth headers
-    tokens = session_data.get("detected_tokens", {})
+    if not target_url:
+        log.error("Captured session not applied: target origin is required")
+        return
+    cookies, cookie_provenance, tokens, _ = filter_captured_session_credentials(
+        session_data,
+        target_url,
+    )
+    if cookies:
+        try:
+            forge_session.update_cookies(
+                cookies,
+                cookie_provenance=cookie_provenance,
+            )
+        except TypeError:
+            log.error(
+                "Captured session not applied: client cannot preserve cookie provenance"
+            )
+            return
+
     headers: dict[str, str] = {}
-    if tokens.get("bearer"):
-        headers["Authorization"] = f"Bearer {tokens['bearer']}"
-    elif tokens.get("jwt"):
+    if tokens.get("jwt"):
         headers["Authorization"] = f"Bearer {tokens['jwt']}"
+    elif tokens.get("bearer"):
+        headers["Authorization"] = f"Bearer {tokens['bearer']}"
     if tokens.get("csrf"):
         headers["X-CSRF-Token"] = tokens["csrf"]
         headers["X-Requested-With"] = "XMLHttpRequest"

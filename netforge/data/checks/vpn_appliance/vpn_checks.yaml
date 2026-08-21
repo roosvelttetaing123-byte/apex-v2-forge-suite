@@ -1,0 +1,165 @@
+id: CVE-2024-3400-panos-cmd-injection
+cve: CVE-2024-3400
+name: "PAN-OS GlobalProtect Command Injection RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, paloalto, cisa-kev, vpn, cmd-injection]
+target_ports: [443, 4443]
+description: |
+  Palo Alto Networks PAN-OS GlobalProtect gateway command injection
+  allowing unauthenticated RCE. CVSS 10.0 — actively exploited by
+  state-sponsored actors including UTA0218.
+detection:
+  - type: http
+    method: GET
+    path: "/global-protect/portal/css/login.css"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(global.?protect|palo.?alto)"
+    match_all: false
+  - type: http
+    method: POST
+    path: "/ssl-vpn/hipreport.esp"
+    match:
+      - status_code: [200, 403, 404]
+    match_all: false
+  - type: version
+    cpe_vendor: "paloaltonetworks"
+    cpe_product: "pan-os"
+    version_range: ">=10.2.0,<10.2.9"
+remediation: "Upgrade PAN-OS to 10.2.9+, 11.0.4+, or 11.1.2+. Apply hotfix."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2024-3400
+  - https://security.paloaltonetworks.com/CVE-2024-3400
+---
+id: CVE-2023-20269-cisco-asa-vpn
+cve: CVE-2023-20269
+name: "Cisco ASA/FTD VPN Brute-Force & Unauthorized Access"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N"
+tags: [auth-bypass, cisco, cisa-kev, vpn]
+target_ports: [443, 8443]
+description: |
+  Cisco ASA and FTD software vulnerability allowing brute-force
+  attacks against VPN credentials and unauthorized VPN tunnel
+  establishment. Exploited by Akira ransomware.
+detection:
+  - type: http
+    method: GET
+    path: "/+CSCOE+/logon.html"
+    match:
+      - body_regex: "(?i)(cisco|anyconnect|webvpn|adaptive security)"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - header_regex: "(?i)(cisco|asa)"
+    match_all: false
+remediation: "Apply Cisco security advisory cisco-sa-asaftd-ravpn-auth. Enable MFA."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-20269
+---
+id: CVE-2019-19781-citrix-adc-rce
+cve: CVE-2019-19781
+name: "Citrix ADC/Gateway Path Traversal RCE (Shitrix)"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, citrix, cisa-kev, vpn, path-traversal]
+target_ports: [443, 8443]
+description: |
+  Citrix ADC and Gateway path traversal allowing unauthenticated
+  RCE via directory traversal to write arbitrary files.
+  Nicknamed Shitrix. Massively exploited.
+detection:
+  - type: http
+    method: GET
+    path: "/vpn/../vpns/cfg/smb.conf"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(\\[global\\]|workgroup|netbios)"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/vpn/index.html"
+    match:
+      - body_regex: "(?i)(citrix|netscaler|receiver)"
+    match_all: false
+remediation: "Upgrade Citrix ADC/Gateway to latest. Check for webshells."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2019-19781
+---
+id: CVE-2021-20016-sonicwall-sqli
+cve: CVE-2021-20016
+name: "SonicWall SMA 100 SQL Injection"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [sqli, sonicwall, cisa-kev, vpn]
+target_ports: [443, 8443]
+description: |
+  SonicWall SMA 100 series SQL injection allowing unauthenticated
+  credential harvesting. Used by UNC2447 threat actor.
+detection:
+  - type: http
+    method: GET
+    path: "/cgi-bin/welcome"
+    match:
+      - body_regex: "(?i)(sonicwall|SMA|virtual office)"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - body_regex: "(?i)(sonicwall|sslvpn)"
+    match_all: false
+remediation: "Apply SonicWall firmware update. Reset all VPN credentials."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-20016
+---
+id: CVE-2023-35078-ivanti-epmm-auth-bypass
+cve: CVE-2023-35078
+name: "Ivanti EPMM (MobileIron) Authentication Bypass"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [auth-bypass, ivanti, mobileiron, cisa-kev]
+target_ports: [443, 8443]
+description: |
+  Ivanti EPMM (formerly MobileIron) authentication bypass via
+  API path manipulation. Exploited against Norwegian government.
+detection:
+  - type: http
+    method: GET
+    path: "/mifs/aad/api/v2/ping"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(mifs|mobileiron|ivanti)"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/mifs/login.jsp"
+    match:
+      - body_regex: "(?i)(mobileiron|ivanti|endpoint manager)"
+    match_all: false
+remediation: "Upgrade Ivanti EPMM to latest version immediately."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-35078
+---
+id: vpn-ssl-weak-ciphers
+name: "VPN SSL/TLS Weak Cipher Suites"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N"
+tags: [crypto, ssl, vpn, weak-ciphers]
+target_ports: [443, 8443, 10443, 4443]
+description: |
+  VPN gateway SSL/TLS configuration supports weak cipher suites
+  vulnerable to cryptographic attacks (BEAST, POODLE, SWEET32).
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - status_code: [200, 301, 302, 403]
+    match_all: false
+remediation: "Disable SSLv3, TLS 1.0, TLS 1.1. Remove RC4, DES, 3DES cipher suites."
+references:
+  - https://www.ssllabs.com/ssltest/

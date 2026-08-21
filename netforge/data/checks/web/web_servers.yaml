@@ -1,0 +1,314 @@
+id: CVE-2021-41773-apache-path-traversal
+cve: CVE-2021-41773
+name: "Apache 2.4.49 Path Traversal + RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, apache, path-traversal, cisa-kev]
+target_service: http
+description: |
+  Apache HTTP Server 2.4.49 path traversal via URL-encoded dots.
+  With mod_cgi enabled, allows remote code execution.
+detection:
+  - type: http
+    method: GET
+    path: "/icons/.%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd"
+    match:
+      - status_code: 200
+      - body_regex: "root:.*:0:0:"
+  - type: http
+    method: GET
+    path: "/cgi-bin/.%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd"
+    match:
+      - status_code: 200
+      - body_regex: "root:.*:0:0:"
+  - type: version
+    cpe_vendor: "apache"
+    cpe_product: "http_server"
+    version_range: ">=2.4.49,<=2.4.50"
+remediation: "Upgrade Apache to 2.4.51+."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-41773
+  - https://httpd.apache.org/security/vulnerabilities_24.html
+---
+id: CVE-2017-5638-struts2-rce
+cve: CVE-2017-5638
+name: "Apache Struts 2 Jakarta Multipart Parser RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, struts, java, cisa-kev]
+target_service: http
+description: |
+  Apache Struts 2 Content-Type header OGNL injection allowing
+  unauthenticated remote code execution. Used in the Equifax breach.
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    headers:
+      Content-Type: "%{#context['com.opensymphony.xwork2.dispatcher.HttpServletResponse'].addHeader('X-Struts-Test','vulnerable')}.multipart/form-data"
+    match:
+      - header_contains: "X-Struts-Test"
+  - type: http
+    method: GET
+    paths: ["/", "/login.action", "/index.action"]
+    match:
+      - body_regex: "(?i)(struts|action.*\\.do|action.*\\.action)"
+    match_all: false
+remediation: "Upgrade Struts to 2.5.12+ or 2.3.32+."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2017-5638
+---
+id: CVE-2019-6340-drupal-rce
+cve: CVE-2019-6340
+name: "Drupal REST API Remote Code Execution"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, drupal, cms, cisa-kev]
+target_service: http
+description: |
+  Drupal 8 REST API deserialization vulnerability allowing RCE
+  via crafted JSON requests to REST-enabled entities.
+detection:
+  - type: http
+    method: GET
+    path: "/node/1?_format=hal_json"
+    match:
+      - body_regex: "(?i)(drupal|_links|hal_json)"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/CHANGELOG.txt"
+    match:
+      - body_contains: "Drupal"
+    match_all: false
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - header_regex: "(?i)X-Generator: Drupal"
+    match_all: false
+remediation: "Update Drupal to latest security release."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2019-6340
+---
+id: CVE-2018-7600-drupalgeddon2
+cve: CVE-2018-7600
+name: "Drupalgeddon 2 — Remote Code Execution"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, drupal, cms, cisa-kev]
+target_service: http
+description: |
+  Drupal before 7.58, 8.x before 8.3.9, 8.4.x before 8.4.6,
+  and 8.5.x before 8.5.1 allows remote code execution via
+  form API render arrays.
+detection:
+  - type: http
+    method: GET
+    path: "/CHANGELOG.txt"
+    match:
+      - body_regex: "Drupal [78]\\."
+    match_all: false
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - body_regex: "(?i)(drupal\\.settings|sites/default|drupal\\.js)"
+    match_all: false
+remediation: "Update to Drupal 7.58+, 8.3.9+, 8.4.6+, or 8.5.1+."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2018-7600
+---
+id: wordpress-xmlrpc-enabled
+name: "WordPress XML-RPC Enabled"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:L"
+tags: [misconfig, wordpress, xmlrpc, brute-force]
+target_service: http
+description: |
+  WordPress XML-RPC interface is enabled, allowing brute-force
+  attacks, DDoS amplification, and SSRF via pingback.
+detection:
+  - type: http
+    method: POST
+    path: "/xmlrpc.php"
+    headers:
+      Content-Type: "text/xml"
+    body: |
+      <?xml version="1.0"?>
+      <methodCall><methodName>system.listMethods</methodName></methodCall>
+    match:
+      - status_code: 200
+      - body_contains: "methodResponse"
+remediation: "Disable XML-RPC via .htaccess, plugin, or web server config."
+references:
+  - https://developer.wordpress.org/plugins/security/securing-output/
+---
+id: wordpress-user-enum
+name: "WordPress User Enumeration"
+severity: low
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [info-disclosure, wordpress, user-enum]
+target_service: http
+description: |
+  WordPress reveals valid usernames via author archives or REST API,
+  enabling targeted brute-force attacks.
+detection:
+  - type: http
+    method: GET
+    path: "/wp-json/wp/v2/users"
+    match:
+      - status_code: 200
+      - body_regex: "\"slug\":\"\\w+"
+  - type: http
+    method: GET
+    path: "/?author=1"
+    match:
+      - status_code: [200, 301, 302]
+    match_all: false
+remediation: "Disable user enumeration via security plugin. Block REST API user endpoint."
+references:
+  - https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/11-Test_Cloud_Storage
+---
+id: tomcat-manager-exposed
+name: "Apache Tomcat Manager Interface Exposed"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [misconfig, tomcat, admin-panel]
+target_service: http
+target_ports: [8080, 8443, 8888, 80, 443]
+description: |
+  Apache Tomcat Manager application is publicly accessible.
+  If default or weak credentials are in use, attackers can
+  deploy malicious WAR files for RCE.
+detection:
+  - type: http
+    method: GET
+    paths:
+      - "/manager/html"
+      - "/manager/status"
+      - "/host-manager/html"
+    match:
+      - status_code: [401, 200, 403]
+      - body_regex: "(?i)(tomcat|manager|coyote)"
+    match_all: false
+remediation: "Restrict Tomcat Manager to localhost. Use strong credentials. Remove if not needed."
+references:
+  - https://tomcat.apache.org/tomcat-9.0-doc/manager-howto.html
+---
+id: nginx-version-disclosure
+name: "Nginx Version Disclosure"
+severity: low
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [info-disclosure, nginx, version]
+target_service: http
+description: "Nginx server reveals version number in HTTP headers."
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - header_regex: "Server: nginx/\\d+\\.\\d+"
+remediation: "Set 'server_tokens off;' in nginx.conf."
+references:
+  - https://nginx.org/en/docs/http/ngx_http_core_module.html#server_tokens
+---
+id: apache-version-disclosure
+name: "Apache Version Disclosure"
+severity: low
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [info-disclosure, apache, version]
+target_service: http
+description: "Apache server reveals version number in HTTP headers."
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - header_regex: "Server: Apache/\\d+\\.\\d+"
+remediation: "Set 'ServerTokens Prod' and 'ServerSignature Off' in httpd.conf."
+references:
+  - https://httpd.apache.org/docs/2.4/mod/core.html#servertokens
+---
+id: iis-version-disclosure
+name: "IIS Version Disclosure"
+severity: low
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [info-disclosure, iis, version]
+target_service: http
+description: "Microsoft IIS server reveals version number in HTTP headers."
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - header_regex: "Server: Microsoft-IIS/\\d+"
+remediation: "Remove Server header via URL Rewrite module or web.config."
+references:
+  - https://docs.microsoft.com/en-us/iis/configuration/system.webServer/security/requestFiltering/
+---
+id: php-version-disclosure
+name: "PHP Version Disclosure"
+severity: low
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [info-disclosure, php, version]
+target_service: http
+description: "PHP version exposed via X-Powered-By header."
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - header_regex: "X-Powered-By: PHP/\\d+"
+remediation: "Set 'expose_php = Off' in php.ini."
+references:
+  - https://www.php.net/manual/en/ini.core.php#ini.expose-php
+---
+id: directory-listing-enabled
+name: "Directory Listing Enabled"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [misconfig, directory-listing, info-disclosure]
+target_service: http
+description: "Web server allows directory listing, exposing file structure."
+detection:
+  - type: http
+    method: GET
+    paths:
+      - "/icons/"
+      - "/images/"
+      - "/css/"
+      - "/js/"
+      - "/assets/"
+      - "/uploads/"
+    match:
+      - body_regex: "(?i)(index of|directory listing|parent directory|\\[dir\\])"
+    match_all: false
+remediation: "Disable directory listing in web server configuration."
+references:
+  - https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information
+---
+id: aspnet-debugging-enabled
+name: "ASP.NET Debugging/Trace Enabled"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [misconfig, aspnet, debug, info-disclosure]
+target_service: http
+description: "ASP.NET application has debugging or trace mode enabled in production."
+detection:
+  - type: http
+    method: GET
+    path: "/trace.axd"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(application trace|request details|trace information)"
+  - type: http
+    method: GET
+    path: "/elmah.axd"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(error log|elmah)"
+    match_all: false
+remediation: "Set debug='false' in web.config. Remove trace.axd and elmah.axd handlers."
+references:
+  - https://docs.microsoft.com/en-us/aspnet/web-forms/overview/performance-and-caching/

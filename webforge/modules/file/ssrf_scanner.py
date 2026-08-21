@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_SSRF      = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:L/A:N"
 CVSS40_SSRF    = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:L/VA:N/SC:H/SI:L/SA:N"
@@ -128,6 +129,10 @@ class SsrfScanner(BaseModule):
                 test_targets.append((f"{target}{path}?{param}=https://example.com", param))
 
         self.log.info("Testing %d URL parameter(s) for SSRF", len(test_targets))
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         sem = asyncio.Semaphore(2)
         tasks = [self._test_ssrf(url, param, target, sem)
@@ -412,8 +417,11 @@ class TestSsrfScanner:
             posted_urls.append(url)
             return MagicMock(__aenter__=MagicMock(), __aexit__=MagicMock())
 
+        async def fake_rate_limit() -> None:
+            return None
+
         with patch.object(mod, "check_scope", side_effect=lambda u: "in-scope.example.com" in u), \
-             patch.object(mod, "rate_limit", return_value=asyncio.sleep(0)):
+             patch.object(mod, "rate_limit", side_effect=fake_rate_limit):
             asyncio.run(mod._post_forms_for_ssrf(forms, "http://in-scope.example.com"))
 
         assert not any("out-of-scope.evil.com" in u for u in posted_urls), \

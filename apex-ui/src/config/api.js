@@ -7,6 +7,8 @@
  * Via Vite proxy: /api and /ws paths are proxied to the backend automatically
  */
 
+import { DASHBOARD_API } from '../generated/dashboard-api';
+
 // HTTP API base — empty string means "use relative paths" (Vite proxy handles it)
 // Falls back to env var for direct backend connections (no proxy)
 const resolveApiBase = () => {
@@ -24,27 +26,36 @@ const resolveApiBase = () => {
 
 // WebSocket URL — auto-detects protocol (ws/wss) and host
 const resolveWsUrl = () => {
+  const websocketPath = DASHBOARD_API.websocket.path;
   if (import.meta.env.VITE_WS_HOST) {
-    return `${import.meta.env.VITE_WS_HOST}/ws/dashboard`;
+    return `${import.meta.env.VITE_WS_HOST.replace(/\/$/, '')}${websocketPath}`;
   }
   // In production, derive from current page location
   if (import.meta.env.PROD) {
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${window.location.host}/ws/dashboard`;
+    return `${proto}//${window.location.host}${websocketPath}`;
   }
   // Dev mode: relative WebSocket path, Vite proxy handles /ws → backend
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${window.location.host}/ws/dashboard`;
+  return `${proto}//${window.location.host}${websocketPath}`;
 };
 
 export const API_BASE = resolveApiBase();
 export const WS_URL   = resolveWsUrl();
 
 export const AUTH_TOKEN_KEY = 'forge_token';
-export const NO_AUTH_TOKEN = '__forge_no_auth__';
+const LEGACY_UNAUTHENTICATED_SENTINEL = '__forge_no_auth__';
 
-export const getAuthToken = () => localStorage.getItem(AUTH_TOKEN_KEY) || '';
+export const getAuthToken = () => {
+  const token = localStorage.getItem(AUTH_TOKEN_KEY) || '';
+  if (token === LEGACY_UNAUTHENTICATED_SENTINEL) {
+    localStorage.removeItem(AUTH_TOKEN_KEY);
+    return '';
+  }
+  return token;
+};
 
+/** @param {string} token */
 export const setAuthToken = (token) => {
   if (token) localStorage.setItem(AUTH_TOKEN_KEY, token);
   else localStorage.removeItem(AUTH_TOKEN_KEY);
@@ -52,9 +63,13 @@ export const setAuthToken = (token) => {
 
 export const authHeaders = (headers = {}) => {
   const token = getAuthToken();
-  return token && token !== NO_AUTH_TOKEN ? { ...headers, Authorization: `Bearer ${token}` } : headers;
+  return token ? { ...headers, Authorization: `Bearer ${token}` } : headers;
 };
 
+/**
+ * @param {string} path
+ * @param {RequestInit} [options]
+ */
 export const apiFetch = (path, options = {}) => {
   const headers = authHeaders(options.headers || {});
   return fetch(`${API_BASE}${path}`, { ...options, headers });

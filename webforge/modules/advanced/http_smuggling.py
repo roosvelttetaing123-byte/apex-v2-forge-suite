@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_SMUGGLING = "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:H/A:N"
 CVSS40_SMUGGLING = "CVSS:4.0/AV:N/AC:H/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:H/SI:H/SA:N"
@@ -35,6 +36,10 @@ class HttpSmuggling(BaseModule):
         use_tls = parsed.scheme == "https"
 
         self.log.info("Testing HTTP request smuggling on %s:%d", host, port)
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         await asyncio.gather(
             self._test_clte(host, port, use_tls, target),

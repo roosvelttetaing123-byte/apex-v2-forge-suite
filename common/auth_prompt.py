@@ -4,7 +4,10 @@ from __future__ import annotations
 import sys
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
+
+from common.scope import safe_target_display
 
 console = Console()
 
@@ -19,10 +22,12 @@ def require_authorization(target: str, tool_name: str) -> None:
     Raises:
         SystemExit: If operator does not confirm authorization.
     """
+    displayed_target = escape(safe_target_display(target))
+    displayed_tool = escape(str(tool_name))
     console.print(Panel(
         f"[bold yellow]  AUTHORIZED PENETRATION TESTING TOOL[/bold yellow]\n\n"
-        f"  Tool   : [cyan]{tool_name}[/cyan]\n"
-        f"  Target : [cyan]{target}[/cyan]\n\n"
+        f"  Tool   : [cyan]{displayed_tool}[/cyan]\n"
+        f"  Target : [cyan]{displayed_target}[/cyan]\n\n"
         f"  [bold]You MUST have written authorization to test this target.[/bold]\n"
         f"  Unauthorized testing is illegal and unethical.\n\n"
         f"  Type [green]yes[/green] to confirm authorization, or [red]no[/red] to exit:",
@@ -41,7 +46,9 @@ def require_authorization(target: str, tool_name: str) -> None:
         console.print("\n[red][!] Authorization not confirmed. Exiting.[/red]")
         sys.exit(1)
 
-    console.print(f"\n[green][+] Authorization confirmed. Starting {tool_name}...[/green]\n")
+    console.print(
+        f"\n[green][+] Authorization confirmed. Starting {displayed_tool}...[/green]\n"
+    )
 
 
 class TestAuthPrompt:
