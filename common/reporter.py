@@ -1,23 +1,16 @@
 """Base report orchestrator — generates HTML, PDF, JSON, CSV from findings."""
 from __future__ import annotations
 
-import asyncio
+import base64
 import csv
-import io
 import json
 import logging
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from common.artifact_io import (
-    ArtifactBoundaryError,
-    atomic_write_bytes,
-    ensure_private_directory,
-    read_verified_regular_file,
-)
 from common.confidence_policy import normalise_finding
-from common.redaction import redact_text, redact_value, redacted_json_dumps
 
 try:
     from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -32,26 +25,6 @@ log = logging.getLogger(__name__)
 SEVERITY_ORDER = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "Informational": 4}
 
 
-def _ensure_report_directory(path: Path) -> None:
-    """Validate/create a no-follow private directory chain."""
-    try:
-        ensure_private_directory(path)
-    except ArtifactBoundaryError as exc:
-        if str(exc) == "artifact directory must be a real directory":
-            raise ValueError("report directory must be a real directory") from None
-        raise ValueError("report directory is unavailable") from None
-
-
-def _write_private_bytes(path: Path, content: bytes) -> None:
-    """Atomically replace a report through a pinned no-follow parent."""
-    atomic_write_bytes(path, content, mode=0o600)
-
-
-def _write_private_text(path: Path, content: str) -> None:
-    """Atomically replace a redacted ordinary artifact with owner-only mode."""
-    _write_private_bytes(path, content.encode("utf-8"))
-
-
 class BaseReporter:
     """Base reporter that serializes findings to multiple output formats."""
 
@@ -64,26 +37,22 @@ class BaseReporter:
         tester: str = "anonymous",
         framework: str = "forge",
         formats: list[str] | None = None,
-        compliance_collection: Any = None,
-        compliance_authority: Any = None,
     ) -> None:
         self.findings     = sorted(
-            [normalise_finding(redact_value(f)) for f in findings],
+            [normalise_finding(f) for f in findings],
             key=lambda f: (
                 -(float(f.get("vpr_score") or f.get("cvss_v31_score") or 0.0)),
                 SEVERITY_ORDER.get(f.get("severity", ""), 99),
             ),
         )
-        self.results_dir  = Path(results_dir)
-        self.engagement   = redact_text(engagement)
-        self.target       = redact_text(target)
-        self.tester       = redact_text(tester)
-        self.framework    = redact_text(framework)
+        self.results_dir  = results_dir
+        self.engagement   = engagement
+        self.target       = target
+        self.tester       = tester
+        self.framework    = framework
         self.formats      = formats or ["html", "pdf", "json", "csv"]
-        self.compliance_collection = compliance_collection
-        self.compliance_authority = compliance_authority
         self.generated_at = datetime.now(timezone.utc).isoformat()
-        _ensure_report_directory(self.results_dir)
+        results_dir.mkdir(parents=True, exist_ok=True)
 
     def generate_all(self) -> dict[str, str]:
         """Generate all configured report formats.
@@ -100,27 +69,21 @@ class BaseReporter:
                     if path:
                         paths[fmt] = path
                         log.info("Report generated: %s → %s", fmt, path)
-            except Exception:
-                log.error("Report generation failed for a configured format")
+            except Exception as exc:
+                log.error("Report generation failed for %s: %s", fmt, exc)
 
         try:
             from common.reporting.compliance_engine import ComplianceEngine
-            c_reports = ComplianceEngine.evaluate_all(
-                self.findings,
-                self.compliance_collection,
-                self.compliance_authority,
-            )
+            c_reports = ComplianceEngine.evaluate_all(self.findings)
             compliance_path = self.results_dir / "compliance_report.json"
-            _write_private_text(
-                compliance_path,
-                redacted_json_dumps(
-                    {k: v.to_dict() for k, v in c_reports.items()}, indent=2
-                ),
+            compliance_path.write_text(
+                json.dumps({k: v.to_dict() for k, v in c_reports.items()}, indent=2),
+                encoding="utf-8",
             )
             paths["compliance"] = str(compliance_path)
             log.info("Compliance report generated: %s", compliance_path)
-        except Exception:
-            log.warning("Compliance report generation failed")
+        except Exception as exc:
+            log.warning("Compliance report generation failed: %s", exc)
 
         return paths
 
@@ -134,9 +97,22 @@ class BaseReporter:
             output_dir=str(self.results_dir),
             formats=formats,
             include_unverified=False,
-            compliance_collection=self.compliance_collection,
-            compliance_authority=self.compliance_authority,
         )
+
+    def _run_professional_report(self, formats: list[str]) -> dict[str, str]:
+        """Run the async report engine when no event loop is already active.
+
+        Framework orchestrators call ``generate_all`` from an async scan.  Calling
+        ``asyncio.run`` there raises and leaves an un-awaited coroutine behind, so
+        the synchronous fallback is selected explicitly in that context.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            from common.reporting.report_engine import ReportEngine
+            config = self._professional_report_config(formats)
+            return asyncio.run(ReportEngine(self.findings, config).generate())
+        return {}
 
     def generate_json(self) -> str:
         """Generate JSON findings export."""
@@ -151,7 +127,7 @@ class BaseReporter:
             "findings":     self.findings,
         }
         path = self.results_dir / "findings.json"
-        _write_private_text(path, redacted_json_dumps(out, indent=2, default=str))
+        path.write_text(json.dumps(out, indent=2, default=str), encoding="utf-8")
         return str(path)
 
     def generate_docx(self) -> str | None:
@@ -172,11 +148,7 @@ class BaseReporter:
         for finding in self.findings:
             doc.add_heading(finding.get("title", "Untitled Finding"), level=2)
             doc.add_paragraph(f"Severity: {finding.get('severity', '')}")
-            doc.add_paragraph(f"Confidence: {finding.get('confidence', 'UNVERIFIED')}")
-            doc.add_paragraph(f"Verification state: {finding.get('verification_state', 'unknown')}")
-            doc.add_paragraph(f"Proof type: {finding.get('proof_type', 'unknown')}")
-            doc.add_paragraph(f"Capability maturity: {finding.get('maturity', 'experimental')}")
-            doc.add_paragraph(f"Workflow status: {finding.get('status', 'open')}")
+            doc.add_paragraph(f"Confidence: {finding.get('confidence', '')}")
             doc.add_paragraph(f"VPR: {finding.get('vpr_score', '')} {finding.get('vpr_priority', '')}")
             doc.add_paragraph(f"Target: {finding.get('url') or finding.get('target', '')}")
             doc.add_paragraph(finding.get("description", ""))
@@ -184,74 +156,54 @@ class BaseReporter:
                 doc.add_heading("Remediation", level=3)
                 doc.add_paragraph(finding["remediation"])
         path = self.results_dir / "report.docx"
-        with io.BytesIO() as artifact:
-            doc.save(artifact)
-            content = artifact.getvalue()
-        _write_private_bytes(path, content)
+        doc.save(str(path))
         return str(path)
 
     def generate_csv(self) -> str:
         """Generate CSV findings export."""
         path = self.results_dir / "findings.csv"
-        fields = [
-            "id", "title", "severity", "cvss_v31_score", "target", "port",
-            "service", "module", "discovered_at", "confidence", "status",
-            "verification_state", "proof_type", "maturity",
-        ]
-        with io.StringIO(newline="") as artifact:
-            writer = csv.DictWriter(artifact, fieldnames=fields, extrasaction="ignore")
+        fields = ["id", "title", "severity", "cvss_v31_score", "target",
+                  "port", "service", "module", "discovered_at", "confidence"]
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(self.findings)
-            content = artifact.getvalue().encode("utf-8")
-        _write_private_bytes(path, content)
         return str(path)
 
     def generate_html(self) -> str:
         """Generate a self-contained HTML report via Jinja2 template (falls back to inline)."""
         try:
-            from common.reporting.report_engine import ReportEngine
-            config = self._professional_report_config(["html"])
-            paths = asyncio.run(ReportEngine(self.findings, config).generate())
+            paths = self._run_professional_report(["html"])
             if paths.get("html"):
                 return paths["html"]
-        except Exception:
-            log.debug("Professional report engine unavailable; using fallback HTML")
+        except Exception as exc:
+            log.debug("Professional report engine unavailable, using fallback HTML: %s", exc)
         path = self.results_dir / "report.html"
         html = self._build_html_jinja2() if _JINJA2_AVAILABLE else self._build_html_inline()
-        _write_private_text(path, redact_text(html))
+        path.write_text(html, encoding="utf-8")
         return str(path)
 
     def generate_pdf(self) -> str | None:
         """Generate PDF report from HTML via WeasyPrint."""
         try:
-            from common.reporting.report_engine import ReportEngine
-            config = self._professional_report_config(["html", "pdf"])
-            paths = asyncio.run(ReportEngine(self.findings, config).generate())
+            paths = self._run_professional_report(["html", "pdf"])
             if paths.get("pdf"):
                 return paths["pdf"]
-        except Exception:
-            log.debug("Professional PDF generation unavailable; using fallback")
+        except Exception as exc:
+            log.debug("Professional PDF generation unavailable, using fallback: %s", exc)
         try:
             from weasyprint import HTML as WeasyprintHTML
             html_path = self.results_dir / "report.html"
-            try:
-                html_content = read_verified_regular_file(html_path)
-            except ArtifactBoundaryError:
+            if not html_path.exists():
                 self.generate_html()
-                html_content = read_verified_regular_file(html_path)
             pdf_path = self.results_dir / "report.pdf"
-            with io.BytesIO() as artifact:
-                WeasyprintHTML(
-                    string=html_content.decode("utf-8", errors="replace")
-                ).write_pdf(artifact)
-                content = artifact.getvalue()
-            _write_private_bytes(pdf_path, content)
+            WeasyprintHTML(filename=str(html_path)).write_pdf(str(pdf_path))
             return str(pdf_path)
         except ImportError:
             log.warning("WeasyPrint not installed — PDF generation skipped")
             return None
-        except Exception:
-            log.error("PDF generation failed")
+        except Exception as exc:
+            log.error("PDF generation failed: %s", exc)
             return None
 
     def _build_html_jinja2(self) -> str:
@@ -262,15 +214,15 @@ class BaseReporter:
         )
         template = env.get_template("report.html.j2")
 
-        # Ordinary reports do not embed protected-original screenshots.  Work
-        # Package 102 owns authorized evidence-custody and redacted derivatives.
+        # Embed screenshots as base64 data URIs so the HTML is self-contained
         enriched: list[dict[str, Any]] = []
         for f in self.findings:
             row = dict(f)
             ev = dict(f.get("evidence") or {})
-            ev["screenshot_path"] = None
-            ev["console_capture_path"] = None
-            ev["pcap_path"] = None
+            sp = ev.get("screenshot_path")
+            if sp and Path(sp).exists():
+                data = base64.b64encode(Path(sp).read_bytes()).decode()
+                ev["screenshot_b64"] = f"data:image/png;base64,{data}"
             row["evidence"] = ev
             enriched.append(row)
 
@@ -316,6 +268,15 @@ class BaseReporter:
             text_color = "#FFFFFF" if sev in ("Critical", "High") else "#000000"
             ev = f.get("evidence", {})
             screenshot_html = ""
+            if ev.get("screenshot_path"):
+                sp = Path(ev["screenshot_path"])
+                if sp.exists():
+                    data = base64.b64encode(sp.read_bytes()).decode()
+                    screenshot_html = (
+                        f'<br><strong>Screenshot (POC):</strong><br>'
+                        f'<img src="data:image/png;base64,{data}" '
+                        f'style="max-width:800px;border:2px solid red;" />'
+                    )
             request_html = ""
             if ev.get("request_raw"):
                 request_html = (
@@ -335,22 +296,20 @@ class BaseReporter:
             refs = ", ".join(f.get("references", []))
             mitre = ", ".join(f.get("mitre_attack", []))
             cvss = f.get("cvss_v31_score", "")
+            confidence = self._escape(f.get("confidence", "UNVERIFIED"))
             rows += f"""
             <tr>
               <td>{i}</td>
               <td><strong>{self._escape(f.get('title',''))}</strong></td>
               <td style="background:{color};color:{text_color};text-align:center;font-weight:bold">
                 {self._escape(sev)}</td>
+              <td><code>{confidence}</code></td>
               <td>{self._escape(str(cvss))}</td>
               <td>{self._escape(f.get('target',''))}</td>
               <td>{self._escape(str(f.get('port','') or ''))}</td>
               <td>{self._escape(f.get('module',''))}</td>
-              <td>{self._escape(f.get('verification_state','unknown'))}<br>
-                  {self._escape(f.get('proof_type','unknown'))} / {self._escape(f.get('maturity','experimental'))}</td>
             </tr>
             <tr><td colspan="8" style="background:#f9f9f9;padding:12px">
-              <strong>Workflow status:</strong> {self._escape(f.get('status','open'))} &nbsp;|&nbsp;
-              <strong>Confidence:</strong> {self._escape(f.get('confidence','UNVERIFIED'))}<br>
               <strong>Description:</strong> {self._escape(f.get('description',''))}<br>
               <strong>Reproduction:</strong><ol>{steps}</ol>
               <strong>Remediation:</strong> {self._escape(f.get('remediation',''))}<br>
@@ -401,8 +360,8 @@ class BaseReporter:
 <div class="summary">{summary_bars}</div>
 <table>
   <thead><tr>
-    <th>#</th><th>Vulnerability</th><th>Severity</th><th>CVSS</th>
-    <th>Target</th><th>Port</th><th>Module</th><th>Verification / Proof</th>
+    <th>#</th><th>Vulnerability</th><th>Severity</th><th>Confidence</th><th>CVSS</th>
+    <th>Target</th><th>Port</th><th>Module</th>
   </tr></thead>
   <tbody>{rows}</tbody>
 </table>
@@ -432,8 +391,7 @@ class TestReporter:
             "remediation": "Use parameterized queries", "references": ["CWE-89"],
             "mitre_attack": ["TA0001/T1190"], "discovered_at": "2024-01-01T00:00:00Z",
             "evidence": {}, "operator_confirmed": False, "tags": [],
-            "confidence": "HIGH", "verification_state": "verified",
-            "proof_type": "response-confirmed", "maturity": "verified",
+            "confidence": "HIGH",
         }]
 
     def test_generate_json(self, tmp_path: Path) -> None:

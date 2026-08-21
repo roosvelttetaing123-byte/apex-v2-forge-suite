@@ -35,6 +35,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
+from common.confidence_policy import normalise_finding
+
 log = logging.getLogger("forge.brain.engagement_bus")
 
 
@@ -126,7 +128,7 @@ CREATE TABLE IF NOT EXISTS findings (
     module      TEXT NOT NULL DEFAULT '',
     description TEXT DEFAULT '',
     remediation TEXT DEFAULT '',
-    confidence  TEXT DEFAULT 'MEDIUM',
+    confidence  TEXT DEFAULT 'UNVERIFIED',
     data_json   TEXT DEFAULT '{}',
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     brain_verdict   TEXT DEFAULT '',
@@ -191,22 +193,19 @@ class _FindingStore:
         self._conn.commit()
         log.debug("EngagementBus SQLite store initialized: %s", self._db_path)
 
-    @property
-    def _connection(self) -> sqlite3.Connection:
-        """Return the open database connection or fail clearly after close."""
-        if self._conn is None:
-            raise RuntimeError("EngagementBus finding store is closed")
-        return self._conn
-
     def store_finding(self, framework: str, finding: dict[str, Any]) -> str:
         """Store a finding and return its ID."""
+        normalised = normalise_finding(finding)
         finding_id = finding.get("id") or str(uuid.uuid4())
         data = {k: v for k, v in finding.items()
                 if k not in ("id", "framework", "title", "severity", "target",
                              "module", "description", "remediation", "confidence")}
+        if "evidence" in normalised:
+            data["evidence"] = normalised["evidence"]
+        data["verification"] = normalised["verification"]
 
         with self._lock:
-            self._connection.execute(
+            self._conn.execute(
                 """INSERT OR REPLACE INTO findings
                    (id, framework, title, severity, target, module,
                     description, remediation, confidence, data_json)
@@ -220,11 +219,11 @@ class _FindingStore:
                     finding.get("module", ""),
                     finding.get("description", ""),
                     finding.get("remediation", ""),
-                    finding.get("confidence", "MEDIUM"),
+                    normalised["confidence"],
                     json.dumps(data, default=str),
                 ),
             )
-            self._connection.commit()
+            self._conn.commit()
         return finding_id
 
     def update_brain_verdict(
@@ -232,12 +231,12 @@ class _FindingStore:
     ) -> None:
         """Update brain analysis results for a finding."""
         with self._lock:
-            self._connection.execute(
+            self._conn.execute(
                 """UPDATE findings SET brain_verdict=?, brain_confidence=?,
                    brain_reasoning=? WHERE id=?""",
                 (verdict, confidence, reasoning, finding_id),
             )
-            self._connection.commit()
+            self._conn.commit()
 
     def store_credential(self, framework: str, cred: dict[str, Any]) -> str:
         """Store a credential and return its ID."""
@@ -247,7 +246,7 @@ class _FindingStore:
                              "password", "hash_value", "hash_type", "domain", "source")}
 
         with self._lock:
-            self._connection.execute(
+            self._conn.execute(
                 """INSERT OR REPLACE INTO credentials
                    (id, framework, host, service, username, password,
                     hash_value, hash_type, domain, source, data_json)
@@ -266,14 +265,14 @@ class _FindingStore:
                     json.dumps(data, default=str),
                 ),
             )
-            self._connection.commit()
+            self._conn.commit()
         return cred_id
 
     def store_chain_action(self, action: ChainAction) -> str:
         """Store a chain action."""
         action_id = str(uuid.uuid4())
         with self._lock:
-            self._connection.execute(
+            self._conn.execute(
                 """INSERT INTO chain_actions
                    (id, chain_type, source_finding, source_framework,
                     target_framework, target_module, target, rationale,
@@ -292,13 +291,13 @@ class _FindingStore:
                     action.triggered_at,
                 ),
             )
-            self._connection.commit()
+            self._conn.commit()
         return action_id
 
     def get_all_findings(self) -> list[dict[str, Any]]:
         """Get all findings across all frameworks."""
         with self._lock:
-            cursor = self._connection.execute(
+            cursor = self._conn.execute(
                 "SELECT * FROM findings ORDER BY created_at DESC"
             )
             cols = [desc[0] for desc in cursor.description]
@@ -308,7 +307,7 @@ class _FindingStore:
     def get_findings_by_framework(self, framework: str) -> list[dict[str, Any]]:
         """Get findings for a specific framework."""
         with self._lock:
-            cursor = self._connection.execute(
+            cursor = self._conn.execute(
                 "SELECT * FROM findings WHERE framework=? ORDER BY created_at DESC",
                 (framework,),
             )
@@ -319,7 +318,7 @@ class _FindingStore:
     def get_all_credentials(self) -> list[dict[str, Any]]:
         """Get all credentials across all frameworks."""
         with self._lock:
-            cursor = self._connection.execute(
+            cursor = self._conn.execute(
                 "SELECT * FROM credentials ORDER BY created_at DESC"
             )
             cols = [desc[0] for desc in cursor.description]
@@ -330,11 +329,11 @@ class _FindingStore:
         """Get chain actions, optionally filtered by execution status."""
         with self._lock:
             if executed is None:
-                cursor = self._connection.execute(
+                cursor = self._conn.execute(
                     "SELECT * FROM chain_actions ORDER BY triggered_at DESC"
                 )
             else:
-                cursor = self._connection.execute(
+                cursor = self._conn.execute(
                     "SELECT * FROM chain_actions WHERE executed=? ORDER BY triggered_at DESC",
                     (1 if executed else 0,),
                 )
@@ -345,13 +344,13 @@ class _FindingStore:
     def count_findings(self) -> int:
         """Return total finding count."""
         with self._lock:
-            cursor = self._connection.execute("SELECT COUNT(*) FROM findings")
+            cursor = self._conn.execute("SELECT COUNT(*) FROM findings")
             return cursor.fetchone()[0]
 
     def severity_counts(self) -> dict[str, int]:
         """Return findings grouped by severity."""
         with self._lock:
-            cursor = self._connection.execute(
+            cursor = self._conn.execute(
                 "SELECT severity, COUNT(*) FROM findings GROUP BY severity"
             )
             return dict(cursor.fetchall())
@@ -372,6 +371,11 @@ class _FindingStore:
                 d.update(extra)
             except (json.JSONDecodeError, TypeError):
                 d.pop("data_json", None)
+        confidence_fields = normalise_finding(d)
+        d["confidence"] = confidence_fields["confidence"]
+        if "evidence" in confidence_fields:
+            d["evidence"] = confidence_fields["evidence"]
+        d["verification"] = confidence_fields["verification"]
         return d
 
 
@@ -591,9 +595,9 @@ class EngagementBus:
             plan_trigger_threshold: Trigger plan_next() after this many
                                     new findings since last plan.
         """
-        self._db_path: str = db_path or os.environ.get(
+        self._db_path = db_path or os.environ.get(
             "FORGE_ENGAGEMENT_DB", "engagement.db"
-        ) or "engagement.db"
+        )
         self._store = _FindingStore(self._db_path)
         self._brain = brain
         self._planner = planner
@@ -651,11 +655,6 @@ class EngagementBus:
         """Set or replace the AttackPlanner instance."""
         self._planner = planner
 
-    @property
-    def planner(self) -> Any | None:
-        """Return the attached planner for read-only integration consumers."""
-        return self._planner
-
     def set_event_bus(self, event_bus: Any) -> None:
         """Set or replace the dashboard EventBus."""
         self._event_bus = event_bus
@@ -675,6 +674,12 @@ class EngagementBus:
         Returns:
             The finding ID.
         """
+        confidence_fields = normalise_finding(finding)
+        finding["confidence"] = confidence_fields["confidence"]
+        if "evidence" in confidence_fields:
+            finding["evidence"] = confidence_fields["evidence"]
+        finding["verification"] = confidence_fields["verification"]
+
         # Store
         finding_id = self._store.store_finding(framework, finding)
         finding["id"] = finding_id
@@ -698,19 +703,20 @@ class EngagementBus:
             "title": finding.get("title", ""),
             "severity": finding.get("severity", ""),
             "target": finding.get("target", ""),
+            "confidence": finding["confidence"],
         })
 
         # Notify sync subscribers (lists already captured under lock above)
 
-        for sync_cb in sync_subs:
+        for cb in sync_subs:
             try:
-                sync_cb(framework, finding)
+                cb(framework, finding)
             except Exception as exc:
                 log.error("Sync subscriber error: %s", exc)
 
-        for async_cb in async_subs:
+        for cb in async_subs:
             try:
-                await async_cb(framework, finding)
+                await cb(framework, finding)
             except Exception as exc:
                 log.error("Async subscriber error: %s", exc)
 
@@ -1048,8 +1054,6 @@ class EngagementBus:
             type_map = {
                 "finding_new": EventType.FINDING_NEW,
                 "credential_found": EventType.CREDENTIAL_FOUND,
-                "brain_verdict": EventType.BRAIN_VERDICT,
-                "chain_action_new": EventType.CHAIN_ACTION_NEW,
             }
             etype = type_map.get(event_type_str)
             if etype:
@@ -1059,6 +1063,8 @@ class EngagementBus:
                     source="engagement_bus",
                 ))
             else:
+                # For new event types (BRAIN_VERDICT, CHAIN_ACTION_NEW),
+                # emit as data with state_snapshot until we add them to EventType
                 self._event_bus.emit(Event(
                     event_type=EventType.STATE_SNAPSHOT,
                     data={"sub_type": event_type_str, **data},
@@ -1072,10 +1078,7 @@ class EngagementBus:
     ) -> None:
         """Analyze a finding with ForgeBrain and store the verdict."""
         try:
-            brain = self._brain
-            if brain is None:
-                return
-            result = await brain.analyze_finding(finding)
+            result = await self._brain.analyze_finding(finding)
             self._store.update_brain_verdict(
                 finding_id,
                 result.verdict.value,

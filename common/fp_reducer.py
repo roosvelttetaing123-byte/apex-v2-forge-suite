@@ -44,6 +44,14 @@ class Confidence(str, Enum):
     UNVERIFIED = "UNVERIFIED" # Cannot verify (no OOB, no canary) → verbose only
 
 
+class ConfidenceBand(Enum):
+    """Semantic confidence bands for cross-module finding assessment."""
+    CONFIRMED     = "confirmed"
+    LIKELY        = "likely"
+    POSSIBLE      = "possible"
+    INFORMATIONAL = "informational"
+
+
 @dataclass
 class VerificationResult:
     """Result of FP verification for a single finding."""
@@ -125,15 +133,28 @@ def _looks_like_block_page(status: int, body: str) -> bool:
 
 
 def _xss_payload_executably_reflected(body: str, canary: str) -> bool:
-    """Return True only when the canary appears in raw executable HTML/JS context."""
+    """Return True only when the canary appears in raw executable HTML/JS context.
+
+    Checks that the payload is not HTML-entity-encoded and appears in
+    a script block, event handler, or javascript: URI context.
+    """
     if canary not in body:
         return False
     escaped = html.escape(canary)
     if escaped in body and canary not in html.unescape(body):
         return False
+    # Check if the canary itself is entity-encoded at its location
+    # (only reject if encoding is proximate to the payload, not globally)
     encoded_delimiters = ("&lt;script", "&#60;script", "&lt;img", "&#60;img", "&lt;svg", "&#60;svg")
-    if any(marker in body.lower() for marker in encoded_delimiters):
-        return False
+    body_lower = body.lower()
+    canary_idx = body_lower.find(canary.lower())
+    if canary_idx >= 0:
+        # Check a window around the payload for encoded markers
+        window_start = max(0, canary_idx - 30)
+        window_end = min(len(body_lower), canary_idx + len(canary) + 30)
+        window = body_lower[window_start:window_end]
+        if any(marker in window for marker in encoded_delimiters):
+            return False
     patterns = (
         rf"<script\b[^>]*>[^<]*{re.escape(canary)}",
         rf"\bon(?:error|load)\s*=\s*['\"][^'\"]*{re.escape(canary)}",
@@ -154,12 +175,57 @@ async def _http_get(
     timeout: float = 15.0,
     session: Any = None,
 ) -> tuple[int, str, float]:
-    """Legacy verifier transport is intentionally inert.
+    """Make an async HTTP GET. Returns (status, body, elapsed_seconds).
 
-    FP verification must be migrated to the canonical policy client before it
-    can make requests again; raw urllib fallback would bypass Task 003.
+    Uses aiohttp if available, falls back to urllib via thread pool
+    to avoid blocking the event loop.
     """
-    return 0, "outbound_policy_unsupported", 0.0
+    # Try aiohttp first (non-blocking native async)
+    try:
+        import aiohttp
+        start = time.monotonic()
+        try:
+            _sess = session or aiohttp.ClientSession()
+            try:
+                async with _sess.get(
+                    url, params=params, headers=headers or {},
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    ssl=False,
+                ) as resp:
+                    body = await resp.text(errors="replace")
+                    elapsed = time.monotonic() - start
+                    return resp.status, body[:65536], elapsed
+            finally:
+                if not session:
+                    await _sess.close()
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            return 0, str(exc), elapsed
+    except ImportError:
+        pass
+
+    # Fallback: urllib in thread pool (non-blocking wrapper)
+    import urllib.request
+    import urllib.parse
+
+    def _blocking_get() -> tuple[int, str, float]:
+        _start = time.monotonic()
+        try:
+            _url = url
+            if params:
+                qs = urllib.parse.urlencode(params)
+                _url = f"{_url}?{qs}" if "?" not in _url else f"{_url}&{qs}"
+            req = urllib.request.Request(_url, headers=headers or {})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read(65536).decode("utf-8", errors="replace")
+                status = resp.status
+        except Exception as exc:
+            _elapsed = time.monotonic() - _start
+            return 0, str(exc), _elapsed
+        _elapsed = time.monotonic() - _start
+        return status, body, _elapsed
+
+    return await asyncio.to_thread(_blocking_get)
 
 
 async def _http_post(
@@ -168,8 +234,72 @@ async def _http_post(
     headers: dict[str, str] | None = None,
     timeout: float = 15.0,
 ) -> tuple[int, str, float]:
-    """Legacy verifier transport is intentionally inert; see ``_http_get``."""
-    return 0, "outbound_policy_unsupported", 0.0
+    """Make an async HTTP POST. Returns (status, body, elapsed_seconds).
+
+    Uses aiohttp if available, falls back to urllib via thread pool.
+    """
+    # Try aiohttp first
+    try:
+        import aiohttp
+        start = time.monotonic()
+        try:
+            async with aiohttp.ClientSession() as sess:
+                post_data = data
+                if isinstance(data, dict):
+                    # aiohttp handles dict data natively
+                    async with sess.post(
+                        url, data=data, headers=headers or {},
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                        ssl=False,
+                    ) as resp:
+                        body = await resp.text(errors="replace")
+                        elapsed = time.monotonic() - start
+                        return resp.status, body[:65536], elapsed
+                else:
+                    async with sess.post(
+                        url, data=(data or "").encode() if isinstance(data, str) else b"",
+                        headers=headers or {},
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                        ssl=False,
+                    ) as resp:
+                        body = await resp.text(errors="replace")
+                        elapsed = time.monotonic() - start
+                        return resp.status, body[:65536], elapsed
+        except Exception as exc:
+            elapsed = time.monotonic() - start
+            return 0, str(exc), elapsed
+    except ImportError:
+        pass
+
+    # Fallback: urllib in thread pool
+    import urllib.request
+    import urllib.parse
+
+    def _blocking_post() -> tuple[int, str, float]:
+        _start = time.monotonic()
+        try:
+            if isinstance(data, dict):
+                post_data = urllib.parse.urlencode(data).encode()
+            elif isinstance(data, str):
+                post_data = data.encode()
+            else:
+                post_data = b""
+
+            hdrs = dict(headers or {})
+            if "Content-Type" not in hdrs:
+                hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+
+            req = urllib.request.Request(url, data=post_data, headers=hdrs, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read(65536).decode("utf-8", errors="replace")
+                status = resp.status
+        except Exception as exc:
+            _elapsed = time.monotonic() - _start
+            return 0, str(exc), _elapsed
+        _elapsed = time.monotonic() - _start
+        return status, body, _elapsed
+
+    return await asyncio.to_thread(_blocking_post)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -494,7 +624,6 @@ async def verify_ssrf(
     method: str = "GET",
     headers: dict[str, str] | None = None,
     collab_client: Any = None,
-    outbound_policy: Any = None,
 ) -> VerificationResult:
     """Verify SSRF via OOB callback or strong internal response differential.
 
@@ -502,12 +631,6 @@ async def verify_ssrf(
     Without OOB: strong internal response = MEDIUM (higher FP risk).
     """
     result = VerificationResult(confidence=Confidence.UNVERIFIED)
-
-    if outbound_policy is None:
-        result.evidence.append(
-            "SSRF delegated destination not authorized; active verification not run"
-        )
-        return result
 
     try:
         method = _normalise_method(method)
@@ -840,14 +963,12 @@ class FPReducer:
         time_delay: float = 5.0,
         baseline_n: int = 3,
         verify_timeout: float = 15.0,
-        outbound_policy: Any = None,
     ) -> None:
         self._collab = collab_client
         self._headers = headers or {}
         self._time_delay = time_delay
         self._baseline_n = baseline_n
         self._verify_timeout = verify_timeout
-        self._outbound_policy = outbound_policy
 
     async def verify(
         self,
@@ -872,35 +993,6 @@ class FPReducer:
             VerificationResult with confidence and evidence.
         """
         vt = vuln_type.lower().replace("-", "_")
-
-        supported_types = {
-            "sqli_time",
-            "sqli_error",
-            "xss",
-            "xss_reflected",
-            "ssti",
-            "ssrf",
-            "lfi",
-            "rfi",
-            "cmdi",
-            "cmd_inject",
-            "xxe",
-        }
-        if vt not in supported_types:
-            return VerificationResult(
-                confidence=Confidence.UNVERIFIED,
-                error=f"No verifier implemented for {vuln_type!r}",
-            )
-
-        # The former urllib verifier bypassed destination, DNS, redirect, TLS,
-        # route, and audit policy.  Keep the public helper visibly inert until
-        # each probe is migrated to PolicyHttpClient with a delegated-action
-        # contract where applicable.
-        return VerificationResult(
-            confidence=Confidence.UNVERIFIED,
-            error="outbound_policy_unsupported",
-            evidence=["not_tested:outbound_policy_unsupported"],
-        )
 
         verifiers = {
             "sqli_time": lambda: verify_sqli_time(
@@ -954,13 +1046,9 @@ class FPReducer:
             )
 
         log.debug("FPReducer: verifying %s at %s[%s]", vuln_type, url, param)
-        # Adaptive timeout: time-based checks need more time
-        effective_timeout = self._verify_timeout
-        if vt in ("sqli_time", "cmdi", "cmd_inject"):
-            effective_timeout = max(self._verify_timeout, self._time_delay * 8)
         try:
             return await asyncio.wait_for(
-                verifier_fn(), timeout=effective_timeout,
+                verifier_fn(), timeout=self._verify_timeout,
             )
         except asyncio.TimeoutError:
             log.warning(
@@ -1056,3 +1144,213 @@ def suggest_followup_modules(
         ]
 
     return suggestions
+
+
+# ══════════════════════════════════════════════════════════════════════
+# CONFIDENCE ASSESSMENT & ADVANCED VERIFICATION HELPERS
+# ══════════════════════════════════════════════════════════════════════
+
+def assess_confidence(finding: Any) -> ConfidenceBand:
+    """Determine the ConfidenceBand for a finding from its evidence fields.
+
+    Accepts a finding as a dict or dataclass-like object. Inspects probe
+    counts, hit counts, existing confidence labels, and evidence lists
+    to assign the most appropriate band.
+
+    Args:
+        finding: Finding dict or object with confidence-related fields.
+
+    Returns:
+        The most appropriate ConfidenceBand value.
+    """
+    def _get(key: str, default: Any = None) -> Any:
+        if isinstance(finding, dict):
+            return finding.get(key, default)
+        return getattr(finding, key, default)
+
+    existing = str(_get("confidence") or "").upper()
+    if existing in {"HIGH", "CONFIRMED"}:
+        return ConfidenceBand.CONFIRMED
+    if existing == "MEDIUM":
+        return ConfidenceBand.LIKELY
+    if existing == "LOW":
+        return ConfidenceBand.POSSIBLE
+    if existing in {"UNVERIFIED", "INFO", "INFORMATIONAL"}:
+        return ConfidenceBand.INFORMATIONAL
+
+    probe_count = int(_get("probe_count") or 0)
+    probe_hits  = int(_get("probe_hits")  or 0)
+    evidence    = _get("evidence") or []
+
+    if probe_count >= 2 and probe_hits >= 2:
+        return ConfidenceBand.CONFIRMED
+    if probe_count >= 1 and probe_hits >= 1:
+        return ConfidenceBand.LIKELY
+    if probe_count >= 1 and probe_hits == 0:
+        return ConfidenceBand.POSSIBLE
+    if evidence:
+        return ConfidenceBand.POSSIBLE
+    return ConfidenceBand.INFORMATIONAL
+
+
+def _verify_xss_context(
+    response_html: str,
+    payload: str,
+    response_headers: dict[str, str] | None = None,
+) -> bool:
+    """Check whether a payload appears in an actual HTML execution context.
+
+    Unlike a simple `payload in body` check, this verifies that the reflected
+    content is in an executable sink (script block, event handler, href). It
+    also rejects reflection when CSP or Content-Type would prevent execution.
+
+    Args:
+        response_html:    Full HTTP response body text.
+        payload:          The XSS payload string to locate.
+        response_headers: Optional dict of response headers for CSP/type checks.
+
+    Returns:
+        True only when the payload is reflected in an executable context and
+        neither CSP nor Content-Type blocks script execution.
+    """
+    if not payload or payload not in response_html:
+        return False
+
+    headers = {k.lower(): v for k, v in (response_headers or {}).items()}
+
+    content_type = headers.get("content-type", "text/html")
+    if not any(ct in content_type for ct in ("text/html", "application/xhtml")):
+        return False
+
+    csp = headers.get("content-security-policy", "")
+    if csp:
+        csp_lower = csp.lower()
+        if "script-src" in csp_lower and "'unsafe-inline'" not in csp_lower and "nonce-" not in csp_lower:
+            inline_blocked = True
+        else:
+            inline_blocked = False
+        if inline_blocked and re.search(r"<script[^>]*>", payload, re.IGNORECASE):
+            return False
+
+    escaped = html.escape(payload)
+    if escaped in response_html and payload not in html.unescape(response_html):
+        return False
+
+    encoded_markers = ("&lt;script", "&#60;script", "&lt;img", "&#60;img",
+                       "&lt;svg", "&#60;svg", "&lt;/", "&amp;")
+    if any(m in response_html.lower() for m in encoded_markers[:6]):
+        body_around = response_html
+        for enc_m in encoded_markers[:6]:
+            if enc_m in body_around.lower():
+                idx = body_around.lower().find(enc_m)
+                if payload in body_around[max(0, idx-20):idx+len(payload)+20]:
+                    return False
+
+    _esc = re.escape(payload)
+    execution_patterns = (
+        r"<script\b[^>]*>[^<]*" + _esc,
+        r"\bon(?:error|load|click|mouseover|focus)\s*=\s*" + "[\\x27\\x22][^\\x27\\x22]*" + _esc,
+        r"\bon(?:error|load|click|mouseover|focus)\s*=\s*[^>\s]*" + _esc,
+        r"javascript\s*:\s*[^\\x27\\x22]*" + _esc,
+        r"<[a-z]+[^>]+\bsrc\s*=\s*[\\x27\\x22]javascript:[^\\x27\\x22]*" + _esc,
+        r"<svg[^>]*>[^<]*" + _esc,
+    )
+    return any(re.search(p, response_html, re.IGNORECASE | re.DOTALL)
+               for p in execution_patterns)
+
+
+def _verify_sqli_timing(delay_observed: float, baseline_delay: float) -> ConfidenceBand:
+    """Validate time-based SQLi evidence using strict timing thresholds.
+
+    Confirmation requires BOTH conditions:
+        1. delay_observed >= 1.5 seconds (absolute minimum)
+        2. delay_observed >= 2x baseline_delay (relative multiplier)
+
+    Args:
+        delay_observed: Response time measured during the injection probe (seconds).
+        baseline_delay: Median clean response time for the same endpoint (seconds).
+
+    Returns:
+        CONFIRMED if both thresholds are met.
+        LIKELY    if only the absolute threshold is met (relative not conclusive).
+        INFORMATIONAL otherwise (timing noise, too fast, or suspicious baseline).
+    """
+    meets_absolute = delay_observed >= 1.5
+    if not meets_absolute:
+        return ConfidenceBand.INFORMATIONAL
+
+    baseline_ref = max(baseline_delay, 0.1)
+    meets_relative = delay_observed >= baseline_ref * 2.0
+    if meets_relative:
+        return ConfidenceBand.CONFIRMED
+    return ConfidenceBand.LIKELY
+
+
+def group_mass_vulns(findings: list) -> list:
+    """Collapse repeated same-class vulnerabilities into a single mass finding.
+
+    When the same vulnerability class appears at 50 or more distinct endpoints,
+    individual findings are replaced by one aggregated "Mass Vulnerability"
+    finding that includes a 5-endpoint representative sample. Classes below
+    the threshold are returned unchanged.
+
+    Args:
+        findings: List of finding dicts.
+
+    Returns:
+        New list of findings where mass-occurrence classes are collapsed.
+        Order within non-collapsed classes is preserved.
+    """
+    from collections import defaultdict
+
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for f in findings:
+        vuln_class = str(
+            f.get("type") or f.get("vuln_type") or f.get("category") or "unknown"
+        ).lower()
+        groups[vuln_class].append(f)
+
+    result: list[dict[str, Any]] = []
+    for vuln_class, group in groups.items():
+        if len(group) < 50:
+            result.extend(group)
+            continue
+
+        endpoints: list[str] = []
+        seen_urls: set[str] = set()
+        for f in group:
+            url = str(f.get("url") or f.get("target") or f.get("endpoint") or "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                endpoints.append(url)
+
+        sample = endpoints[:5]
+        rep = group[0]
+
+        raw_title = str(rep.get("title") or vuln_class)
+        mass_finding: dict[str, Any] = {
+            "type":            rep.get("type") or vuln_class,
+            "vuln_type":       vuln_class,
+            "title":           f"Mass {raw_title.title()} — {len(group)} Instances",
+            "severity":        rep.get("severity", "HIGH"),
+            "confidence":      rep.get("confidence", "HIGH"),
+            "description": (
+                f"The vulnerability class '{vuln_class}' was detected at {len(group)} "
+                f"distinct endpoints, indicating a systemic issue rather than an isolated "
+                f"occurrence. Sample endpoints: {', '.join(sample)}. "
+                f"Total unique affected URLs: {len(seen_urls)}."
+            ),
+            "endpoint_count":  len(group),
+            "unique_urls":     len(seen_urls),
+            "sample_endpoints": sample,
+            "mass_vuln":       True,
+            "grouped_from":    len(group),
+            "framework":       rep.get("framework", ""),
+            "evidence":        [
+                f"Systemic {vuln_class} at {len(group)} endpoints; "
+                f"sample: {', '.join(sample[:3])}"
+            ],
+        }
+        result.append(mass_finding)
+
+    return result

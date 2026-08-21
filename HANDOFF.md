@@ -1,122 +1,165 @@
-> [!IMPORTANT]
-> **HISTORICAL IMPLEMENTATION HANDOFF - NOT THE CURRENT MATURITY VERDICT OR PLAN**
->
-> This file preserves historical implementation claims. Use [ENTERPRISE_MATURITY_ASSESSMENT.md](ENTERPRISE_MATURITY_ASSESSMENT.md) for the current verdict and [ROADMAP.md](ROADMAP.md) for the authoritative plan.
+# Forge Suite v5 APEX - Engineering Handoff
 
-# FORGE-SUITE v5 APEX — Handoff
-# Updated: 2026-06-28 | Score: 8.2/10 vs Enterprise | Sprint 1: ✅ | FP/FN: ✅ | v5.3: ✅
+Updated: 2026-07-18
 
-## Codebase: 498+ files · 135K+ lines · ~5.8MB
+Current status: engineering prototype / alpha, enterprise readiness approximately 3.5/10.
 
-## STATUS (11/25 Pillars complete)
+The weighted score gives the most credit to scanner accuracy/evidence (20%), control-plane integrity (15%), and identity/governance (10%). Architecture breadth is approximately 6/10, but scanner accuracy is 3/10, business-logic detection is approximately 2.5/10, Nessus-like maturity is 4/10, Acunetix-like maturity is 4/10, and C2/operator maturity is 2/10. New files or modules do not improve the score without passing end-to-end acceptance gates.
 
-| Pillar | Status | Notes |
-|--------|--------|-------|
-| 1 C2 | ✅ | Server, operator shell, beacons, listeners, transport, **BOF engine**, **malleable profiles** |
-| 2 Dashboard | ✅ | FastAPI+WS, 17 pages, DA-1/2/3 wired, **BOF/profile APIs**, **v5.3 module IDs wired** |
-| 3 Multi-Target | ✅ | File targets, parallel, pause/resume |
-| 4 Post-Exploit | ✅ | SAM/NTDS, mimikatz, lateral, rootkits |
-| 5 Intel | ✅ | NVD, ExploitDB, Nuclei, MITRE ATT&CK |
-| 6 Payload | ✅ | 12 formats, 11 stagers, 5 encoders |
-| 7 NetForge VAPT | ✅ | **v5.3: 36 credentialed modules, 102 YAML checks, AD/ADCS/CIS/PCI/Exchange/IIS/macOS** |
-| 8 Packaging | ✅ | Docker, install.sh, Makefile |
-| 9 ForgeBrain | 🟡 | Core done. 9G (dashboard panel) pending |
-| 10 FP/FN | ✅ | FPReducer retrofitted to 60/60 detection modules, 5 new Nessus-parity modules |
-| 12 Chains | 🟡 | Engine done. Wiring to AutonomousEngine pending |
-| 17A OOB Server | ✅ | ForgeCollab running |
-| All others | ❌ | See ROADMAP.md |
+## Authoritative Memory
 
-## SPRINT 1 COMPLETE ✅ — Red Team Parity (2026-06-24)
-1. **BOF Framework** — `forge_c2/bof/` — COFF loader, BeaconAPI shim, 10 built-in BOFs, task_bof.py, operator shell `bof` command
-2. **Malleable C2 Profiles** — `forge_c2/profiles/` — YAML parser, 5 built-in profiles (office365/amazon/slack/cloudfront/generic_cdn), `--profile` CLI flag, dashboard APIs
+- `ROADMAP.md` is the single source of truth for gaps, priorities, accuracy gates, phases, and release criteria.
+- `HANDOFF.md` is the concise current-state memory for future engineering sessions.
+- Older `task*.md`, `implementation_plan.md`, sprint documents, and enterprise review files are historical input only.
 
-## v5.3 COMPLETE ✅ — NetForge Nessus Gap Closure (2026-06-28)
-1. **AD/ADCS/Kerberos** — `win_adcs_audit` (ESC1/2/4/6/8), `win_kerberos_audit` (Kerberoast/ASREPRoast/RC4/krbtgt), `win_ad_enum` (delegation, LAPS, DA bloat, reversible encryption)
-2. **Compliance** — `linux_cis_audit` (CIS Linux Benchmark L1, 18 checks), `win_cis_audit` (CIS Windows Server, 18 checks), `linux_pci_audit` (PCI DSS v4.0, 19 checks)
-3. **Windows App Depth** — `win_iis_audit` (9 checks, CVE-2017-7269), `win_exchange_audit` (ProxyLogon/Shell/NotShell by build number, webshell scan), `win_mssql_deep` (xp_cmdshell, SA, CLR, linked servers)
-4. **macOS Coverage** — `win_mssql_deep`, `macos_patch_audit` (SIP, Gatekeeper, FileVault, unsigned kexts), `macos_user_audit` (admin accounts, NOPASSWD sudo, setuid diff)
-5. **YAML Checks: 58 → 102** — new `active_directory/` (10 checks: LDAP anon bind, noPac, PetitPotam, PrintNightmare, AD CS ESC8) and `cloud/` (13 checks: AWS/Azure/GCP IMDS, k8s, Docker daemon, Grafana, Kibana, MinIO, Jupyter, Argo CD, Vault)
-6. **Dashboard wired** — All 11 new modules registered in `UI_MODULE_MAP` with IDs: `adcs`, `kerberoast`, `adenum`, `cisbench`, `wincis`, `pcidss`, `iis`, `exchange`, `mssqldeep`, `macos`, `macosusers`
+Read these two files first. Then inspect only the code involved in the requested change.
 
-## NEXT SPRINT: S2 — Evasion & Process Injection (see ROADMAP.md)
+## Verified Local Baseline
 
-## Architecture
-```
-forge-suite/
-├── forge.py                  # Unified CLI (--profile flag added)
-├── apex-ui/                  # React UI (17 pages, Vite, port 5173)
-├── common/                   # Shared: brain, dashboard, intel, reporting, FP reducer
-├── webforge/                 # Web app pentesting (12 phases, 87 modules)
-├── netforge/                 # Network pentesting (14 phases, 108+ modules, 102 YAML checks)
-├── adforge/                  # AD attacks (14 phases, 85+ modules)
-├── aiforge/                  # AI/LLM red team (8 phases, 30 modules)
-├── forge_c2/                 # C2 framework
-│   ├── bof/                  # BOF engine (loader, API shim, 10 builtins)
-│   ├── profiles/             # Malleable C2 profiles (parser, 5 builtins)
-│   └── tasks/task_bof.py     # BOF task type
-├── forge_payload/            # Payload generation
-├── forge_collab/             # OOB callback server
-├── skill.md                  # AI coding reference
-├── ROADMAP.md                # ALL remaining tasks (single source)
-└── HANDOFF.md                # This file
+Validation performed without scans, listeners, payload generation, or external network calls:
+
+```text
+python3 forge.py --help                                      PASS
+framework/dashboard imports                                 PASS
+pytest common webforge netforge adforge aiforge forge_c2 tests
+                                                           245 passed in 15.31s
+Python AST parse                                            497 files, 0 errors
 ```
 
-## Key Backend APIs (server.py)
-| Method | Endpoint | Purpose |
-|--------|----------|---------|
-| POST | `/api/v1/scans/launch` | Launch scan (ScanBuilder config) |
-| GET | `/api/v1/scans/history` | Scan history |
-| GET/POST | `/api/v1/scan/templates` | Templates CRUD |
-| GET | `/api/v1/findings` | Paginated findings |
-| PATCH | `/api/v1/findings/{id}/status` | Update finding status |
-| POST | `/api/v1/findings/{id}/retest` | Re-test finding |
-| GET | `/api/v1/c2/bofs` | List available BOFs |
-| POST | `/api/v1/c2/bofs/{name}/execute` | Execute BOF locally |
-| GET | `/api/v1/c2/profiles` | List malleable C2 profiles |
-| GET | `/api/v1/c2/profiles/{name}` | Profile detail |
-| WS | `/ws/dashboard` | Real-time events |
+The preferred `.claude/skills/run-forge-suite/smoke.py` driver is currently missing.
 
-## HOW TO RUN
-```bash
-cd forge-suite/apex-ui && npm run dev   # UI at http://localhost:5173
-python forge.py dashboard              # Backend at https://localhost:1337
+## Product Inventory
+
+```text
+forge.py                    unified CLI entry point
+common/                     finding, evidence, scope, FP reduction, DB,
+                            reporting, intel, brain, dashboard/event systems
+netforge/                   network discovery, service/vulnerability modules
+webforge/                   DAST, Playwright/auth, API/schema, logic modules
+adforge/                    Active Directory assessment/emulation modules
+aiforge/                    AI/LLM assessment modules
+forge_c2/                   C2 server/listener/transport/task prototypes
+forge_payload/              payload/build prototypes
+forge_collab/               OOB callback service
+apex-ui/                    React UI source; 19 pages
 ```
 
-## KEY ENV VARS
+Repository snapshot: 602 files, 147,276 Python lines, and 286 `BaseModule` implementation files.
+
+## What Is Real Today
+
+- CLI help and all four framework orchestrator imports work.
+- Python test suite currently collects and passes 245 tests.
+- Structured findings/evidence, SQLite models, reports, compliance maps, VPR, delta code, intel sync, event bus, scan controls, browser/auth helpers, schema import, and many scanner modules exist.
+- FM-P0-001 is fixture-validated: missing, null, blank, whitespace, and unknown finding confidence fail closed to `UNVERIFIED` at shared creation, persistence, dashboard, engagement-bus, and report boundaries.
+- Six WebForge detector files use `FPReducer`: SQLi, XSS, SSTI, LFI/RFI, CMDi, and blind CMDi.
+- Some dashboard scan, finding, credential-analysis, scan-library, and scan-detail paths use backend APIs.
+- High-risk C2/payload CLI paths require both `--red-team` and `FORGE_ENABLE_HIGH_RISK=1` at the outer launcher.
+
+## What Is Not Enterprise-Ready
+
+### Scanner Accuracy
+
+- 272 module files create findings; only 6 use `FPReducer`, only 12 set confidence explicitly, and no module passes structured `verification=` into `new_finding()`.
+- Historical `MEDIUM` rows created before confidence provenance was recorded cannot be automatically distinguished from explicitly verified `MEDIUM` rows.
+- Report formats can expose different finding sets.
+- Logic modules often infer impact from status, length, reflection, or keywords without proving authoritative state changes.
+- Compliance can treat missing findings as PASS instead of NOT_TESTED.
+
+Accuracy work is P0. See `ROADMAP.md` for the proof contract, detector-specific requirements, fixture strategy, and precision/recall gates.
+
+### Control Plane
+
+- `/api/v1/events/emit` is unauthenticated and remote event TLS verification is disabled.
+- Dashboard jobs are process handles in memory; history/templates are global JSON.
+- Shared dashboard state is cleared on `SCAN_START`, so concurrent scans collide.
+- Findings are not canonically owned by run/tenant/engagement.
+- Finding retest is random simulation.
+- Dashboard launch passes `--auto-confirm` and does not enforce an approved engagement scope.
+
+### Identity And Secrets
+
+- Dashboard defaults to `operator / forge2026` with unsalted SHA-256.
+- C2 defaults to `changeme` with fast SHA-256.
+- OIDC ID-token verification is incomplete.
+- UI bearer tokens use `localStorage`.
+- Browser storage-state artifacts may contain plaintext cookies/tokens.
+
+### Frontend And Product Truth
+
+- `apex-ui/package.json` and a lockfile are absent, so install/test/build is not reproducible.
+- 6 of 19 pages use APIs/WebSockets; 13 are static or seeded.
+- Several ScanBuilder controls are accepted but not applied to runtime behavior.
+- Product mode can display fabricated vulnerability/C2/team/agent/schedule data.
+
+### C2
+
+- `forge.py` imports nonexistent `C2Server`; implementation class is `TeamServer`.
+- Operator-shell construction/signature is mismatched; listener CLI is nonfunctional.
+- Operator control traffic is plaintext; auth/session lifecycle is development-grade.
+- Beacon handshake/encryption/result flow is not a coherent interoperable authenticated protocol.
+- Parallel listener, transport, task, and build implementations are not composed.
+- Dashboard C2/team/audit pages are UI-only.
+- Build paths can silently substitute another artifact type while retaining the requested extension.
+
+Do not add C2 stealth/evasion breadth. Fix containment, protocol correctness, identity, durable state, audit, and inert lab conformance first.
+
+### Deployment And QA
+
+- Docker/Compose ship weak default secrets.
+- Health checks call an authenticated endpoint without credentials.
+- Docker has no frontend build stage; result volume paths do not match all scanner output paths.
+- Dependencies and downloaded tooling are not reproducibly locked/signed.
+- CI runs a small suite, does not build/test the frontend, has no accuracy fixture corpus, and does not enforce a coverage or security threshold.
+
+## Red Team Sprint Memory
+
+The authoritative Sprint 0-11 disposition is in `ROADMAP.md`.
+
+- Active now: Sprint 2 integration correctness, Sprint 9 evidence/reporting, Sprint 10 safe connector contracts, and Sprint 11 scanner accuracy.
+- Resume after P0/P1: Sprint 0 passive leak-intel coverage and Sprint 1 bounded read-only cloud/container coverage.
+- Partial: Sprints 0, 1, 2, 6, 9, 10, and 11; none currently passes its full end-to-end acceptance contract.
+- Missing or mostly missing: Sprints 3, 4, 5, 7, and 8.
+- Deferred: offensive C2 task, evasion, supply-chain, macOS implant, transport, delivery, OPSEC, and exfiltration expansion until scope, identity, protocol, persistence, audit, and inert lab gates pass.
+
+Do not mark a sprint complete because files import or a UI exists. Require launcher/API wiring, authorization and scope enforcement, durable state, deterministic evidence, reporting, and automated acceptance tests.
+
+## Immediate Work Order
+
+`FM-P0-001` is fixture-validated. Continue with `FM-P0-002`, then process `FM-P0-003` through `FM-P0-014` in order.
+
+Current ordered accuracy/reporting work:
+
+1. Build one canonical report dataset shared by all formats.
+2. Quarantine weak logic findings from default reports.
+3. Add detector verification metadata and positive/negative fixtures.
+4. Authenticate event ingestion and enforce approved scope.
+
+## Latest Acceptance Evidence
+
+FM-P0-001 was fixture-validated on 2026-07-18 without network activity, scans, listeners, or payload generation:
+
+```text
+pytest -q -W error tests/test_confidence_policy.py
+55 passed in 2.64s under warnings-as-errors
+
+pytest -q common webforge netforge adforge aiforge forge_c2 tests
+245 passed in 15.31s
 ```
-ANTHROPIC_API_KEY, FORGE_BRAIN_MODEL=claude-opus-4-8, FORGE_COLLAB_DOMAIN
-FORGE_DASHBOARD_PASSWORD, FORGE_C2_ADMIN_PW
-```
 
-## DO NOT TOUCH
-- `index.css` design tokens
-- `Sidebar.jsx` routes
-- `Card.jsx` / `Button.jsx` / `Badge.jsx` base components
-- `useWebSocket.js` hook
+The acceptance matrix covers policy normalization, finding creation, module output, database persistence, dashboard snapshots, engagement-bus publication/storage, JSON, CSV, HTML, and the PDF HTML-source contract. Explicit canonical confidence remains unchanged. The score remains 3.5/10 because canonical cross-format parity, structured detector proof, measured precision/recall, and the remaining Phase 0 gates have not passed.
 
-## CVE COVERAGE ENGINE (v5.2)
-Three-layer architecture scaling CVE coverage from ~64 to 200,000+:
+## Safety Boundaries
 
-### Layer 1: CPE Version Matching (200K+ CVEs)
-- `netforge/data/cve_db.py` — SQLite engine: downloads NVD JSON feeds, stores CVEs + CPE match criteria, KEV + EPSS data
-- `netforge/data/cpe_generator.py` — Translates service banners to CPE 2.3 strings (138 product mappings)
-- `netforge/modules/vuln/cpe_vuln_engine.py` — BaseModule that queries CVE DB with discovered CPEs at scan time
-- **First run**: `forge cve-db update` to populate (~2GB NVD data → compressed SQLite)
+- Never scan targets without written authorization.
+- Do not start listeners, generate payloads, or perform active exploit validation during ordinary tests.
+- Use loopback/inert fixtures and local vulnerable applications for integration tests.
+- Enforce scope at every outbound hop, including redirects and resolved IPs.
+- Do not expose secrets in argv, logs, events, reports, UI state, screenshots, or test artifacts.
+- High-risk actions need explicit policy, scope, actor, approval, audit, and cleanup state.
 
-### Layer 2: YAML Active Checks (102 checks, 60+ CVEs) — v5.3 updated
-- `netforge/data/check_schema.py` — Schema for YAML check definitions (HTTP/banner/TCP/version probes)
-- `netforge/modules/vuln/yaml_check_engine.py` — Engine that loads and executes YAML checks with concurrency control (rglob auto-discovers all subdirs)
-- `netforge/data/checks/` — Check packs organized by category:
-  - `cisa_kev/` — CISA KEV: Log4Shell, ProxyShell, ProxyLogon, Spring4Shell, MOVEit, Citrix Bleed, FortiOS
-  - `network/` — 21 checks: SSH (regreSSHion, agent RCE, weak KEX), SMB (EternalBlue), FTP, RDP, SNMP, IPMI RAKP, glibc Looney Tunables
-  - `web/` — 13 checks: Apache path traversal, Struts2, Drupalgeddon2, WordPress XML-RPC, Tomcat manager, IIS/Nginx/Apache version disclosure
-  - `infrastructure/` — 10 checks: FortiOS (4 CVEs), Ivanti, F5 BIG-IP, Confluence OGNL, VMware vCenter, Jenkins unauth
-  - `database/` — 20 checks: Redis, MongoDB, Elasticsearch, MySQL, PostgreSQL, Cassandra, InfluxDB, Neo4j, RabbitMQ, Druid RCE, Oracle TNS
-  - `vpn_appliance/` — 6 checks: PAN-OS CVE-2024-3400, Cisco ASA, Citrix (Shitrix), SonicWall, Ivanti EPMM
-  - `active_directory/` — **NEW (v5.3)** 10 checks: LDAP anon bind, noPac, Zerologon probe, PetitPotam, PrintNightmare, Kerberoastable indicator, AD CS ESC8
-  - `cloud/` — **NEW (v5.3)** 13 checks: AWS/Azure/GCP IMDS, k8s API server, etcd, Docker daemon, Prometheus, Grafana default creds, Kibana, MinIO, Jupyter, Argo CD, Vault UI
-- **Adding checks**: Just drop a `.yaml` file in the right subdirectory. Multi-doc (---) supported.
+## Product Positioning
 
-### Layer 3: External Integration (unchanged)
-- `nuclei_runner.py` — Nuclei template engine wrapper
-- `cve_matcher.py` — Legacy hardcoded CVE matching (to be migrated to Layer 1)
+Current approved label: `Engineering Prototype / Alpha`.
+
+Do not claim enterprise-grade status or parity with Nessus, Acunetix, or Cobalt Strike until the corresponding release gates in `ROADMAP.md` pass.

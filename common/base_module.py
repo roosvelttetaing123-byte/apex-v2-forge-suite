@@ -2,54 +2,34 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import hashlib
-import inspect
 import logging
-import math
 import re
 import time
 import uuid
-import weakref
-from abc import ABC, ABCMeta, abstractmethod
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import FunctionType
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from common.dashboard.event_bus import EventBus
 
 from common.config import BaseForgeConfig
+from common.confidence_policy import infer_confidence, normalise_confidence
 from common.confirm_gate import confirm
 from common.db import Session, save_finding
 from common.evidence import Evidence
 from common.finding import Finding, Severity, cvss31_score
 from common.scope import Scope, ScopeViolation
 
-from common.action_authorization import (
-    ActionAuthorizationEnvelope,
-    AuthorizationContext,
-    claim_consumed_authorization_execution,
-    open_authorization_session,
-    redact_authorization_value,
-    validate_consumed_authorization,
-)
-from common.outbound_policy import (
-    ApprovedEgressRoute,
-    AuthorizationDatabaseOutboundAuditSink,
-    DeniedPolicyHttpClient,
-    OutboundContext,
-    OutboundPolicy,
-    OutboundReason,
-    OutboundDenied,
-    PolicyHttpClient,
-    _outbound_context_runtime_binding,
-    _outbound_policy_runtime_binding,
-    _normalized_proxy_origin,
-    evaluate_module_outbound_support,
-    module_requires_outbound_context,
-    outbound_context_claim_is_valid,
-)
+
+class _UnsetConfidence:
+    pass
+
+
+_UNSET_CONFIDENCE = _UnsetConfidence()
 
 
 @dataclass
@@ -63,526 +43,7 @@ class ModuleResult:
     skip_reason: str           = ""
 
 
-def module_result_error_text(result: Any) -> str:
-    """Return redacted terminal error text from a module result, fail closed."""
-    raw_errors = getattr(result, "errors", []) if result is not None else []
-    if not raw_errors:
-        return ""
-    if isinstance(raw_errors, (str, bytes)):
-        items = [raw_errors]
-    elif isinstance(raw_errors, (list, tuple, set)):
-        items = list(raw_errors)
-    else:
-        return "malformed module result errors"
-    safe_errors = [
-        str(redact_authorization_value(str(item)))
-        for item in items
-        if str(item).strip()
-    ]
-    return "; ".join(safe_errors) or "module reported an unspecified error"
-
-
-_MODULE_SHARED_OUTPUT_KEYS = frozenset(
-    {
-        "crawled_urls",
-        "found_forms",
-        "found_params",
-        "js_api_endpoints",
-        "hidden_form_fields",
-        "js_files_analyzed",
-    }
-)
-
-
-_BASE_MODULE_EXECUTION_AUTHORITIES: dict[int, tuple[Any, ...]] = {}
-_BASE_MODULE_OUTBOUND_AUTHORITIES: dict[int, tuple[Any, ...]] = {}
-_GUARDED_RUN_AUTHORITIES: dict[int, tuple[Any, ...]] = {}
-
-
-def merge_module_output_extra(
-    shared: dict[str, Any],
-    isolated: dict[str, Any],
-) -> None:
-    """Publish module-produced workflow state without leaking capabilities."""
-    for key, value in isolated.items():
-        name = str(key)
-        if name not in _MODULE_SHARED_OUTPUT_KEYS:
-            continue
-        shared[name] = value
-
-
-def _has_valid_module_authorization(
-    instance: "BaseModule",
-    *,
-    engine: str,
-    module_id: str,
-) -> bool:
-    """Validate the exact consumed Task 002 module-execution capability."""
-    claim_session = None
-    try:
-        authority = _BASE_MODULE_EXECUTION_AUTHORITIES.get(id(instance))
-        if authority is None or authority[0]() is not instance:
-            return False
-        trusted_envelope = authority[1]
-        trusted_context = authority[2]
-        trusted_boundary = authority[3]
-        envelope = object.__getattribute__(instance, "authorization_envelope")
-        context = object.__getattribute__(instance, "authorization_context")
-        boundary = object.__getattribute__(instance, "authorization_boundary")
-        config = object.__getattribute__(instance, "config")
-        if not (
-            type(envelope) is ActionAuthorizationEnvelope
-            and envelope is trusted_envelope
-            and type(context) is AuthorizationContext
-            and context is trusted_context
-            and boundary == trusted_boundary == f"{engine}.module"
-            and object.__getattribute__(instance, "authorization_decision_id")
-            == envelope.decision_id
-            and envelope.engine == engine
-            and envelope.module_id == module_id
-            and envelope.run_id == object.__getattribute__(instance, "run_id")
-            and context.engine == engine
-            and context.module_id == module_id
-            and context.run_id == envelope.run_id
-            and context.action_kind == "module.execute"
-            and context.requested_target == config.target
-            and context.resolved_target == config.target
-            and context.allowed_scope
-            == tuple(config.extra.get("allowed_scope", []))
-            and context.excluded_scope
-            == tuple(config.extra.get("excluded_scope", []))
-        ):
-            return False
-        claim_session = open_authorization_session()
-        return validate_consumed_authorization(
-            session=claim_session,
-            envelope=envelope,
-            expected=context,
-            boundary=boundary,
-        ).allowed
-    except Exception:
-        return False
-    finally:
-        if claim_session is not None:
-            claim_session.close()
-
-
-def _claim_module_execution(
-    instance: "BaseModule",
-    *,
-    engine: str,
-    module_id: str,
-) -> bool:
-    """Atomically claim this consumed action's one permitted invocation."""
-    claim_session = None
-    try:
-        if not _has_valid_module_authorization(
-            instance,
-            engine=engine,
-            module_id=module_id,
-        ):
-            return False
-        authority = _BASE_MODULE_EXECUTION_AUTHORITIES.get(id(instance))
-        if authority is None or authority[0]() is not instance:
-            return False
-        claim_session = open_authorization_session()
-        return claim_consumed_authorization_execution(
-            session=claim_session,
-            envelope=authority[1],
-            expected=authority[2],
-            boundary=authority[3],
-        ).allowed
-    except Exception:
-        return False
-    finally:
-        if claim_session is not None:
-            claim_session.close()
-
-
-def _has_valid_outbound_context(
-    instance: "BaseModule",
-    *,
-    engine: str,
-    module_id: str,
-) -> bool:
-    """Validate transport authority captured by the canonical Base initializer."""
-    claim_session = None
-    try:
-        if not _has_valid_module_authorization(
-            instance,
-            engine=engine,
-            module_id=module_id,
-        ):
-            return False
-        authority = _BASE_MODULE_OUTBOUND_AUTHORITIES.get(id(instance))
-        if authority is None or authority[0]() is not instance:
-            return False
-        trusted_policy = authority[1]()
-        trusted_context = authority[2]()
-        if trusted_policy is None or trusted_context is None:
-            return False
-        trusted_policy_binding = authority[3]
-        trusted_context_binding = authority[4]
-        trusted_rate = authority[5]
-        policy = object.__getattribute__(instance, "outbound_policy")
-        if (
-            type(policy) is not OutboundPolicy
-            or policy is not trusted_policy
-            or policy
-            is not object.__getattribute__(
-                instance,
-                "_authorized_outbound_policy",
-            )
-        ):
-            return False
-        context = policy.context
-        if (
-            type(context) is not OutboundContext
-            or context is not trusted_context
-            or context
-            is not object.__getattribute__(
-                instance,
-                "_authorized_outbound_context",
-            )
-        ):
-            return False
-        if (
-            _outbound_policy_runtime_binding(policy) != trusted_policy_binding
-            or object.__getattribute__(
-                instance,
-                "_authorized_outbound_policy_binding",
-            )
-            != trusted_policy_binding
-        ):
-            return False
-        if (
-            _outbound_context_runtime_binding(context) != trusted_context_binding
-            or object.__getattribute__(
-                instance,
-                "_authorized_outbound_context_binding",
-            )
-            != trusted_context_binding
-        ):
-            return False
-        envelope = context.envelope
-        boundary = f"{engine}.module"
-        config = object.__getattribute__(instance, "config")
-        configured_rate = config.rate.requests_per_second
-        retained_envelope = object.__getattribute__(
-            instance,
-            "authorization_envelope",
-        )
-        retained_context = object.__getattribute__(
-            instance,
-            "authorization_context",
-        )
-        if not (
-            type(retained_envelope) is ActionAuthorizationEnvelope
-            and type(retained_context) is AuthorizationContext
-            and retained_envelope == envelope
-            and object.__getattribute__(
-                instance,
-                "authorization_decision_id",
-            )
-            == envelope.decision_id
-            and object.__getattribute__(
-                instance,
-                "authorization_boundary",
-            )
-            == boundary
-            and envelope.engine == engine
-            and envelope.module_id == module_id
-            and envelope.run_id == object.__getattribute__(instance, "run_id")
-            and context.authorized_target == config.target
-            and context.allowed_scope
-            == tuple(config.extra.get("allowed_scope", []))
-            and context.excluded_scope
-            == tuple(config.extra.get("excluded_scope", []))
-            and retained_context.engine == engine
-            and retained_context.module_id == module_id
-            and retained_context.run_id == envelope.run_id
-            and retained_context.resolved_target == context.authorized_target
-            and type(configured_rate) in {int, float}
-            and math.isfinite(float(configured_rate))
-            and float(configured_rate) == trusted_rate
-            and object.__getattribute__(
-                instance,
-                "_authorized_rate_requests_per_second",
-            )
-            == trusted_rate
-        ):
-            return False
-        claim_session = open_authorization_session()
-        return outbound_context_claim_is_valid(
-            session=claim_session,
-            context=context,
-            expected=retained_context,
-            boundary=boundary,
-        )
-    except Exception:
-        return False
-    finally:
-        if claim_session is not None:
-            claim_session.close()
-
-
-class _GuardedRunDescriptor:
-    """Non-shadowable run boundary installed by the BaseModule metaclass."""
-
-    _declared_identity_valid: bool
-    _declared_module_path: str
-    _declared_engine: str
-    _declared_module_id: str
-    _implementation_valid: bool
-
-    __slots__ = (
-        "_declared_identity_valid",
-        "_declared_module_path",
-        "_declared_engine",
-        "_declared_module_id",
-        "_implementation_valid",
-        "__isabstractmethod__",
-        "__weakref__",
-    )
-
-    def __init__(
-        self,
-        original_run: Any,
-        declared_module_value: Any,
-        declared_name_value: Any,
-        *,
-        implementation_valid: bool,
-    ) -> None:
-        declared_identity_valid = (
-            type(declared_module_value) is str
-            and type(declared_name_value) is str
-        )
-        declared_module_path = declared_module_value if declared_identity_valid else ""
-        declared_engine = declared_module_path.partition(".")[0].strip().lower()
-        declared_module_id = (
-            declared_name_value.strip() if declared_identity_valid else ""
-        )
-        object.__setattr__(
-            self,
-            "_declared_identity_valid",
-            declared_identity_valid,
-        )
-        object.__setattr__(self, "_declared_module_path", declared_module_path)
-        object.__setattr__(self, "_declared_engine", declared_engine)
-        object.__setattr__(self, "_declared_module_id", declared_module_id)
-        object.__setattr__(self, "_implementation_valid", implementation_valid)
-        object.__setattr__(
-            self,
-            "__isabstractmethod__",
-            bool(getattr(original_run, "__isabstractmethod__", False)),
-        )
-        descriptor_id = id(self)
-
-        def forget_descriptor(
-            reference: weakref.ReferenceType[_GuardedRunDescriptor],
-        ) -> None:
-            current_authority = _GUARDED_RUN_AUTHORITIES.get(descriptor_id)
-            if current_authority is not None and current_authority[0] is reference:
-                _GUARDED_RUN_AUTHORITIES.pop(descriptor_id, None)
-
-        _GUARDED_RUN_AUTHORITIES[descriptor_id] = (
-            weakref.ref(self, forget_descriptor),
-            original_run,
-            declared_identity_valid,
-            declared_module_path,
-            declared_engine,
-            declared_module_id,
-            implementation_valid,
-        )
-
-    def __setattr__(self, _name: str, _value: Any) -> None:
-        raise AttributeError("module run boundary metadata is immutable")
-
-    def __get__(self, instance: Any, _owner: Any = None) -> Any:
-        if instance is None:
-            return self
-
-        async def bound_run(*args: Any, **kwargs: Any) -> ModuleResult:
-            return await self(instance, *args, **kwargs)
-
-        return bound_run
-
-    def __set__(self, _instance: Any, _value: Any) -> None:
-        raise AttributeError("module run boundary cannot be replaced")
-
-    async def __call__(
-        self,
-        instance: "BaseModule",
-        *args: Any,
-        **run_kwargs: Any,
-    ) -> ModuleResult:
-        authority = _GUARDED_RUN_AUTHORITIES.get(id(self))
-        if authority is None or authority[0]() is not self:
-            return ModuleResult(
-                module_name="",
-                findings=[],
-                errors=[OutboundReason.AUTHORIZATION_INVALID.value],
-                duration_s=0.0,
-                skipped=True,
-                skip_reason=OutboundReason.AUTHORIZATION_INVALID.value,
-            )
-        original_run = authority[1]
-        declared_identity_valid = authority[2]
-        declared_module_path = authority[3]
-        declared_engine = authority[4]
-        declared_module_id = authority[5]
-        implementation_valid = authority[6]
-        if (
-            self._declared_identity_valid != declared_identity_valid
-            or self._declared_module_path != declared_module_path
-            or self._declared_engine != declared_engine
-            or self._declared_module_id != declared_module_id
-            or self._implementation_valid is not implementation_valid
-        ):
-            implementation_valid = False
-        runtime_class = type(instance)
-        try:
-            runtime_module_value = type.__getattribute__(
-                runtime_class,
-                "__module__",
-            )
-            runtime_name_value = type.__getattribute__(runtime_class, "NAME")
-        except Exception:
-            runtime_module_value = None
-            runtime_name_value = None
-        runtime_identity_valid = (
-            type(runtime_module_value) is str
-            and type(runtime_name_value) is str
-        )
-        runtime_module_path = runtime_module_value if runtime_identity_valid else ""
-        runtime_engine = runtime_module_path.partition(".")[0].strip().lower()
-        runtime_module_id = (
-            runtime_name_value.strip() if runtime_identity_valid else ""
-        )
-        # Every concrete BaseModule is guarded by default.  Engine/module
-        # registries decide support; no caller-selected module namespace is a
-        # no-context exception.
-        protected = True
-        reason = ""
-        if not implementation_valid:
-            reason = OutboundReason.AUTHORIZATION_INVALID.value
-        elif protected and (
-            not declared_identity_valid
-            or not runtime_identity_valid
-            or not declared_engine
-            or not declared_module_id
-            or not runtime_engine
-            or not runtime_module_id
-            or runtime_module_path != declared_module_path
-            or runtime_engine != declared_engine
-            or runtime_module_id != declared_module_id
-        ):
-            reason = OutboundReason.AUTHORIZATION_INVALID.value
-        elif protected:
-            support = evaluate_module_outbound_support(
-                engine=declared_engine,
-                module_id=declared_module_id,
-            )
-            if not support.supported:
-                reason = support.reason_code
-            elif not _has_valid_module_authorization(
-                instance,
-                engine=declared_engine,
-                module_id=declared_module_id,
-            ):
-                reason = OutboundReason.AUTHORIZATION_INVALID.value
-            elif (
-                module_requires_outbound_context(
-                    engine=declared_engine,
-                    module_id=declared_module_id,
-                )
-                and not _has_valid_outbound_context(
-                    instance,
-                    engine=declared_engine,
-                    module_id=declared_module_id,
-                )
-            ):
-                reason = OutboundReason.AUTHORIZATION_INVALID.value
-            elif not _claim_module_execution(
-                instance,
-                engine=declared_engine,
-                module_id=declared_module_id,
-            ):
-                reason = OutboundReason.AUTHORIZATION_INVALID.value
-        if reason:
-            object.__setattr__(instance, "_outbound_denied_reason", reason)
-            return ModuleResult(
-                module_name=declared_module_id or runtime_module_id,
-                findings=[],
-                errors=[reason],
-                duration_s=0.0,
-                skipped=True,
-                skip_reason=reason,
-            )
-        return await original_run(instance, *args, **run_kwargs)
-
-
-class _BaseModuleMeta(ABCMeta):
-    """Install and preserve the non-shadowable module execution boundary."""
-
-    def __new__(
-        mcls,
-        name: str,
-        bases: tuple[type, ...],
-        namespace: dict[str, Any],
-        **kwargs: Any,
-    ) -> "_BaseModuleMeta":
-        class_namespace = dict(namespace)
-        for forbidden_name in ("__getattribute__", "__getattr__"):
-            if forbidden_name in class_namespace:
-                raise TypeError(
-                    f"BaseModule subclasses cannot override {forbidden_name}"
-                )
-        if "run" in class_namespace:
-            original_run = class_namespace["run"]
-            if isinstance(original_run, _GuardedRunDescriptor):
-                source_authority = _GUARDED_RUN_AUTHORITIES.get(id(original_run))
-                if (
-                    source_authority is not None
-                    and source_authority[0]() is original_run
-                ):
-                    original_run = source_authority[1]
-                    implementation_valid = bool(source_authority[6])
-                else:
-                    implementation_valid = False
-            else:
-                implementation_valid = (
-                    type(original_run) is FunctionType
-                    and inspect.iscoroutinefunction(original_run)
-                )
-            declared_name_value = class_namespace.get("NAME")
-            if declared_name_value is None:
-                for base in bases:
-                    try:
-                        declared_name_value = type.__getattribute__(base, "NAME")
-                    except Exception:
-                        continue
-                    break
-            class_namespace["run"] = _GuardedRunDescriptor(
-                original_run,
-                class_namespace.get("__module__"),
-                declared_name_value,
-                implementation_valid=implementation_valid,
-            )
-        return super().__new__(mcls, name, bases, class_namespace, **kwargs)
-
-    def __setattr__(cls, name: str, value: Any) -> None:
-        if name in {"run", "__getattribute__", "__getattr__"}:
-            raise AttributeError("module run boundary cannot be replaced")
-        super().__setattr__(name, value)
-
-    def __delattr__(cls, name: str) -> None:
-        if name in {"run", "__getattribute__", "__getattr__"}:
-            raise AttributeError("module run boundary cannot be removed")
-        super().__delattr__(name)
-
-
-class BaseModule(ABC, metaclass=_BaseModuleMeta):
+class BaseModule(ABC):
     """Abstract base class for all forge modules.
 
     Every module must implement run() and provide NAME, DESCRIPTION, PHASE.
@@ -619,8 +80,6 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
             run_id:      Scan run UUID for correlation.
             event_bus:   Optional dashboard event bus for real-time UI.
         """
-        _BASE_MODULE_EXECUTION_AUTHORITIES.pop(id(self), None)
-        _BASE_MODULE_OUTBOUND_AUTHORITIES.pop(id(self), None)
         self.config      = config
         self.scope       = scope
         self.db          = db_session
@@ -632,213 +91,10 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         self._screenshot_dir = self._evidence_dir / "screenshots"
         self._event_bus: "EventBus | None" = event_bus
         self._request_count: int = 0
-        self._authorized_rate_requests_per_second = float(
-            config.rate.requests_per_second
-        )
-        if (
-            not math.isfinite(self._authorized_rate_requests_per_second)
-            or self._authorized_rate_requests_per_second <= 0
-            or self._authorized_rate_requests_per_second > 1000
-        ):
-            raise ValueError("requests_per_second is outside the supported bound")
-        self.authorization_decision_id = ""
-        self.authorization_envelope: ActionAuthorizationEnvelope | None = None
-        self.authorization_context: AuthorizationContext | None = None
-        self.authorization_boundary = ""
-        self.outbound_policy: OutboundPolicy | None = None
-        self._authorized_outbound_policy: OutboundPolicy | None = None
-        self._authorized_outbound_context: OutboundContext | None = None
-        self._authorized_outbound_policy_binding: tuple[Any, ...] | None = None
-        self._authorized_outbound_context_binding: tuple[Any, ...] | None = None
-        self._outbound_denied_reason = ""
         # Deduplication guard — tracks (module, title, url) tuples already emitted.
         # Prevents per-origin / per-payload / per-probe-variant inflation where the
         # same vulnerability fires N times because an inner loop wasn't broken early.
-        # Initialize it before the local-only authorization path returns without
-        # constructing any network transport context.
         self._seen_finding_keys: dict[str, int] = {}
-        # A plain id/boolean in config is not an authorization capability.  The
-        # engine adapter must provide the exact envelope and a persisted,
-        # single-use consumption; verify both before exposing confirmation to a
-        # sensitive module.
-        authorized_envelopes = config.extra.get("authorized_module_envelopes", {})
-        envelope_value = (
-            authorized_envelopes.get(self.NAME)
-            if isinstance(authorized_envelopes, dict)
-            else None
-        )
-        if envelope_value is not None:
-            try:
-                envelope = ActionAuthorizationEnvelope.from_value(envelope_value)
-                expected = AuthorizationContext(
-                    tenant_id=envelope.tenant_id,
-                    engagement_id=envelope.engagement_id,
-                    run_id=self.run_id,
-                    job_id=envelope.job_id,
-                    operator_id=envelope.operator_id,
-                    operator_role=envelope.operator_role,
-                    action_kind="module.execute",
-                    engine=envelope.engine,
-                    module_id=self.NAME,
-                    requested_target=config.target,
-                    resolved_target=config.target,
-                    allowed_scope=config.extra.get("allowed_scope", []),
-                    excluded_scope=config.extra.get("excluded_scope", []),
-                    scope_policy_version=envelope.scope_policy_version,
-                    safety_mode=envelope.safety_mode,
-                    credential_approval_required=envelope.credential_approval_required,
-                    network_escalation_approval_required=(
-                        envelope.network_escalation_approval_required
-                    ),
-                    high_risk_approval_required=envelope.high_risk_approval_required,
-                    confirmation_method=envelope.confirmation_method,
-                    confirmed_by=envelope.confirmed_by,
-                    credential_reference=envelope.credential_reference,
-                    parent_decision_id=envelope.parent_decision_id,
-                )
-                auth_session = open_authorization_session()
-                try:
-                    verified = validate_consumed_authorization(
-                        session=auth_session,
-                        envelope=envelope,
-                        expected=expected,
-                        boundary=f"{envelope.engine}.module",
-                    )
-                finally:
-                    auth_session.close()
-                if verified.allowed:
-                    self.authorization_decision_id = envelope.decision_id
-                    self.authorization_envelope = envelope
-                    self.authorization_context = expected
-                    self.authorization_boundary = f"{envelope.engine}.module"
-                    instance_id = id(self)
-
-                    def forget_instance(
-                        reference: weakref.ReferenceType[BaseModule],
-                    ) -> None:
-                        for registry in (
-                            _BASE_MODULE_EXECUTION_AUTHORITIES,
-                            _BASE_MODULE_OUTBOUND_AUTHORITIES,
-                        ):
-                            current_authority = registry.get(instance_id)
-                            if (
-                                current_authority is not None
-                                and current_authority[0] is reference
-                            ):
-                                registry.pop(instance_id, None)
-
-                    instance_reference = weakref.ref(self, forget_instance)
-                    _BASE_MODULE_EXECUTION_AUTHORITIES[instance_id] = (
-                        instance_reference,
-                        envelope,
-                        expected,
-                        self.authorization_boundary,
-                    )
-                    if not module_requires_outbound_context(
-                        engine=envelope.engine,
-                        module_id=self.NAME,
-                    ):
-                        return
-                    route_value = config.extra.get("approved_egress_route")
-                    route_values = config.extra.get("approved_egress_routes", {})
-                    if isinstance(route_values, dict) and self.NAME in route_values:
-                        route_value = route_values[self.NAME]
-                    approved_route = (
-                        ApprovedEgressRoute.from_value(route_value)
-                        if route_value is not None
-                        else None
-                    )
-                    configured_proxy = str(
-                        getattr(config, "proxy", "")
-                        or config.extra.get("proxy", "")
-                        or ""
-                    ).strip()
-                    if configured_proxy and approved_route is None:
-                        raise OutboundDenied(OutboundReason.ROUTE_REQUIRED)
-                    if (
-                        configured_proxy
-                        and approved_route is not None
-                        and _normalized_proxy_origin(configured_proxy)
-                        != approved_route.proxy_url
-                    ):
-                        raise OutboundDenied(OutboundReason.ROUTE_BINDING_MISMATCH)
-                    outbound_auth_session = open_authorization_session()
-                    try:
-                        outbound_context = OutboundContext.from_consumed_authorization(
-                            session=outbound_auth_session,
-                            envelope=envelope,
-                            expected=expected,
-                            boundary=f"{envelope.engine}.module",
-                            authorized_target=config.target,
-                            allowed_scope=tuple(config.extra.get("allowed_scope", [])),
-                            excluded_scope=tuple(config.extra.get("excluded_scope", [])),
-                            audit_sink=AuthorizationDatabaseOutboundAuditSink(),
-                            route=approved_route,
-                            max_redirects=int(config.extra.get("outbound_max_redirects", 5)),
-                            max_retries=int(config.extra.get("outbound_max_retries", 2)),
-                            timeout_seconds=float(config.extra.get("outbound_timeout_seconds", 30.0)),
-                            max_response_bytes=int(
-                                config.extra.get("outbound_max_response_bytes", 10 * 1024 * 1024)
-                            ),
-                            cancellation_check=(
-                                config.extra.get("outbound_cancellation_check")
-                                if callable(config.extra.get("outbound_cancellation_check"))
-                                else None
-                            ),
-                            attempt_limiter=self.rate_limit,
-                            # A mutable config flag is not the separately consumed,
-                            # target-bound child authorization required to disable
-                            # certificate verification.  Engine integration remains
-                            # fail-closed until that child envelope is handed off.
-                            lab_only_insecure_tls=False,
-                            insecure_tls_target=str(
-                                config.extra.get("insecure_tls_target", "") or ""
-                            ),
-                        )
-                    finally:
-                        outbound_auth_session.close()
-                    # Route continuity is enforced atomically by the protected
-                    # append-only route-health store.  Never let caller-owned
-                    # config establish or replace that baseline.
-                    self.outbound_policy = OutboundPolicy(outbound_context)
-                    self._authorized_outbound_policy = self.outbound_policy
-                    self._authorized_outbound_context = outbound_context
-                    self._authorized_outbound_policy_binding = (
-                        _outbound_policy_runtime_binding(self.outbound_policy)
-                    )
-                    self._authorized_outbound_context_binding = (
-                        _outbound_context_runtime_binding(outbound_context)
-                    )
-                    # Engines pass each module an isolated config copy.  This is
-                    # an in-process capability handoff for shared helpers, not a
-                    # caller-controlled authorization flag.
-                    self.config.extra["outbound_policy"] = self.outbound_policy
-                    _BASE_MODULE_OUTBOUND_AUTHORITIES[instance_id] = (
-                        instance_reference,
-                        weakref.ref(self.outbound_policy),
-                        weakref.ref(outbound_context),
-                        self._authorized_outbound_policy_binding,
-                        self._authorized_outbound_context_binding,
-                        self._authorized_rate_requests_per_second,
-                    )
-            except Exception as exc:
-                if isinstance(exc, OutboundDenied):
-                    self._outbound_denied_reason = exc.reason_code
-                self.log.warning(
-                    "Sensitive module authorization unavailable; action denied (%s)",
-                    type(exc).__name__,
-                )
-    # ── Cross-module global dedup ────────────────────────────────────────
-    # Normalized keys shared across module instances, scoped by run_id.
-    # Catches: CSP missing from header_audit AND csp_audit, clickjacking
-    # from header_audit AND clickjacking module, version disclosure from
-    # tech_detect AND header_audit, etc.
-    _global_finding_keys: set[str] = set()
-
-    @classmethod
-    def reset_global_dedup(cls) -> None:
-        """Reset global dedup between scan runs."""
-        cls._global_finding_keys = set()
 
     @abstractmethod
     async def run(self) -> ModuleResult:
@@ -847,45 +103,6 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         Returns:
             ModuleResult containing all findings and metadata.
         """
-
-    @staticmethod
-    def _normalize_for_global_dedup(title: str) -> str:
-        """Normalize a finding title for cross-module dedup.
-
-        Uses explicit keyword mapping to canonicalize overlapping findings.
-        """
-        t = title.lower().strip()
-
-        # Explicit concept mapping — order matters, first match wins
-        _CONCEPT_KEYWORDS = [
-            ("content-security-policy", "csp-missing"),
-            ("csp", "csp-missing"),
-            ("x-frame-options", "clickjacking"),
-            ("clickjacking", "clickjacking"),
-            ("x-content-type-options", "xcto-missing"),
-            ("strict-transport-security", "hsts-missing"),
-            ("hsts", "hsts-missing"),
-            ("referrer-policy", "referrer-policy-missing"),
-            ("permissions-policy", "permissions-policy-missing"),
-            ("cross-origin-opener", "coop-missing"),
-            ("cross-origin-embedder", "coep-missing"),
-            ("cross-origin-resource", "corp-missing"),
-        ]
-
-        for keyword, concept in _CONCEPT_KEYWORDS:
-            if keyword in t:
-                return concept
-
-        # For info disclosure headers, extract the header name
-        # "Information Disclosure — Response Header 'Server'" → "info:server"
-        # "Version Disclosure in 'server' Header" → "info:server"
-        import re
-        m = re.search(r"['\"]([^'\"]+)['\"]", t)
-        if m and ("disclosure" in t or "version" in t):
-            return f"info:{m.group(1).lower()}"
-
-        # Fallback: return the title as-is (no normalization)
-        return t
 
     def check_scope(self, target: str) -> bool:
         """Validate target is in scope before any request.
@@ -905,21 +122,13 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         Uses a class-level lock per target so the configured req/s cap holds
         globally regardless of how many modules are running in parallel.
         """
-        requests_per_second = self._authorized_rate_requests_per_second
-        authority = _BASE_MODULE_OUTBOUND_AUTHORITIES.get(id(self))
-        if authority is not None and authority[0]() is self:
-            requests_per_second = float(authority[5])
-        if (
-            not math.isfinite(requests_per_second)
-            or requests_per_second <= 0
-            or requests_per_second > 1000
-        ):
-            raise OutboundDenied(OutboundReason.AUTHORIZATION_INVALID)
+        if self.config.rate.requests_per_second <= 0:
+            return
         target = self.config.target
         if target not in BaseModule._shared_rate_locks:
             BaseModule._shared_rate_locks[target] = asyncio.Lock()
             BaseModule._shared_rate_last[target]  = 0.0
-        min_interval = 1.0 / requests_per_second
+        min_interval = 1.0 / self.config.rate.requests_per_second
         async with BaseModule._shared_rate_locks[target]:
             elapsed = time.monotonic() - BaseModule._shared_rate_last[target]
             if elapsed < min_interval:
@@ -938,10 +147,7 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         CORS) without requiring every module to track dedup state manually.
         """
         _url = finding.url or finding.target or ""
-        # Normalize: strip query params so same-page findings dedup correctly
-        # e.g. /ReadNews.aspx?id=3&NewsAd=PAYLOAD → /ReadNews.aspx
-        _dedup_url = _url.split("?")[0] if "?" in _url else _url
-        _dedup_key = f"{self.NAME}\x00{finding.title}\x00{_dedup_url}"
+        _dedup_key = f"{self.NAME}\x00{finding.title}\x00{_url}"
         if _dedup_key in self._seen_finding_keys:
             self._seen_finding_keys[_dedup_key] += 1
             self.log.warning(
@@ -952,30 +158,9 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
             )
             return
         self._seen_finding_keys[_dedup_key] = 1
-
-        # Cross-module dedup — normalize title to catch overlapping modules
-        # e.g. "Security Header Missing: Content-Security-Policy" ≈ "Content-Security-Policy Header Missing"
-        _norm_title = self._normalize_for_global_dedup(finding.title)
-        _tenant_id = (
-            self.authorization_envelope.tenant_id
-            if self.authorization_envelope is not None
-            else "default"
-        )
-        _global_key = (
-            f"{_tenant_id}\x00{self.run_id}\x00{_norm_title}\x00{_dedup_url}"
-        )
-        if _global_key in BaseModule._global_finding_keys:
-            self.log.warning(
-                "[GLOBAL-DEDUP] Suppressed cross-module duplicate: '%s' (module=%s)",
-                finding.title, self.NAME,
-            )
-            return
-        BaseModule._global_finding_keys.add(_global_key)
         self.findings.append(finding)
         try:
-            persisted_finding = finding.to_dict()
-            persisted_finding["tenant_id"] = _tenant_id
-            save_finding(self.db, persisted_finding, run_id=self.run_id)
+            save_finding(self.db, finding.to_dict(), run_id=self.run_id)
         except Exception as exc:
             self.log.error("Failed to save finding to DB: %s", exc)
         self.log.info(
@@ -1003,24 +188,19 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
             status=finding.status,
             vpr_score=finding.vpr_score,
             vpr_priority=finding.vpr_priority or finding.vpr,
-            verification_state=finding.verification_state,
-            proof_type=finding.proof_type,
-            maturity=finding.maturity,
             verification=finding.verification or {},
             evidence=finding.evidence.to_dict(),
         )
 
-        # External model analysis is an independent outbound action.  It stays
-        # disabled until a provider-specific consumed envelope and canonical
-        # policy client are injected; environment API keys are not authority.
-        self.config.extra["brain_outbound_state"] = "outbound_policy_unsupported"
+        # Start auto-analysis in background
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._async_analyze_finding(finding))
+        except RuntimeError:
+            pass
 
     async def _async_analyze_finding(self, finding: Finding) -> None:
-        """External finding analysis is inert without its own outbound policy."""
-        self.config.extra["brain_outbound_state"] = "outbound_policy_unsupported"
-        return
-        # Retained implementation below is unreachable until the provider
-        # adapter is migrated to the canonical outbound boundary.
+        """Background task to run Brain analysis on a new finding."""
         try:
             from common.brain.analyst import FindingAnalyst
             analyst = FindingAnalyst()
@@ -1064,16 +244,17 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         service: str | None = None,
         target: str | None = None,
         url: str | None = None,
-        confidence: str = "UNVERIFIED",
+        confidence: str | None | _UnsetConfidence = _UNSET_CONFIDENCE,
         verification: "dict[str, Any] | None" = None,
-        proof_type: str = "unknown",
-        maturity: str = "experimental",
         operator_confirmed: bool = False,
         tags: list[str] | None = None,
     ) -> Finding:
         """Create a new finding, add it, and return it."""
         evidence = evidence or Evidence()
-        verification = verification or self._verification_from_evidence(evidence)
+        verification_value = verification or self._verification_from_evidence(evidence)
+        verification = (
+            dict(verification_value) if isinstance(verification_value, Mapping) else {}
+        )
         confidence = self._normalise_confidence(
             confidence,
             verification=verification,
@@ -1081,10 +262,9 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         )
         cvss_score = cvss31_score(cvss_v31_vector) if cvss_v31_vector else 0.0
         vpr_score, vpr_priority = self._calculate_vpr(cvss_score, title)
+        status = "verified" if confidence in {"HIGH", "MEDIUM"} else "open"
         if verification:
             verification.setdefault("confidence", confidence)
-            verification.setdefault("proof_type", proof_type)
-            verification.setdefault("maturity", maturity)
 
         f = Finding(
             title=title,
@@ -1105,13 +285,11 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
             tags=tags or [],
             url=url,
             confidence=confidence,
-            status="open",
+            status=status,
             vpr_score=vpr_score,
             vpr_priority=vpr_priority,
             vpr=vpr_priority,
             verification=verification or None,
-            proof_type=proof_type,
-            maturity=maturity,
         )
         self.add_finding(f)
         return f
@@ -1163,27 +341,16 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         include_auth: bool = True,
         **kwargs: Any,
     ) -> Any:
-        """Create a module-bound policy client; legacy direct sessions are denied."""
-        if self.outbound_policy is None:
-            return DeniedPolicyHttpClient(
-                OutboundReason.AUTHORIZATION_INVALID,
-                on_deny=lambda reason: setattr(self, "_outbound_denied_reason", reason),
-            )
-        if kwargs:
-            raise ValueError("custom HTTP session options bypass the outbound policy")
-        context = self.outbound_policy.context.with_timeout_seconds(
-            min(float(timeout), self.outbound_policy.context.timeout_seconds),
-        )
-        policy = self.outbound_policy.fork(context)
-        return PolicyHttpClient(
-            policy,
+        """Create an aiohttp ClientSession using proxy-safe auth headers/cookies."""
+        import aiohttp
+
+        connector = kwargs.pop("connector", None) or aiohttp.TCPConnector(ssl=False)
+        return aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=timeout),
             headers=self.auth_headers(headers, include_auth=include_auth),
             cookies=self.auth_cookies(cookies) if include_auth else (cookies or {}),
-            cookie_provenance=(
-                self.config.extra.get("session_cookie_provenance", {})
-                if include_auth
-                else {}
-            ),
+            **kwargs,
         )
 
     def _parse_cookie_header(self, value: str) -> dict[str, str]:
@@ -1206,18 +373,17 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
 
     def _normalise_confidence(
         self,
-        confidence: str,
+        confidence: str | None | _UnsetConfidence,
         verification: dict[str, Any] | None = None,
         evidence: Evidence | None = None,
     ) -> str:
         """Return canonical finding confidence."""
-        raw = confidence
-        if raw == "UNVERIFIED" and verification:
-            raw = str(verification.get("confidence") or raw)
-        if raw == "UNVERIFIED" and evidence:
-            raw = str(evidence.extra.get("fp_confidence") or raw)
-        raw = raw.upper().replace(" ", "_")
-        return raw if raw in {"HIGH", "MEDIUM", "LOW", "UNVERIFIED"} else "UNVERIFIED"
+        if confidence is not _UNSET_CONFIDENCE:
+            return normalise_confidence(confidence)
+        return infer_confidence({
+            "verification": verification,
+            "evidence": {"extra": (evidence.extra if evidence else {})},
+        })
 
     def _verification_from_evidence(self, evidence: Evidence) -> dict[str, Any]:
         """Promote FPReducer evidence extras into the first-class verification field."""
@@ -1264,14 +430,17 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         if _cache_key in self.config.extra:
             return set(self.config.extra[_cache_key] or [])
 
+        import aiohttp
         fps: set[str] = set()
         try:
-            async with self.http_session(timeout=5, include_auth=False) as session:
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False)
+            ) as session:
                 for _ in range(max(1, probes)):
                     canary = f"{target}/_forge_missing_{uuid.uuid4().hex[:12]}"
                     async with session.get(
                         canary, allow_redirects=True,
-                        timeout=5,
+                        timeout=aiohttp.ClientTimeout(total=5),
                     ) as resp:
                         body = await resp.text(errors="ignore")
                         if resp.status in {200, 401, 403, 404, 406, 429}:
@@ -1350,14 +519,7 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         on_skip: Any = None,
         module: str | None = None,
     ) -> bool:
-        """Collect human confirmation only after exact module authorization."""
-        if not self.authorization_decision_id:
-            self.log.warning(
-                "Sensitive action denied: module authorization envelope is missing"
-            )
-            if on_skip:
-                on_skip()
-            return False
+        """Require operator confirmation before executing a sensitive action."""
         return confirm(
             module=module or self.NAME,
             action=action,
@@ -1393,15 +555,6 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
 
     def _make_result(self, start_time: float, skipped: bool = False, skip_reason: str = "") -> ModuleResult:
         """Build a ModuleResult from accumulated findings."""
-        policy_denial = (
-            self.outbound_policy.last_denial_reason
-            if self.outbound_policy is not None
-            else ""
-        )
-        denial_reason = self._outbound_denied_reason or policy_denial
-        if denial_reason and not skipped:
-            skipped = True
-            skip_reason = denial_reason
         duration = time.monotonic() - start_time
         if skipped:
             self._emit_event("module_skip", name=self.NAME, reason=skip_reason)
@@ -1413,7 +566,6 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         return ModuleResult(
             module_name=self.NAME,
             findings=self.findings,
-            errors=[denial_reason] if denial_reason else [],
             duration_s=duration,
             skipped=skipped,
             skip_reason=skip_reason,
@@ -1447,13 +599,16 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         if _cache_key in self.config.extra:
             return self.config.extra[_cache_key]
 
+        import aiohttp
         canary = f"{target}/_forge_probe_{uuid.uuid4().hex[:8]}"
         result: str | None = None
         try:
-            async with self.http_session(timeout=5, include_auth=False) as session:
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False)
+            ) as session:
                 async with session.get(
                     canary, allow_redirects=True,
-                    timeout=5,
+                    timeout=aiohttp.ClientTimeout(total=5),
                 ) as resp:
                     if resp.status == 200:
                         body = await resp.text(errors="ignore")
@@ -1488,18 +643,15 @@ class TestBaseModule:
             DESCRIPTION = "Test module"
             PHASE = 1
 
-            async def fixture_run(self) -> ModuleResult:
+            async def run(self) -> ModuleResult:
                 start = time.monotonic()
                 return self._make_result(start)
-
-            async def run(self) -> ModuleResult:
-                return await self.fixture_run()
 
         cfg = BaseForgeConfig(target="10.0.0.1")
         scope = Scope(["10.0.0.0/24"])
         session = create_db(tmp_path / "test.db")
         mod = DummyModule(cfg, scope, session, tmp_path)
-        result = asyncio.run(mod.fixture_run())
+        result = asyncio.run(mod.run())
         assert result.module_name == "dummy"
         assert result.findings == []
         session.close()
