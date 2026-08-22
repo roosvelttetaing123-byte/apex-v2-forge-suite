@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.finding import Severity
 from common.fp_reducer import FPReducer, Confidence
+from common.framework_params import is_framework_param
 
 PAYLOADS_ERROR = [
     "'", '"', "';", '";', "' OR '1'='1", '" OR "1"="1',
@@ -174,6 +175,7 @@ class SqliScanner(BaseModule):
         if not params:
             return
         for param_name, param_values in params.items():
+            if is_framework_param(param_name): continue
             await self._test_param(session, url, param_name, param_values[0] if param_values else "", "GET")
 
     async def _test_post_form(self, session: Any, form: dict, target: str) -> None:
@@ -185,6 +187,7 @@ class SqliScanner(BaseModule):
             return
 
         for field_name in inputs:
+            if is_framework_param(field_name): continue
             for payload in PAYLOADS_ERROR[:8]:
                 await self.rate_limit()
                 data = {i: "test" for i in inputs}

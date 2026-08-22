@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import importlib
+import os
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,15 +32,49 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common.auth_prompt import require_authorization
+from common.action_authorization import (
+    AUTHORIZATION_ENVELOPES_ENV,
+    ActionAuthorizationEnvelope,
+    AuthorizationContext,
+    AuthorizationDecision,
+    AuthorizationReason,
+    ConfirmationMethod,
+    OperatorRole,
+    SafetyMode,
+    authorization_runtime_environment,
+    consume_authorization,
+    derive_authorization,
+    issue_authorization,
+    load_authorization_envelopes,
+    load_authorization_runtime_facts,
+    module_binding_allows,
+    module_set_binding,
+    open_authorization_session,
+    protected_credential_reference,
+    redact_authorization_value,
+    record_boundary_denial,
+    record_authorization_denial,
+    select_authorization_envelope,
+    validate_consumed_authorization,
+)
 from common.config import BaseForgeConfig, load_config
-from common.confirm_gate import set_auto_confirm
+from common.confirm_gate import (
+    LAUNCH_CONFIRMATIONS_ENV,
+    ActionConfirmation,
+    decide_action,
+    load_launch_confirmations,
+    load_launch_expectation,
+    set_auto_confirm,
+)
 from common.db import create_db, ScanRunModel, Session as DbSession
 from common.logger import get_logger, phase_banner, console
 from common.reporter import BaseReporter
-from common.scope import Scope
+from common.scope import Scope, ScopeDecision, ScopeReason, canonical_target, decision_for_reason, safe_target_display
 
 log = get_logger("adforge")
-VERSION = "5.0.0"
+from common.version import VERSION
+ENGINE_NAME = "adforge"
+DEFAULT_LAUNCH_ACTION = "scan"
 
 PHASES: list[tuple[int, str, list[str], list[str]]] = [
     # (num, name, modules, required_modes)
@@ -233,7 +270,13 @@ def _emit(bus: Any, Event: Any, EventType: Any, etype: str, source: str = "adfor
     if bus is None:
         return
     try:
-        bus.emit(Event(event_type=EventType(etype), data=data, source=source))
+        bus.emit(
+            Event(
+                event_type=EventType(etype),
+                data=redact_authorization_value(data),
+                source=source,
+            )
+        )
     except Exception:
         pass
 
@@ -272,7 +315,10 @@ class ScanControl:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="ADForge — Active Directory Penetration Testing Framework")
+    p = argparse.ArgumentParser(
+        description="ADForge — Active Directory Penetration Testing Framework",
+        allow_abbrev=False,
+    )
     p.add_argument("--dc",           required=True,                         help="Domain controller IP")
     p.add_argument("--domain",       required=True,                         help="Domain name (e.g. corp.local)")
     p.add_argument("--mode",         default="unauth",
@@ -285,6 +331,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tester",       default="anonymous",                    help="Tester name")
     p.add_argument("--modules",      default=None,                          help="Comma-separated modules to run")
     p.add_argument("--skip-modules", default=None,                          help="Comma-separated modules to skip")
+    p.add_argument("--scope",        action="append", default=[],          help="Explicitly authorized host/domain/CIDR (repeatable)")
+    p.add_argument("--exclude",      action="append", default=[],          help="Explicitly excluded host/domain/CIDR (repeatable)")
     p.add_argument("--dcsync",       action="store_true",                    help="Enable DCSync in post phase (admin only)")
     p.add_argument("--bloodhound",   action="store_true",                    help="Export BloodHound JSON")
     p.add_argument("--spray-delay",  type=float, default=60.0,               help="Password spray round delay (s)")
@@ -300,6 +348,517 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dashboard-url", default=None,
                    help="Live dashboard URL (e.g. http://localhost:1337) — streams events in real time")
     return p.parse_args()
+
+
+def _denied_summary(
+    decision: ScopeDecision,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    return {
+        "status": "not_authorized",
+        "findings": 0,
+        "errors": [decision.reason],
+        "duration": 0.0,
+        "dry_run": dry_run,
+        "authorized": False,
+        "reason_code": decision.reason_code,
+        "reason": decision.reason,
+    }
+
+
+def _authorization_denied_summary(decision: AuthorizationDecision) -> dict[str, Any]:
+    return {
+        "status": "not_authorized",
+        "findings": 0,
+        "errors": [decision.reason],
+        "duration": 0.0,
+        "dry_run": False,
+        "authorized": False,
+        "reason_code": decision.reason_code,
+        "reason": decision.reason,
+    }
+
+
+def _print_launch_denial(decision: ScopeDecision) -> None:
+    console.print(
+        f"[bold red]Launch denied:[/bold red] reason_code={decision.reason_code}; "
+        f"{decision.reason}"
+    )
+
+
+def _confirmation_for_target(
+    confirmations: list[ActionConfirmation],
+    target: str,
+) -> ActionConfirmation | None:
+    try:
+        expected_target = canonical_target(target)
+    except ValueError:
+        return None
+    exact = [
+        record
+        for record in confirmations
+        if record.engine == ENGINE_NAME and record.target == expected_target
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    return confirmations[0] if len(confirmations) == 1 else None
+
+
+def _authorization_context_from_envelope(
+    envelope: ActionAuthorizationEnvelope,
+    cfg: BaseForgeConfig,
+    *,
+    action_kind: str,
+    module_id: str | None = None,
+) -> AuthorizationContext:
+    runtime = cfg.extra.get("authorization_runtime")
+    if not isinstance(runtime, Mapping):
+        runtime = {}
+    try:
+        operator_role: OperatorRole | str = OperatorRole(
+            str(runtime.get("operator_role", ""))
+        )
+    except ValueError:
+        operator_role = OperatorRole.SYSTEM
+    try:
+        safety_mode: SafetyMode | str = SafetyMode(
+            str(runtime.get("safety_mode", ""))
+        )
+    except ValueError:
+        safety_mode = SafetyMode.LOCAL_LAB
+    return AuthorizationContext(
+        tenant_id=str(runtime.get("tenant_id") or "runtime-missing-tenant"),
+        engagement_id=str(runtime.get("engagement_id") or "runtime-missing-engagement"),
+        run_id=str(runtime.get("run_id") or "runtime-missing-run"),
+        job_id=str(cfg.extra.get("job_id") or "runtime-missing-job"),
+        operator_id=str(runtime.get("operator_id") or "runtime-missing-operator"),
+        operator_role=operator_role,
+        action_kind=action_kind,
+        engine=ENGINE_NAME,
+        module_id=envelope.module_id if module_id is None else module_id,
+        requested_target=cfg.target,
+        resolved_target=cfg.target,
+        allowed_scope=cfg.extra.get("allowed_scope", []),
+        excluded_scope=cfg.extra.get("excluded_scope", []),
+        scope_policy_version=str(
+            runtime.get("scope_policy_version") or "runtime-missing-policy"
+        ),
+        safety_mode=safety_mode,
+        credential_approval_required=bool(
+            cfg.extra.get("runtime_credential_reference")
+        ),
+        network_escalation_approval_required=False,
+        high_risk_approval_required=False,
+        confirmation_method=ConfirmationMethod.INHERITED,
+        confirmed_by=str(runtime.get("operator_id") or ""),
+        credential_reference=str(
+            cfg.extra.get("runtime_credential_reference") or ""
+        ),
+        parent_decision_id=envelope.decision_id,
+    )
+
+
+def _requested_modules(args: argparse.Namespace) -> list[str]:
+    return [item.strip() for item in args.modules.split(",") if item.strip()] if args.modules else []
+
+
+def _credential_values(args: argparse.Namespace) -> dict[str, str]:
+    """Return credential inputs actually available to this ADForge process."""
+    names = ("username", "password", "hash", "ticket")
+    return {
+        name: str(getattr(args, name, "") or "")
+        for name in names
+        if getattr(args, name, "")
+    }
+
+
+def _credential_reference(args: argparse.Namespace) -> str:
+    return protected_credential_reference(_credential_values(args))
+
+
+_DIRECT_SECRET_ARGUMENTS = ("password", "hash", "ticket")
+
+
+def _has_direct_secret_args(
+    args: argparse.Namespace,
+    cfg: BaseForgeConfig | None = None,
+) -> bool:
+    return any(
+        getattr(args, field, None)
+        or (cfg is not None and cfg.extra.get(field))
+        for field in _DIRECT_SECRET_ARGUMENTS
+    )
+
+
+def _clear_direct_secret_args(
+    args: argparse.Namespace,
+    cfg: BaseForgeConfig | None = None,
+) -> None:
+    for field in _DIRECT_SECRET_ARGUMENTS:
+        setattr(args, field, None)
+        if cfg is not None:
+            cfg.extra.pop(field, None)
+
+
+def _audit_scope_denial(
+    args: argparse.Namespace,
+    decision: ScopeDecision,
+    *,
+    target: str | None = None,
+) -> None:
+    if bool(getattr(args, "dry_run", False)):
+        return
+    runtime = getattr(args, "_authorization_runtime", None)
+    if not isinstance(runtime, Mapping):
+        runtime = load_authorization_runtime_facts()
+    operator_id = str(
+        runtime.get("operator_id")
+        or getpass.getuser().strip()
+        or "operator"
+    )
+    session = open_authorization_session()
+    try:
+        record_boundary_denial(
+            session=session,
+            reason_code=decision.reason_code,
+            action_kind=getattr(args, "_launch_action", DEFAULT_LAUNCH_ACTION),
+            engine=ENGINE_NAME,
+            target=target if target is not None else getattr(args, "dc", None),
+            allowed_scope=getattr(args, "scope", []),
+            excluded_scope=getattr(args, "exclude", []),
+            tenant_id=runtime.get(
+                "tenant_id",
+                os.environ.get("FORGE_TENANT_ID", "default"),
+            ),
+            engagement_id=runtime.get(
+                "engagement_id",
+                getattr(args, "engagement", "preflight"),
+            ),
+            run_id=runtime.get("run_id", "adforge-preflight-run"),
+            job_id=getattr(args, "_launch_job_id", "adforge-preflight-job"),
+            operator_id=operator_id,
+            operator_role=runtime.get(
+                "operator_role",
+                OperatorRole.OPERATOR.value,
+            ),
+            module_id=module_set_binding(_requested_modules(args)),
+            scope_policy_version=runtime.get(
+                "scope_policy_version",
+                "scope-policy-v1",
+            ),
+            safety_mode=runtime.get("safety_mode", SafetyMode.ACTIVE.value),
+            credential_reference=_credential_reference(args),
+        )
+    finally:
+        session.close()
+
+
+def _prepare_cli_confirmation(
+    args: argparse.Namespace,
+) -> tuple[ScopeDecision, list[ActionConfirmation]]:
+    inherited = load_launch_confirmations()
+    if not args.dry_run and os.environ.get(LAUNCH_CONFIRMATIONS_ENV) and not inherited:
+        return decision_for_reason(ScopeReason.INVALID_CONFIRMATION), []
+    inherited_expectation = load_launch_expectation() if inherited else None
+    if inherited and inherited_expectation is None:
+        return decision_for_reason(ScopeReason.INVALID_CONFIRMATION), []
+    job_id, expected_action = inherited_expectation or (
+        f"adforge-cli-{uuid.uuid4().hex}",
+        DEFAULT_LAUNCH_ACTION,
+    )
+    if expected_action != DEFAULT_LAUNCH_ACTION:
+        return decision_for_reason(ScopeReason.ACTION_MISMATCH), []
+    args._launch_job_id = job_id
+    args._launch_action = expected_action
+    decision = decide_action(
+        target=args.dc,
+        allowed_scope=args.scope,
+        excluded_scope=args.exclude,
+        confirmation=None,
+        job_id=job_id,
+        engine=ENGINE_NAME,
+        action=expected_action,
+        require_confirmation=False,
+    )
+    if not decision.allowed or args.dry_run:
+        return decision, []
+
+    confirmation = _confirmation_for_target(inherited, args.dc)
+    if confirmation is None and inherited:
+        return decision_for_reason(ScopeReason.MISSING_CONFIRMATION), []
+    if confirmation is None:
+        if not (args.auto_confirm or args.autopilot):
+            try:
+                require_authorization(args.dc, "ADForge")
+            except SystemExit:
+                _audit_scope_denial(
+                    args,
+                    decision_for_reason(ScopeReason.MISSING_CONFIRMATION),
+                    target=args.dc,
+                )
+                raise
+        confirmation = ActionConfirmation.create(
+            job_id=job_id,
+            target=args.dc,
+            engine=ENGINE_NAME,
+            action=expected_action,
+        )
+    decision = decide_action(
+        target=args.dc,
+        allowed_scope=args.scope,
+        excluded_scope=args.exclude,
+        confirmation=confirmation,
+        job_id=job_id,
+        engine=ENGINE_NAME,
+        action=expected_action,
+    )
+    return decision, [confirmation] if decision.allowed else []
+
+
+def _prepare_engine_authorization(
+    args: argparse.Namespace,
+    confirmations: list[ActionConfirmation],
+) -> tuple[ScopeDecision, ActionAuthorizationEnvelope | None]:
+    inherited = load_authorization_envelopes()
+    if os.environ.get(AUTHORIZATION_ENVELOPES_ENV) and not inherited:
+        denied = decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
+        _audit_scope_denial(args, denied, target=args.dc)
+        return denied, None
+    job_id = str(getattr(args, "_launch_job_id", ""))
+    module_binding = module_set_binding(_requested_modules(args))
+    if inherited:
+        selected = select_authorization_envelope(
+            inherited,
+            job_id=job_id,
+            engine=ENGINE_NAME,
+            action_kind="engine.execute",
+            requested_target=args.dc,
+            resolved_target=args.dc,
+            module_id=module_binding,
+        )
+        if selected is None:
+            denied = decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
+            _audit_scope_denial(args, denied, target=args.dc)
+            return denied, None
+        return decision_for_reason(ScopeReason.ALLOWED), selected
+
+    confirmation = _confirmation_for_target(confirmations, args.dc)
+    if confirmation is None:
+        return decision_for_reason(ScopeReason.MISSING_CONFIRMATION), None
+    operator_id = getpass.getuser().strip() or "operator"
+    credential_reference = _credential_reference(args)
+    base_context = AuthorizationContext(
+        tenant_id=os.environ.get("FORGE_TENANT_ID", "default").strip() or "default",
+        engagement_id=str(args.engagement or "default"),
+        run_id=f"run-{uuid.uuid4().hex}",
+        job_id=job_id,
+        operator_id=operator_id,
+        operator_role=OperatorRole.OPERATOR,
+        action_kind=str(getattr(args, "_launch_action", DEFAULT_LAUNCH_ACTION)),
+        engine=ENGINE_NAME,
+        module_id=module_binding,
+        requested_target=args.dc,
+        resolved_target=args.dc,
+        allowed_scope=args.scope,
+        excluded_scope=args.exclude,
+        safety_mode=SafetyMode.ACTIVE,
+        credential_approval_required=bool(credential_reference),
+        credential_reference=credential_reference,
+        confirmation_method=(
+            ConfirmationMethod.CLI_FLAG
+            if args.auto_confirm or args.autopilot
+            else ConfirmationMethod.CLI_PROMPT
+        ),
+        confirmed_by=operator_id,
+    )
+    session = open_authorization_session()
+    try:
+        issued = issue_authorization(
+            session=session,
+            context=base_context,
+            confirmation=confirmation,
+        )
+        if not issued.allowed:
+            return decision_for_reason(ScopeReason.INVALID_CONFIRMATION), None
+        consumed = consume_authorization(
+            session=session,
+            envelope=issued.envelope,
+            expected=base_context,
+            boundary="adforge.cli",
+        )
+        if not consumed.allowed:
+            return decision_for_reason(ScopeReason.INVALID_CONFIRMATION), None
+        engine_context = AuthorizationContext(
+            **{
+                **base_context.__dict__,
+                "action_kind": "engine.execute",
+                "parent_decision_id": issued.envelope.decision_id,
+                "confirmation_method": ConfirmationMethod.INHERITED,
+            }
+        )
+        derived = derive_authorization(
+            session=session,
+            parent_envelope=issued.envelope,
+            context=engine_context,
+            parent_boundary="adforge.cli",
+        )
+        if not derived.allowed:
+            return decision_for_reason(ScopeReason.INVALID_CONFIRMATION), None
+        args._authorization_runtime = load_authorization_runtime_facts(
+            authorization_runtime_environment(derived.envelope)
+        )
+        return decision_for_reason(ScopeReason.ALLOWED), derived.envelope
+    finally:
+        session.close()
+
+
+def _apply_launch_context(
+    cfg: BaseForgeConfig,
+    args: argparse.Namespace,
+    confirmations: list[ActionConfirmation],
+    authorization: ActionAuthorizationEnvelope | None,
+) -> None:
+    cfg.extra["allowed_scope"] = list(args.scope or [])
+    cfg.extra["excluded_scope"] = list(args.exclude or [])
+    requested_modules = _requested_modules(args)
+    cfg.extra["authorized_requested_modules"] = requested_modules
+    cfg.extra["authorization_module_binding"] = module_set_binding(requested_modules)
+    runtime = getattr(args, "_authorization_runtime", None)
+    if not isinstance(runtime, Mapping):
+        runtime = load_authorization_runtime_facts()
+    cfg.extra["authorization_runtime"] = dict(runtime)
+    cfg.extra["runtime_credential_reference"] = _credential_reference(args)
+    confirmation = _confirmation_for_target(confirmations, args.dc)
+    if confirmation is not None:
+        cfg.extra["job_id"] = getattr(args, "_launch_job_id", "")
+        cfg.extra["launch_action"] = getattr(args, "_launch_action", "")
+        cfg.extra["launch_confirmation"] = confirmation
+    if authorization is not None:
+        cfg.extra["authorization_envelope"] = authorization
+
+
+def _launch_decision(cfg: BaseForgeConfig, args: argparse.Namespace) -> ScopeDecision:
+    action = str(cfg.extra.get("launch_action") or DEFAULT_LAUNCH_ACTION)
+    if action != DEFAULT_LAUNCH_ACTION:
+        return decision_for_reason(ScopeReason.ACTION_MISMATCH)
+    return decide_action(
+        target=cfg.target,
+        allowed_scope=cfg.extra.get("allowed_scope", getattr(args, "scope", None)),
+        excluded_scope=cfg.extra.get("excluded_scope", getattr(args, "exclude", None)),
+        confirmation=cfg.extra.get("launch_confirmation"),
+        job_id=str(cfg.extra.get("job_id") or ""),
+        engine=ENGINE_NAME,
+        action=action,
+        require_confirmation=not bool(args.dry_run),
+    )
+
+
+def _consume_engine_authorization(cfg: BaseForgeConfig) -> AuthorizationDecision:
+    envelope = cfg.extra.get("authorization_envelope")
+    if isinstance(envelope, dict):
+        try:
+            envelope = ActionAuthorizationEnvelope.from_value(envelope)
+        except (TypeError, ValueError):
+            pass
+    if isinstance(envelope, ActionAuthorizationEnvelope):
+        expected = _authorization_context_from_envelope(
+            envelope,
+            cfg,
+            action_kind="engine.execute",
+            module_id=str(cfg.extra.get("authorization_module_binding", "")),
+        )
+    else:
+        expected = AuthorizationContext(
+            tenant_id="default",
+            engagement_id=str(cfg.engagement or "default"),
+            run_id=str(cfg.extra.get("job_id") or "legacy-run"),
+            job_id=str(cfg.extra.get("job_id") or "legacy-job"),
+            operator_id="legacy-operator",
+            operator_role=OperatorRole.OPERATOR,
+            action_kind="engine.execute",
+            engine=ENGINE_NAME,
+            module_id="",
+            requested_target=cfg.target,
+            resolved_target=cfg.target,
+            allowed_scope=cfg.extra.get("allowed_scope", []),
+            excluded_scope=cfg.extra.get("excluded_scope", []),
+            safety_mode=SafetyMode.ACTIVE,
+            confirmation_method=ConfirmationMethod.NONE,
+        )
+    session = open_authorization_session()
+    try:
+        if (
+            isinstance(envelope, ActionAuthorizationEnvelope)
+            and cfg.extra.get("consumed_engine_authorization") == envelope.decision_id
+        ):
+            return validate_consumed_authorization(
+                session=session,
+                envelope=envelope,
+                expected=expected,
+                boundary="adforge.engine",
+            )
+        decision = consume_authorization(
+            session=session,
+            envelope=envelope,
+            expected=expected,
+            boundary="adforge.engine",
+        )
+        if decision.allowed:
+            cfg.extra["consumed_engine_authorization"] = decision.envelope.decision_id
+        return decision
+    finally:
+        session.close()
+
+
+def _authorize_module_execution(
+    cfg: BaseForgeConfig,
+    parent: ActionAuthorizationEnvelope,
+    module_name: str,
+) -> AuthorizationDecision:
+    context = _authorization_context_from_envelope(
+        parent,
+        cfg,
+        action_kind="module.execute",
+        module_id=module_name,
+    )
+    session = open_authorization_session()
+    try:
+        if not module_binding_allows(
+            parent.module_id,
+            cfg.extra.get("authorized_requested_modules", []),
+            module_name,
+        ):
+            return record_authorization_denial(
+                session=session,
+                context=context,
+                reason_code=AuthorizationReason.MODULE_MISMATCH,
+                parent_decision_id=parent.decision_id,
+            )
+        derived = derive_authorization(
+            session=session,
+            parent_envelope=parent,
+            context=context,
+            parent_boundary="adforge.engine",
+        )
+        if not derived.allowed:
+            return derived
+        consumed = consume_authorization(
+            session=session,
+            envelope=derived.envelope,
+            expected=context,
+            boundary="adforge.module",
+        )
+        if consumed.allowed:
+            cfg.extra.setdefault("authorized_module_decisions", {})[module_name] = (
+                derived.envelope.decision_id
+            )
+            cfg.extra.setdefault("authorized_module_envelopes", {})[module_name] = (
+                derived.envelope
+            )
+        return consumed
+    finally:
+        session.close()
 
 
 def setup_results(engagement: str, domain: str, resume: str | None) -> Path:
@@ -324,6 +883,24 @@ def load_module(name: str):
         return None
 
 
+class _ADForgeResourceLifecycle:
+    """Own scan resources and release them without masking primary failures."""
+
+    def __init__(self) -> None:
+        self.db_session: Any = None
+        self._cleaned = False
+
+    def cleanup(self) -> None:
+        if self._cleaned:
+            return
+        self._cleaned = True
+        if self.db_session is not None:
+            try:
+                self.db_session.close()
+            except BaseException as exc:
+                log.debug("Database cleanup error: %s", type(exc).__name__)
+
+
 async def run_scan(
     cfg: BaseForgeConfig,
     args: argparse.Namespace,
@@ -331,18 +908,85 @@ async def run_scan(
     event_bus: Any = None,
     scan_control: ScanControl | None = None,
 ) -> dict[str, Any]:
+    """Run one scan with deterministic exceptional-path resource cleanup."""
+    lifecycle = _ADForgeResourceLifecycle()
+    try:
+        return await _run_scan_impl(
+            cfg,
+            args,
+            results_dir,
+            event_bus,
+            scan_control,
+            lifecycle,
+        )
+    finally:
+        lifecycle.cleanup()
+
+
+async def _run_scan_impl(
+    cfg: BaseForgeConfig,
+    args: argparse.Namespace,
+    results_dir: Path,
+    event_bus: Any = None,
+    scan_control: ScanControl | None = None,
+    lifecycle: _ADForgeResourceLifecycle | None = None,
+) -> dict[str, Any]:
     """Core scan loop — EventBus wired, pause/resume/abort ready."""
+    if _has_direct_secret_args(args, cfg):
+        _clear_direct_secret_args(args, cfg)
+        return {
+            "status": "failed",
+            "findings": 0,
+            "errors": ["credential_reference_required"],
+            "duration": 0.0,
+        }
+    launch_decision = _launch_decision(cfg, args)
+    if not launch_decision.allowed:
+        _audit_scope_denial(args, launch_decision, target=cfg.target)
+        _print_launch_denial(launch_decision)
+        return _denied_summary(launch_decision, dry_run=bool(args.dry_run))
+    if args.dry_run:
+        return {
+            "status": "completed",
+            "findings": 0,
+            "errors": [],
+            "duration": 0.0,
+            "dry_run": True,
+            "authorized": False,
+            "plan": {
+                "target": cfg.target,
+                "engine": ENGINE_NAME,
+                "authorized": False,
+            },
+        }
+
+    authorization_decision = _consume_engine_authorization(cfg)
+    if not authorization_decision.allowed:
+        log.warning(
+            "Engine authorization denied reason_code=%s",
+            authorization_decision.reason_code,
+        )
+        return _authorization_denied_summary(authorization_decision)
+    engine_authorization = authorization_decision.envelope
+
     bus, Event, EventType = _get_event_bus(event_bus)
     ctrl = scan_control or ScanControl()
+    cfg.extra["outbound_cancellation_check"] = lambda: ctrl.is_aborted
     eng_bus = _get_eng_bus()
 
     target_str = f"{args.domain} (DC: {args.dc})"
 
     db_session  = create_db(results_dir / "adforge.db")
-    scope       = Scope([args.dc, args.domain])
-    run_id      = str(uuid.uuid4())
+    if lifecycle is not None:
+        lifecycle.db_session = db_session
+    scope       = Scope(
+        cfg.extra.get("allowed_scope", args.scope),
+        excluded=cfg.extra.get("excluded_scope", args.exclude),
+    )
+    run_id      = engine_authorization.run_id
     all_findings = []
     errors: list[str] = []
+    aborted = False
 
     scan_run = ScanRunModel(
         id=run_id, framework="adforge",
@@ -377,8 +1021,7 @@ async def run_scan(
     for phase_num, phase_name, phase_mods, required_modes in PHASES:
         # ── Abort check ───────────────────────────────────────────────
         if ctrl.is_aborted:
-            _emit(bus, Event, EventType, "scan_aborted", source="adforge",
-                  reason="operator", target=target_str)
+            aborted = True
             break
 
         # ── Pause gate ────────────────────────────────────────────────
@@ -386,6 +1029,7 @@ async def run_scan(
             _emit(bus, Event, EventType, "scan_paused", source="adforge")
             await ctrl.wait_if_paused()
             if ctrl.is_aborted:
+                aborted = True
                 break
             _emit(bus, Event, EventType, "scan_resumed", source="adforge")
 
@@ -414,13 +1058,30 @@ async def run_scan(
         for module_name in filtered:
             # ── Abort / pause mid-phase ───────────────────────────────
             if ctrl.is_aborted:
+                aborted = True
                 break
             if ctrl.is_paused:
                 _emit(bus, Event, EventType, "scan_paused", source="adforge")
                 await ctrl.wait_if_paused()
                 if ctrl.is_aborted:
+                    aborted = True
                     break
                 _emit(bus, Event, EventType, "scan_resumed", source="adforge")
+
+            if module_name in MODULE_MAP:
+                from common.outbound_policy import evaluate_module_outbound_support
+                support = evaluate_module_outbound_support(
+                    engine=ENGINE_NAME,
+                    module_id=module_name,
+                )
+                if not support.supported:
+                    errors.append(f"{module_name}: {support.reason_code}")
+                    _emit(
+                        bus, Event, EventType, "module_skip",
+                        source=module_name, name=module_name,
+                        reason=support.reason_code, outcome=support.outcome,
+                    )
+                    continue
 
             cls = load_module(module_name)
             if cls is None:
@@ -429,20 +1090,72 @@ async def run_scan(
                       name=module_name, reason="not built")
                 continue
 
+            module_authorization = _authorize_module_execution(
+                cfg,
+                engine_authorization,
+                module_name,
+            )
+            if not module_authorization.allowed:
+                reason = module_authorization.reason_code
+                errors.append(f"{module_name}: not authorized ({reason})")
+                _emit(
+                    bus,
+                    Event,
+                    EventType,
+                    "module_skip",
+                    source=module_name,
+                    name=module_name,
+                    reason=reason,
+                )
+                continue
+
             # ── Emit: module_start ────────────────────────────────────
             _emit(bus, Event, EventType, "module_start", source=module_name,
                   name=module_name, phase=phase_num)
 
             try:
-                mod = cls(config=cfg, scope=scope, db_session=db_session,
+                module_config = cfg.model_copy(deep=False)
+                module_config.extra = dict(cfg.extra)
+                mod = cls(config=module_config, scope=scope, db_session=db_session,
                           results_dir=results_dir, run_id=run_id)
-                if args.dry_run:
-                    log.info("[DRY RUN] Would run: %s", module_name)
-                    _emit(bus, Event, EventType, "module_skip", source=module_name,
-                          name=module_name, reason="dry run")
-                    continue
-
                 result = await mod.run()
+                if ctrl.is_aborted:
+                    aborted = True
+                    _emit(
+                        bus, Event, EventType, "module_skip",
+                        source=module_name, name=module_name,
+                        reason="cancelled", outcome="canceled",
+                    )
+                    break
+                module_policy = getattr(mod, "outbound_policy", None)
+                if module_policy is not None and module_policy.last_denial_reason:
+                    from common.outbound_policy import OutboundDenied
+                    raise OutboundDenied(module_policy.last_denial_reason)
+                from common.base_module import (
+                    merge_module_output_extra,
+                    module_result_error_text,
+                )
+                result_error = module_result_error_text(result)
+                if result_error:
+                    raise RuntimeError(result_error)
+                if getattr(result, "skipped", False):
+                    reason = str(
+                        redact_authorization_value(
+                            str(getattr(result, "skip_reason", "") or "not_tested")
+                        )
+                    )
+                    _emit(
+                        bus,
+                        Event,
+                        EventType,
+                        "module_skip",
+                        source=module_name,
+                        name=module_name,
+                        reason=reason,
+                        outcome="not_tested",
+                    )
+                    continue
+                merge_module_output_extra(cfg.extra, module_config.extra)
                 all_findings.extend(result.findings)
 
                 # ── Emit: module_complete + findings ──────────────────
@@ -457,10 +1170,19 @@ async def run_scan(
                         eng_bus.publish(finding)
 
             except Exception as exc:
-                log.error("Module %s failed: %s", module_name, exc)
-                errors.append(f"{module_name}: {exc}")
+                if ctrl.is_aborted or getattr(exc, "reason_code", "") == "cancelled":
+                    aborted = True
+                    _emit(
+                        bus, Event, EventType, "module_skip",
+                        source=module_name, name=module_name,
+                        reason="cancelled", outcome="canceled",
+                    )
+                    break
+                safe_error = str(redact_authorization_value(str(exc)))
+                log.error("Module %s failed: %s", module_name, safe_error)
+                errors.append(f"{module_name}: {safe_error}")
                 _emit(bus, Event, EventType, "module_fail", source=module_name,
-                      name=module_name, error=str(exc))
+                      name=module_name, error=safe_error)
 
         # ── Emit: phase_complete ──────────────────────────────────────
         phase_duration = time.monotonic() - phase_start
@@ -468,14 +1190,24 @@ async def run_scan(
               number=phase_num, name=phase_name, duration=round(phase_duration, 1))
 
     elapsed = time.monotonic() - start_time
+    status = "aborted" if aborted else ("failed" if errors else "completed")
 
     scan_run.ended_at = datetime.now(timezone.utc)
-    scan_run.status = "completed"
+    scan_run.status = status
     db_session.commit()
 
-    # ── Emit: scan_complete ───────────────────────────────────────────
-    _emit(bus, Event, EventType, "scan_complete", source="adforge",
-          target=target_str, findings=len(all_findings), duration=round(elapsed, 1))
+    if aborted:
+        _emit(bus, Event, EventType, "scan_aborted", source="adforge",
+              reason="operator", target=target_str,
+              findings=len(all_findings), duration=round(elapsed, 1))
+    elif errors:
+        _emit(bus, Event, EventType, "scan_interrupted", source="adforge",
+              target=target_str, findings=len(all_findings),
+              duration=round(elapsed, 1), errors=errors)
+    else:
+        _emit(bus, Event, EventType, "scan_complete", source="adforge",
+              target=target_str, findings=len(all_findings),
+              duration=round(elapsed, 1))
 
     formats = [f.strip() for f in args.report_format.split(",")]
     reporter = BaseReporter(
@@ -489,15 +1221,17 @@ async def run_scan(
     )
     reporter.generate_all()
 
-    console.print(f"\n[bold green]═══ SCAN COMPLETE ═══[/bold green]")
+    label = "SCAN ABORTED" if aborted else ("SCAN FAILED" if errors else "SCAN COMPLETE")
+    color = "yellow" if aborted else ("red" if errors else "green")
+    console.print(f"\n[bold {color}]═══ {label} ═══[/bold {color}]")
     console.print(f"  Duration: {elapsed:.1f}s | Findings: {len(all_findings)}")
     console.print(f"  Results:  {results_dir}")
     console.print(f"  Hashes:   {results_dir}/hashes/")
     if args.bloodhound:
         console.print(f"  BloodHound: {results_dir}/bloodhound/")
-    db_session.close()
 
     return {
+        "status": status,
         "findings": len(all_findings),
         "errors": errors,
         "duration": round(elapsed, 1),
@@ -513,6 +1247,16 @@ async def run_for_target(
     """Entry point for TargetManager multi-target orchestration."""
     import copy
     args = copy.deepcopy(base_args)
+    if _has_direct_secret_args(args):
+        if not args.dry_run:
+            _clear_direct_secret_args(args)
+            return {
+                "status": "failed",
+                "findings": 0,
+                "errors": ["credential_reference_required"],
+                "duration": 0.0,
+            }
+        _clear_direct_secret_args(args)
 
     # ADForge target is dc+domain, extract from target_entry
     target = target_entry.target
@@ -520,11 +1264,29 @@ async def run_for_target(
         args.dc = target
     args.target = target
 
-    for key, val in target_entry.options.items():
-        if hasattr(args, key):
-            setattr(args, key, val)
+    for key in ("spray_delay", "spray_max_rounds"):
+        if key in target_entry.options and hasattr(args, key):
+            setattr(args, key, target_entry.options[key])
 
-    results_dir = setup_results(args.engagement, args.domain, args.resume)
+    confirmations = list(
+        getattr(args, "_launch_confirmations", None) or load_launch_confirmations()
+    )
+    confirmation = _confirmation_for_target(confirmations, args.dc)
+    preflight = decide_action(
+        target=args.dc,
+        allowed_scope=args.scope,
+        excluded_scope=args.exclude,
+        confirmation=confirmation,
+        job_id=str(getattr(args, "_launch_job_id", "")),
+        engine=ENGINE_NAME,
+        action=str(getattr(args, "_launch_action", DEFAULT_LAUNCH_ACTION)),
+        require_confirmation=not bool(args.dry_run),
+    )
+    if not preflight.allowed:
+        _audit_scope_denial(args, preflight, target=args.dc)
+        _print_launch_denial(preflight)
+        return _denied_summary(preflight, dry_run=bool(args.dry_run))
+
     cfg = load_config(Path(__file__).parent / "adforge.yaml")
     cfg.target     = args.dc
     cfg.engagement = args.engagement
@@ -542,19 +1304,62 @@ async def run_for_target(
         "ticket":     args.ticket,
         "dcsync":     args.dcsync,
         "bloodhound": args.bloodhound,
-        "results_dir": str(results_dir),
     })
+    authorization = getattr(args, "_authorization_envelope", None)
+    if authorization is None and not args.dry_run:
+        authorization = select_authorization_envelope(
+            load_authorization_envelopes(),
+            job_id=str(getattr(args, "_launch_job_id", "")),
+            engine=ENGINE_NAME,
+            action_kind="engine.execute",
+            requested_target=args.dc,
+            resolved_target=args.dc,
+            module_id=module_set_binding(_requested_modules(args)),
+        )
+    _apply_launch_context(cfg, args, confirmations, authorization)
+
+    if not args.dry_run:
+        authorization_decision = _consume_engine_authorization(cfg)
+        if not authorization_decision.allowed:
+            return _authorization_denied_summary(authorization_decision)
+
+    results_dir = setup_results(args.engagement, args.domain, args.resume)
+    cfg.extra["results_dir"] = str(results_dir)
 
     return await run_scan(cfg, args, results_dir, event_bus, scan_control)
 
 
-async def main() -> None:
+def _summary_exit_code(summary: Mapping[str, Any] | None) -> int:
+    return 0 if summary and summary.get("status") == "completed" else 1
+
+
+async def main() -> int:
     args = parse_args()
-    target_str = f"{args.domain} (DC: {args.dc})"
-    require_authorization(target_str, "ADForge")
+    if _has_direct_secret_args(args):
+        if not args.dry_run:
+            _clear_direct_secret_args(args)
+            log.error("Direct secret-bearing AD credential options are disabled")
+            return 1
+        _clear_direct_secret_args(args)
+    launch_decision, confirmations = _prepare_cli_confirmation(args)
+    if not launch_decision.allowed:
+        _audit_scope_denial(args, launch_decision, target=args.dc)
+        _print_launch_denial(launch_decision)
+        sys.exit(1)
+    args._launch_confirmations = confirmations
+    if args.dry_run:
+        authorization = None
+    else:
+        auth_decision, authorization = _prepare_engine_authorization(
+            args,
+            confirmations,
+        )
+        if not auth_decision.allowed or authorization is None:
+            _print_launch_denial(auth_decision)
+            sys.exit(1)
+    args._authorization_envelope = authorization
     set_auto_confirm(args.auto_confirm or args.autopilot)
 
-    results_dir = setup_results(args.engagement, args.domain, args.resume)
     cfg = load_config(Path(__file__).parent / "adforge.yaml")
     cfg.target     = args.dc
     cfg.engagement = args.engagement
@@ -572,8 +1377,23 @@ async def main() -> None:
         "ticket":     args.ticket,
         "dcsync":     args.dcsync,
         "bloodhound": args.bloodhound,
-        "results_dir": str(results_dir),
     })
+    _apply_launch_context(cfg, args, confirmations, authorization)
+
+    if not args.dry_run:
+        authorization_decision = _consume_engine_authorization(cfg)
+        if not authorization_decision.allowed:
+            log.warning(
+                "Engine authorization denied reason_code=%s",
+                authorization_decision.reason_code,
+            )
+            sys.exit(1)
+
+    results_dir = setup_results(args.engagement, args.domain, args.resume)
+    cfg.extra["results_dir"] = str(results_dir)
+
+    if args.dry_run:
+        return _summary_exit_code(await run_scan(cfg, args, results_dir))
 
     # Wire EventBus — remote when dashboard URL given, local otherwise
     event_bus = None
@@ -581,10 +1401,19 @@ async def main() -> None:
         try:
             from common.dashboard.event_bus import RemoteEventBus
             event_bus = RemoteEventBus(args.dashboard_url, run_id="adforge")
-            event_bus.start()
-            log.info("Dashboard relay: %s", args.dashboard_url)
+            if event_bus.start():
+                log.info("Dashboard relay active: %s", args.dashboard_url)
+            else:
+                cfg.extra["dashboard_relay_state"] = event_bus.disabled_reason
+                log.warning(
+                    "Dashboard relay not authorized: %s",
+                    event_bus.disabled_reason,
+                )
         except Exception as exc:
-            log.warning("RemoteEventBus init failed: %s — events won't reach dashboard", exc)
+            log.warning(
+                "RemoteEventBus init failed (%s); events will not reach dashboard",
+                type(exc).__name__,
+            )
     else:
         try:
             from common.dashboard.event_bus import EventBus
@@ -593,11 +1422,16 @@ async def main() -> None:
         except ImportError:
             pass
 
-    await run_scan(cfg, args, results_dir, event_bus=event_bus)
-
-    if event_bus and hasattr(event_bus, "stop"):
-        event_bus.stop()
+    try:
+        summary = await run_scan(cfg, args, results_dir, event_bus=event_bus)
+        return _summary_exit_code(summary)
+    finally:
+        if event_bus and hasattr(event_bus, "stop"):
+            try:
+                event_bus.stop()
+            except BaseException as exc:
+                log.debug("EventBus cleanup error: %s", type(exc).__name__)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

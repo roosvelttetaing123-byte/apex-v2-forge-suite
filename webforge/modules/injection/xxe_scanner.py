@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence, save_http_evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_XXE = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:L"
 CVSS40_XXE = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:L/VA:L/SC:N/SI:N/SA:N"
@@ -64,8 +65,19 @@ class XxeScanner(BaseModule):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
         # Find XML-accepting endpoints
-        endpoints = await self._find_xml_endpoints(target)
+        # Scan all crawled URLs for XML endpoints (not just target)
+        all_urls = self.config.extra.get("crawled_urls", [target])
+        endpoints = []
+        for url in all_urls[:20]:
+            endpoints.extend(await self._find_xml_endpoints(url))
+        if not endpoints:
+            endpoints = await self._find_xml_endpoints(target)
         self.log.info("Testing %d XML endpoint(s) for XXE", len(endpoints))
+        # Initialise FPReducer for false-positive verification
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         sem = asyncio.Semaphore(2)
         tasks = [self._test_xxe(ep, target, sem) for ep in endpoints]

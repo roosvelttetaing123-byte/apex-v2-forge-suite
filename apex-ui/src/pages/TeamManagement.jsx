@@ -4,14 +4,7 @@ import Card from '../components/Card';
 import Button from '../components/Button';
 import Badge from '../components/Badge';
 
-const users = [
-  { username: 'Op_Carter', role: 'Operator', email: 'op_carter@company.com', lastActive: '2h ago', status: 'Active' },
-  { username: 'Op_Torres', role: 'Operator', email: 'op_torres@company.com', lastActive: '1d ago', status: 'Active' },
-  { username: 'Op_Chen', role: 'Analyst', email: 'op_chen@company.com', lastActive: '3h ago', status: 'Active' },
-  { username: 'Op_Reeves', role: 'Operator', email: 'op_reeves@company.com', lastActive: 'Just now', status: 'Active' },
-  { username: 'Op_Park', role: 'Analyst', email: 'op_park@company.com', lastActive: '7d ago', status: 'Active' },
-  { username: 'admin', role: 'Super Admin', email: 'admin@company.com', lastActive: '45m ago', status: 'Active' },
-];
+const users = [];
 
 const permissions = [
   { name: 'Manage Users',    cols: [true, true, false, false, false] },
@@ -44,9 +37,9 @@ const TeamManagement = () => {
         {/* ROW 1: Stat Cards */}
         <div style={{ display: 'flex', gap: '14px' }}>
           {[
-            { label: 'TOTAL USERS', value: 8, color: '#2979ff' },
-            { label: 'OPERATORS', value: 4, color: '#e53935' },
-            { label: 'API KEYS', value: 12, color: '#ffc400' },
+            { label: 'TOTAL USERS', value: 0, color: '#2979ff' },
+            { label: 'OPERATORS', value: 0, color: '#e53935' },
+            { label: 'API KEYS', value: 0, color: '#ffc400' },
             { label: 'FAILED LOGINS', value: 0, color: '#00c853' },
           ].map(s => (
             <Card key={s.label} style={{ flex: 1 }}>
@@ -72,7 +65,13 @@ const TeamManagement = () => {
                 </tr>
               </thead>
               <tbody>
-                {users.map(u => (
+                {users.length === 0 ? (
+                  <tr>
+                    <td colSpan={6} style={{ textAlign: 'center', padding: '48px 0', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', fontSize: '12px' }}>
+                      No users configured — invite a user to begin
+                    </td>
+                  </tr>
+                ) : users.map(u => (
                   <tr key={u.username}>
                     <td style={{ fontFamily: 'var(--font-mono)', fontSize: '13px', fontWeight: 500 }}>{u.username}</td>
                     <td style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>{u.role}</td>

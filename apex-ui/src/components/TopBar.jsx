@@ -2,7 +2,7 @@ import React from 'react';
 import Button from './Button';
 import { Users } from 'lucide-react';
 
-const TopBar = ({ title, subtitle, actions }) => {
+const TopBar = ({ title, subtitle = null, actions = null }) => {
   return (
     <div style={{
       padding: '20px 32px',

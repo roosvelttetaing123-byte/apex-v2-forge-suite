@@ -8,37 +8,37 @@ const categories = [
   {
     label: 'SIEM Platforms',
     items: [
-      { name: 'Splunk', desc: 'Forward findings and events to Splunk SIEM', status: 'Connected', dotColor: '#00c853' },
-      { name: 'Elastic SIEM', desc: 'Elasticsearch / Kibana SIEM integration', status: 'Connected', dotColor: '#00c853' },
-      { name: 'IBM QRadar', desc: 'QRadar offense and log source ingestion', status: 'Configured', dotColor: '#ffc400' },
-      { name: 'MS Sentinel', desc: 'Azure Sentinel connector and analytics', status: 'Configured', dotColor: '#ffc400' },
+      { name: 'Splunk', desc: 'Forward findings and events to Splunk SIEM', status: 'Disconnected', dotColor: '#3d4f6e' },
+      { name: 'Elastic SIEM', desc: 'Elasticsearch / Kibana SIEM integration', status: 'Disconnected', dotColor: '#3d4f6e' },
+      { name: 'IBM QRadar', desc: 'QRadar offense and log source ingestion', status: 'Disconnected', dotColor: '#3d4f6e' },
+      { name: 'MS Sentinel', desc: 'Azure Sentinel connector and analytics', status: 'Disconnected', dotColor: '#3d4f6e' },
     ]
   },
   {
     label: 'Ticketing & Alerting',
     items: [
-      { name: 'Jira', desc: 'Auto-create and update issues from findings', status: 'Connected', dotColor: '#00c853' },
-      { name: 'ServiceNow', desc: 'ITSM ticket creation for remediation', status: 'Connected', dotColor: '#00c853' },
-      { name: 'GitHub Issues', desc: 'Create GitHub issues for dev team remediation', status: 'Configured', dotColor: '#ffc400' },
-      { name: 'PagerDuty', desc: 'Critical finding escalation and on-call routing', status: 'Connected', dotColor: '#00c853' },
+      { name: 'Jira', desc: 'Auto-create and update issues from findings', status: 'Disconnected', dotColor: '#3d4f6e' },
+      { name: 'ServiceNow', desc: 'ITSM ticket creation for remediation', status: 'Disconnected', dotColor: '#3d4f6e' },
+      { name: 'GitHub Issues', desc: 'Create GitHub issues for dev team remediation', status: 'Disconnected', dotColor: '#3d4f6e' },
+      { name: 'PagerDuty', desc: 'Critical finding escalation and on-call routing', status: 'Disconnected', dotColor: '#3d4f6e' },
     ]
   },
   {
     label: 'CI/CD & DevSecOps',
     items: [
-      { name: 'Jenkins', desc: 'Trigger security scans in Jenkins pipelines', status: 'Configured', dotColor: '#ffc400' },
-      { name: 'GitHub Actions', desc: 'APEX scan step for GitHub Actions workflows', status: 'Configured', dotColor: '#ffc400' },
+      { name: 'Jenkins', desc: 'Trigger security scans in Jenkins pipelines', status: 'Disconnected', dotColor: '#3d4f6e' },
+      { name: 'GitHub Actions', desc: 'APEX scan step for GitHub Actions workflows', status: 'Disconnected', dotColor: '#3d4f6e' },
       { name: 'GitLab CI', desc: 'GitLab CI/CD security stage integration', status: 'Disconnected', dotColor: '#3d4f6e' },
-      { name: 'DefectDojo', desc: 'Push findings to DefectDojo for deduplication', status: 'Connected', dotColor: '#00c853' },
+      { name: 'DefectDojo', desc: 'Push findings to DefectDojo for deduplication', status: 'Disconnected', dotColor: '#3d4f6e' },
     ]
   },
   {
     label: 'Security Tools & Threat Intel',
     items: [
-      { name: 'Burp Suite', desc: 'Import Burp findings and sync scan configs', status: 'Connected', dotColor: '#00c853' },
-      { name: 'Metasploit', desc: 'Trigger Metasploit modules for confirmed vulns', status: 'Configured', dotColor: '#ffc400' },
-      { name: 'Shodan', desc: 'Asset discovery via Shodan internet scan data', status: 'Connected', dotColor: '#00c853' },
-      { name: 'VirusTotal', desc: 'Reputation lookup for payloads and domains', status: 'Connected', dotColor: '#00c853' },
+      { name: 'Burp Suite', desc: 'Import Burp findings and sync scan configs', status: 'Disconnected', dotColor: '#3d4f6e' },
+      { name: 'Metasploit', desc: 'Trigger Metasploit modules for confirmed vulns', status: 'Disconnected', dotColor: '#3d4f6e' },
+      { name: 'Shodan', desc: 'Asset discovery via Shodan internet scan data', status: 'Disconnected', dotColor: '#3d4f6e' },
+      { name: 'VirusTotal', desc: 'Reputation lookup for payloads and domains', status: 'Disconnected', dotColor: '#3d4f6e' },
     ]
   },
 ];

@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N"
 CVSS40 = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:N/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -22,6 +23,10 @@ class PriceTamper(BaseModule):
         if not self.check_scope(target):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
         confirmed = self.confirm_action(
             module=self.NAME,
             action="POST modified price/quantity values (-1, 0) to cart/checkout endpoints",
@@ -181,7 +186,7 @@ class TestPriceTamper:
     def test_phase(self) -> None: assert PriceTamper.PHASE == 9
 
     def test_confirm_gate_declined(self) -> None:
-        """Operator declining confirmation must skip the module."""
+        """A confirmation mock cannot bypass the authorization envelope boundary."""
         import asyncio
         from unittest.mock import MagicMock, patch
 
@@ -195,8 +200,9 @@ class TestPriceTamper:
         mod.findings = []
 
         with patch.object(mod, "check_scope", return_value=True), \
-             patch.object(mod, "confirm_action", return_value=False):
+             patch.object(mod, "confirm_action", return_value=False) as confirm:
             result = asyncio.run(mod.run())
 
         assert result.skipped is True
-        assert result.skip_reason == "operator declined"
+        assert result.skip_reason == "authorization_invalid"
+        confirm.assert_not_called()

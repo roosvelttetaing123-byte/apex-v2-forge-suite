@@ -12,6 +12,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
+from webforge.core.source_root import (
+    SourceRootError,
+    iter_source_files,
+    open_source_file,
+    require_approved_source_root,
+)
 
 CVSS_SECRET = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
 CVSS40_SECRET = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -72,51 +79,86 @@ class SecretScan(BaseModule):
         start = time.monotonic()
         target = self.config.target.rstrip("/")
 
-        # Determine source directory
-        source_dir = Path(self.config.extra.get("source_dir", "."))
-        if not source_dir.exists():
-            self.log.info("Source directory not found — secret scan skipped")
-            return self._make_result(start, skipped=True, skip_reason="no source directory")
+        try:
+            source_root = require_approved_source_root(
+                self.config.extra.get("source_root")
+            )
+        except SourceRootError as exc:
+            return self._make_result(start, skipped=True, skip_reason=str(exc))
 
-        self.log.info("Scanning secrets in %s", source_dir)
-        await self._scan_directory(source_dir, target)
+        self.log.info("Scanning approved whitebox source root")
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
+        try:
+            await self._scan_directory(source_root, target)
+            # A descriptor-safe final read is not sufficient coverage proof if
+            # the approved pathname is replaced before the module completes.
+            require_approved_source_root(source_root)
+        except SourceRootError as exc:
+            return self._make_result(
+                start,
+                skipped=True,
+                skip_reason=str(exc),
+            )
 
         return self._make_result(start)
 
-    async def _scan_directory(self, source_dir: Path, target: str) -> None:
-        """Walk directory and scan each file."""
+    async def _scan_directory(self, source_root: Path, target: str) -> None:
+        """Walk the approved tree without following symlinks."""
         files_scanned = 0
         findings_count = 0
+        skip_directories = frozenset({
+            ".git", "node_modules", "vendor", "__pycache__", ".tox", "venv"
+        })
 
-        for file_path in source_dir.rglob("*"):
-            if not file_path.is_file():
-                continue
-            if any(file_path.suffix.lower() in SKIP_EXTENSIONS or
-                   str(file_path).endswith(ext) for ext in SKIP_EXTENSIONS):
-                continue
-            if any(part in str(file_path) for part in
-                   [".git", "node_modules", "vendor", "__pycache__", ".tox", "venv"]):
+        # Complete descriptor-relative discovery before creating findings so a
+        # traversal failure cannot be reported as successful partial coverage.
+        source_files = list(
+            iter_source_files(
+                source_root,
+                skip_directories=skip_directories,
+            )
+        )
+        for file_path, relative_path in source_files:
+            if any(
+                file_path.suffix.lower() in SKIP_EXTENSIONS
+                or relative_path.endswith(ext)
+                for ext in SKIP_EXTENSIONS
+            ):
                 continue
 
-            # Skip large files (> 1MB)
-            if file_path.stat().st_size > 1024 * 1024:
-                continue
-
-            findings_count += await self._scan_file(file_path, source_dir, target)
+            findings_count += await self._scan_file(
+                file_path,
+                source_root,
+                target,
+                relative_path=relative_path,
+            )
             files_scanned += 1
 
             if files_scanned % 100 == 0:
-                await asyncio.sleep(0)  # Yield control
+                await asyncio.sleep(0)
 
         self.log.info("Scanned %d files, found %d secret(s)", files_scanned, findings_count)
 
     async def _scan_file(
-        self, file_path: Path, source_dir: Path, target: str
+        self,
+        file_path: Path,
+        source_root: Path,
+        target: str,
+        *,
+        relative_path: str | None = None,
     ) -> int:
         count = 0
         try:
-            content = file_path.read_text(encoding="utf-8", errors="ignore")
+            content = open_source_file(
+                source_root,
+                file_path,
+                max_bytes=1024 * 1024,
+            ).decode("utf-8", errors="ignore")
             is_priority = file_path.name in PRIORITY_FILES
+            safe_relative_path = relative_path or file_path.relative_to(source_root).as_posix()
 
             found_in_file: set[str] = set()
             for pattern, name, severity in SECRET_PATTERNS:
@@ -125,23 +167,16 @@ class SecretScan(BaseModule):
                         continue
                     found_in_file.add(name)
 
-                    # Get context around match
-                    start_pos = max(0, match.start() - 40)
-                    end_pos   = min(len(content), match.end() + 40)
-                    context   = content[start_pos:end_pos].replace("\n", " ")
-
                     # Calculate line number
                     line_num = content[:match.start()].count("\n") + 1
 
-                    relative_path = str(file_path.relative_to(source_dir))
+                    relative_path = safe_relative_path
 
                     ev = Evidence(
                         extra={
-                            "file":    relative_path,
-                            "line":    line_num,
+                            "file": relative_path,
+                            "line": line_num,
                             "pattern": name,
-                            "context": context[:80],
-                            "match":   match.group()[:40],
                         }
                     )
                     self.new_finding(
@@ -149,10 +184,10 @@ class SecretScan(BaseModule):
                         severity=severity if not is_priority else Severity.CRITICAL,
                         description=(
                             f"{name} found in {relative_path} at line {line_num}. "
-                            f"Context: ...{context[:60]}..."
+                            "The matched value and surrounding source are omitted from output."
                         ),
                         reproduction_steps=[
-                            f"grep -n '{pattern[:30]}' {relative_path}",
+                            f"Review {relative_path} at line {line_num} within the approved source root.",
                         ],
                         remediation=(
                             "Remove hardcoded secrets immediately. "
@@ -168,8 +203,17 @@ class SecretScan(BaseModule):
                         target=target,
                     )
                     count += 1
-        except Exception:
-            pass
+        except SourceRootError as exc:
+            # A missing/raced individual file is safe to omit only while the
+            # approved root capability itself is still valid.  Whole-root
+            # replacement must abort the module instead of looking like a
+            # successful zero-finding scan.
+            require_approved_source_root(source_root)
+            if str(exc) == "source entry is unavailable or unsafe":
+                return 0
+            raise
+        except Exception as exc:
+            self.log.debug("Approved source file scan failed: %s", type(exc).__name__)
         return count
 
 

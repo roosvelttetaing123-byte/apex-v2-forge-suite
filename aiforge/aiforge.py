@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import importlib
+import os
 import sys
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,19 +31,60 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from common.auth_prompt import require_authorization
+from common.action_authorization import (
+    AUTHORIZATION_ENVELOPES_ENV,
+    ActionAuthorizationEnvelope,
+    AuthorizationContext,
+    AuthorizationDecision,
+    AuthorizationReason,
+    ConfirmationMethod,
+    OperatorRole,
+    SafetyMode,
+    authorization_runtime_environment,
+    consume_authorization,
+    derive_authorization,
+    issue_authorization,
+    load_authorization_envelopes,
+    load_authorization_runtime_facts,
+    module_binding_allows,
+    module_set_binding,
+    open_authorization_session,
+    protected_credential_reference,
+    redact_authorization_value,
+    record_boundary_denial,
+    record_authorization_denial,
+    select_authorization_envelope,
+    validate_consumed_authorization,
+)
 from common.config import BaseForgeConfig, load_config
-from common.confirm_gate import set_auto_confirm
+from common.confirm_gate import (
+    LAUNCH_CONFIRMATIONS_ENV,
+    ActionConfirmation,
+    decide_action,
+    load_launch_confirmations,
+    load_launch_expectation,
+    set_auto_confirm,
+)
 from common.db import create_db, ScanRunModel
 from common.finding import Finding
 from common.logger import get_logger, phase_banner, console
 from common.reporter import BaseReporter
-from common.scope import Scope
+from common.scope import (
+    Scope,
+    ScopeDecision,
+    ScopeReason,
+    canonical_target,
+    decision_for_reason,
+    safe_target_display,
+)
 
 from rich.panel import Panel
 
 log = get_logger("aiforge")
 
-VERSION = "5.0.0"
+from common.version import VERSION
+ENGINE_NAME = "aiforge"
+DEFAULT_LAUNCH_ACTION = "scan"
 
 DOS_MODULES = {"resource_exhaustion", "rate_limit_test"}
 DESTRUCTIVE_MODULES = {"resource_exhaustion"}  # overlap intentional — resource_exhaustion is both
@@ -52,11 +96,12 @@ def confirm_dangerous_module(module_name: str, target: str, category: str) -> bo
     This CANNOT be bypassed by --auto-confirm. Only --allow-destructive skips it.
     Returns True if operator explicitly types 'YES I UNDERSTAND'.
     """
+    safe_target = safe_target_display(target)
     console.print()
     console.print(Panel(
         f"[bold white on red]  WARNING: DESTRUCTIVE / DoS MODULE  [/bold white on red]\n\n"
         f"  Module   : [bold]{module_name}[/bold]\n"
-        f"  Target   : [bold]{target}[/bold]\n"
+        f"  Target   : [bold]{safe_target}[/bold]\n"
         f"  Category : [bold red]{category.upper()}[/bold red]\n\n"
         f"  This module can cause [bold red]service disruption[/bold red],\n"
         f"  [bold red]resource exhaustion[/bold red], or [bold red]denial of service[/bold red]\n"
@@ -77,10 +122,10 @@ def confirm_dangerous_module(module_name: str, target: str, category: str) -> bo
     confirmed = answer == "YES I UNDERSTAND"
     if confirmed:
         console.print(f"[bold red]  Proceeding with {module_name} — operator accepted risk.[/bold red]")
-        log.warning("DESTRUCTIVE MODULE %s confirmed by operator on %s", module_name, target)
+        log.warning("DESTRUCTIVE MODULE %s confirmed by operator on %s", module_name, safe_target)
     else:
         console.print(f"[yellow]  Skipped {module_name} — operator declined.[/yellow]")
-        log.info("DESTRUCTIVE MODULE %s skipped by operator on %s", module_name, target)
+        log.info("DESTRUCTIVE MODULE %s skipped by operator on %s", module_name, safe_target)
     return confirmed
 
 MODULE_MAP: dict[str, str] = {
@@ -205,7 +250,13 @@ def _emit(bus: Any, Event: Any, EventType: Any, etype: str, source: str = "aifor
     if bus is None:
         return
     try:
-        bus.emit(Event(event_type=EventType(etype), data=data, source=source))
+        bus.emit(
+            Event(
+                event_type=EventType(etype),
+                data=redact_authorization_value(data),
+                source=source,
+            )
+        )
     except Exception:
         pass
 
@@ -247,6 +298,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="AIForge — AI/LLM Security Assessment Framework",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
     )
     parser.add_argument("--target",        required=True,              help="Target AI endpoint URL")
     parser.add_argument("--mode",          default="blackbox",
@@ -267,7 +319,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--proxy",         default=None,               help="HTTP proxy")
     parser.add_argument("--modules",       default=None,               help="Comma-separated modules to run")
     parser.add_argument("--skip-modules",  default=None,               help="Comma-separated modules to skip")
-    parser.add_argument("--scope",         nargs="*", default=[],      help="In-scope hosts/CIDRs")
+    parser.add_argument("--scope",         action="append", default=[], help="In-scope hosts/CIDRs (repeatable)")
+    parser.add_argument("--exclude",       action="append", default=[], help="Excluded hosts/CIDRs (repeatable)")
     parser.add_argument("--auto-confirm",  action="store_true",        help="Skip confirmation gates")
     parser.add_argument("--no-dos",        action="store_true",        help="Skip all DoS/resource exhaustion modules")
     parser.add_argument("--no-destructive", action="store_true",       help="Skip all destructive exploit modules")
@@ -277,10 +330,519 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list-modules",  action="store_true",        help="List modules and exit")
     parser.add_argument("--verbose",       action="store_true",        help="Verbose output")
     parser.add_argument("--quiet",         action="store_true",        help="Suppress UI output")
+    parser.add_argument("--dry-run",       action="store_true",        help="Return a local plan without target I/O")
     parser.add_argument("--version",       action="version", version=f"AIForge {VERSION}")
     parser.add_argument("--dashboard-url", default=None,
                         help="Live dashboard URL (e.g. http://localhost:1337) — streams events in real time")
     return parser.parse_args()
+
+
+def _denied_summary(
+    decision: ScopeDecision,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    return {
+        "status": "not_authorized",
+        "findings": 0,
+        "errors": [decision.reason],
+        "duration": 0.0,
+        "dry_run": dry_run,
+        "authorized": False,
+        "reason_code": decision.reason_code,
+        "reason": decision.reason,
+    }
+
+
+def _authorization_denied_summary(decision: AuthorizationDecision) -> dict[str, Any]:
+    return {
+        "status": "not_authorized",
+        "findings": 0,
+        "errors": [decision.reason],
+        "duration": 0.0,
+        "dry_run": False,
+        "authorized": False,
+        "reason_code": decision.reason_code,
+        "reason": decision.reason,
+    }
+
+
+def _print_launch_denial(decision: ScopeDecision) -> None:
+    console.print(
+        f"[bold red]Launch denied:[/bold red] reason_code={decision.reason_code}; "
+        f"{decision.reason}"
+    )
+
+
+def _confirmation_for_target(
+    confirmations: list[ActionConfirmation],
+    target: str,
+) -> ActionConfirmation | None:
+    try:
+        expected_target = canonical_target(target)
+    except ValueError:
+        return None
+    exact = [
+        record
+        for record in confirmations
+        if record.engine == ENGINE_NAME and record.target == expected_target
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    return confirmations[0] if len(confirmations) == 1 else None
+
+
+def _authorization_context_from_envelope(
+    envelope: ActionAuthorizationEnvelope,
+    cfg: BaseForgeConfig,
+    *,
+    action_kind: str,
+    module_id: str | None = None,
+) -> AuthorizationContext:
+    runtime = cfg.extra.get("authorization_runtime")
+    if not isinstance(runtime, Mapping):
+        runtime = {}
+    try:
+        operator_role: OperatorRole | str = OperatorRole(
+            str(runtime.get("operator_role", ""))
+        )
+    except ValueError:
+        operator_role = OperatorRole.SYSTEM
+    try:
+        safety_mode: SafetyMode | str = SafetyMode(
+            str(runtime.get("safety_mode", ""))
+        )
+    except ValueError:
+        safety_mode = SafetyMode.LOCAL_LAB
+    return AuthorizationContext(
+        tenant_id=str(runtime.get("tenant_id") or "runtime-missing-tenant"),
+        engagement_id=str(runtime.get("engagement_id") or "runtime-missing-engagement"),
+        run_id=str(runtime.get("run_id") or "runtime-missing-run"),
+        job_id=str(cfg.extra.get("job_id") or "runtime-missing-job"),
+        operator_id=str(runtime.get("operator_id") or "runtime-missing-operator"),
+        operator_role=operator_role,
+        action_kind=action_kind,
+        engine=ENGINE_NAME,
+        module_id=envelope.module_id if module_id is None else module_id,
+        requested_target=cfg.target,
+        resolved_target=cfg.target,
+        allowed_scope=cfg.extra.get("allowed_scope", []),
+        excluded_scope=cfg.extra.get("excluded_scope", []),
+        scope_policy_version=str(
+            runtime.get("scope_policy_version") or "runtime-missing-policy"
+        ),
+        safety_mode=safety_mode,
+        credential_approval_required=bool(
+            cfg.extra.get("runtime_credential_reference")
+        ),
+        network_escalation_approval_required=False,
+        high_risk_approval_required=True,
+        confirmation_method=ConfirmationMethod.INHERITED,
+        confirmed_by=str(runtime.get("operator_id") or ""),
+        credential_reference=str(
+            cfg.extra.get("runtime_credential_reference") or ""
+        ),
+        parent_decision_id=envelope.decision_id,
+    )
+
+
+def _requested_modules(args: argparse.Namespace) -> list[str]:
+    return [item.strip() for item in args.modules.split(",") if item.strip()] if args.modules else []
+
+
+def _credential_reference(args: argparse.Namespace) -> str:
+    return protected_credential_reference(
+        {"api_key": str(getattr(args, "api_key", "") or "")}
+    )
+
+
+def _audit_scope_denial(
+    args: argparse.Namespace,
+    decision: ScopeDecision,
+    *,
+    target: str | None = None,
+) -> None:
+    if bool(getattr(args, "dry_run", False)):
+        return
+    runtime = getattr(args, "_authorization_runtime", None)
+    if not isinstance(runtime, Mapping):
+        runtime = load_authorization_runtime_facts()
+    operator_id = str(
+        runtime.get("operator_id")
+        or getpass.getuser().strip()
+        or "operator"
+    )
+    session = open_authorization_session()
+    try:
+        record_boundary_denial(
+            session=session,
+            reason_code=decision.reason_code,
+            action_kind=getattr(args, "_launch_action", DEFAULT_LAUNCH_ACTION),
+            engine=ENGINE_NAME,
+            target=target if target is not None else getattr(args, "target", None),
+            allowed_scope=getattr(args, "scope", []),
+            excluded_scope=getattr(args, "exclude", []),
+            tenant_id=runtime.get(
+                "tenant_id",
+                os.environ.get("FORGE_TENANT_ID", "default"),
+            ),
+            engagement_id=runtime.get(
+                "engagement_id",
+                getattr(args, "engagement", "preflight"),
+            ),
+            run_id=runtime.get("run_id", "aiforge-preflight-run"),
+            job_id=getattr(args, "_launch_job_id", "aiforge-preflight-job"),
+            operator_id=operator_id,
+            operator_role=runtime.get(
+                "operator_role",
+                OperatorRole.OPERATOR.value,
+            ),
+            module_id=module_set_binding(_requested_modules(args)),
+            scope_policy_version=runtime.get(
+                "scope_policy_version",
+                "scope-policy-v1",
+            ),
+            safety_mode=runtime.get(
+                "safety_mode",
+                SafetyMode.HIGH_RISK.value,
+            ),
+            credential_reference=_credential_reference(args),
+            high_risk_approval_required=True,
+        )
+    finally:
+        session.close()
+
+
+def _prepare_cli_confirmation(
+    args: argparse.Namespace,
+) -> tuple[ScopeDecision, list[ActionConfirmation]]:
+    inherited = load_launch_confirmations()
+    if not args.dry_run and os.environ.get(LAUNCH_CONFIRMATIONS_ENV) and not inherited:
+        return decision_for_reason(ScopeReason.INVALID_CONFIRMATION), []
+    inherited_expectation = load_launch_expectation() if inherited else None
+    if inherited and inherited_expectation is None:
+        return decision_for_reason(ScopeReason.INVALID_CONFIRMATION), []
+    job_id, expected_action = inherited_expectation or (
+        f"aiforge-cli-{uuid.uuid4().hex}",
+        DEFAULT_LAUNCH_ACTION,
+    )
+    if expected_action != DEFAULT_LAUNCH_ACTION:
+        return decision_for_reason(ScopeReason.ACTION_MISMATCH), []
+    args._launch_job_id = job_id
+    args._launch_action = expected_action
+    decision = decide_action(
+        target=args.target,
+        allowed_scope=args.scope,
+        excluded_scope=args.exclude,
+        confirmation=None,
+        job_id=job_id,
+        engine=ENGINE_NAME,
+        action=expected_action,
+        require_confirmation=False,
+    )
+    if not decision.allowed or args.dry_run:
+        return decision, []
+
+    confirmation = _confirmation_for_target(inherited, args.target)
+    if confirmation is None and inherited:
+        return decision_for_reason(ScopeReason.MISSING_CONFIRMATION), []
+    if confirmation is None:
+        if not args.auto_confirm:
+            try:
+                require_authorization(args.target, "AIForge")
+            except SystemExit:
+                _audit_scope_denial(
+                    args,
+                    decision_for_reason(ScopeReason.MISSING_CONFIRMATION),
+                    target=args.target,
+                )
+                raise
+        confirmation = ActionConfirmation.create(
+            job_id=job_id,
+            target=args.target,
+            engine=ENGINE_NAME,
+            action=expected_action,
+        )
+    decision = decide_action(
+        target=args.target,
+        allowed_scope=args.scope,
+        excluded_scope=args.exclude,
+        confirmation=confirmation,
+        job_id=job_id,
+        engine=ENGINE_NAME,
+        action=expected_action,
+    )
+    return decision, [confirmation] if decision.allowed else []
+
+
+def _prepare_engine_authorization(
+    args: argparse.Namespace,
+    confirmations: list[ActionConfirmation],
+) -> tuple[ScopeDecision, ActionAuthorizationEnvelope | None]:
+    inherited = load_authorization_envelopes()
+    if os.environ.get(AUTHORIZATION_ENVELOPES_ENV) and not inherited:
+        denied = decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
+        _audit_scope_denial(args, denied, target=args.target)
+        return denied, None
+    job_id = str(getattr(args, "_launch_job_id", ""))
+    module_binding = module_set_binding(_requested_modules(args))
+    if inherited:
+        selected = select_authorization_envelope(
+            inherited,
+            job_id=job_id,
+            engine=ENGINE_NAME,
+            action_kind="engine.execute",
+            requested_target=args.target,
+            resolved_target=args.target,
+            module_id=module_binding,
+        )
+        if selected is None:
+            denied = decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
+            _audit_scope_denial(args, denied, target=args.target)
+            return denied, None
+        return decision_for_reason(ScopeReason.ALLOWED), selected
+
+    confirmation = _confirmation_for_target(confirmations, args.target)
+    if confirmation is None:
+        return decision_for_reason(ScopeReason.MISSING_CONFIRMATION), None
+    operator_id = getpass.getuser().strip() or "operator"
+    credential_reference = _credential_reference(args)
+    base_context = AuthorizationContext(
+        tenant_id=os.environ.get("FORGE_TENANT_ID", "default").strip() or "default",
+        engagement_id=str(args.engagement or "default"),
+        run_id=f"run-{uuid.uuid4().hex}",
+        job_id=job_id,
+        operator_id=operator_id,
+        operator_role=OperatorRole.OPERATOR,
+        action_kind=str(getattr(args, "_launch_action", DEFAULT_LAUNCH_ACTION)),
+        engine=ENGINE_NAME,
+        module_id=module_binding,
+        requested_target=args.target,
+        resolved_target=args.target,
+        allowed_scope=args.scope,
+        excluded_scope=args.exclude,
+        safety_mode=SafetyMode.HIGH_RISK,
+        credential_approval_required=bool(credential_reference),
+        high_risk_approval_required=True,
+        credential_reference=credential_reference,
+        confirmation_method=(
+            ConfirmationMethod.CLI_FLAG
+            if args.auto_confirm or args.allow_destructive
+            else ConfirmationMethod.CLI_PROMPT
+        ),
+        confirmed_by=operator_id,
+    )
+    session = open_authorization_session()
+    try:
+        issued = issue_authorization(
+            session=session,
+            context=base_context,
+            confirmation=confirmation,
+        )
+        if not issued.allowed:
+            return decision_for_reason(ScopeReason.INVALID_CONFIRMATION), None
+        consumed = consume_authorization(
+            session=session,
+            envelope=issued.envelope,
+            expected=base_context,
+            boundary="aiforge.cli",
+        )
+        if not consumed.allowed:
+            return decision_for_reason(ScopeReason.INVALID_CONFIRMATION), None
+        engine_context = AuthorizationContext(
+            **{
+                **base_context.__dict__,
+                "action_kind": "engine.execute",
+                "parent_decision_id": issued.envelope.decision_id,
+                "confirmation_method": ConfirmationMethod.INHERITED,
+            }
+        )
+        derived = derive_authorization(
+            session=session,
+            parent_envelope=issued.envelope,
+            context=engine_context,
+            parent_boundary="aiforge.cli",
+        )
+        if not derived.allowed:
+            return decision_for_reason(ScopeReason.INVALID_CONFIRMATION), None
+        args._authorization_runtime = load_authorization_runtime_facts(
+            authorization_runtime_environment(derived.envelope)
+        )
+        return decision_for_reason(ScopeReason.ALLOWED), derived.envelope
+    finally:
+        session.close()
+
+
+def _apply_launch_context(
+    cfg: BaseForgeConfig,
+    args: argparse.Namespace,
+    confirmations: list[ActionConfirmation],
+    authorization: ActionAuthorizationEnvelope | None,
+) -> None:
+    cfg.extra["allowed_scope"] = list(args.scope or [])
+    cfg.extra["excluded_scope"] = list(args.exclude or [])
+    requested_modules = _requested_modules(args)
+    cfg.extra["authorized_requested_modules"] = requested_modules
+    cfg.extra["authorization_module_binding"] = module_set_binding(requested_modules)
+    runtime = getattr(args, "_authorization_runtime", None)
+    if not isinstance(runtime, Mapping):
+        runtime = load_authorization_runtime_facts()
+    cfg.extra["authorization_runtime"] = dict(runtime)
+    cfg.extra["runtime_credential_reference"] = _credential_reference(args)
+    confirmation = _confirmation_for_target(confirmations, args.target)
+    if confirmation is not None:
+        cfg.extra["job_id"] = getattr(args, "_launch_job_id", "")
+        cfg.extra["launch_action"] = getattr(args, "_launch_action", "")
+        cfg.extra["launch_confirmation"] = confirmation
+    if authorization is not None:
+        cfg.extra["authorization_envelope"] = authorization
+
+
+def _launch_decision(cfg: BaseForgeConfig, args: argparse.Namespace) -> ScopeDecision:
+    action = str(cfg.extra.get("launch_action") or DEFAULT_LAUNCH_ACTION)
+    if action != DEFAULT_LAUNCH_ACTION:
+        return decision_for_reason(ScopeReason.ACTION_MISMATCH)
+    return decide_action(
+        target=cfg.target,
+        allowed_scope=cfg.extra.get("allowed_scope", getattr(args, "scope", None)),
+        excluded_scope=cfg.extra.get("excluded_scope", getattr(args, "exclude", None)),
+        confirmation=cfg.extra.get("launch_confirmation"),
+        job_id=str(cfg.extra.get("job_id") or ""),
+        engine=ENGINE_NAME,
+        action=action,
+        require_confirmation=not bool(args.dry_run),
+    )
+
+
+def _consume_engine_authorization(cfg: BaseForgeConfig) -> AuthorizationDecision:
+    envelope = cfg.extra.get("authorization_envelope")
+    if isinstance(envelope, dict):
+        try:
+            envelope = ActionAuthorizationEnvelope.from_value(envelope)
+        except (TypeError, ValueError):
+            pass
+    if isinstance(envelope, ActionAuthorizationEnvelope):
+        expected = _authorization_context_from_envelope(
+            envelope,
+            cfg,
+            action_kind="engine.execute",
+            module_id=str(cfg.extra.get("authorization_module_binding", "")),
+        )
+    else:
+        expected = AuthorizationContext(
+            tenant_id="default",
+            engagement_id=str(cfg.engagement or "default"),
+            run_id=str(cfg.extra.get("job_id") or "legacy-run"),
+            job_id=str(cfg.extra.get("job_id") or "legacy-job"),
+            operator_id="legacy-operator",
+            operator_role=OperatorRole.OPERATOR,
+            action_kind="engine.execute",
+            engine=ENGINE_NAME,
+            module_id="",
+            requested_target=cfg.target,
+            resolved_target=cfg.target,
+            allowed_scope=cfg.extra.get("allowed_scope", []),
+            excluded_scope=cfg.extra.get("excluded_scope", []),
+            safety_mode=SafetyMode.HIGH_RISK,
+            high_risk_approval_required=True,
+            confirmation_method=ConfirmationMethod.NONE,
+        )
+    session = open_authorization_session()
+    try:
+        if (
+            isinstance(envelope, ActionAuthorizationEnvelope)
+            and cfg.extra.get("consumed_engine_authorization") == envelope.decision_id
+        ):
+            return validate_consumed_authorization(
+                session=session,
+                envelope=envelope,
+                expected=expected,
+                boundary="aiforge.engine",
+            )
+        decision = consume_authorization(
+            session=session,
+            envelope=envelope,
+            expected=expected,
+            boundary="aiforge.engine",
+        )
+        if decision.allowed:
+            cfg.extra["consumed_engine_authorization"] = decision.envelope.decision_id
+        return decision
+    finally:
+        session.close()
+
+
+def _authorize_module_execution(
+    cfg: BaseForgeConfig,
+    parent: ActionAuthorizationEnvelope,
+    module_name: str,
+) -> AuthorizationDecision:
+    context = _authorization_context_from_envelope(
+        parent,
+        cfg,
+        action_kind="module.execute",
+        module_id=module_name,
+    )
+    session = open_authorization_session()
+    try:
+        if not module_binding_allows(
+            parent.module_id,
+            cfg.extra.get("authorized_requested_modules", []),
+            module_name,
+        ):
+            return record_authorization_denial(
+                session=session,
+                context=context,
+                reason_code=AuthorizationReason.MODULE_MISMATCH,
+                parent_decision_id=parent.decision_id,
+            )
+        derived = derive_authorization(
+            session=session,
+            parent_envelope=parent,
+            context=context,
+            parent_boundary="aiforge.engine",
+        )
+        if not derived.allowed:
+            return derived
+        consumed = consume_authorization(
+            session=session,
+            envelope=derived.envelope,
+            expected=context,
+            boundary="aiforge.module",
+        )
+        if consumed.allowed:
+            cfg.extra.setdefault("authorized_module_decisions", {})[module_name] = (
+                derived.envelope.decision_id
+            )
+            cfg.extra.setdefault("authorized_module_envelopes", {})[module_name] = (
+                derived.envelope
+            )
+        return consumed
+    finally:
+        session.close()
+
+
+def _record_module_denial(
+    cfg: BaseForgeConfig,
+    parent: ActionAuthorizationEnvelope,
+    module_name: str,
+) -> None:
+    context = _authorization_context_from_envelope(
+        parent,
+        cfg,
+        action_kind="module.execute",
+        module_id=module_name,
+    )
+    session = open_authorization_session()
+    try:
+        record_authorization_denial(
+            session=session,
+            context=context,
+            reason_code=AuthorizationReason.APPROVAL_MISMATCH,
+            parent_decision_id=parent.decision_id,
+        )
+    finally:
+        session.close()
 
 
 def load_module_class(module_name: str) -> Any:
@@ -314,16 +876,48 @@ async def run_scan(
     scan_control: ScanControl | None = None,
 ) -> dict[str, Any]:
     """Core scan loop — EventBus wired, pause/resume/abort ready."""
+    launch_decision = _launch_decision(cfg, args)
+    if not launch_decision.allowed:
+        _audit_scope_denial(args, launch_decision, target=cfg.target)
+        _print_launch_denial(launch_decision)
+        return _denied_summary(launch_decision, dry_run=bool(args.dry_run))
+    if args.dry_run:
+        return {
+            "status": "completed",
+            "findings": 0,
+            "errors": [],
+            "duration": 0.0,
+            "dry_run": True,
+            "authorized": False,
+            "plan": {
+                "target": safe_target_display(cfg.target),
+                "engine": ENGINE_NAME,
+                "authorized": False,
+            },
+        }
+
+    authorization_decision = _consume_engine_authorization(cfg)
+    if not authorization_decision.allowed:
+        log.warning(
+            "Engine authorization denied reason_code=%s",
+            authorization_decision.reason_code,
+        )
+        return _authorization_denied_summary(authorization_decision)
+    engine_authorization = authorization_decision.envelope
+
     bus, Event, EventType = _get_event_bus(event_bus)
     ctrl = scan_control or ScanControl()
+    cfg.extra["outbound_cancellation_check"] = lambda: ctrl.is_aborted
 
     db_path = results_dir / "aiforge.db"
     db_session = create_db(db_path)
 
-    scope_targets = [cfg.target] + (args.scope or [])
-    scope = Scope(scope_targets)
+    scope = Scope(
+        cfg.extra.get("allowed_scope", args.scope),
+        excluded=cfg.extra.get("excluded_scope", args.exclude),
+    )
 
-    run_id = str(uuid.uuid4())
+    run_id = engine_authorization.run_id
     run = ScanRunModel(
         id=run_id, framework="aiforge", target=cfg.target,
         mode=cfg.mode, engagement=cfg.engagement, tester=cfg.tester,
@@ -338,7 +932,7 @@ async def run_scan(
 
     # ── Emit: scan_start ──────────────────────────────────────────────
     _emit(bus, Event, EventType, "scan_start", source="aiforge",
-          target=cfg.target, mode=cfg.mode, engagement=cfg.engagement,
+          target=safe_target_display(cfg.target), mode=cfg.mode, engagement=cfg.engagement,
           tester=cfg.tester, framework="AIForge", modules=all_module_names)
 
     total_modules = sum(len(p["modules"]) for p in PHASES)
@@ -347,6 +941,7 @@ async def run_scan(
 
     all_findings: list[Finding] = []
     errors: list[str] = []
+    aborted = False
     start_time = time.monotonic()
 
     for phase in PHASES:
@@ -355,8 +950,7 @@ async def run_scan(
 
         # ── Abort check ───────────────────────────────────────────────
         if ctrl.is_aborted:
-            _emit(bus, Event, EventType, "scan_aborted", source="aiforge",
-                  reason="operator", target=cfg.target)
+            aborted = True
             break
 
         # ── Pause gate ────────────────────────────────────────────────
@@ -364,6 +958,7 @@ async def run_scan(
             _emit(bus, Event, EventType, "scan_paused", source="aiforge")
             await ctrl.wait_if_paused()
             if ctrl.is_aborted:
+                aborted = True
                 break
             _emit(bus, Event, EventType, "scan_resumed", source="aiforge")
 
@@ -383,11 +978,13 @@ async def run_scan(
 
             # ── Abort / pause mid-phase ───────────────────────────────
             if ctrl.is_aborted:
+                aborted = True
                 break
             if ctrl.is_paused:
                 _emit(bus, Event, EventType, "scan_paused", source="aiforge")
                 await ctrl.wait_if_paused()
                 if ctrl.is_aborted:
+                    aborted = True
                     break
                 _emit(bus, Event, EventType, "scan_resumed", source="aiforge")
 
@@ -409,8 +1006,24 @@ async def run_scan(
             if (is_dos or is_destructive) and not args.allow_destructive:
                 category = "DoS + Destructive" if (is_dos and is_destructive) else ("DoS" if is_dos else "Destructive")
                 if not confirm_dangerous_module(module_name, cfg.target, category):
+                    _record_module_denial(cfg, engine_authorization, module_name)
                     _emit(bus, Event, EventType, "module_skip", source=module_name,
                           name=module_name, reason="operator declined destructive")
+                    continue
+
+            if module_name in MODULE_MAP:
+                from common.outbound_policy import evaluate_module_outbound_support
+                support = evaluate_module_outbound_support(
+                    engine=ENGINE_NAME,
+                    module_id=module_name,
+                )
+                if not support.supported:
+                    errors.append(f"{module_name}: {support.reason_code}")
+                    _emit(
+                        bus, Event, EventType, "module_skip",
+                        source=module_name, name=module_name,
+                        reason=support.reason_code, outcome=support.outcome,
+                    )
                     continue
 
             cls = load_module_class(module_name)
@@ -420,18 +1033,76 @@ async def run_scan(
                       name=module_name, reason="not built")
                 continue
 
+            module_authorization = _authorize_module_execution(
+                cfg,
+                engine_authorization,
+                module_name,
+            )
+            if not module_authorization.allowed:
+                reason = module_authorization.reason_code
+                errors.append(f"{module_name}: not authorized ({reason})")
+                _emit(
+                    bus,
+                    Event,
+                    EventType,
+                    "module_skip",
+                    source=module_name,
+                    name=module_name,
+                    reason=reason,
+                )
+                continue
+
             # ── Emit: module_start ────────────────────────────────────
             _emit(bus, Event, EventType, "module_start", source=module_name,
                   name=module_name, phase=phase["number"])
 
+            module_config = cfg.model_copy(deep=False)
+            module_config.extra = dict(cfg.extra)
             mod_instance = cls(
-                config=cfg, scope=scope, db_session=db_session,
+                config=module_config, scope=scope, db_session=db_session,
                 results_dir=results_dir, run_id=run_id,
             )
 
             try:
                 log.info("Running module: %s", module_name)
                 result = await mod_instance.run()
+                if ctrl.is_aborted:
+                    aborted = True
+                    _emit(
+                        bus, Event, EventType, "module_skip",
+                        source=module_name, name=module_name,
+                        reason="cancelled", outcome="canceled",
+                    )
+                    break
+                module_policy = getattr(mod_instance, "outbound_policy", None)
+                if module_policy is not None and module_policy.last_denial_reason:
+                    from common.outbound_policy import OutboundDenied
+                    raise OutboundDenied(module_policy.last_denial_reason)
+                from common.base_module import (
+                    merge_module_output_extra,
+                    module_result_error_text,
+                )
+                result_error = module_result_error_text(result)
+                if result_error:
+                    raise RuntimeError(result_error)
+                if result is not None and getattr(result, "skipped", False):
+                    reason = str(
+                        redact_authorization_value(
+                            str(getattr(result, "skip_reason", "") or "not_tested")
+                        )
+                    )
+                    _emit(
+                        bus,
+                        Event,
+                        EventType,
+                        "module_skip",
+                        source=module_name,
+                        name=module_name,
+                        reason=reason,
+                        outcome="not_tested",
+                    )
+                    continue
+                merge_module_output_extra(cfg.extra, module_config.extra)
                 if result and result.findings:
                     all_findings.extend(result.findings)
 
@@ -449,10 +1120,19 @@ async def run_scan(
                           name=module_name, findings_count=0)
 
             except Exception as exc:
-                log.error("Module %s failed: %s", module_name, exc)
-                errors.append(f"{module_name}: {exc}")
+                if ctrl.is_aborted or getattr(exc, "reason_code", "") == "cancelled":
+                    aborted = True
+                    _emit(
+                        bus, Event, EventType, "module_skip",
+                        source=module_name, name=module_name,
+                        reason="cancelled", outcome="canceled",
+                    )
+                    break
+                safe_error = str(redact_authorization_value(str(exc)))
+                log.error("Module %s failed: %s", module_name, safe_error)
+                errors.append(f"{module_name}: {safe_error}")
                 _emit(bus, Event, EventType, "module_fail", source=module_name,
-                      name=module_name, error=str(exc))
+                      name=module_name, error=safe_error)
 
         # ── Emit: phase_complete ──────────────────────────────────────
         phase_duration = time.monotonic() - phase_start
@@ -460,15 +1140,25 @@ async def run_scan(
               number=phase["number"], name=phase["name"],
               duration=round(phase_duration, 1))
 
+    status = "aborted" if aborted else ("failed" if errors else "completed")
     run.ended_at = datetime.now(timezone.utc)
-    run.status = "completed"
+    run.status = status
     db_session.commit()
 
     elapsed = time.monotonic() - start_time
 
-    # ── Emit: scan_complete ───────────────────────────────────────────
-    _emit(bus, Event, EventType, "scan_complete", source="aiforge",
-          target=cfg.target, findings=len(all_findings), duration=round(elapsed, 1))
+    if aborted:
+        _emit(bus, Event, EventType, "scan_aborted", source="aiforge",
+              reason="operator", target=safe_target_display(cfg.target),
+              findings=len(all_findings), duration=round(elapsed, 1))
+    elif errors:
+        _emit(bus, Event, EventType, "scan_interrupted", source="aiforge",
+              target=safe_target_display(cfg.target), findings=len(all_findings),
+              duration=round(elapsed, 1), errors=errors)
+    else:
+        _emit(bus, Event, EventType, "scan_complete", source="aiforge",
+              target=safe_target_display(cfg.target), findings=len(all_findings),
+              duration=round(elapsed, 1))
 
     phase_banner(len(PHASES), len(PHASES), "Reporting")
     formats = [f.strip() for f in args.report_format.split(",")]
@@ -483,7 +1173,13 @@ async def run_scan(
     )
     report_paths = reporter.generate_all()
 
-    console.print(f"\n[bold green]═══ AI ASSESSMENT COMPLETE ═══[/bold green]")
+    label = (
+        "AI ASSESSMENT ABORTED"
+        if aborted
+        else ("AI ASSESSMENT FAILED" if errors else "AI ASSESSMENT COMPLETE")
+    )
+    color = "yellow" if aborted else ("red" if errors else "green")
+    console.print(f"\n[bold {color}]═══ {label} ═══[/bold {color}]")
     console.print(f"  Duration:  {elapsed:.1f}s")
     console.print(f"  Findings:  {len(all_findings)}")
     console.print(f"  Results:   {results_dir}")
@@ -493,6 +1189,7 @@ async def run_scan(
     db_session.close()
 
     return {
+        "status": status,
         "findings": len(all_findings),
         "errors": errors,
         "duration": round(elapsed, 1),
@@ -510,17 +1207,36 @@ async def run_for_target(
     args = copy.deepcopy(base_args)
     args.target = target_entry.target
 
-    for key, val in target_entry.options.items():
-        if hasattr(args, key):
-            setattr(args, key, val)
+    for key in ("rate", "max_tokens", "temperature"):
+        if key in target_entry.options and hasattr(args, key):
+            setattr(args, key, target_entry.options[key])
 
-    results_dir = setup_results_dir(args.target, args.engagement)
+    confirmations = list(
+        getattr(args, "_launch_confirmations", None) or load_launch_confirmations()
+    )
+    confirmation = _confirmation_for_target(confirmations, args.target)
+    preflight = decide_action(
+        target=args.target,
+        allowed_scope=args.scope,
+        excluded_scope=args.exclude,
+        confirmation=confirmation,
+        job_id=str(getattr(args, "_launch_job_id", "")),
+        engine=ENGINE_NAME,
+        action=str(getattr(args, "_launch_action", DEFAULT_LAUNCH_ACTION)),
+        require_confirmation=not bool(args.dry_run),
+    )
+    if not preflight.allowed:
+        _audit_scope_denial(args, preflight, target=args.target)
+        _print_launch_denial(preflight)
+        return _denied_summary(preflight, dry_run=bool(args.dry_run))
+
     config_path = Path(args.config) if args.config else Path(__file__).parent / "aiforge.yaml"
     cfg = load_config(config_path)
     cfg.target     = args.target
     cfg.engagement = args.engagement
     cfg.tester     = args.tester
     cfg.mode       = args.mode
+    cfg.dry_run    = args.dry_run
     cfg.rate.requests_per_second = args.rate
     cfg.verbose    = getattr(args, "verbose", False)
     cfg.quiet      = getattr(args, "quiet", False)
@@ -533,11 +1249,34 @@ async def run_for_target(
     cfg.extra["model_name"]   = args.model_name or ""
     cfg.extra["max_tokens"]   = args.max_tokens
     cfg.extra["temperature"]  = args.temperature
+    authorization = getattr(args, "_authorization_envelope", None)
+    if authorization is None and not args.dry_run:
+        authorization = select_authorization_envelope(
+            load_authorization_envelopes(),
+            job_id=str(getattr(args, "_launch_job_id", "")),
+            engine=ENGINE_NAME,
+            action_kind="engine.execute",
+            requested_target=args.target,
+            resolved_target=args.target,
+            module_id=module_set_binding(_requested_modules(args)),
+        )
+    _apply_launch_context(cfg, args, confirmations, authorization)
+
+    if not args.dry_run:
+        authorization_decision = _consume_engine_authorization(cfg)
+        if not authorization_decision.allowed:
+            return _authorization_denied_summary(authorization_decision)
+
+    results_dir = setup_results_dir(args.target, args.engagement)
 
     return await run_scan(cfg, args, results_dir, event_bus, scan_control)
 
 
-async def main() -> None:
+def _summary_exit_code(summary: Mapping[str, Any] | None) -> int:
+    return 0 if summary and summary.get("status") == "completed" else 1
+
+
+async def main() -> int:
     args = parse_args()
 
     if args.list_modules:
@@ -546,13 +1285,26 @@ async def main() -> None:
             console.print(f"\n[bold]Phase {phase['number']}: {phase['name']}[/bold]")
             for mod in phase["modules"]:
                 console.print(f"  • {mod}")
-        return
+        return 0
 
-    require_authorization(args.target, "AIForge")
+    launch_decision, confirmations = _prepare_cli_confirmation(args)
+    if not launch_decision.allowed:
+        _audit_scope_denial(args, launch_decision, target=args.target)
+        _print_launch_denial(launch_decision)
+        sys.exit(1)
+    args._launch_confirmations = confirmations
+    if args.dry_run:
+        authorization = None
+    else:
+        auth_decision, authorization = _prepare_engine_authorization(
+            args,
+            confirmations,
+        )
+        if not auth_decision.allowed or authorization is None:
+            _print_launch_denial(auth_decision)
+            sys.exit(1)
+    args._authorization_envelope = authorization
     set_auto_confirm(args.auto_confirm)
-
-    results_dir = setup_results_dir(args.target, args.engagement)
-    log.info("Results directory: %s", results_dir)
 
     config_path = Path(args.config) if args.config else Path(__file__).parent / "aiforge.yaml"
     cfg = load_config(config_path)
@@ -560,6 +1312,7 @@ async def main() -> None:
     cfg.engagement = args.engagement
     cfg.tester     = args.tester
     cfg.mode       = args.mode
+    cfg.dry_run    = args.dry_run
     cfg.rate.requests_per_second = args.rate
     cfg.verbose    = args.verbose
     cfg.quiet      = args.quiet
@@ -576,6 +1329,22 @@ async def main() -> None:
         cfg.extra["known_system_prompt"] = args.system_prompt
     if args.model_info:
         cfg.extra["model_info_path"] = args.model_info
+    _apply_launch_context(cfg, args, confirmations, authorization)
+
+    if not args.dry_run:
+        authorization_decision = _consume_engine_authorization(cfg)
+        if not authorization_decision.allowed:
+            log.warning(
+                "Engine authorization denied reason_code=%s",
+                authorization_decision.reason_code,
+            )
+            sys.exit(1)
+
+    results_dir = setup_results_dir(args.target, args.engagement)
+    log.info("Results directory: %s", results_dir)
+
+    if args.dry_run:
+        return _summary_exit_code(await run_scan(cfg, args, results_dir))
 
     # Wire EventBus — remote when dashboard URL given, local otherwise
     event_bus = None
@@ -583,8 +1352,14 @@ async def main() -> None:
         try:
             from common.dashboard.event_bus import RemoteEventBus
             event_bus = RemoteEventBus(args.dashboard_url, run_id="aiforge")
-            event_bus.start()
-            log.info("Dashboard relay: %s", args.dashboard_url)
+            if event_bus.start():
+                log.info("Dashboard relay active: %s", args.dashboard_url)
+            else:
+                cfg.extra["dashboard_relay_state"] = event_bus.disabled_reason
+                log.warning(
+                    "Dashboard relay not authorized: %s",
+                    event_bus.disabled_reason,
+                )
         except Exception as exc:
             log.warning("RemoteEventBus init failed: %s — events won't reach dashboard", exc)
     else:
@@ -595,11 +1370,12 @@ async def main() -> None:
         except ImportError:
             pass
 
-    await run_scan(cfg, args, results_dir, event_bus=event_bus)
+    summary = await run_scan(cfg, args, results_dir, event_bus=event_bus)
 
     if event_bus and hasattr(event_bus, "stop"):
         event_bus.stop()
+    return _summary_exit_code(summary)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

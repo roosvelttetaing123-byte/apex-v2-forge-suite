@@ -46,6 +46,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from common.version import PRODUCT_USER_AGENT
+
 log = logging.getLogger("forge.intel.techniques")
 
 # MITRE ATT&CK STIX 2.1 bundle (Enterprise matrix)
@@ -101,11 +103,15 @@ STIX_TOOL           = "tool"
 STIX_MITIGATION     = "course-of-action"
 
 BATCH_SIZE = 500
+TECHNIQUE_LEARNER_USER_AGENT = (
+    f"{PRODUCT_USER_AGENT} IntelPipeline (TechniqueLearner)"
+)
 
 
 # ── HTTP helper ──────────────────────────────────────────────────
 
 async def _fetch_bundle(url: str) -> dict[str, Any]:
+    raise RuntimeError("outbound_policy_unsupported")
     """Download the STIX 2.1 JSON bundle.
 
     The enterprise-attack.json is ~30MB so we stream it in a thread
@@ -116,7 +122,7 @@ async def _fetch_bundle(url: str) -> dict[str, Any]:
 
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Forge-Suite/5.0 IntelPipeline (TechniqueLearner)",
+        "User-Agent": TECHNIQUE_LEARNER_USER_AGENT,
     }
     request = urllib.request.Request(url, headers=headers)
 
@@ -197,6 +203,7 @@ class TechniqueLearner:
         Returns:
             Dict with records_new, records_updated, records_total counts.
         """
+        raise RuntimeError("outbound_policy_unsupported")
         log.info("ATT&CK technique sync starting (since=%s)", since)
         from common.intel.intel_engine import IntelRecord
 
@@ -373,6 +380,8 @@ class TechniqueLearner:
         if since:
             try:
                 since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                if since_dt.tzinfo is None:
+                    since_dt = since_dt.replace(tzinfo=timezone.utc)
             except ValueError:
                 try:
                     since_dt = datetime.strptime(since[:10], "%Y-%m-%d").replace(
@@ -420,6 +429,8 @@ class TechniqueLearner:
         if since_dt and modified:
             try:
                 mod_dt = datetime.fromisoformat(modified.replace("Z", "+00:00"))
+                if mod_dt.tzinfo is None:
+                    mod_dt = mod_dt.replace(tzinfo=timezone.utc)
                 if mod_dt < since_dt:
                     return None
             except ValueError:
@@ -444,7 +455,7 @@ class TechniqueLearner:
                     tactics.append(phase_name)
 
         # ── Severity (based on highest-impact tactic) ─────────────
-        severity = "medium"
+        severity = "info"
         for tactic in tactics:
             tactic_sev = TACTIC_SEVERITY.get(tactic, "medium")
             if _severity_rank(tactic_sev) > _severity_rank(severity):

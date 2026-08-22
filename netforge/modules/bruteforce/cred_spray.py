@@ -11,12 +11,16 @@ import asyncio
 import sys
 import time
 from pathlib import Path
+from typing import NoReturn
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
+from common.action_authorization import protected_credential_reference
 from common.evidence import Evidence
 from common.finding import Severity
+from common.outbound_policy import OutboundDenied, OutboundReason
+from common.redaction import redact_secret_fragments
 
 CVSS_SPRAY      = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
 CVSS40_SPRAY    = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -25,6 +29,11 @@ SPRAY_PASSWORDS = [
     "Password1", "Welcome1", "Changeme1", "Company123",
     "Summer2024", "Winter2024", "P@ssw0rd", "Password123",
 ]
+
+
+def _deny_unmigrated_credential_effect() -> NoReturn:
+    """Keep legacy credential transports inert pending protected adapters."""
+    raise OutboundDenied(OutboundReason.OUTBOUND_POLICY_UNSUPPORTED)
 
 
 class CredSpray(BaseModule):
@@ -53,7 +62,10 @@ class CredSpray(BaseModule):
 
         # Spray one password at a time across all users
         for password in passwords[:5]:
-            self.log.info("Spraying password: %s across %d users", password[:3] + "***", len(usernames))
+            self.log.info(
+                "Spraying one protected credential candidate across %d users",
+                len(usernames),
+            )
             for host in hosts[:5]:
                 if not self.check_scope(host):
                     continue
@@ -74,10 +86,12 @@ class CredSpray(BaseModule):
         return self._make_result(start)
 
     async def _try_ssh(self, host: str, username: str, password: str) -> bool:
+        _deny_unmigrated_credential_effect()
         try:
             import paramiko
             client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.load_system_host_keys()
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
             client.connect(
                 host, port=22, username=username, password=password,
                 timeout=5, look_for_keys=False, allow_agent=False,
@@ -88,6 +102,7 @@ class CredSpray(BaseModule):
             return False
 
     async def _try_smb(self, host: str, username: str, password: str) -> bool:
+        _deny_unmigrated_credential_effect()
         try:
             from impacket.smbconnection import SMBConnection
             conn = SMBConnection(host, host, timeout=5)
@@ -100,23 +115,53 @@ class CredSpray(BaseModule):
     def _report_success(
         self, host: str, port: int, service: str, username: str, password: str
     ) -> None:
+        secret_values = (password,)
+        safe_host = redact_secret_fragments(host, secret_values)
+        safe_service = redact_secret_fragments(service, secret_values)
+        safe_username = redact_secret_fragments(username, secret_values)
+        reference = protected_credential_reference(
+            {
+                "host": safe_host,
+                "service": safe_service,
+                "username": safe_username,
+                "source": self.NAME,
+            }
+        )
+        cred_engine = self.config.extra.get("cred_engine")
+        if cred_engine is not None and callable(getattr(cred_engine, "add", None)):
+            try:
+                stored = cred_engine.add(
+                    safe_host,
+                    safe_service,
+                    safe_username,
+                    password=password,
+                    source=self.NAME,
+                )
+                safe = stored.to_dict()
+                reference = str(safe.get("credential_reference") or reference)
+            except Exception:
+                self.log.debug("Credential reference storage failed")
         ev = Evidence(
             extra={
-                "host": host, "port": port, "service": service,
-                "username": username, "password": password,
+                "host": safe_host, "port": port, "service": safe_service,
+                "username": safe_username, "credential_reference": reference,
             },
         )
         self.new_finding(
-            title=f"Password Spray Success — {username}:{password}@{host}/{service}",
+            title=(
+                f"Password Spray Success — "
+                f"{safe_username}@{safe_host}/{safe_service}"
+            ),
             severity=Severity.CRITICAL,
             description=(
                 f"Credential spray found valid login:\n"
-                f"  {username}:{password} on {host}:{port} ({service})\n\n"
+                f"  {safe_username} on {safe_host}:{port} ({safe_service})\n"
+                f"  Credential reference: {reference}\n\n"
                 "Password spraying bypasses account lockout by trying one password "
                 "against many accounts before moving to the next password."
             ),
             reproduction_steps=[
-                f"# {service}: {username}:{password}@{host}",
+                f"Use the protected credential reference for {safe_service}: {reference}",
             ],
             remediation=(
                 "1. Change the password immediately\n"
@@ -129,7 +174,7 @@ class CredSpray(BaseModule):
             cvss_v31_vector=CVSS_SPRAY,
             cvss_v40_vector=CVSS40_SPRAY,
             mitre_attack=["TA0006/T1110.003"],
-            port=port, service=service, target=host,
+            port=port, service=safe_service, target=safe_host,
         )
 
 

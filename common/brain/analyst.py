@@ -122,7 +122,9 @@ class FindingAnalyst:
             batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
             for j, result in enumerate(batch_results):
-                if isinstance(result, Exception):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                if isinstance(result, BaseException):
                     log.warning("Bulk analysis failed for finding %d: %s", i + j, result)
                     finding = batch[j]
                     fid = (

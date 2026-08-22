@@ -46,6 +46,8 @@ def main() -> None:
 
     print("\n[*] forge-suite — Session Capture Tool")
     print("[*] FOR AUTHORIZED PENETRATION TESTING ONLY\n")
+    print("[!] Session capture disabled: outbound_policy_unsupported")
+    sys.exit(1)
 
     print_browser_status()
 

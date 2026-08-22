@@ -1,0 +1,25 @@
+schema_version = 2
+
+[[warning]]
+category = "DeprecationWarning"
+module = "sqlalchemy.engine.default"
+message_prefix = "The default datetime adapter is deprecated as of Python 3.12"
+owner = "Core Security Engineering Lead"
+reason = "SQLAlchemy's SQLite adapter emits this dependency warning on Python 3.12+; application datetime migration belongs to Gate 1 durable state work."
+expires = "2026-11-01"
+
+[[warning]]
+category = "DeprecationWarning"
+module = "ldap3.utils.asn1"
+message_prefix = "tagMap is deprecated. Please use TAG_MAP instead."
+owner = "Core Security Engineering Lead"
+reason = "The maintained LDAP dependency imports the aliases while encoding a fixture security descriptor; no Forge call site uses the deprecated names."
+expires = "2026-11-01"
+
+[[warning]]
+category = "DeprecationWarning"
+module = "ldap3.utils.asn1"
+message_prefix = "typeMap is deprecated. Please use TYPE_MAP instead."
+owner = "Core Security Engineering Lead"
+reason = "The maintained LDAP dependency imports the aliases while encoding a fixture security descriptor; no Forge call site uses the deprecated names."
+expires = "2026-11-01"

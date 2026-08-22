@@ -1,25 +1,72 @@
-# forge-suite — Docker ignore
-__pycache__/
-*.pyc
-*.pyo
-.git/
-.gitignore
-.vscode/
-.idea/
-*.md
-!README.md
-*.zip
-*.tar.gz
-webforge/results/
-netforge/results/
-adforge/results/
-aiforge/results/
-*.db
-*.sqlite
-*.log
-.env
-.env.*
-test_*.db
-Dockerfile
-docker-compose.yml
-.dockerignore
+# Task 008 fail-closed build-context allowlist.
+#
+# Everything is denied first.  Every local Dockerfile COPY source is then
+# admitted explicitly; new top-level files and directories cannot enter a
+# build until this contract, its scanner, and its independent review change.
+**
+
+# Canonical release identity and locked Python dependency graph.
+!VERSION
+!requirements.lock
+
+# Runtime entry points.
+!forge.py
+!forge_agent.py
+
+# Runtime Python packages and their checked-in data/templates.
+!common/
+!common/**
+!webforge/
+!webforge/**
+!netforge/
+!netforge/**
+!adforge/
+!adforge/**
+!aiforge/
+!aiforge/**
+!forge_c2/
+!forge_c2/**
+!forge_collab/
+!forge_collab/**
+!forge_payload/
+!forge_payload/**
+!cloud/
+!cloud/**
+!leak_intel/
+!leak_intel/**
+
+# Exact frontend build inputs.  Tests, local env files, audit policy, installed
+# packages, and prior dist output are not inputs to the image build.
+!apex-ui/
+apex-ui/*
+!apex-ui/package.json
+!apex-ui/package-lock.json
+!apex-ui/index.html
+!apex-ui/tsconfig.json
+!apex-ui/vite.config.js
+!apex-ui/public/
+!apex-ui/public/**
+!apex-ui/src/
+!apex-ui/src/**
+
+# Machine-local credentials and TLS material are never source or image inputs.
+**/.env
+**/.env.*
+**/.tls/
+**/*.key
+**/*.pem
+
+# Generated/runtime state inside admitted package trees is never shipped.
+**/__pycache__/
+**/.mypy_cache/
+**/.pytest_cache/
+**/.ruff_cache/
+**/build/
+**/dist/
+**/node_modules/
+**/results/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+common/intel/forge_intel.db
+webforge/engagement.db

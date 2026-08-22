@@ -6,6 +6,8 @@ import Button from '../components/Button';
 import CredentialsCard from '../components/CredentialsCard';
 
 import { apiFetch } from '../config/api';
+import { DASHBOARD_API } from '../generated/dashboard-api';
+import { applyActionConfirmations, dashboardErrorMessage, prepareActionConfirmations } from '../utils/actionConfirmation';
 
 
 const MODULES = {
@@ -62,6 +64,21 @@ const MODULES = {
     { id: 'serverless',    name: 'Serverless Injection',    severity: 'high',     desc: 'Event injection in Lambda/Cloud Functions' },
     { id: 'container',     name: 'Container Escape',        severity: 'critical', desc: 'Privileged container and socket mount abuse' },
   ],
+  activedirectory: [
+    { id: 'adcs',          name: 'ADCS Certificate Abuse',  severity: 'critical', desc: 'ESC1-ESC8 certificate template misconfigurations enabling domain takeover' },
+    { id: 'kerberoast',    name: 'Kerberoasting / ASREPRoast', severity: 'high',  desc: 'SPNs with crackable tickets and accounts without pre-auth' },
+    { id: 'adenum',        name: 'AD Enumeration & Policy', severity: 'high',     desc: 'Delegation abuse, LAPS gaps, password policy, privileged group sprawl' },
+  ],
+  compliance: [
+    { id: 'cisbench',      name: 'CIS Benchmark (Linux)',   severity: 'medium',   desc: 'CIS Level 1/2 hardening checks for Linux servers' },
+    { id: 'wincis',        name: 'CIS Benchmark (Windows)', severity: 'medium',   desc: 'CIS Level 1/2 hardening checks for Windows servers' },
+    { id: 'pcidss',        name: 'PCI DSS v4.0 Audit',      severity: 'high',     desc: 'PCI DSS v4.0 technical control validation' },
+    { id: 'iis',           name: 'IIS Deep Audit',          severity: 'high',     desc: 'IIS configuration, virtual directory, handler, and auth weaknesses' },
+    { id: 'exchange',      name: 'Exchange Server Audit',   severity: 'critical', desc: 'ProxyLogon, ProxyShell, ProxyNotShell, OWA exposure' },
+    { id: 'mssqldeep',     name: 'MSSQL Deep Audit',        severity: 'critical', desc: 'xp_cmdshell, SA account, CLR assembly, linked server abuse' },
+    { id: 'macos',         name: 'macOS Patch & Security',  severity: 'medium',   desc: 'SIP, Gatekeeper, FileVault, kext signing, patch status' },
+    { id: 'macosusers',    name: 'macOS User Audit',        severity: 'medium',   desc: 'Admin accounts, NOPASSWD sudo, setuid binaries' },
+  ],
 };
 
 const DEFAULT_SELECTED = new Set([
@@ -70,7 +87,17 @@ const DEFAULT_SELECTED = new Set([
   'portscan','svcfp','ssltls',
   'bola','cors',
   'defaultcreds','mfabypass',
-  's3','iam','metadata',
+  'metadata',
+  'adcs','kerberoast','adenum',
+]);
+
+// Keep the UI's early mixed-plan check aligned with the implemented NetForge
+// entries in the server's UI_MODULE_MAP. The server remains authoritative.
+const NETWORK_ACTION_IDS = new Set([
+  ...MODULES.network.map(module => module.id),
+  'pwspray', 'metadata', 'container',
+  ...MODULES.activedirectory.map(module => module.id),
+  ...MODULES.compliance.map(module => module.id),
 ]);
 
 const INTENSITY_LEVELS = ['Passive', 'Low', 'Moderate', 'Aggressive', 'Maximum'];
@@ -94,7 +121,7 @@ const severityColor = {
   info:     'var(--color-info)',
 };
 
-export default function ScanBuilder() {
+export default function ScanBuilder({ authToken: _authToken = '' }) {
   const [activeTab, setActiveTab]       = useState('web');
   const [selected, setSelected]         = useState(new Set(DEFAULT_SELECTED));
   const [intensity, setIntensity]       = useState(2);
@@ -106,7 +133,9 @@ export default function ScanBuilder() {
   const [timeout, setTimeout_]          = useState(30);
   const [rateLimit, setRateLimit]       = useState(1000);
   const [maxDepth, setMaxDepth]         = useState(5);
-  const [targetScope, setTargetScope]   = useState('192.168.0.0/16');
+  const [targetScope, setTargetScope]   = useState('');
+  const [networkTarget, setNetworkTarget] = useState('');
+  const [sourceRoot, setSourceRoot] = useState('');
   const [severityFilter, setSeverityFilter] = useState('all');
 
   // Scan mode + credential state
@@ -125,6 +154,11 @@ export default function ScanBuilder() {
 
   const allModules = useMemo(() => Object.values(MODULES).flat(), []);
   const totalSelected = useMemo(() => [...allModules].filter(m => selected.has(m.id)).length, [allModules, selected]);
+  const mixedEngineSelection = useMemo(() => {
+    const ids = [...selected];
+    return ids.some(id => NETWORK_ACTION_IDS.has(id))
+      && ids.some(id => !NETWORK_ACTION_IDS.has(id));
+  }, [selected]);
 
   const tabModules = useMemo(() => {
     let mods = MODULES[activeTab] || [];
@@ -166,7 +200,12 @@ export default function ScanBuilder() {
     });
   };
 
-  const TABS = ['web','network','api','auth','cloud'];
+  const TABS = ['web','network','api','auth','cloud','activedirectory','compliance'];
+
+  const TAB_LABELS = {
+    web: 'Web', network: 'Network', api: 'API', auth: 'Auth',
+    cloud: 'Cloud', activedirectory: 'Active Directory', compliance: 'Compliance',
+  };
 
   const tabCount = (tab) => MODULES[tab].filter(m => selected.has(m.id)).length;
 
@@ -182,7 +221,7 @@ export default function ScanBuilder() {
 
   // Load saved templates on mount
   useEffect(() => {
-    apiFetch('/api/v1/scan/templates')
+    apiFetch(DASHBOARD_API.scanTemplates.path)
       .then(r => r.ok ? r.json() : { templates: [] })
       .then(d => setSavedTemplates(d.templates || []))
       .catch(() => {});
@@ -199,8 +238,8 @@ export default function ScanBuilder() {
     setTestingCreds(true);
     setTestResult(null);
     try {
-      const res = await apiFetch('/api/v1/auth/test', {
-        method: 'POST',
+      const res = await apiFetch(DASHBOARD_API.authTest.path, {
+        method: DASHBOARD_API.authTest.method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           auth_type: authType, username, password, token,
@@ -221,6 +260,21 @@ export default function ScanBuilder() {
 
   const launchScan = useCallback(async () => {
     if (launching || !targetScope.trim()) return;
+    const requestedTarget = targetScope.trim();
+    const requestedNetworkTarget = networkTarget.trim();
+    if (selected.size === 0) {
+      setLaunchError('Select at least one implemented module before launch.');
+      return;
+    }
+    if (scanMode === 'whitebox' && !sourceRoot.trim()) {
+      setLaunchError('Whitebox scans require an absolute canonical source root.');
+      return;
+    }
+    if (mixedEngineSelection && !requestedNetworkTarget) {
+      setLaunchError('Mixed WebForge/NetForge plans require a separately approved exact network IP.');
+      return;
+    }
+    if (!window.confirm(`Confirm launching ${selected.size} selected modules against exact target ${requestedTarget}?`)) return;
     setLaunching(true);
     setLaunchError('');
     try {
@@ -234,7 +288,7 @@ export default function ScanBuilder() {
         login_url: loginUrl,
       };
       const payload = {
-        target: targetScope.trim(),
+        target: requestedTarget,
         profile,
         modules: [...selected],
         intensity,
@@ -246,11 +300,31 @@ export default function ScanBuilder() {
         schedule,
         mode: scanMode,
         auth_profile,
+        ...(scanMode === 'whitebox' ? { source_root: sourceRoot.trim() } : {}),
       };
-      const res = await apiFetch('/api/v1/scans/launch', {
-        method: 'POST',
+      const confirmationBundle = await prepareActionConfirmations({
+        intent: 'scan.launch',
+        target: requestedTarget,
+        scope: [requestedTarget],
+        exclude: [],
+        modules: [...selected],
+        mode: scanMode,
+        ...(scanMode === 'whitebox' ? { source_root: sourceRoot.trim() } : {}),
+        ...(requestedNetworkTarget ? {
+          network_target: requestedNetworkTarget,
+          network_scope: [requestedNetworkTarget],
+        } : {}),
+      });
+      if (
+        confirmationBundle.network_target
+        && !window.confirm(
+          `Separately approve NetForge web-to-network escalation to exact IP ${confirmationBundle.network_target}?`
+        )
+      ) return;
+      const res = await apiFetch(DASHBOARD_API.launchScan.path, {
+        method: DASHBOARD_API.launchScan.method,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(applyActionConfirmations(payload, confirmationBundle)),
       });
       if (res.ok) {
         const data = await res.json();
@@ -263,16 +337,18 @@ export default function ScanBuilder() {
         setTimeout(() => navigate('/'), 1500);
       } else {
         const err = await res.json().catch(() => ({}));
-        setLaunchError(err.detail || `Error ${res.status}`);
-        setToast({ type: 'error', msg: err.detail || `Launch failed (${res.status})` });
+        const message = dashboardErrorMessage(err, `Error ${res.status}`);
+        setLaunchError(message);
+        setToast({ type: 'error', msg: message });
       }
-    } catch {
-      setLaunchError('Cannot reach backend — is forge.py dashboard running?');
-      setToast({ type: 'error', msg: 'Cannot reach backend' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Cannot reach backend — is forge.py dashboard running?';
+      setLaunchError(message);
+      setToast({ type: 'error', msg: message });
     } finally {
       setLaunching(false);
     }
-  }, [targetScope, profile, selected, intensity, maxThreads, timeout, rateLimit, maxDepth, followRedirects, schedule, scanMode, authType, username, password, token, headerName, cookieJar, loginUrl, launching, navigate]);
+  }, [targetScope, networkTarget, profile, selected, mixedEngineSelection, sourceRoot, intensity, maxThreads, timeout, rateLimit, maxDepth, followRedirects, schedule, scanMode, authType, username, password, token, headerName, cookieJar, loginUrl, launching, navigate]);
 
   const saveTemplate = useCallback(async () => {
     if (saving || !templateName.trim()) return;
@@ -300,8 +376,8 @@ export default function ScanBuilder() {
         mode: scanMode,
         auth_profile,
       };
-      const res = await apiFetch('/api/v1/scan/templates', {
-        method: 'POST',
+      const res = await apiFetch(DASHBOARD_API.saveScanTemplate.path, {
+        method: DASHBOARD_API.saveScanTemplate.method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
@@ -408,7 +484,17 @@ export default function ScanBuilder() {
         actions={
           <>
             <Button variant="secondary" onClick={() => setShowSaveModal(true)}>Save Template</Button>
-            <Button variant="primary" onClick={launchScan} disabled={launching || !targetScope.trim()}>
+            <Button
+              variant="primary"
+              onClick={launchScan}
+              disabled={
+                launching
+                || !targetScope.trim()
+                || totalSelected === 0
+                || (mixedEngineSelection && !networkTarget.trim())
+                || (scanMode === 'whitebox' && !sourceRoot.trim())
+              }
+            >
               {launching ? (
                 <>
                   <svg viewBox="0 0 24 24" style={{ width: 14, height: 14, animation: 'spin 1s linear infinite' }}>
@@ -462,6 +548,25 @@ export default function ScanBuilder() {
                   style={{ width: '100%' }}
                 />
               </Field>
+              <Field label="Network Escalation IP (when mixed)">
+                <input
+                  type="text"
+                  value={networkTarget}
+                  onChange={e => setNetworkTarget(e.target.value)}
+                  placeholder="Exact separately approved IP"
+                  style={{ width: '100%' }}
+                />
+              </Field>
+              {scanMode === 'whitebox' && (
+                <Field label="Canonical Whitebox Source Root">
+                  <input
+                    type="text"
+                    value={sourceRoot}
+                    onChange={e => setSourceRoot(e.target.value)}
+                    placeholder="/absolute/path/to/source"
+                  />
+                </Field>
+              )}
               <Field label="Scan Profile">
                 <select value={profile} onChange={e => setProfile(e.target.value)} style={{ width: '100%' }}>
                   {PROFILES.map(p => <option key={p}>{p}</option>)}
@@ -645,7 +750,7 @@ export default function ScanBuilder() {
                     marginBottom: '-1px',
                   }}
                 >
-                  {tab}
+                  {TAB_LABELS[tab] || tab}
                   <span style={{
                     background: cnt === total ? 'rgba(229,57,53,0.2)' : 'var(--bg-input)',
                     color: cnt === total ? 'var(--color-brand-red)' : 'var(--text-muted)',
@@ -881,7 +986,7 @@ function Toggle({ value, onChange }) {
   );
 }
 
-function SummaryItem({ label, value, accent }) {
+function SummaryItem({ label, value, accent = undefined }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
       <span style={{ fontSize: '10px', fontFamily: 'var(--font-mono)', color: 'var(--text-dimmed)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>{label}</span>

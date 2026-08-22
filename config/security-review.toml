@@ -1,0 +1,52 @@
+schema_version = 2
+receipt_type = "LOCAL_UNSIGNED"
+task_id = "008"
+task_sha256 = "ba38ababe417c56ebb1296b8e54a1877d27ace0da10e81b280a726ae900e5e15"
+decision = "ACCEPT"
+implementer_identity = "codex:/root"
+reviewer_identity = "codex:/root/task008_supply_review_sol56max"
+implemented_on = "2026-08-06"
+reviewed_on = "2026-08-19"
+expires_on = "2026-11-30"
+reviewed_contract_sha256 = "e1a82a88444bfb91a6fa58062b0425717db44f837b1e380b405e826087fa344f"
+proposal_manifest_sha256 = "ed4569d441a9f59a806f4a3bbf1803396398d8d3d5a33164ee6a49fb36831b0c"
+review_evidence_id = "task008-supply-review-sol56max-20260819T153400Z/independent-review.md"
+review_evidence_sha256 = "5e1f8052f22e40ff774c0f95df008041375f144f23f68d4dac44afd429614dbf"
+
+[scanner_contract]
+path = "scripts/verify_supply_chain.py"
+sha256 = "a792b87cd82ceac4352d7d3b0568fa86db85fc0ef397b44a3701285da1d20e1a"
+python_version = "3.13.9"
+development_lock = "requirements-dev.lock"
+development_lock_sha256 = "b7cc0f9a39b5f632dbde52458bc179bccbcafa78167b9aaa7a41964b109da7c7"
+context_inventory_contract = "forge-filesystem-candidate-with-docker-context-v1"
+dockerfile = "Dockerfile"
+dockerfile_sha256 = "34ebf3c8b30f466f11c28c4b18d5d5352ac8b53d90a1ee9fc8f7f5a4341f3a66"
+dockerignore = ".dockerignore"
+dockerignore_sha256 = "ddc6a9d3a1f86298f19f44583c95f755af1fedd14e2927b578bc381f474c520e"
+
+[baseline_set]
+sha256 = "f99a47fe99e1bb55d0548bd484203ccdaaf6cb51c4ba03efb35dba41924293b8"
+
+[bandit]
+baseline = "config/bandit-baseline.json"
+baseline_sha256 = "4d9c73fa43f83db544cd3d9305d69bc7af540e2d5ebdf6767229aa5f5be955d7"
+finding_count = 87
+scope = ["common", "webforge", "netforge", "adforge", "aiforge", "forge_c2", "forge_collab", "forge_payload", "cloud", "leak_intel"]
+config = "pyproject.toml"
+config_sha256 = "19583f83e379ac0d7be574654ca7fdf234be63499ea9d6f1e404455392ed48f8"
+scanner_version = "1.8.6"
+severity = "medium"
+confidence = "medium"
+
+[detect_secrets]
+baseline = ".secrets.baseline"
+baseline_sha256 = "a014a56415d5176824f3b6bbe860f06436cc2a5f0af879ebe3a4009ec007d0a6"
+finding_count = 249
+path_count = 786
+paths_sha256 = "815acae208beb3f94c6267d74b00134d1d39d33c83ac5128432c983665236b99"
+docker_path_count = 682
+docker_paths_sha256 = "87c312a2434559f3a77b98a61d63bc66d0fab94c0cddc6887f201942799396a7"
+plugin_count = 27
+plugins_sha256 = "ba415e50000530b6b2cfae1ac8087d2224696444e140bbd82d5d7b3b917ae11f"
+scanner_version = "1.5.0"

@@ -107,6 +107,7 @@ class ResourceExhaustion(BaseModule):
             model_name=self.config.extra.get("model_name", ""),
             max_tokens=4000, temperature=0.0,
             proxy=self.config.extra.get("proxy"),
+            outbound_policy=self.outbound_policy,
         ) as client:
             results: list[dict[str, Any]] = []
 

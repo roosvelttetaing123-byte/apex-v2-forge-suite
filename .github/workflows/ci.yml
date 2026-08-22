@@ -1,4 +1,4 @@
-name: Forge Suite CI
+name: Forge Gate 0 Baseline
 
 on:
   push:
@@ -6,196 +6,281 @@ on:
   pull_request:
     branches: [main, master, develop]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  PYTHON_DEFAULT: "3.12"
+  PYTHON_VERSION: "3.13.9"
+  NODE_VERSION: "20.19.5"
+  NPM_VERSION: "10.8.2"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_NO_INPUT: "1"
+  PIP_PROGRESS_BAR: "off"
+  PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  # ── Syntax check — fast fail before expensive tests ───────────────────────
-  syntax:
-    name: Syntax check
-    runs-on: ubuntu-latest
+  python-quality:
+    name: Python quality and supply chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ env.PYTHON_DEFAULT }}
-        uses: actions/setup-python@v5
+      - name: Check out the candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install qualified Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.6.0
         with:
-          python-version: ${{ env.PYTHON_DEFAULT }}
-
-      - name: Compile all Python files
-        run: |
-          find . -name "*.py" \
-            ! -path "./apex-ui/*" \
-            ! -path "./.git/*" \
-            -print0 | xargs -0 python -m py_compile
-
-  # ── Unit + integration tests ──────────────────────────────────────────────
-  test:
-    name: Tests (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    needs: syntax
-
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12"]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          # Install only the packages needed by the test suite
-          # (avoids heavy optional deps like WeasyPrint, Playwright, Scapy)
-          pip install \
-            'pydantic[email]>=2.5.0' \
-            'pyyaml>=6.0.1' \
-            'aiohttp>=3.9.0' \
-            'jinja2>=3.1.2' \
-            'sqlalchemy>=2.0.0' \
-            'networkx>=3.2.0' \
-            'httpx>=0.27.0' \
-            'fastapi>=0.109.0' \
-            'uvicorn[standard]>=0.27.0' \
-            'rich>=13.7.0' \
-            'pytest>=7.4.0' \
-            'pytest-asyncio>=0.23.0' \
-            'pytest-timeout>=2.2.0'
-
-      - name: Run test suite
-        run: |
-          cd forge-suite 2>/dev/null || true
-          python -m pytest tests/ \
-            -v \
-            --tb=short \
-            --strict-markers \
-            -p no:warnings \
-            --timeout=60
-        env:
-          PYTHONPATH: .
-
-      - name: Upload test results
+          cache-dependency-path: requirements-dev.lock
+      - name: Install the reviewed development graph
+        run: python -m pip install --require-hashes --requirement requirements-dev.lock
+      - name: Verify installed Python dependencies
+        run: python -m pip check
+      - name: Run all static and supply-chain gates
+        run: python scripts/run_quality_gates.py static --output-dir build/quality
+      - name: Publish quality evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: test-results-py${{ matrix.python-version }}
+          name: python-quality-${{ github.sha }}
+          path: build/quality
+          if-no-files-found: error
+          retention-days: 30
+
+  python-tests:
+    name: Python tests and coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install qualified Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+      - name: Install the reviewed development graph
+        run: python -m pip install --require-hashes --requirement requirements-dev.lock
+      - name: Verify installed Python dependencies
+        run: python -m pip check
+      - name: Create test evidence paths
+        run: mkdir -p build/test-results build/quality
+      - name: Record the normal discovery inventory
+        run: python -m pytest tests/ --collect-only -q --forge-qualification > build/test-results/collection.txt
+      - name: Run the complete test and coverage gate
+        run: >-
+          python -m pytest tests/ -v --tb=short --strict-markers --timeout=60
+          --forge-qualification
+          --junitxml=build/test-results/pytest.xml
+          --cov=common --cov=webforge/core --cov=netforge/data
+          --cov-report=term-missing --cov-report=xml:build/coverage.xml
+          --cov-report=json:build/coverage.json
+      - name: Verify total and safety-critical coverage thresholds
+        run: python scripts/run_quality_gates.py coverage --coverage-json build/coverage.json --output-dir build/quality
+      - name: Publish test and coverage evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: python-tests-${{ github.sha }}
           path: |
-            **/pytest-results.xml
-          if-no-files-found: ignore
+            build/test-results
+            build/coverage.xml
+            build/coverage.json
+            build/quality
+          if-no-files-found: error
+          retention-days: 30
 
-  # ── Security scan (bandit) ────────────────────────────────────────────────
-  security:
-    name: Security scan
-    runs-on: ubuntu-latest
-    needs: syntax
-
+  frontend:
+    name: Frontend lock, contracts, types, tests, and build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ env.PYTHON_DEFAULT }}
-        uses: actions/setup-python@v5
+      - name: Check out the candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install qualified Python for contract generation
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.6.0
         with:
-          python-version: ${{ env.PYTHON_DEFAULT }}
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install qualified Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apex-ui/package-lock.json
+      - name: Verify the qualified Node and npm pair
+        run: |
+          test "$(node --version)" = "v${NODE_VERSION}"
+          test "$(npm --version)" = "${NPM_VERSION}"
+      - name: Create frontend evidence path
+        run: mkdir -p build/frontend
+      - name: Install the exact frontend graph
+        working-directory: apex-ui
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Record the resolved frontend dependency graph
+        working-directory: apex-ui
+        run: npm ls --all --json > ../build/frontend/npm-tree.json
+      - name: Verify generated API contracts
+        working-directory: apex-ui
+        run: npm run contracts:check > ../build/frontend/contracts.log 2>&1
+      - name: Type-check every declared JavaScript, JSX, and TypeScript input
+        working-directory: apex-ui
+        run: npm run typecheck > ../build/frontend/typecheck.log 2>&1
+      - name: Run operator workflow and negative type-contract tests
+        working-directory: apex-ui
+        run: npm test -- --reporter=json --outputFile=../build/frontend/vitest.json
+      - name: Enforce the reviewed npm advisory disposition
+        working-directory: apex-ui
+        run: npm run audit:ci > ../build/frontend/npm-audit-gate.log 2>&1
+      - name: Build the production frontend
+        working-directory: apex-ui
+        run: npm run build > ../build/frontend/build.log 2>&1
+      - name: Hash the production frontend artifact
+        run: find apex-ui/dist -type f -print0 | sort -z | xargs -0 sha256sum > build/frontend/dist.sha256
+      - name: Publish frontend evidence and build
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: frontend-${{ github.sha }}
+          path: |
+            build/frontend
+            apex-ui/dist
+          if-no-files-found: error
+          retention-days: 30
+
+  container-sbom:
+    name: Container, Compose, SBOM, and build identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    needs: [python-quality, python-tests, frontend]
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install qualified Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-
-      - name: Install bandit
-        run: pip install 'bandit>=1.7.6'
-
-      - name: Run bandit
+          cache-dependency-path: requirements-dev.lock
+      - name: Install the reviewed development graph
+        run: python -m pip install --require-hashes --requirement requirements-dev.lock
+      - name: Verify installed Python dependencies
+        run: python -m pip check
+      - name: Create container evidence path
+        run: mkdir -p build/container
+      - name: Build the immutable-input image
         run: |
-          cd forge-suite 2>/dev/null || true
-          bandit -r . \
-            --exclude ./apex-ui,./tests \
-            -ll \
-            -ii \
-            -f txt \
-            --exit-zero
-        continue-on-error: false
+          FORGE_VERSION="$(tr -d '\r\n' < VERSION)"
+          docker build --build-arg FORGE_VERSION="${FORGE_VERSION}" --build-arg VCS_REF="${GITHUB_SHA}" --tag "forge-suite:${FORGE_VERSION}" .
+          docker image inspect "forge-suite:${FORGE_VERSION}" > build/container/image-inspect.json
+      - name: Validate secure Compose interpolation
+        run: |
+          umask 077
+          FORGE_VERSION="$(tr -d '\r\n' < VERSION)"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost' -keyout build/container/dashboard-key.pem -out build/container/dashboard-cert.pem
+          FORGE_VERSION="${FORGE_VERSION}" FORGE_DASHBOARD_PASSWORD_HASH="ci-interpolation-only-not-a-credential" FORGE_DASHBOARD_TLS_CERT_FILE="${PWD}/build/container/dashboard-cert.pem" FORGE_DASHBOARD_TLS_KEY_FILE="${PWD}/build/container/dashboard-key.pem" docker compose --project-name forge-ci config > build/container/compose-config.yml
+          env -u FORGE_DASHBOARD_PASSWORD_HASH -u FORGE_DASHBOARD_TLS_CERT_FILE -u FORGE_DASHBOARD_TLS_KEY_FILE FORGE_VERSION="${FORGE_VERSION}" FORGE_C2_ADMIN_PW="ci-interpolation-only-not-a-credential" docker compose --project-name forge-ci --profile local-lab-c2 config forge-c2 > build/container/compose-c2-config.yml
+          env -u FORGE_DASHBOARD_PASSWORD_HASH -u FORGE_DASHBOARD_TLS_CERT_FILE -u FORGE_DASHBOARD_TLS_KEY_FILE FORGE_VERSION="${FORGE_VERSION}" docker compose --project-name forge-ci --profile scan config forge-scan > build/container/compose-scan-config.yml
+          if env -u FORGE_VERSION docker compose --project-name forge-ci --profile scan config forge-scan > build/container/compose-missing-version.log 2>&1; then
+            echo 'Compose accepted a missing canonical version' >&2
+            exit 1
+          fi
+      - name: Prove authenticated TLS startup and health
+        run: |
+          umask 077
+          FORGE_VERSION="$(tr -d '\r\n' < VERSION)"
+          export FORGE_VERSION
+          cleanup() {
+            docker compose --project-name forge-ci down --volumes --remove-orphans
+            rm -f build/container/runtime-inspect.raw.json
+          }
+          trap cleanup EXIT
+          set +e
+          docker compose --project-name forge-ci run --rm --no-deps forge-dashboard > build/container/dashboard-missing-credential.log 2>&1
+          dashboard_guard_status="$?"
+          docker compose --project-name forge-ci --profile local-lab-c2 run --rm --no-deps forge-c2 > build/container/c2-missing-credential.log 2>&1
+          c2_guard_status="$?"
+          set -e
+          test "${dashboard_guard_status}" -eq 64
+          test "${c2_guard_status}" -eq 64
+          DASHBOARD_PASSWORD="$(openssl rand -hex 32)"
+          DASHBOARD_HASH="$(docker run --rm --entrypoint python3 -e DASHBOARD_PASSWORD="${DASHBOARD_PASSWORD}" "forge-suite:${FORGE_VERSION}" -c 'import os; from common.dashboard.auth import _hash_password; print(_hash_password(os.environ["DASHBOARD_PASSWORD"]))')"
+          chmod 0444 build/container/dashboard-cert.pem
+          chmod 0400 build/container/dashboard-key.pem
+          sudo chown 10001:10001 build/container/dashboard-cert.pem build/container/dashboard-key.pem
+          export FORGE_DASHBOARD_PASSWORD_HASH="${DASHBOARD_HASH}"
+          export FORGE_DASHBOARD_TLS_CERT_FILE="${PWD}/build/container/dashboard-cert.pem"
+          export FORGE_DASHBOARD_TLS_KEY_FILE="${PWD}/build/container/dashboard-key.pem"
+          docker compose --project-name forge-ci up --detach --no-build forge-dashboard
+          healthy=false
+          for attempt in {1..60}; do
+            container_id="$(docker compose --project-name forge-ci ps --quiet forge-dashboard)"
+            health_status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "${container_id}")"
+            if test "${health_status}" = "healthy"; then
+              healthy=true
+              break
+            fi
+            sleep 2
+          done
+          test "${healthy}" = "true"
+          curl --fail --silent --show-error --cacert build/container/dashboard-cert.pem https://localhost:1337/api/v1/health > build/container/health.json
+          if curl --fail --silent --show-error --cacert build/container/dashboard-cert.pem https://127.0.0.1:1337/api/v1/health > /dev/null 2> build/container/tls-hostname-rejection.log; then
+            echo 'TLS accepted an unlisted IP address' >&2
+            exit 1
+          fi
+          protected_status="$(curl --silent --show-error --cacert build/container/dashboard-cert.pem --output build/container/protected-response.json --write-out '%{http_code}' https://localhost:1337/api/v1/tools)"
+          test "${protected_status}" = "401"
+          container_id="$(docker compose --project-name forge-ci ps --quiet forge-dashboard)"
+          docker inspect "${container_id}" > build/container/runtime-inspect.raw.json
+          python scripts/verify_container_runtime.py --inspect build/container/runtime-inspect.raw.json --sanitized-output build/container/runtime-inspect.json | tee build/container/runtime-verification.log
+          rm -f build/container/runtime-inspect.raw.json
+          docker compose --project-name forge-ci logs --no-color forge-dashboard > build/container/dashboard.log 2>&1
+      - name: Inventory all installed image packages
+        run: |
+          FORGE_VERSION="$(tr -d '\r\n' < VERSION)"
+          docker run --rm --entrypoint dpkg-query "forge-suite:${FORGE_VERSION}" -W '-f=${binary:Package}\t${Version}\t${Architecture}\t${db:Status-Abbrev}\n' > build/container/packages.tsv
+      - name: Generate and verify the full build SBOM
+        run: |
+          FORGE_VERSION="$(tr -d '\r\n' < VERSION)"
+          IMAGE_ID="$(docker image inspect --format '{{.Id}}' "forge-suite:${FORGE_VERSION}")"
+          python scripts/generate_sbom.py --container-packages build/container/packages.tsv --image-ref "forge-suite:${FORGE_VERSION}@${IMAGE_ID}" --output build/forge-sbom.cdx.json
+          python scripts/verify_sbom.py --input build/forge-sbom.cdx.json --require-container-inventory
+      - name: Generate exact tested-build identity
+        run: |
+          FORGE_VERSION="$(tr -d '\r\n' < VERSION)"
+          IMAGE_ID="$(docker image inspect --format '{{.Id}}' "forge-suite:${FORGE_VERSION}")"
+          python scripts/generate_build_manifest.py --output build/forge-build-manifest.json --image-ref "forge-suite:${FORGE_VERSION}" --image-digest "${IMAGE_ID}" --python-image "python:3.13.9-slim-bookworm@sha256:b685a4fa58bb19d1814d78a1ec0f0208f351452724f78b20212c984d6e124a34" --node-image "node:20.19.5-bookworm-slim@sha256:9e70124bd00f47dd023e349cd587132ae61892acc0e47ed641416c3e18f401c3" --npm-version "${NPM_VERSION}" --vcs-ref "${GITHUB_SHA}"
+      - name: Remove ephemeral credential material from evidence
+        if: always()
+        run: |
+          find build/container -maxdepth 1 -type f -name 'dashboard-*.pem' -delete
+          test ! -e build/container/dashboard-key.pem
+      - name: Publish container, SBOM, and build identity evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: container-sbom-${{ github.sha }}
+          path: |
+            build/container
+            build/forge-sbom.cdx.json
+            build/forge-build-manifest.json
+          if-no-files-found: error
+          retention-days: 30
 
-  # ── Docker build check ────────────────────────────────────────────────────
-  docker:
-    name: Docker build
-    runs-on: ubuntu-latest
-    needs: [test]
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-
+  gate-0-baseline:
+    name: Required Gate 0 baseline
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: always()
+    needs: [python-quality, python-tests, frontend, container-sbom]
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image (no push)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          tags: forge-suite:ci-${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          build-args: |
-            BUILDKIT_INLINE_CACHE=1
-
-  # ── Coverage report ───────────────────────────────────────────────────────
-  coverage:
-    name: Coverage
-    runs-on: ubuntu-latest
-    needs: syntax
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ env.PYTHON_DEFAULT }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_DEFAULT }}
-          cache: pip
-
-      - name: Install dependencies + coverage
+      - name: Require every producer gate to succeed
         run: |
-          pip install \
-            'pydantic[email]>=2.5.0' \
-            'pyyaml>=6.0.1' \
-            'aiohttp>=3.9.0' \
-            'jinja2>=3.1.2' \
-            'sqlalchemy>=2.0.0' \
-            'networkx>=3.2.0' \
-            'httpx>=0.27.0' \
-            'fastapi>=0.109.0' \
-            'uvicorn[standard]>=0.27.0' \
-            'rich>=13.7.0' \
-            'pytest>=7.4.0' \
-            'pytest-asyncio>=0.23.0' \
-            'pytest-timeout>=2.2.0' \
-            'pytest-cov>=4.1.0'
-
-      - name: Run coverage
-        run: |
-          cd forge-suite 2>/dev/null || true
-          python -m pytest tests/ \
-            --cov=common \
-            --cov=webforge/core \
-            --cov-report=term-missing \
-            --cov-report=xml:coverage.xml \
-            -q
-        env:
-          PYTHONPATH: .
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-report
-          path: "**/coverage.xml"
-          if-no-files-found: ignore
+          test "${{ needs.python-quality.result }}" = "success"
+          test "${{ needs.python-tests.result }}" = "success"
+          test "${{ needs.frontend.result }}" = "success"
+          test "${{ needs.container-sbom.result }}" = "success"

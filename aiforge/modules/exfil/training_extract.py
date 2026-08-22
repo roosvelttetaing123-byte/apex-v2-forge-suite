@@ -83,6 +83,7 @@ class TrainingExtract(BaseModule):
             model_name=self.config.extra.get("model_name", ""),
             max_tokens=1000, temperature=1.0,  # high temp for divergence
             proxy=self.config.extra.get("proxy"),
+            outbound_policy=self.outbound_policy,
         ) as client:
             findings_data: list[dict[str, Any]] = []
 

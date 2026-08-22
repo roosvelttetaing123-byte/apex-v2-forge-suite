@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_MFA_BYPASS = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N"
 CVSS40_MFA_BYPASS = "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -38,6 +39,10 @@ class MfaBypass(BaseModule):
         if not self.check_scope(target):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
         await asyncio.gather(
             self._find_mfa_endpoints(target),
             self._check_mfa_brute_protection(target),
@@ -218,7 +223,14 @@ class MfaBypass(BaseModule):
                 except Exception:
                     break
 
-            if codes_tried >= 5 and not locked:
+            # Verify the endpoint actually handles MFA — check if responses
+            # contain MFA-related keywords (not generic 404/homepage)
+            mfa_keywords = ["code", "otp", "verification", "token", "digit",
+                           "invalid", "incorrect", "expired", "mfa", "2fa",
+                           "authenticator", "verify"]
+            looks_like_mfa = any(kw in body.lower() for kw in mfa_keywords)
+            
+            if codes_tried >= 5 and not locked and looks_like_mfa:
                 ev = Evidence(
                     extra={
                         "mfa_url": url,

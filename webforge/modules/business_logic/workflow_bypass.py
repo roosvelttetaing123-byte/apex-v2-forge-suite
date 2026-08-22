@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 import aiohttp
 
 CVSS = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N"
@@ -56,6 +57,10 @@ class WorkflowBypass(BaseModule):
         if not self.check_scope(target):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
         confirmed = self.confirm_action(
             module=self.NAME,
             action=(
@@ -151,7 +156,7 @@ class WorkflowBypass(BaseModule):
         POSTs forged 'approved' payloads from an attacker-controlled Origin to
         detect handlers that trust the POST body without verifying HMAC/signature
         or querying the PSP API (e.g. Mastercard 3DS mcredirect with validation
-        logic commented out — as seen in the Bakong/NBC engagement, CRIT-5).
+        logic commented out since the first commit — a known-exploitable pattern).
         """
         for path in PAYMENT_CALLBACK_PATHS:
             url = f"{target}{path}"
@@ -243,7 +248,7 @@ class TestWorkflowBypass:
         assert any("payment_status" in p for p in FORGED_CALLBACK_PAYLOADS)
 
     def test_confirm_gate_declined(self) -> None:
-        """Operator declining confirmation must skip the module."""
+        """A decline mock cannot substitute for an authorization envelope."""
         import asyncio
         from unittest.mock import MagicMock, patch
 
@@ -257,14 +262,15 @@ class TestWorkflowBypass:
         mod.findings = []
 
         with patch.object(mod, "check_scope", return_value=True), \
-             patch.object(mod, "confirm_action", return_value=False):
+             patch.object(mod, "confirm_action", return_value=False) as confirm:
             result = asyncio.run(mod.run())
 
         assert result.skipped is True
-        assert result.skip_reason == "operator declined"
+        assert result.skip_reason == "authorization_invalid"
+        confirm.assert_not_called()
 
     def test_confirm_gate_accepted(self) -> None:
-        """Operator accepting confirmation must not skip (http calls are mocked)."""
+        """An acceptance mock cannot substitute for an authorization envelope."""
         import asyncio
         from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -291,11 +297,11 @@ class TestWorkflowBypass:
         mock_session.__aexit__ = AsyncMock(return_value=False)
 
         with patch.object(mod, "check_scope", return_value=True), \
-             patch.object(mod, "confirm_action", return_value=True), \
+             patch.object(mod, "confirm_action", return_value=True) as confirm, \
              patch.object(mod, "rate_limit", new=AsyncMock()), \
-             patch.object(mod, "http_session", return_value=mock_session), \
-             patch.object(mod, "_make_result", return_value=MagicMock(skipped=False)) as mr:
-            asyncio.run(mod.run())
-            mr.assert_called_once()
-            call_kwargs = mr.call_args
-            assert call_kwargs[1].get("skipped", False) is False or len(call_kwargs[0]) == 1
+             patch.object(mod, "http_session", return_value=mock_session):
+            result = asyncio.run(mod.run())
+
+        assert result.skipped is True
+        assert result.skip_reason == "authorization_invalid"
+        confirm.assert_not_called()

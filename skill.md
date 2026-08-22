@@ -265,6 +265,10 @@ FORGE_DASHBOARD_PASSWORD   # Dashboard auth
 - Exploit modules require operator confirmation
 - AIForge DoS/destructive gates cannot be bypassed with `--auto-confirm`
 
+## Project Docs (2 files — no redundancy)
+- `ROADMAP.md` — ALL remaining tasks, sprint-organized. Single source of truth.
+- `HANDOFF.md` — Current state, architecture, how to run. One file.
+
 ## Quick Reference — Existing Module Inventory (Do Not Rebuild)
 ADForge: ADCS ESC1-14, ACL abuse, delegation, GPO abuse, BloodHound, DCSync, Golden/Silver tickets, Zerologon, PetitPotam, NoPac, Kerberoast, AS-REP roast, NTLM relay, Pass-the-Hash/Ticket
 

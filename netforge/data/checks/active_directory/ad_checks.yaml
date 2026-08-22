@@ -1,0 +1,401 @@
+id: ldap-anonymous-bind
+name: "LDAP Anonymous Bind Enabled — Root DSE Accessible Without Authentication"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [misconfig, ldap, anonymous, active-directory, reconnaissance]
+target_service: ldap
+target_ports: [389, 3268]
+description: |
+  The LDAP server accepts anonymous binds and returns directory information
+  in response to root DSE queries. An unauthenticated attacker can enumerate
+  domain naming contexts, supported LDAP controls, server capabilities, and
+  potentially user and group objects depending on default ACLs.
+  In Active Directory environments, anonymous LDAP access is disabled by default
+  but may be re-enabled by misconfiguration (dsHeuristics bit 7).
+  MITRE ATT&CK: T1087.002 (Domain Account Discovery), T1069.002 (Domain Groups).
+detection:
+  - type: tcp_probe
+    ports: [389]
+    send: "\x30\x0c\x02\x01\x01\x60\x07\x02\x01\x03\x04\x00\x80\x00"
+    read_bytes: 4096
+    match:
+      - banner_regex: "(?i)(rootDSE|namingContexts|supportedLDAPVersion|currentTime|subschemaSubentry)"
+    match_all: false
+  - type: tcp_probe
+    ports: [3268]
+    match:
+      - banner_regex: "(?i)(rootDSE|namingContexts|supportedSASLMechanisms)"
+    match_all: false
+remediation: |
+  Disable anonymous LDAP bind on all domain controllers via dsHeuristics:
+  set bit 7 of dsHeuristics attribute on CN=Directory Service,CN=Windows NT,CN=Services,CN=Configuration,DC=...
+  Apply 'Restrict Anonymous' Group Policy setting. Verify with:
+  ldapsearch -H ldap://dc01 -x -s base -b "" "(objectClass=*)"
+references:
+  - https://docs.microsoft.com/en-us/troubleshoot/windows-server/identity/anonymous-ldap-operations-active-directory-disabled
+  - https://cwe.mitre.org/data/definitions/306.html
+  - https://attack.mitre.org/techniques/T1087/002/
+---
+id: ldap-signing-not-enforced
+name: "LDAP Signing Not Required — SMB/LDAP Relay Attack Surface"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:H"
+tags: [misconfig, ldap, smb-relay, ntlm-relay, active-directory, signing]
+target_service: ldap
+target_ports: [389, 445]
+description: |
+  LDAP signing is not enforced on domain controllers, allowing NTLM relay
+  attacks from SMB to LDAP. Combined with coercion techniques (PetitPotam,
+  PrinterBug, DFSCoerce), an attacker can relay DC machine account credentials
+  to LDAP to add a computer account, configure shadow credentials (msDS-KeyCredentialLink),
+  or perform resource-based constrained delegation (RBCD) for domain compromise.
+  Tools: ntlmrelayx.py --attack-target ldap://dc01 --escalate-user.
+  NOTE: This check detects LDAP service presence and Windows SMB exposure only.
+  Confirmation that LDAP signing is actually NOT required must be verified
+  manually via ldap-server-signing Nmap script or a controlled relay test.
+  MITRE ATT&CK: T1557.001 (LLMNR/NBT-NS Poisoning), T1649 (Shadow Credentials).
+detection:
+  - type: tcp_probe
+    ports: [389]
+    send: "\x30\x0c\x02\x01\x01\x60\x07\x02\x01\x03\x04\x00\x80\x00"
+    read_bytes: 1024
+    match:
+      - banner_regex: "(?i)(supportedSASLMechanisms|namingContexts|rootDSE)"
+    match_all: false
+  - type: banner
+    ports: [445]
+    match:
+      - banner_regex: "(?i)(NTLMSSP|SMB2)"
+    match_all: false
+remediation: |
+  Enable LDAP server signing requirement via GPO:
+  Computer Configuration > Windows Settings > Security Settings >
+  Local Policies > Security Options > "Domain controller: LDAP server signing requirements" = Require signing.
+  Also enable LDAP channel binding (LdapEnforceChannelBinding = 2).
+  Apply Microsoft ADV190023 guidance. Verify with ldap-server-signing Nmap script.
+references:
+  - https://support.microsoft.com/en-us/topic/microsoft-security-advisory-adv190023-ldap-channel-binding-and-ldap-signing-updates-october-2019-2e30c797-e8d5-4b26-40fc-5c9a79e1049a
+  - https://attack.mitre.org/techniques/T1557/001/
+  - https://dirkjanm.io/worst-of-both-worlds-ntlm-relaying-and-kerberos-delegation/
+---
+id: CVE-2021-42287-CVE-2021-42278-nopac
+cve: CVE-2021-42287
+cves:
+  - CVE-2021-42287
+  - CVE-2021-42278
+name: "noPac — sAMAccountName Spoofing Domain Privilege Escalation"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H"
+tags: [privesc, active-directory, kerberos, nopac, domain-compromise, cisa-kev]
+target_service: kerberos
+target_ports: [88, 445, 389]
+description: |
+  CVE-2021-42278 allows any domain user to rename a machine account to match
+  a DC name (removing the trailing $). CVE-2021-42287 is a Kerberos PAC
+  confusion bug where the KDC looks up the machine name without $ appended,
+  finding the DC instead. Combined, a domain user can obtain a Kerberos service
+  ticket with DC privileges — achieving domain compromise in one chain.
+  Attack tool: noPac.py or Impacket's smbexec.py post-exploitation.
+  Requires one domain user account and MAQ > 0 (default MAQ=10).
+  NOTE: Detection identifies DC presence (Kerberos + LDAP + version) — confirmation
+  of exploitability requires a credentialed check (domain user account) to verify
+  ms-DS-MachineAccountQuota > 0 and that the November 2021 patches are absent.
+  MITRE ATT&CK: T1558.003 (Kerberoasting), T1134.005 (Token Impersonation/Theft).
+detection:
+  - type: tcp_probe
+    ports: [389]
+    send: "\x30\x0c\x02\x01\x01\x60\x07\x02\x01\x03\x04\x00\x80\x00"
+    read_bytes: 1024
+    match:
+      - banner_regex: "(?i)(namingContexts|rootDSE|domainFunctionality)"
+    match_all: false
+  - type: version
+    cpe_vendor: "microsoft"
+    cpe_product: "windows_server_2019"
+    version_range: ">=10.0,<10.0.17763.2300"
+  - type: version
+    cpe_vendor: "microsoft"
+    cpe_product: "windows_server_2016"
+    version_range: ">=10.0,<10.0.14393.4704"
+remediation: |
+  Apply November 2021 Patch Tuesday updates (KB5008380, KB5008102).
+  Reduce Machine Account Quota to 0: Set ms-DS-MachineAccountQuota = 0 on domain root.
+  Monitor for sAMAccountName changes on machine accounts.
+  Detect with Event ID 4741/4742 (computer account creation/modification).
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-42287
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-42278
+  - https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+  - https://exploit.ph/cve-2021-42287-cve-2021-42278-weaponisation.html
+---
+id: CVE-2020-1472-zerologon
+cve: CVE-2020-1472
+name: "Zerologon — Netlogon Null Authentication Indicator (CVE-2020-1472)"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+tags: [rce, active-directory, netlogon, zerologon, cisa-kev, domain-compromise, detection-only]
+target_service: msrpc
+target_ports: [445, 135, 49152]
+description: |
+  A cryptographic flaw in Microsoft Netlogon Remote Protocol (MS-NRPC) allows
+  an unauthenticated attacker to impersonate a domain controller and reset
+  the machine password to empty, achieving immediate domain compromise.
+  The vulnerability exists because AES-CFB8 with all-zero IV and plaintext
+  has a 1/256 probability of producing all-zero ciphertext per block.
+  IMPORTANT — DETECTION ONLY: This check detects DC presence via SMB banner and
+  version fingerprinting ONLY. It does NOT execute the Zerologon authentication
+  probe (which would reset the DC machine password and break AD replication).
+  Severity set to HIGH (not CRITICAL) to reflect detection-only confidence.
+  Confirm exploitability with: zerologon_tester.py <dc-name> <dc-ip> (read-only PoC).
+  DO NOT run full Zerologon exploit — it is destructive in production environments.
+  MITRE ATT&CK: T1190, T1003.006 (DCSync after compromise).
+detection:
+  - type: tcp_probe
+    ports: [445]
+    match:
+      - banner_regex: "(?i)(NTLMSSP|SMB2)"
+    match_all: false
+  - type: version
+    cpe_vendor: "microsoft"
+    cpe_product: "windows_server_2019"
+    version_range: ">=10.0,<10.0.17763.1432"
+  - type: version
+    cpe_vendor: "microsoft"
+    cpe_product: "windows_server_2016"
+    version_range: ">=10.0,<10.0.14393.3930"
+remediation: |
+  Apply Microsoft security update MS20-1472 (August 2020) immediately.
+  Enable "Full enforcement" mode in Netlogon after deploying the update
+  (set FullSecureChannelProtection = 1 registry key).
+  Monitor for Event ID 5829 (Netlogon using vulnerable secure channel).
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2020-1472
+  - https://www.secura.com/blog/zero-logon
+  - https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+---
+id: CVE-2022-26925-petitpotam
+cve: CVE-2022-26925
+name: "PetitPotam — LSARPC NTLM Coercion Surface Indicator (CVE-2022-26925)"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:U/C:H/I:H/A:H"
+tags: [ntlm-relay, active-directory, lsarpc, petitpotam, coercion, adcs, detection-only]
+target_service: msrpc
+target_ports: [445, 135]
+description: |
+  The LSARPC interface (LSA Remote Protocol) allows unauthenticated attackers
+  to coerce a Windows domain controller or server into authenticating to an
+  attacker-controlled machine via EfsRpcOpenFileRaw. Combined with NTLM relay
+  to AD CS HTTP enrollment endpoint, this achieves certificate theft and
+  domain compromise (ESC8 + PetitPotam chain). CVE-2022-26925 is the official
+  CVE for the Windows LSA spoofing variant.
+  DETECTION SCOPE: This check detects that SMB (port 445) and MSRPC (port 135)
+  are accessible, indicating potential LSARPC interface exposure. It does NOT
+  execute PetitPotam coercion. To confirm exploitability, use PetitPotam.py in
+  probe-only mode with a controlled listener (Responder) — do not run against
+  production without operator approval since it triggers authentication callbacks.
+  MITRE ATT&CK: T1557.001, T1649 (Shadow Credentials via ADCS), T1187 (Forced Authentication).
+detection:
+  - type: tcp_probe
+    ports: [445]
+    match:
+      - banner_regex: "(?i)(NTLMSSP|SMB2)"
+    match_all: false
+  - type: tcp_probe
+    ports: [135]
+    send: "\x05\x00\x0b\x03\x10\x00\x00\x00\x48\x00\x00\x00\x01\x00\x00\x00\xb8\x10\xb8\x10\x00\x00\x00\x00"
+    read_bytes: 512
+    match:
+      - banner_regex: "(?i)(MSRPC|\\x05\\x00\\x0c)"
+    match_all: false
+remediation: |
+  Apply May 2022 Patch Tuesday updates. Enable Extended Protection for Authentication (EPA)
+  on AD CS enrollment endpoints. Disable NTLM authentication on domain controllers where possible.
+  Block inbound SMB from DC to non-DC hosts at firewall (prevent coerced auth relay).
+  Enable LDAP signing + channel binding to block relay to LDAP.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2022-26925
+  - https://github.com/topotam/PetitPotam
+  - https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+---
+id: msrpc-lsarpc-unauthenticated
+name: "MSRPC LSARPC Interface Exposed — SMB Named Pipe Accessible"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [exposure, msrpc, lsarpc, active-directory, smb, reconnaissance]
+target_service: smb
+target_ports: [445, 135]
+description: |
+  The LSARPC (Local Security Authority Remote Protocol) interface is exposed
+  via SMB named pipe \PIPE\lsarpc without requiring authentication for the
+  binding step. This interface is used by LSA enumeration tools to query
+  domain trusts, user/group information, and privilege data. Additionally,
+  this is the interface leveraged by PetitPotam (CVE-2022-26925) for NTLM
+  coercion. Open access to this interface increases the attack surface for
+  credential relay and domain reconnaissance.
+  NOTE: Detection fires on any Windows host with SMB accessible. This is an
+  enumeration/exposure finding — not a direct CVE. Report as informational
+  exposure unless combined with AD CS ESC8 or missing EPA configuration.
+  MITRE ATT&CK: T1069.002, T1482 (Domain Trust Discovery).
+detection:
+  - type: tcp_probe
+    ports: [445]
+    match:
+      - banner_regex: "(?i)(NTLMSSP|SMB2)"
+    match_all: false
+remediation: |
+  Apply all Windows security patches. Enable Windows Firewall rules to restrict
+  SMB access to authorized management hosts only. Configure IPSec policies to
+  require mutual authentication for SMB traffic. Block port 445 at perimeter.
+references:
+  - https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-lsad
+  - https://attack.mitre.org/techniques/T1482/
+---
+id: kerberoastable-accounts-indicator
+name: "Kerberoastable Accounts — LDAP Service Exposure Indicator (Requires Credentialed Follow-Up)"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N"
+tags: [kerberoast, active-directory, kerberos, credentials, spn, indicator-only]
+target_service: ldap
+target_ports: [389, 636, 88]
+description: |
+  Service Principal Names (SPNs) are set on domain user accounts, making them
+  targets for Kerberoasting attacks. Any authenticated domain user can request
+  a Kerberos TGS ticket for these accounts, obtain the RC4 or AES encrypted
+  service ticket, and perform offline brute-force cracking of the service account
+  password. Privileged service accounts with SPNs (SQL service accounts, IIS
+  accounts, backup accounts) are high-value targets.
+  IMPORTANT — INDICATOR ONLY: Network-level detection cannot enumerate SPNs
+  without domain credentials. This check confirms LDAP and Kerberos ports are
+  accessible (prerequisite for Kerberoasting), but does NOT confirm that
+  kerberoastable accounts actually exist. A credentialed LDAP query is required:
+    GetUserSPNs.py domain/user:pass -dc-ip <dc-ip> -request
+  or via BloodHound/SharpHound data collection. Severity set to MEDIUM for the
+  exposure indicator; escalate to HIGH if credentialed enumeration confirms SPNs.
+  MITRE ATT&CK: T1558.003 (Kerberoasting).
+detection:
+  - type: tcp_probe
+    ports: [389]
+    send: "\x30\x0c\x02\x01\x01\x60\x07\x02\x01\x03\x04\x00\x80\x00"
+    read_bytes: 1024
+    match:
+      - banner_regex: "(?i)(namingContexts|rootDSE|supportedLDAPVersion)"
+    match_all: false
+remediation: |
+  Audit SPNs on user accounts: Get-ADUser -Filter {ServicePrincipalName -ne "$null"} -Properties ServicePrincipalName.
+  Use Group Managed Service Accounts (gMSA) which have automatically rotated 120-character passwords.
+  Enable AES-only encryption for service accounts (disable RC4): Set-ADUser -KerberosEncryptionType AES256.
+  Monitor for TGS-REQ for user accounts (Event ID 4769 with encryption type 0x17 = RC4).
+references:
+  - https://attack.mitre.org/techniques/T1558/003/
+  - https://docs.microsoft.com/en-us/windows-server/security/group-managed-service-accounts/group-managed-service-accounts-overview
+  - https://adsecurity.org/?p=3458
+---
+id: ldap-global-catalog-no-tls
+name: "LDAP Global Catalog Port 3268 Accessible Without TLS"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N"
+tags: [misconfig, ldap, global-catalog, cleartext, active-directory, credential-exposure]
+target_service: ldap
+target_ports: [3268, 3269]
+description: |
+  The Active Directory Global Catalog is accessible on port 3268 (cleartext LDAP)
+  without requiring TLS. Credentials transmitted during LDAP authentication
+  (SIMPLE bind, NTLM, or Kerberos) on cleartext port 3268 can be intercepted
+  via network-level MitM or passive sniffing. The Global Catalog contains a
+  partial replica of ALL objects in the forest, making it a high-value target.
+  Port 3269 (LDAPS) should be used exclusively for all Global Catalog queries.
+  MITRE ATT&CK: T1040 (Network Sniffing), T1557 (Adversary-in-the-Middle).
+detection:
+  - type: tcp_probe
+    ports: [3268]
+    send: "\x30\x0c\x02\x01\x01\x60\x07\x02\x01\x03\x04\x00\x80\x00"
+    read_bytes: 2048
+    match:
+      - banner_regex: "(?i)(rootDSE|namingContexts|ldap|objectClass)"
+    match_all: false
+remediation: |
+  Enable LDAPS on port 3269 by installing a valid DC certificate.
+  Enforce LDAP channel binding and signing (ADV190023).
+  Block port 3268 at internal network switches for north-south traffic.
+  Use SSL certificate from enterprise CA: configure LDAP over SSL/TLS.
+references:
+  - https://docs.microsoft.com/en-us/previous-versions/windows/it-pro/windows-2000-server/cc978012(v=technet.10)
+  - https://support.microsoft.com/en-us/topic/how-to-enable-ldap-over-ssl-with-a-third-party-certification-authority-776e10d3-a52a-252d-aa21-ed3b1e60ccd7
+---
+id: CVE-2021-34527-printnightmare
+cve: CVE-2021-34527
+name: "PrintNightmare — Windows Print Spooler RCE/LPE Version Indicator (CVE-2021-34527)"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, active-directory, spooler, print, cisa-kev, domain-compromise]
+target_service: msrpc
+target_ports: [445, 135]
+description: |
+  The Windows Print Spooler service fails to restrict access to the
+  RpcAddPrinterDriverEx() and RpcAddPrinterEx() functions. Authenticated
+  domain users can exploit this to load a malicious DLL as SYSTEM (local
+  privilege escalation) or remotely from a domain-joined host (RCE).
+  On domain controllers, this leads to immediate domain compromise.
+  NOTE: Version-based detection triggers on unpatched Windows Server 2019.
+  SMB banner alone does NOT confirm Spooler is running. Confirm spooler
+  status with: rpcdump.py <target> | grep -i spoolss (via Impacket).
+  MITRE ATT&CK: T1547.012 (Print Processors), T1068 (Exploitation for Privesc).
+detection:
+  - type: tcp_probe
+    ports: [445]
+    match:
+      - banner_regex: "(?i)(NTLMSSP|SMB2)"
+    match_all: false
+  - type: version
+    cpe_vendor: "microsoft"
+    cpe_product: "windows_server_2019"
+    version_range: ">=10.0,<10.0.17763.2029"
+remediation: |
+  Apply CVE-2021-34527 security update (KB5004945 and subsequent patches).
+  Disable Print Spooler on all DCs and servers where printing is not required:
+  Stop-Service -Name Spooler -Force; Set-Service -Name Spooler -StartupType Disabled.
+  Restrict inbound RPC to the spooler via Windows Firewall. Use 'Point and Print Restrictions' GPO.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-34527
+  - https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-34527
+  - https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+  - https://github.com/cube0x0/CVE-2021-1675
+---
+id: adcs-web-enrollment-exposed
+name: "Active Directory Certificate Services Web Enrollment Interface Exposed"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N"
+tags: [adcs, active-directory, certsrv, ntlm-relay, esc8, web-enrollment]
+target_service: http
+target_ports: [80, 443]
+description: |
+  The Active Directory Certificate Services (AD CS) web enrollment interface
+  (/certsrv/) is exposed. This interface uses NTLM authentication by default,
+  making it a target for NTLM relay attacks (ESC8). Combined with coercion
+  techniques (PetitPotam, PrinterBug), an attacker can relay DC machine account
+  credentials to the web enrollment endpoint to request a DC certificate,
+  enabling Kerberos PKINIT authentication as the DC and DCSync (domain compromise).
+  MITRE ATT&CK: T1557.001, T1649 (Shadow Credentials), T1003.006 (DCSync).
+detection:
+  - type: http
+    method: GET
+    path: "/certsrv/"
+    match:
+      - status_code: [200, 401]
+      - body_regex: "(?i)(Certificate Services|Microsoft Active Directory Certificate|certsrv\\.asp|certenroll)"
+  - type: http
+    method: GET
+    path: "/certsrv/certrqma.asp"
+    match:
+      - status_code: [200, 401]
+      - body_regex: "(?i)(Microsoft Certificate Services|Web Enrollment|certificate request)"
+    match_all: false
+remediation: |
+  Enable Extended Protection for Authentication (EPA) on all IIS-based AD CS endpoints:
+  set Require SSL and enable Windows Authentication with EPA = Required.
+  Disable NTLM authentication on AD CS web enrollment, require Kerberos only.
+  Apply Microsoft ADV210003. Run Certify.exe or Certipy to audit all enabled templates.
+references:
+  - https://posts.specterops.io/certified-pre-owned-d95910965cd2
+  - https://github.com/ly4k/Certipy
+  - https://docs.microsoft.com/en-us/windows-server/identity/ad-cs/active-directory-certificate-services-overview

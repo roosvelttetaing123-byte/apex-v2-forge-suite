@@ -774,6 +774,127 @@ _CHAIN_DEFINITIONS: list[ChainTrigger] = [
         success_probability=0.55,
         stealth_cost=0.3,
     ),
+    # ── Sprint 0: Leak Intelligence Chains ────────────────────────────
+    ChainTrigger(
+        chain_id="git_leak_to_cred_to_webapp",
+        name="Git Leak → Credential → Internal Web App",
+        trigger_event="finding.confirmed",
+        trigger_types=["git_secret_find", "github_leak", "gitlab_leak", "bitbucket_leak"],
+        next_module="credential_tester",
+        description=(
+            "Secrets discovered in Git repositories (GitHub/GitLab/Bitbucket) "
+            "are extracted and tested against internal web applications, "
+            "then used for authenticated access and further exploitation."
+        ),
+        mitre_tactics=["T1552.001", "T1552.004", "T1078"],
+        opsec_level="STEALTH",
+        auto_execute=True,
+    ),
+    ChainTrigger(
+        chain_id="pastebin_leak_to_vpn",
+        name="Pastebin Leak → VPN/RDP Credential → Perimeter",
+        trigger_event="finding.confirmed",
+        trigger_types=["pastebin_leak", "paste_credential", "paste_dump_leak"],
+        next_module="credential_tester",
+        description=(
+            "Credentials found in paste sites (Pastebin, Ghostbin, Hastebin) "
+            "are tested against VPN portals and RDP gateways for perimeter access."
+        ),
+        mitre_tactics=["T1589.001", "T1078", "T1133"],
+        opsec_level="STEALTH",
+        auto_execute=True,
+    ),
+    ChainTrigger(
+        chain_id="crtsh_to_hidden_subdomain",
+        name="Cert Transparency → Hidden Subdomain → Forgotten App",
+        trigger_event="finding.confirmed",
+        trigger_types=["crtsh_find", "ct_log_subdomain", "internal_subdomain_leak"],
+        next_module="subdomain_probe",
+        description=(
+            "Certificate Transparency logs reveal hidden subdomains that may host "
+            "forgotten, unpatched, or internal-only applications. These are probed "
+            "for outdated software and default credentials."
+        ),
+        mitre_tactics=["T1596.003", "T1590.002", "T1190"],
+        opsec_level="STEALTH",
+        auto_execute=True,
+    ),
+    ChainTrigger(
+        chain_id="shodan_origin_to_cdn_bypass",
+        name="Shodan Origin IP → CDN Bypass → Direct Backend",
+        trigger_event="finding.confirmed",
+        trigger_types=["shodan_origin_find", "origin_ip_discovery", "cdn_bypass"],
+        next_module="direct_ip_probe",
+        description=(
+            "Shodan reveals the real origin IP behind a CDN/WAF. Direct connection "
+            "bypasses WAF protections, enabling exploitation of backend vulnerabilities "
+            "that are normally filtered."
+        ),
+        mitre_tactics=["T1590.004", "T1595.001", "T1190"],
+        opsec_level="STANDARD",
+        auto_execute=True,
+    ),
+    ChainTrigger(
+        chain_id="dns_history_to_stale_auth",
+        name="DNS History → Decommissioned Subdomain → Stale Auth",
+        trigger_event="finding.confirmed",
+        trigger_types=["dns_history", "stale_subdomain", "dangling_cname"],
+        next_module="subdomain_probe",
+        description=(
+            "Historical DNS records reveal decommissioned subdomains with dangling "
+            "CNAME records or expired cloud resources. These are tested for subdomain "
+            "takeover and stale authentication bypass."
+        ),
+        mitre_tactics=["T1596.001", "T1584.001", "T1078"],
+        opsec_level="STEALTH",
+        auto_execute=True,
+    ),
+    # ── Sprint 1: Cloud & Container Chains ────────────────────────────
+    ChainTrigger(
+        chain_id="ssrf_to_cloud_metadata",
+        name="SSRF → Cloud Metadata → IAM Pivot",
+        trigger_event="finding.confirmed",
+        trigger_types=["ssrf", "blind_ssrf", "ssrf_confirmed"],
+        next_module="cloud_api_scanner",
+        description=(
+            "Confirmed SSRF is leveraged to access cloud instance metadata APIs "
+            "(169.254.169.254). Extracted IAM credentials are then used to pivot "
+            "through cloud infrastructure via role assumption and API abuse."
+        ),
+        mitre_tactics=["T1190", "T1552.005", "T1078.004"],
+        opsec_level="STEALTH",
+        auto_execute=True,
+    ),
+    ChainTrigger(
+        chain_id="container_escape_to_host",
+        name="Container Escape → Host → Cloud Creds",
+        trigger_event="finding.confirmed",
+        trigger_types=["container_escape", "docker_escape", "privileged_container"],
+        next_module="cloud_api_scanner",
+        description=(
+            "Container breakout (via cgroup, mount namespace, or Docker socket) "
+            "grants host access. Host-level cloud credentials (instance metadata, "
+            "kubelet certs, cloud CLI configs) are exfiltrated for cloud pivot."
+        ),
+        mitre_tactics=["T1611", "T1552.005", "T1078.004"],
+        opsec_level="STANDARD",
+        auto_execute=True,
+    ),
+    ChainTrigger(
+        chain_id="k8s_pod_to_cluster_admin",
+        name="K8s Pod → Service Account → Cluster Admin",
+        trigger_event="finding.confirmed",
+        trigger_types=["kubectl_pod_exec", "k8s_pod_access", "sa_token_exfil"],
+        next_module="k8s_attack",
+        description=(
+            "Pod-level access is leveraged to extract the mounted service account "
+            "token. The token is used to enumerate RBAC permissions, read secrets, "
+            "and escalate to cluster-admin via role binding abuse."
+        ),
+        mitre_tactics=["T1528", "T1552.001", "T1078"],
+        opsec_level="STANDARD",
+        auto_execute=True,
+    ),
 ]
 
 

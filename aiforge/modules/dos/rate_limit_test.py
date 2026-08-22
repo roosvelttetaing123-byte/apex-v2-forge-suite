@@ -60,6 +60,7 @@ class RateLimitTest(BaseModule):
             model_name=self.config.extra.get("model_name", ""),
             max_tokens=50, temperature=0.0,
             proxy=self.config.extra.get("proxy"),
+            outbound_policy=self.outbound_policy,
         ) as client:
             test_results: list[dict[str, Any]] = []
 

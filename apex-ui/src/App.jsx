@@ -3,7 +3,8 @@ import { Routes, Route } from 'react-router-dom';
 import Sidebar from './components/Sidebar';
 import Button from './components/Button';
 import Card from './components/Card';
-import { API_BASE, NO_AUTH_TOKEN, getAuthToken, setAuthToken } from './config/api';
+import { API_BASE, getAuthToken, setAuthToken } from './config/api';
+import { DASHBOARD_API } from './generated/dashboard-api';
 
 // Pages
 import AutomatedScans from './pages/AutomatedScans';
@@ -26,9 +27,29 @@ import Agents from './pages/Agents';
 import ScanDetail from './pages/ScanDetail';
 import CredentialAnalysis from './pages/CredentialAnalysis';
 
+export const FORGE_UI_VERSION = __FORGE_VERSION__;
+
+const BuildVersion = () => (
+  <div
+    aria-label={`Forge build version ${FORGE_UI_VERSION}`}
+    className="font-mono"
+    style={{
+      position: 'fixed',
+      right: '12px',
+      bottom: '8px',
+      zIndex: 100,
+      color: 'var(--text-very-dim)',
+      fontSize: '10px',
+      letterSpacing: '0.5px',
+      pointerEvents: 'none',
+    }}
+  >
+    FORGE v{FORGE_UI_VERSION}
+  </div>
+);
+
 function App() {
   const [token, setToken] = useState(getAuthToken());
-  const [checkingAuthMode, setCheckingAuthMode] = useState(!getAuthToken());
 
   // Handle SSO exchange code in URL on mount
   useEffect(() => {
@@ -37,8 +58,8 @@ function App() {
     if (ssoCode) {
       // Clean URL immediately
       window.history.replaceState({}, '', window.location.pathname);
-      fetch(`${API_BASE}/api/v1/auth/sso/exchange`, {
-        method: 'POST',
+      fetch(`${API_BASE}${DASHBOARD_API.authSsoExchange.path}`, {
+        method: DASHBOARD_API.authSsoExchange.method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ code: ssoCode }),
       })
@@ -58,47 +79,13 @@ function App() {
     }
   }, []);
 
-  useEffect(() => {
-    if (token) {
-      setCheckingAuthMode(false);
-      return;
-    }
-    let cancelled = false;
-    fetch(`${API_BASE}/api/v1/health`)
-      .then(res => res.ok ? res.json() : null)
-      .then(data => {
-        if (cancelled) return;
-        if (data && data.auth_enabled === false) {
-          setAuthToken(NO_AUTH_TOKEN);
-          setToken(NO_AUTH_TOKEN);
-        }
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (!cancelled) setCheckingAuthMode(false);
-      });
-    return () => { cancelled = true; };
-  }, [token]);
-
-  if (checkingAuthMode) {
-    return (
-      <div style={{
-        minHeight: '100vh',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        background: 'var(--bg-app)',
-        color: 'var(--text-muted)',
-        fontFamily: 'var(--font-mono)',
-        fontSize: '12px',
-      }}>
-        CONNECTING TO DASHBOARD...
-      </div>
-    );
-  }
-
   if (!token) {
-    return <LoginScreen onLogin={setToken} />;
+    return (
+      <>
+        <LoginScreen onLogin={setToken} />
+        <BuildVersion />
+      </>
+    );
   }
 
   return (
@@ -127,6 +114,7 @@ function App() {
           <Route path="/credential-analysis" element={<CredentialAnalysis authToken={token} />} />
         </Routes>
       </main>
+      <BuildVersion />
     </div>
   );
 }
@@ -141,9 +129,9 @@ function LoginScreen({ onLogin }) {
 
   // Check if SSO is available
   useEffect(() => {
-    fetch(`${API_BASE}/api/v1/auth/sso/config`)
+    fetch(`${API_BASE}${DASHBOARD_API.authSsoConfig.path}`)
       .then(r => r.ok ? r.json() : null)
-      .then(data => { if (data?.enabled) setSsoConfig(data); })
+      .then(data => { if (data?.enabled && data?.operational) setSsoConfig(data); })
       .catch(() => {});
   }, []);
 
@@ -162,14 +150,17 @@ function LoginScreen({ onLogin }) {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch(`${API_BASE}/api/v1/auth/login`, {
-        method: 'POST',
+      const res = await fetch(`${API_BASE}${DASHBOARD_API.authLogin.path}`, {
+        method: DASHBOARD_API.authLogin.method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username: username.trim(), password }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.token) {
-        setError(data.detail || 'Login failed');
+        const reason = typeof data.detail === 'string'
+          ? data.detail
+          : data?.detail?.reason_code || data?.reason_code;
+        setError(reason || 'Login failed');
         return;
       }
       setAuthToken(data.token);
@@ -183,12 +174,7 @@ function LoginScreen({ onLogin }) {
 
   const startSSO = () => {
     setSsoLoading(true);
-    window.location.href = `${API_BASE}/api/v1/auth/sso/start?next=${encodeURIComponent(window.location.pathname)}`;
-  };
-
-  const continueWithoutAuth = () => {
-    setAuthToken(NO_AUTH_TOKEN);
-    onLogin(NO_AUTH_TOKEN);
+    window.location.href = `${API_BASE}${DASHBOARD_API.authSsoStart.path}?next=${encodeURIComponent(window.location.pathname)}`;
   };
 
   return (
@@ -234,11 +220,8 @@ function LoginScreen({ onLogin }) {
           <Button variant="primary" onClick={login} disabled={loading || !username.trim() || !password} fullWidth>
             {loading ? 'CONNECTING...' : 'CONNECT'}
           </Button>
-          <Button variant="secondary" onClick={continueWithoutAuth} fullWidth>
-            NO-AUTH DASHBOARD
-          </Button>
           <div className="text-muted" style={{ fontSize: '12px' }}>
-            Use the Forge dashboard account. Default user is operator unless configured otherwise.
+            A valid dashboard account or configured SSO identity is required.
           </div>
         </div>
       </Card>

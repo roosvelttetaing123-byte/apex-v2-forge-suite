@@ -1,0 +1,38 @@
+id: CVE-2021-34473-proxyshell
+cve: CVE-2021-34473
+cves:
+  - CVE-2021-34473
+  - CVE-2021-34523
+  - CVE-2021-31207
+name: "Microsoft Exchange ProxyShell RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, exchange, cisa-kev, proxyshell]
+target_ports: [443, 8443]
+description: |
+  Microsoft Exchange Server ProxyShell vulnerability chain allowing
+  pre-auth RCE via SSRF (CVE-2021-34473), privilege escalation
+  (CVE-2021-34523), and arbitrary file write (CVE-2021-31207).
+detection:
+  - type: http
+    method: GET
+    path: "/autodiscover/autodiscover.json?@test.com/mapi/nspi/?&Email=autodiscover/autodiscover.json%3f@test.com"
+    match:
+      - status_code: 200
+      - body_contains: "Microsoft"
+  - type: http
+    method: GET
+    path: "/autodiscover/autodiscover.json?@test.com/owa/?&Email=autodiscover/autodiscover.json%3F@test.com"
+    match:
+      - status_code: [200, 302]
+  - type: http
+    method: GET
+    path: "/owa/"
+    match:
+      - header_regex: "X-OWA-Version: 15\\."
+      - body_contains: "owa"
+    match_all: false
+remediation: "Apply Microsoft Exchange security updates KB5001779, KB5003435."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-34473
+  - https://msrc.microsoft.com/update-guide/vulnerability/CVE-2021-34473

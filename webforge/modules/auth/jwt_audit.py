@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 WEAK_SECRETS = [
     "secret", "password", "123456", "admin", "test", "key",
@@ -138,6 +139,10 @@ class JwtAudit(BaseModule):
             return self._make_result(start, skipped=True, skip_reason="no token provided")
 
         self.log.info("Auditing JWT token")
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
         await self._audit_token(token, target)
         return self._make_result(start)
 
@@ -154,8 +159,8 @@ class JwtAudit(BaseModule):
         if none_token:
             await self.rate_limit()
             from webforge.core.session import ForgeSession
-            async with ForgeSession(
-                rate=self.config.rate.requests_per_second,
+            async with ForgeSession.from_config(
+                self.config,
                 headers={"Authorization": f"Bearer {none_token}"},
             ) as session:
                 try:
@@ -276,8 +281,8 @@ class JwtAudit(BaseModule):
             await self.rate_limit()
             try:
                 from webforge.core.session import ForgeSession
-                async with ForgeSession(
-                    rate=self.config.rate.requests_per_second,
+                async with ForgeSession.from_config(
+                    self.config,
                     headers={"Authorization": f"Bearer {test_token}"},
                 ) as session:
                     resp = await session.get(target)
@@ -357,8 +362,8 @@ class JwtAudit(BaseModule):
 
             await self.rate_limit()
             from webforge.core.session import ForgeSession
-            async with ForgeSession(
-                rate=self.config.rate.requests_per_second,
+            async with ForgeSession.from_config(
+                self.config,
                 headers={"Authorization": f"Bearer {test_token}"},
             ) as session:
                 resp = await session.get(target)
@@ -413,12 +418,9 @@ class JwtAudit(BaseModule):
         for jwks_url in jwks_urls:
             await self.rate_limit()
             try:
-                import aiohttp
-                async with aiohttp.ClientSession(
-                    connector=aiohttp.TCPConnector(ssl=False)
-                ) as session:
+                async with self.http_session(timeout=5, include_auth=False) as session:
                     async with session.get(
-                        jwks_url, timeout=aiohttp.ClientTimeout(total=5)
+                        jwks_url, timeout=5
                     ) as resp:
                         if resp.status == 200:
                             jwks = await resp.json(content_type=None)
@@ -442,8 +444,8 @@ class JwtAudit(BaseModule):
         await self.rate_limit()
         try:
             from webforge.core.session import ForgeSession
-            async with ForgeSession(
-                rate=self.config.rate.requests_per_second,
+            async with ForgeSession.from_config(
+                self.config,
                 headers={"Authorization": f"Bearer {confused_token}"},
             ) as session:
                 resp = await session.get(target)

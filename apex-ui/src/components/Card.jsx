@@ -1,6 +1,14 @@
 import React from 'react';
 
-const Card = ({ children, className = '', title, headerRight, noPadding = false, style, onClick }) => {
+const Card = ({
+  children,
+  className = '',
+  title = null,
+  headerRight = null,
+  noPadding = false,
+  style = {},
+  onClick = undefined,
+}) => {
   return (
     <div 
       className={`card ${className}`} 

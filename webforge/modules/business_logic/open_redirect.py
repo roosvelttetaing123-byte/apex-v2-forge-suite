@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_OPEN_REDIR = "CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N"
 CVSS40_OPEN_REDIR = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:P/VC:L/VI:L/VA:N/SC:N/SI:N/SA:N"
@@ -70,6 +71,10 @@ class OpenRedirect(BaseModule):
                 ))
 
         self.log.info("Testing %d redirect parameter(s)", len(test_targets))
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         sem = asyncio.Semaphore(3)
         tasks = [self._test_redirect(url, param, target, sem)
@@ -192,8 +197,11 @@ class TestOpenRedirect:
         sem = asyncio.Semaphore(1)
         url = "http://example.com/login?redirect=https://example.com"
 
+        async def fake_rate_limit() -> None:
+            return None
+
         with patch.object(mod, "check_scope", return_value=True), \
-             patch.object(mod, "rate_limit", return_value=asyncio.sleep(0)), \
+             patch.object(mod, "rate_limit", side_effect=fake_rate_limit), \
              patch.object(mod, "http_session", return_value=mock_session_cm):
             # Must complete without raising NameError or any other exception
             asyncio.run(mod._test_redirect(url, "redirect", "http://example.com", sem))

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_MASS_ASSIGN = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:N"
 CVSS40_MASS_ASSIGN = "CVSS:4.0/AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -74,6 +75,10 @@ class MassAssignment(BaseModule):
             test_targets.append((f"{target}{path}", "PATCH"))
 
         self.log.info("Testing %d endpoint(s) for mass assignment", len(test_targets))
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         sem = asyncio.Semaphore(2)
         tasks = [self._test_mass_assign(url, method, target, sem)

@@ -14,12 +14,17 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import NoReturn
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
+from common.action_authorization import protected_credential_reference
+from common.credential_boundary import protected_artifact
 from common.evidence import Evidence
 from common.finding import Severity
+from common.outbound_policy import OutboundDenied, OutboundReason
+from common.redaction import redact_secret_fragments
 
 CVSS_BRUTE      = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
 CVSS40_BRUTE    = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -30,6 +35,11 @@ DEFAULT_PASSWORDS = [
     "admin", "password", "123456", "root", "test", "guest",
     "changeme", "default", "letmein", "welcome", "P@ssw0rd",
 ]
+
+
+def _deny_unmigrated_credential_effect() -> NoReturn:
+    """Keep legacy credential transports inert pending protected adapters."""
+    raise OutboundDenied(OutboundReason.OUTBOUND_POLICY_UNSUPPORTED)
 
 
 class HydraWrap(BaseModule):
@@ -73,22 +83,16 @@ class HydraWrap(BaseModule):
     async def _run_hydra(
         self, hydra: str, host: str, port: int, service: str
     ) -> None:
-        # Create temp user/pass files
-        import tempfile
-        import os
-
-        user_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
-        pass_file = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
-
+        _deny_unmigrated_credential_effect()
         users = self.config.extra.get("brute_users", DEFAULT_USERS)
         passwords = self.config.extra.get("brute_passwords", DEFAULT_PASSWORDS)
+        user_data = "\n".join(users).encode("utf-8")
+        password_data = "\n".join(passwords).encode("utf-8")
 
-        user_file.write("\n".join(users))
-        user_file.close()
-        pass_file.write("\n".join(passwords))
-        pass_file.close()
-
-        try:
+        with (
+            protected_artifact(user_data, suffix=".txt") as user_artifact,
+            protected_artifact(password_data, suffix=".txt") as password_artifact,
+        ):
             # Map service names to hydra protocols
             hydra_service = {
                 "ssh": "ssh", "ftp": "ftp", "rdp": "rdp",
@@ -99,8 +103,8 @@ class HydraWrap(BaseModule):
             threads = self.config.extra.get("hydra_threads", 4)
             cmd = [
                 hydra,
-                "-L", user_file.name,
-                "-P", pass_file.name,
+                "-L", str(user_artifact.path),
+                "-P", str(password_artifact.path),
                 "-s", str(port),
                 "-t", str(threads),
                 "-f",  # Stop after first valid pair
@@ -124,46 +128,14 @@ class HydraWrap(BaseModule):
                 r"\[(\d+)\]\[(\S+)\]\s+host:\s+(\S+)\s+login:\s+(\S+)\s+password:\s+(\S*)",
                 output,
             ):
-                found_port, found_svc, found_host, user, password = m.groups()
-                ev = Evidence(
-                    request_raw=f"hydra -l {user} -p {password} {host} {service}",
-                    extra={
-                        "host": host, "port": port, "service": service,
-                        "username": user, "password": password or "(empty)",
-                    },
-                )
-                self.new_finding(
-                    title=f"Brute Force Success — {user}:{password}@{host}:{port}/{service}",
-                    severity=Severity.CRITICAL,
-                    description=(
-                        f"Valid credentials found via brute force:\n"
-                        f"  Host: {host}:{port}\n"
-                        f"  Service: {service}\n"
-                        f"  Username: {user}\n"
-                        f"  Password: {password or '(empty)'}"
-                    ),
-                    reproduction_steps=[
-                        f"hydra -l {user} -p '{password}' -s {port} {host} {service}",
-                    ],
-                    remediation=(
-                        "1. Change the password immediately\n"
-                        "2. Implement account lockout after failed attempts\n"
-                        "3. Enable MFA where possible\n"
-                        "4. Use strong password policy"
-                    ),
-                    references=["CWE-307", "CWE-521"],
-                    evidence=ev,
-                    cvss_v31_vector=CVSS_BRUTE,
-                    cvss_v40_vector=CVSS40_BRUTE,
-                    mitre_attack=["TA0006/T1110"],
-                    port=port, service=service, target=host,
-                )
-        finally:
-            os.unlink(user_file.name)
-            os.unlink(pass_file.name)
+                _found_port, _found_svc, _found_host, user, password = m.groups()
+                # Target/service facts come from the authorized invocation,
+                # never from subprocess-controlled output text.
+                self._report_success(host, port, service, user, password)
 
     async def _builtin_brute(self, target: str) -> None:
         """Minimal built-in SSH brute force when hydra is not available."""
+        _deny_unmigrated_credential_effect()
         try:
             import paramiko
         except ImportError:
@@ -174,31 +146,97 @@ class HydraWrap(BaseModule):
                 await self.rate_limit()
                 try:
                     client = paramiko.SSHClient()
-                    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    client.load_system_host_keys()
+                    client.set_missing_host_key_policy(paramiko.RejectPolicy())
                     client.connect(
                         target, port=22, username=user, password=password,
                         timeout=5, look_for_keys=False, allow_agent=False,
                     )
                     client.close()
 
-                    ev = Evidence(
-                        extra={"username": user, "password": password, "service": "ssh"},
-                    )
-                    self.new_finding(
-                        title=f"SSH Brute Force Success — {user}@{target}:22",
-                        severity=Severity.CRITICAL,
-                        description=f"SSH login with {user}:{password} on {target}:22",
-                        reproduction_steps=[f"ssh {user}@{target}  # password: {password}"],
-                        remediation="Change password. Enable MFA. Disable password auth (use keys).",
-                        references=["CWE-307"],
-                        evidence=ev,
-                        cvss_v31_vector=CVSS_BRUTE,
-                        cvss_v40_vector=CVSS40_BRUTE,
-                        port=22, service="ssh", target=target,
-                    )
+                    self._report_success(target, 22, "ssh", user, password)
                     return
                 except Exception:
                     pass
+
+    def _report_success(
+        self,
+        host: str,
+        port: int,
+        service: str,
+        username: str,
+        password: str,
+    ) -> None:
+        """Report only a protected reference; keep parsed plaintext transient."""
+        secret_values = (password,)
+        safe_host = redact_secret_fragments(host, secret_values)
+        safe_service = redact_secret_fragments(service, secret_values)
+        safe_username = redact_secret_fragments(username, secret_values)
+        reference = protected_credential_reference(
+            {
+                "host": safe_host,
+                "service": safe_service,
+                "username": safe_username,
+                "source": self.NAME,
+            }
+        )
+        cred_engine = self.config.extra.get("cred_engine")
+        if cred_engine is not None and callable(getattr(cred_engine, "add", None)):
+            try:
+                stored = cred_engine.add(
+                    safe_host,
+                    safe_service,
+                    safe_username,
+                    password=password,
+                    source=self.NAME,
+                )
+                safe = stored.to_dict()
+                reference = str(safe.get("credential_reference") or reference)
+            except Exception:
+                self.log.debug("Credential reference storage failed")
+
+        ev = Evidence(
+            request_raw=(
+                f"credential attempt via protected reference {reference} "
+                f"for {safe_host}:{port}/{safe_service}"
+            ),
+            extra={
+                "host": safe_host,
+                "port": port,
+                "service": safe_service,
+                "username": safe_username,
+                "credential_reference": reference,
+            },
+        )
+        self.new_finding(
+            title=(
+                f"Brute Force Success — "
+                f"{safe_username}@{safe_host}:{port}/{safe_service}"
+            ),
+            severity=Severity.CRITICAL,
+            description=(
+                "Valid credentials were found via bounded authentication attempts.\n"
+                f"Host: {safe_host}:{port}\nService: {safe_service}\n"
+                f"Username: {safe_username}\nCredential reference: {reference}"
+            ),
+            reproduction_steps=[
+                f"Use the protected credential reference for retest: {reference}",
+            ],
+            remediation=(
+                "1. Change the password immediately\n"
+                "2. Implement account lockout after failed attempts\n"
+                "3. Enable MFA where possible\n"
+                "4. Use strong password policy"
+            ),
+            references=["CWE-307", "CWE-521"],
+            evidence=ev,
+            cvss_v31_vector=CVSS_BRUTE,
+            cvss_v40_vector=CVSS40_BRUTE,
+            mitre_attack=["TA0006/T1110"],
+            port=port,
+            service=safe_service,
+            target=safe_host,
+        )
 
 
 class TestHydraWrap:

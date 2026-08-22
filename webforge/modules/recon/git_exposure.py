@@ -62,6 +62,23 @@ REMOTE_URL_RE     = re.compile(r"url\s*=\s*(.+)",                               
 COMMITTER_RE      = re.compile(r"^(?:author|committer)\s+(.+?)\s+<([^>]+)>",     re.MULTILINE)
 SHA1_RE           = re.compile(r"^[0-9a-f]{40}$")
 
+# Regex to extract cloud/internal hostname from committer email fields in git reflog.
+# Matches hostnames in commit identity email fields that reveal deployment infrastructure:
+#   root@ip-172-31-43-73.ap-southeast-1.compute.internal  → AWS region + private IP
+#   deploy@prdsrv01.corp.internal                         → internal hostname
+REFLOG_HOST_RE = re.compile(
+    r"@([a-zA-Z0-9][a-zA-Z0-9.\-]*\."
+    r"(?:internal|local|corp|lan|intranet|compute\.internal|compute\.amazonaws\.com))",
+    re.IGNORECASE,
+)
+# AWS EC2 hostname pattern: ip-A-B-C-D.region.compute.internal → extract IP and region
+AWS_HOST_RE = re.compile(
+    r"ip-(\d+)-(\d+)-(\d+)-(\d+)\.([\w-]+-\d+)\.compute\.internal",
+    re.IGNORECASE,
+)
+# Private IPv4 ranges embedded in hostnames (AWS style)
+PRIVATE_IP_PREFIXES = ("10.", "172.", "192.168.")
+
 
 class GitExposure(BaseModule):
     """Exposed .git directory detector and source code dumper."""
@@ -354,35 +371,134 @@ class GitExposure(BaseModule):
                 self.log.info("Git remote URLs found: %s", remote_urls[:3])
 
     def _extract_committer_intel(self, logs_head: str, target: str) -> None:
-        """Extract unique committer identities from git reflog."""
+        """Extract committer identities and deployment infrastructure from git reflog.
+
+        Parses both identity entries (author/committer lines) and reflog operation
+        entries. Reflog entries use the format:
+          <old-sha> <new-sha> Name <email> <timestamp> <tz>\t<action>
+        When deployments are done manually on production servers the email field
+        contains the server hostname, e.g.:
+          root <root@ip-172-31-43-73.ap-southeast-1.compute.internal>
+        This passively discloses cloud provider, region, VPC subnet, and privilege level.
+        """
         committers: set[tuple[str, str]] = set()
         for m in COMMITTER_RE.finditer(logs_head):
             committers.add((m.group(1).strip(), m.group(2).strip()))
-        if not committers:
+
+        if committers:
+            committer_list = "\n".join(f"  • {n} <{e}>" for n, e in sorted(committers))
+            ev = Evidence(
+                response_raw=logs_head[:400],
+                extra={"committers": [{"name": n, "email": e} for n, e in sorted(committers)]},
+            )
+            self.new_finding(
+                title=f"Git History — Committer PII Exposed ({len(committers)} contributor(s))",
+                severity=Severity.MEDIUM,
+                description=(
+                    f".git/logs/HEAD at {target} reveals contributor identities "
+                    "enabling spear-phishing and developer targeting.\n\n"
+                    f"{committer_list}"
+                ),
+                reproduction_steps=[
+                    f"curl {target}/.git/logs/HEAD",
+                    "grep -oE '(author|committer) .+ <[^>]+>' .git/logs/HEAD | sort -u",
+                ],
+                remediation="Block HTTP access to /.git/. Avoid personal email addresses in git commits.",
+                references=["CWE-538", "OWASP A05:2021"],
+                evidence=ev,
+                cvss_v31_vector=CVSS_GIT_EXPOSED,
+                cvss_v40_vector=CVSS40_GIT_EXPOSED,
+                mitre_attack=["TA0043/T1589.002"],
+                target=target,
+                url=f"{target}/.git/logs/HEAD",
+            )
+
+        self._extract_infra_from_reflog(logs_head, target)
+
+    def _extract_infra_from_reflog(self, logs_head: str, target: str) -> None:
+        """Parse git reflog for server hostnames that reveal deployment infrastructure.
+
+        When ops teams run 'git pull' or 'git clone' directly on production servers,
+        the reflog records the committer identity as 'user@hostname'. Internal or
+        cloud hostnames in these fields passively disclose the full deployment stack.
+        """
+        internal_hosts: set[str] = set()
+        aws_regions:    set[str] = set()
+        private_ips:    set[str] = set()
+        root_deploys    = False
+
+        all_emails: list[str] = []
+        for line in logs_head.splitlines():
+            # Reflog entry format: <sha> <sha> Name <email> <ts> <tz>\t<msg>
+            bracket = line.find("<")
+            end     = line.find(">", bracket) if bracket != -1 else -1
+            if bracket != -1 and end != -1:
+                all_emails.append(line[bracket + 1:end])
+
+        for email in all_emails:
+            if email.startswith("root@"):
+                root_deploys = True
+
+            m_aws = AWS_HOST_RE.search(email)
+            if m_aws:
+                ip  = f"{m_aws.group(1)}.{m_aws.group(2)}.{m_aws.group(3)}.{m_aws.group(4)}"
+                region = m_aws.group(5)
+                private_ips.add(ip)
+                aws_regions.add(region)
+                internal_hosts.add(email.split("@", 1)[1])
+                continue
+
+            m_host = REFLOG_HOST_RE.search(email)
+            if m_host:
+                internal_hosts.add(m_host.group(1))
+
+        if not (internal_hosts or private_ips or aws_regions):
             return
-        committer_list = "\n".join(f"  • {n} <{e}>" for n, e in sorted(committers))
+
+        parts: list[str] = []
+        if aws_regions:
+            parts.append(f"Cloud provider: AWS — region(s): {', '.join(sorted(aws_regions))}")
+        if private_ips:
+            parts.append(f"Internal IPs discovered: {', '.join(sorted(private_ips))}")
+        if internal_hosts:
+            parts.append(f"Internal hostnames: {', '.join(sorted(internal_hosts))}")
+        if root_deploys:
+            parts.append("Deployments running as root (no privilege separation on production servers)")
+
+        desc = (
+            f".git/logs/HEAD at {target} contains server hostname(s) in committer "
+            "identity fields, revealing deployment infrastructure:\n\n"
+            + "\n".join(f"  • {p}" for p in parts)
+            + "\n\nThis information is valuable for pivoting: internal IPs are candidates "
+            "for SSRF targets; AWS regions confirm cloud provider and aid in attack surface mapping."
+        )
         ev = Evidence(
-            response_raw=logs_head[:400],
-            extra={"committers": [{"name": n, "email": e} for n, e in sorted(committers)]},
+            response_raw=logs_head[:500],
+            extra={
+                "internal_hosts": sorted(internal_hosts),
+                "private_ips":    sorted(private_ips),
+                "aws_regions":    sorted(aws_regions),
+                "root_deploys":   root_deploys,
+            },
         )
         self.new_finding(
-            title=f"Git History — Committer PII Exposed ({len(committers)} contributor(s))",
-            severity=Severity.MEDIUM,
-            description=(
-                f".git/logs/HEAD at {target} reveals contributor identities "
-                "enabling spear-phishing and developer targeting.\n\n"
-                f"{committer_list}"
-            ),
+            title=f"Git Reflog — Internal Infrastructure Disclosed via Committer Hostnames",
+            severity=Severity.HIGH,
+            description=desc,
             reproduction_steps=[
                 f"curl {target}/.git/logs/HEAD",
-                "grep -oE '(author|committer) .+ <[^>]+>' .git/logs/HEAD | sort -u",
+                r"grep -oP '(?<=<)[^>]+(?=>)' .git/logs/HEAD | grep -E '\.(internal|local|corp)$'",
             ],
-            remediation="Block HTTP access to /.git/. Avoid personal email addresses in git commits.",
-            references=["CWE-538", "OWASP A05:2021"],
+            remediation=(
+                "Block HTTP access to /.git/ (see git exposure finding). "
+                "Use CI/CD pipelines for deployments — never run git commands "
+                "as root directly on production servers."
+            ),
+            references=["CWE-200", "OWASP A05:2021"],
             evidence=ev,
             cvss_v31_vector=CVSS_GIT_EXPOSED,
             cvss_v40_vector=CVSS40_GIT_EXPOSED,
-            mitre_attack=["TA0043/T1589.002"],
+            mitre_attack=["TA0043/T1592", "TA0007/T1016"],
             target=target,
             url=f"{target}/.git/logs/HEAD",
         )

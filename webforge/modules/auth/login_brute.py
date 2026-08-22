@@ -6,6 +6,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import NoReturn
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
@@ -13,6 +14,8 @@ from common.base_module import BaseModule, ModuleResult
 from common.confirm_gate import confirm
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
+from common.outbound_policy import OutboundDenied, OutboundReason
 
 CVSS_BRUTE  = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
 CVSS40_BRUTE = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -39,6 +42,11 @@ SUCCESS_INDICATORS = [
 ]
 
 
+def _deny_unmigrated_credential_effect() -> NoReturn:
+    """Keep legacy credential transports inert pending protected adapters."""
+    raise OutboundDenied(OutboundReason.OUTBOUND_POLICY_UNSUPPORTED)
+
+
 class LoginBrute(BaseModule):
     """Login brute force with lockout detection and confirm gate."""
 
@@ -53,6 +61,10 @@ class LoginBrute(BaseModule):
         if not self.check_scope(target):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
         # Find login forms
         login_url, user_field, pass_field = await self._find_login_form(target)
         if not login_url:
@@ -122,6 +134,7 @@ class LoginBrute(BaseModule):
         self, target: str
     ) -> tuple[str | None, str, str]:
         """Find a login form and identify username/password field names."""
+        _deny_unmigrated_credential_effect()
         paths = ["", "/login", "/signin", "/auth", "/user/login", "/admin",
                  "/account/login", "/wp-login.php"]
 
@@ -178,6 +191,7 @@ class LoginBrute(BaseModule):
         self, url: str, user_field: str, pass_field: str,
         username: str, password: str
     ) -> str | None:
+        _deny_unmigrated_credential_effect()
         try:
             import aiohttp
             data = {user_field: username, pass_field: password}

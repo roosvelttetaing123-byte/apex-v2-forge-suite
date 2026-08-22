@@ -50,6 +50,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
+from common.framework_params import is_framework_param
 
 CVSS_LOG4SHELL    = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
 CVSS40_LOG4SHELL  = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H/SC:H/SI:H/SA:H"
@@ -125,9 +127,24 @@ class Log4ShellScanner(BaseModule):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
         self.log.info("Starting Log4Shell scan on %s", target)
+        # Initialise FPReducer for false-positive verification
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         collab = self.config.extra.get("collab_client")
         oob_domain = self.config.extra.get("oob_domain", "")
+
+        # JNDI/DNS callback destinations are delegated egress and cannot
+        # inherit the target's module envelope.  The current ForgeCollab
+        # launch contract does not carry an exact, consumed OOB authorization,
+        # so stop before constructing a payload or opening the target session.
+        return self._make_result(
+            start,
+            skipped=True,
+            skip_reason="oob_destination_not_authorized",
+        )
 
         # Register a unique token with ForgeCollab (if available)
         token = uuid.uuid4().hex[:16]
@@ -137,11 +154,17 @@ class Log4ShellScanner(BaseModule):
         elif oob_domain:
             callback_host = f"{token}.{oob_domain}"
         else:
-            # No OOB — use a known-safe canary that will never get a callback
-            # but the payload injection still tests for error responses
-            callback_host = f"{token}.burpcollaborator.net"
+            return self._make_result(
+                start,
+                skipped=True,
+                skip_reason="oob_destination_not_authorized",
+            )
 
         payloads = _build_payloads(callback_host)
+        # Test all crawled URLs, not just target
+        urls_to_test = self.config.extra.get("crawled_urls", [target])[:15]
+        if target not in urls_to_test:
+            urls_to_test.insert(0, target)
 
         # Track which headers/fields triggered (for evidence)
         triggered_surfaces: list[str] = []
@@ -319,6 +342,7 @@ class Log4ShellScanner(BaseModule):
                 data = {field: "test" for field in inputs}
                 # Inject into username/password fields
                 for field_name in inputs:
+                    if is_framework_param(field_name): continue
                     if any(kw in field_name.lower() for kw in ["user", "email", "login", "name"]):
                         data[field_name] = payload
                     elif any(kw in field_name.lower() for kw in ["pass", "pwd", "secret"]):
@@ -408,7 +432,18 @@ class TestLog4ShellScanner:
     def test_payload_contains_jndi(self) -> None:
         payloads = _build_payloads("cb.example.com")
         for p in payloads:
-            assert "jndi" in p.lower() or "%24%7B" in p or "jndi" in p.replace("%3A", ":").lower()
+            normalized = (
+                p.lower()
+                .replace("${lower:j}", "j")
+                .replace("${upper:j}", "j")
+                .replace("${upper:n}", "n")
+                .replace("${::-j}", "j")
+                .replace("${::-n}", "n")
+                .replace("${::-d}", "d")
+                .replace("${::-i}", "i")
+                .replace("%3a", ":")
+            )
+            assert "jndi" in normalized or "%24%7b" in normalized
 
     def test_lower_bypass_variant(self) -> None:
         payloads = _build_payloads("cb.example.com")

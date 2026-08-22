@@ -4,14 +4,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import ssl
 import time
 from typing import Any
 
 import aiohttp
-from aiohttp import ClientSession, ClientTimeout, TCPConnector
 
 from common.config import BaseForgeConfig
+from common.outbound_policy import (
+    OutboundDenied,
+    OutboundPolicy,
+    OutboundReason,
+    PolicyHttpClient,
+    PolicyResponse,
+    _normalized_proxy_origin,
+)
 
 log = logging.getLogger(__name__)
 
@@ -24,21 +30,25 @@ class ForgeSession:
         rate: float = 10.0,
         proxy: str | None = None,
         timeout: int = 30,
-        verify_ssl: bool = False,
+        verify_ssl: bool = True,
         headers: dict[str, str] | None = None,
         cookies: dict[str, str] | None = None,
+        cookie_provenance: dict[str, dict[str, Any]] | None = None,
+        outbound_policy: OutboundPolicy | None = None,
     ) -> None:
         self.rate = rate
         self.proxy = proxy
-        self.timeout = ClientTimeout(total=timeout)
+        self.timeout = float(timeout)
         self.verify_ssl = verify_ssl
+        self.outbound_policy = outbound_policy
         self.base_headers: dict[str, str] = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
             "Accept-Encoding": "gzip, deflate",  # avoid brotli — not natively decoded by aiohttp
             **(headers or {}),
         }
         self.base_cookies = cookies or {}
-        self._session: ClientSession | None = None
+        self.cookie_provenance = cookie_provenance or {}
+        self._session: PolicyHttpClient | None = None
         self._last_request: float = 0.0
         self.request_count: int = 0
 
@@ -50,17 +60,22 @@ class ForgeSession:
         await self.close()
 
     async def start(self) -> None:
-        """Create the underlying aiohttp session."""
-        ssl_ctx = ssl.create_default_context()
-        if not self.verify_ssl:
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
-        connector = TCPConnector(ssl=ssl_ctx, limit=50, limit_per_host=10)
-        self._session = ClientSession(
-            connector=connector,
-            timeout=self.timeout,
+        """Create the policy client without session-wide credential defaults."""
+        if self.outbound_policy is None:
+            raise OutboundDenied(OutboundReason.AUTHORIZATION_INVALID)
+        if not self.verify_ssl and not self.outbound_policy.context.lab_only_insecure_tls:
+            raise OutboundDenied(OutboundReason.INSECURE_TLS_NOT_AUTHORIZED)
+        if self.proxy:
+            route = self.outbound_policy.context.route
+            if route is None:
+                raise OutboundDenied(OutboundReason.ROUTE_REQUIRED)
+            if _normalized_proxy_origin(self.proxy) != route.proxy_url:
+                raise OutboundDenied(OutboundReason.ROUTE_BINDING_MISMATCH)
+        self._session = PolicyHttpClient(
+            self.outbound_policy,
             headers=self.base_headers,
             cookies=self.base_cookies,
+            cookie_provenance=self.cookie_provenance,
         )
 
     async def close(self) -> None:
@@ -76,52 +91,48 @@ class ForgeSession:
             await asyncio.sleep(min_interval - elapsed)
         self._last_request = time.monotonic()
 
-    async def get(self, url: str, **kwargs: Any) -> aiohttp.ClientResponse:
+    async def get(self, url: str, **kwargs: Any) -> PolicyResponse:
         """Rate-limited GET request."""
         return await self._request("GET", url, **kwargs)
 
-    async def post(self, url: str, **kwargs: Any) -> aiohttp.ClientResponse:
+    async def post(self, url: str, **kwargs: Any) -> PolicyResponse:
         """Rate-limited POST request."""
         return await self._request("POST", url, **kwargs)
 
     async def _request(
         self, method: str, url: str, retries: int = 3, **kwargs: Any
-    ) -> aiohttp.ClientResponse:
-        """Execute a rate-limited HTTP request with exponential backoff retry."""
+    ) -> PolicyResponse:
+        """Execute a rate-limited request through the canonical policy client."""
         assert self._session, "Session not started — use async with ForgeSession()"
         await self._rate_limit()
-        kwargs.setdefault("proxy", self.proxy)
         kwargs.setdefault("allow_redirects", True)
-        last_exc: Exception | None = None
-        for attempt in range(retries):
-            try:
-                resp = await self._session.request(method, url, **kwargs)
-                self.request_count += 1
-                if resp.status == 429:
-                    wait = min(2 ** attempt * 2, 30)
-                    log.debug("Rate limited by server — waiting %ds", wait)
-                    await asyncio.sleep(wait)
-                    continue
-                return resp
-            except asyncio.TimeoutError as exc:
-                last_exc = exc
-                await asyncio.sleep(2 ** attempt)
-            except aiohttp.ClientError as exc:
-                last_exc = exc
-                await asyncio.sleep(1)
-        raise last_exc or RuntimeError(f"Request failed after {retries} retries: {url}")
+        kwargs.setdefault("retries", max(0, retries - 1))
+        kwargs.setdefault("timeout", self.timeout)
+        response = await self._session.request(method, url, **kwargs)
+        self.request_count += 1
+        return response
 
     def update_headers(self, headers: dict[str, str]) -> None:
         """Update session headers (e.g., after login)."""
         self.base_headers.update(headers)
         if self._session:
-            self._session.headers.update(headers)
+            self._session.update_headers(headers)
 
-    def update_cookies(self, cookies: dict[str, str]) -> None:
+    def update_cookies(
+        self,
+        cookies: dict[str, str],
+        *,
+        cookie_provenance: dict[str, dict[str, Any]] | None = None,
+    ) -> None:
         """Update session cookies."""
         self.base_cookies.update(cookies)
+        if cookie_provenance:
+            self.cookie_provenance.update(cookie_provenance)
         if self._session:
-            self._session.cookie_jar.update_cookies(cookies)
+            self._session.update_cookies(
+                cookies,
+                cookie_provenance=cookie_provenance,
+            )
 
     @classmethod
     def from_config(
@@ -153,12 +164,21 @@ class ForgeSession:
 
         merged_headers.update(headers or {})
         merged_cookies.update(cookies or {})
+        outbound_policy = config.extra.get("outbound_policy")
+        if not isinstance(outbound_policy, OutboundPolicy):
+            outbound_policy = None
         return cls(
             rate=config.rate.requests_per_second,
             proxy=config.extra.get("proxy") or config.proxy,
             timeout=timeout,
             headers=merged_headers,
             cookies=merged_cookies,
+            cookie_provenance=(
+                config.extra.get("session_cookie_provenance", {})
+                if include_auth
+                else {}
+            ),
+            outbound_policy=outbound_policy,
         )
 
 

@@ -394,7 +394,11 @@ class SchemaImporter:
 
 # ── Async helpers for live introspection ──────────────────────────────────────
 
-async def fetch_graphql_schema(url: str, headers: dict | None = None) -> SchemaImportResult:
+async def fetch_graphql_schema(
+    url: str,
+    headers: dict | None = None,
+    outbound_policy: Any = None,
+) -> SchemaImportResult:
     """Run a GraphQL introspection query against a live endpoint."""
     introspection_query = {
         "query": """
@@ -413,13 +417,18 @@ async def fetch_graphql_schema(url: str, headers: dict | None = None) -> SchemaI
             }
         """
     }
+    if outbound_policy is None:
+        return SchemaImportResult(
+            format="graphql",
+            errors=["outbound policy authorization is required for live schema fetch"],
+        )
     try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
+        from common.outbound_policy import PolicyHttpClient
+        async with PolicyHttpClient(outbound_policy) as session:
             async with session.post(
                 url, json=introspection_query,
                 headers={**(headers or {}), "Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=10,
             ) as resp:
                 data = await resp.json()
                 importer = SchemaImporter(base_url=url.rsplit("/", 1)[0])
@@ -428,14 +437,23 @@ async def fetch_graphql_schema(url: str, headers: dict | None = None) -> SchemaI
         return SchemaImportResult(format="graphql", errors=[str(exc)])
 
 
-async def fetch_openapi_spec(url: str, headers: dict | None = None) -> SchemaImportResult:
+async def fetch_openapi_spec(
+    url: str,
+    headers: dict | None = None,
+    outbound_policy: Any = None,
+) -> SchemaImportResult:
     """Fetch and parse an OpenAPI/Swagger spec from a live URL."""
+    if outbound_policy is None:
+        return SchemaImportResult(
+            format="openapi",
+            errors=["outbound policy authorization is required for live schema fetch"],
+        )
     try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
+        from common.outbound_policy import PolicyHttpClient
+        async with PolicyHttpClient(outbound_policy) as session:
             async with session.get(
                 url, headers=headers or {},
-                timeout=aiohttp.ClientTimeout(total=10),
+                timeout=10,
             ) as resp:
                 text = await resp.text()
                 data = json.loads(text)

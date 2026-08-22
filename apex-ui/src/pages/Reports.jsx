@@ -25,10 +25,10 @@ const Reports = () => {
         {/* ROW 0: Stats */}
         <div style={{ display: 'flex', gap: '14px' }}>
           {[
-            { label: 'TOTAL REPORTS', value: '2,041', icon: FileText, color: 'var(--color-info)' },
-            { label: 'THIS MONTH', value: '14', icon: TrendingUp, color: 'var(--color-success)' },
-            { label: 'PDF', value: '1,847', icon: Download, color: 'var(--color-critical)' },
-            { label: 'HTML / DOCX', value: '194', icon: FileCheck, color: 'var(--color-medium)' },
+            { label: 'TOTAL REPORTS', value: '0', icon: FileText, color: 'var(--color-info)' },
+            { label: 'THIS MONTH', value: '0', icon: TrendingUp, color: 'var(--color-success)' },
+            { label: 'PDF', value: '0', icon: Download, color: 'var(--color-critical)' },
+            { label: 'HTML / DOCX', value: '0', icon: FileCheck, color: 'var(--color-medium)' },
           ].map(stat => (
             <Card key={stat.label} style={{ flex: 1 }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
@@ -78,27 +78,11 @@ const Reports = () => {
               </tr>
             </thead>
             <tbody>
-              {[
-                { id: 'RPT-2041', title: 'PHANTOM REACH — Executive Summary', fmt: 'PDF', date: '2025-06-19', op: 'Op_Carter', size: '2.4 MB' },
-                { id: 'RPT-2040', title: 'Web App SC-1042 — Technical Report', fmt: 'PDF', date: '2025-06-19', op: 'Op_Torres', size: '18.7 MB' },
-                { id: 'RPT-2039', title: 'PCI-DSS Q2 2025 Compliance Report', fmt: 'PDF', date: '2025-06-18', op: 'System', size: '4.1 MB' },
-                { id: 'RPT-2038', title: 'API Security Assessment — Full', fmt: 'HTML', date: '2025-06-17', op: 'Op_Chen', size: '892 KB' },
-                { id: 'RPT-2037', title: 'Network Infrastructure — Technical', fmt: 'DOCX', date: '2025-06-15', op: 'Op_Reeves', size: '12.3 MB' },
-              ].map((row, i) => (
-                <tr key={i}>
-                  <td className="font-mono text-muted">{row.id}</td>
-                  <td style={{ fontWeight: 500 }}>{row.title}</td>
-                  <td><Badge severity={fmtColor(row.fmt)}>{row.fmt}</Badge></td>
-                  <td className="font-mono text-muted">{row.date}</td>
-                  <td className="text-muted" style={{ fontSize: '12px' }}>{row.op}</td>
-                  <td className="font-mono text-muted">{row.size}</td>
-                  <td>
-                    <Button variant="secondary" style={{ padding: '4px 12px', fontSize: '11px', display: 'inline-flex', alignItems: 'center', gap: '6px' }}>
-                      <Download size={12} /> Download
-                    </Button>
-                  </td>
-                </tr>
-              ))}
+              <tr>
+                <td colSpan={7} style={{ textAlign: 'center', padding: '48px 0', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', fontSize: '12px' }}>
+                  No reports generated yet — select a template above to begin
+                </td>
+              </tr>
             </tbody>
           </table>
         </Card>
@@ -108,7 +92,8 @@ const Reports = () => {
           transform: translateY(-4px);
           box-shadow: 0 8px 24px rgba(0,0,0,0.4);
         }
-      `}</style>
+      `}
+      </style>
     </div>
   );
 };

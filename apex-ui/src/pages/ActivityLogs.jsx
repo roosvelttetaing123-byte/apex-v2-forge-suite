@@ -4,16 +4,7 @@ import Card from '../components/Card';
 import Button from '../components/Button';
 import Badge from '../components/Badge';
 
-const events = [
-  { time: '14:32:01', user: 'Op_Carter', event: 'Scan Started', detail: 'SC-1043 on web-prod-01', ip: '192.168.1.5', result: 'SUCCESS', blocked: false },
-  { time: '14:15:44', user: 'Op_Torres', event: 'Report Generated', detail: 'RPT-2041 Executive Summary', ip: '10.0.1.8', result: 'SUCCESS', blocked: false },
-  { time: '13:58:22', user: 'System', event: 'Auto-Scan Triggered', detail: 'SC-1044 Cloud Config AWS', ip: 'internal', result: 'SUCCESS', blocked: false },
-  { time: '13:44:11', user: 'Op_Reeves', event: 'Target Added', detail: 'production-db-02 to Corp Infra', ip: '192.168.1.12', result: 'SUCCESS', blocked: false },
-  { time: '13:21:03', user: 'admin', event: 'User Created', detail: 'op_reeves@company.com (Operator)', ip: '10.0.0.2', result: 'SUCCESS', blocked: false },
-  { time: '12:55:34', user: 'Op_Carter', event: 'Beacon Connected', detail: 'GHOST-01 @ 192.168.1.45', ip: 'C2 Server', result: 'SUCCESS', blocked: false },
-  { time: '12:33:48', user: 'Op_Chen', event: 'Policy Updated', detail: 'OWASP Top 10 rules modified', ip: '10.0.1.15', result: 'SUCCESS', blocked: false },
-  { time: '11:47:29', user: 'unknown', event: 'Login Failed (×3)', detail: '3 failed attempts detected', ip: '185.220.101.4', result: 'BLOCKED', blocked: true },
-];
+const events = [];
 
 const ActivityLogs = () => {
   return (
@@ -30,9 +21,6 @@ const ActivityLogs = () => {
           />
           <select style={{ height: '36px', width: '140px' }}>
             <option>All Users</option>
-            <option>Op_Carter</option>
-            <option>Op_Torres</option>
-            <option>System</option>
           </select>
           <select style={{ height: '36px', width: '140px' }}>
             <option>All Events</option>
@@ -62,7 +50,13 @@ const ActivityLogs = () => {
               </tr>
             </thead>
             <tbody>
-              {events.map((e, i) => (
+              {events.length === 0 ? (
+                <tr>
+                  <td colSpan={6} style={{ textAlign: 'center', padding: '48px 0', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', fontSize: '12px' }}>
+                    No activity recorded yet
+                  </td>
+                </tr>
+              ) : events.map((e, i) => (
                 <tr
                   key={i}
                   style={{

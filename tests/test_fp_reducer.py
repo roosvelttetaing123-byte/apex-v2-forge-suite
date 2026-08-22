@@ -141,14 +141,24 @@ def test_verify_cmdi_accepts_bounded_output_token(monkeypatch) -> None:
     assert result.probe_hits == 2
 
 
-def test_fp_reducer_timeout_returns_low(monkeypatch) -> None:
-    async def slow_verify(*args, **kwargs):
-        await asyncio.sleep(0.05)
-
-    monkeypatch.setattr(fp_reducer, "verify_xss_reflected", slow_verify)
+def test_fp_reducer_is_inert_until_policy_migration(monkeypatch) -> None:
     reducer = fp_reducer.FPReducer(verify_timeout=0.001)
 
     result = _run(reducer.verify("xss", "http://example.test", "q"))
 
-    assert result.confidence == Confidence.LOW
-    assert "timed out" in result.error
+    assert result.confidence == Confidence.UNVERIFIED
+    assert result.error == "outbound_policy_unsupported"
+    assert result.evidence == ["not_tested:outbound_policy_unsupported"]
+
+
+def test_legacy_http_helpers_make_zero_urlopen_calls(monkeypatch) -> None:
+    import urllib.request
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: pytest.fail("legacy FPReducer opened the network"),
+    )
+
+    assert _run(fp_reducer._http_get("http://example.test"))[0] == 0
+    assert _run(fp_reducer._http_post("http://example.test"))[0] == 0

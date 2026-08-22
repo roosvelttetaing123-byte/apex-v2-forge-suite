@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from common.confidence_policy import normalise_finding, should_include_default
+from common.version import VERSION
 
 log = logging.getLogger("forge.reporting.engine")
 
@@ -149,6 +150,7 @@ class ReportEngine:
         logo_b64 = self._load_logo()
 
         context = {
+            "product_version":   VERSION,
             "engagement":        self.config.engagement,
             "target":            self.config.target,
             "tester":            self.config.tester,

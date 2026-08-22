@@ -5,10 +5,12 @@ import Card from '../components/Card';
 import Button from '../components/Button';
 import Badge from '../components/Badge';
 import CredentialsCard from '../components/CredentialsCard';
-import { Wifi, WifiOff, Brain, CheckCircle, AlertTriangle, XCircle, Square, Pause, Play, RefreshCw, Server, Trash2 } from 'lucide-react';
+import { Wifi, WifiOff, Brain, CheckCircle, AlertTriangle, XCircle, Square, Pause, Play, RefreshCw, Server, Trash2, GitBranch } from 'lucide-react';
 import { useWebSocket } from '../hooks/useWebSocket';
 
 import { apiFetch } from '../config/api';
+import { DASHBOARD_API } from '../generated/dashboard-api';
+import { applyActionConfirmations, dashboardErrorMessage, prepareActionConfirmations } from '../utils/actionConfirmation';
 
 const STATUS_COLOR = {
   running:     'var(--color-high)',
@@ -18,6 +20,28 @@ const STATUS_COLOR = {
   interrupted: 'var(--color-medium)',
   aborted:     'var(--color-critical)',
   orphaned:    'var(--color-medium)',
+};
+
+const BRAIN_CONFIDENCE_PERCENT = {
+  HIGH: 90,
+  MEDIUM: 65,
+  LOW: 35,
+  UNVERIFIED: 10,
+};
+
+const normalizeBrainVerdict = (data = {}) => {
+  const rawConfidence = data.confidence ?? 'UNVERIFIED';
+  const confidenceLabel = String(rawConfidence).toUpperCase();
+  const numericConfidence = Number(rawConfidence);
+  return {
+    finding: data.finding || data.finding_id || '',
+    verdict: data.verdict || 'LIKELY',
+    confidence: Number.isFinite(numericConfidence)
+      ? Math.max(0, Math.min(100, numericConfidence))
+      : (BRAIN_CONFIDENCE_PERCENT[confidenceLabel] ?? 50),
+    confidenceLabel,
+    reason: data.reasoning || data.reason || '',
+  };
 };
 
 const AutomatedScans = ({ authToken }) => {
@@ -31,7 +55,9 @@ const AutomatedScans = ({ authToken }) => {
   // Scan form
   const [target, setTarget]       = useState('');
   const [scanType, setScanType]   = useState('web');
+  const [networkTarget, setNetworkTarget] = useState('');
   const [scanMode, setScanMode]   = useState('blackbox');
+  const [sourceRoot, setSourceRoot] = useState('');
   const [launching, setLaunching] = useState(false);
   const [launchError, setLaunchError] = useState('');
 
@@ -56,6 +82,7 @@ const AutomatedScans = ({ authToken }) => {
   // Live data — cleared on each new scan_start
   const [liveFindings, setLiveFindings]   = useState([]);
   const [brainVerdicts, setBrainVerdicts] = useState([]);
+  const [chainActions, setChainActions]   = useState([]);
 
   // Scan history from backend
   const [scanHistory, setScanHistory]       = useState([]);
@@ -71,7 +98,7 @@ const AutomatedScans = ({ authToken }) => {
 
   const fetchConnection = useCallback(async () => {
     try {
-      const res = await apiFetch('/api/v1/health');
+      const res = await apiFetch(DASHBOARD_API.health.path);
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         setConnection(prev => ({ ...prev, api: 'down', error: data.detail || `HTTP ${res.status}` }));
@@ -92,7 +119,7 @@ const AutomatedScans = ({ authToken }) => {
   const fetchHistory = useCallback(async () => {
     setHistoryLoading(true);
     try {
-      const res = await apiFetch('/api/v1/scans/history');
+      const res = await apiFetch(DASHBOARD_API.scanHistory.path);
       if (res.ok) {
         const data = await res.json();
         setScanHistory(data.history || []);
@@ -126,8 +153,15 @@ const AutomatedScans = ({ authToken }) => {
           target:   f.target || '',
           module:   f.module || '',
           url:      f.url || '',
+          confidence: f.confidence || 'UNVERIFIED',
           time:     (f.timestamp || '').slice(11, 19),
         })));
+      }
+      if (snap.brain_verdicts?.length) {
+        setBrainVerdicts(snap.brain_verdicts.map(normalizeBrainVerdict).slice(-30).reverse());
+      }
+      if (snap.chain_actions?.length) {
+        setChainActions(snap.chain_actions.slice(-30).reverse());
       }
       return;
     }
@@ -138,6 +172,7 @@ const AutomatedScans = ({ authToken }) => {
       case 'scan_start':
         setLiveFindings([]);
         setBrainVerdicts([]);
+        setChainActions([]);
         setScanProgress({ module: '', phase: '', pct: 0 });
         setIsPaused(false);
         setActiveScan({
@@ -227,17 +262,26 @@ const AutomatedScans = ({ authToken }) => {
           target:   data.target || '',
           module:   data.module || '',
           url:      data.url    || data.target || '',
+          confidence: data.confidence || 'UNVERIFIED',
           time:     new Date().toISOString().slice(11, 19),
         }, ...prev].slice(0, 100));
         break;
 
       case 'brain_verdict':
-        setBrainVerdicts(prev => [{
-          finding:    data.finding    || '',
-          verdict:    data.verdict    || 'LIKELY',
-          confidence: data.confidence || 0,
-          reason:     data.reason     || '',
+        setBrainVerdicts(prev => [normalizeBrainVerdict(data), ...prev].slice(0, 30));
+        break;
+
+      case 'chain_action_new':
+        setChainActions(prev => [{
+          chain_type: data.chain_type || data.phase || 'planner_action',
+          source_framework: data.source_framework || data.framework || '',
+          target_framework: data.target_framework || data.framework || '',
+          target_module: data.target_module || data.module || '',
+          target: data.target || '',
+          rationale: data.rationale || '',
+          auto_execute: !!data.auto_execute,
         }, ...prev].slice(0, 30));
+        fetchConnection();
         break;
 
       default:
@@ -257,8 +301,8 @@ const AutomatedScans = ({ authToken }) => {
     setTestingCreds(true);
     setTestResult(null);
     try {
-      const res = await apiFetch('/api/v1/auth/test', {
-        method: 'POST',
+      const res = await apiFetch(DASHBOARD_API.authTest.path, {
+        method: DASHBOARD_API.authTest.method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           auth_type: authType, username, password, token,
@@ -279,6 +323,17 @@ const AutomatedScans = ({ authToken }) => {
 
   const initiateScan = async () => {
     if (!target.trim() || activeScan || launching) return;
+    const requestedTarget = target.trim();
+    const requestedNetworkTarget = networkTarget.trim();
+    if (scanMode === 'whitebox' && scanType !== 'net' && !sourceRoot.trim()) {
+      setLaunchError('Whitebox scans require an absolute canonical source root.');
+      return;
+    }
+    if (scanType === 'vapt' && !requestedNetworkTarget) {
+      setLaunchError('Full VAPT requires a separately approved exact network IP.');
+      return;
+    }
+    if (!window.confirm(`Confirm launching the ${scanType} scan against exact target ${requestedTarget}?`)) return;
     setLaunchError('');
     setLaunching(true);
     try {
@@ -291,10 +346,36 @@ const AutomatedScans = ({ authToken }) => {
         cookie_jar: cookieJar,
         login_url: loginUrl,
       };
-      const res = await apiFetch('/api/v1/scans/start', {
-        method: 'POST',
+      const launchPayload = {
+        target: requestedTarget,
+        scan_type: scanType,
+        mode: scanMode,
+        auth_profile,
+        ...(scanMode === 'whitebox' ? { source_root: sourceRoot.trim() } : {}),
+      };
+      const confirmationBundle = await prepareActionConfirmations({
+        intent: 'scan.start',
+        target: requestedTarget,
+        scope: [requestedTarget],
+        exclude: [],
+        scan_type: scanType,
+        mode: scanMode,
+        ...(scanMode === 'whitebox' ? { source_root: sourceRoot.trim() } : {}),
+        ...(scanType === 'vapt' ? {
+          network_target: requestedNetworkTarget,
+          network_scope: [requestedNetworkTarget],
+        } : {}),
+      });
+      if (
+        confirmationBundle.network_target
+        && !window.confirm(
+          `Separately approve NetForge web-to-network escalation to exact IP ${confirmationBundle.network_target}?`
+        )
+      ) return;
+      const res = await apiFetch(DASHBOARD_API.startScan.path, {
+        method: DASHBOARD_API.startScan.method,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target: target.trim(), scan_type: scanType, mode: scanMode, auth_profile }),
+        body: JSON.stringify(applyActionConfirmations(launchPayload, confirmationBundle)),
       });
       if (res.ok) {
         // Clear secrets on success — preserve on failure so user can retry
@@ -304,22 +385,25 @@ const AutomatedScans = ({ authToken }) => {
         setTestResult(null);
       } else {
         const err = await res.json().catch(() => ({}));
-        setLaunchError(err.detail || `Error ${res.status}`);
+        setLaunchError(dashboardErrorMessage(err, `Error ${res.status}`));
       }
-    } catch {
-      setLaunchError('Cannot reach backend — is forge.py dashboard running?');
+    } catch (error) {
+      setLaunchError(error instanceof Error ? error.message : 'Cannot reach backend — is forge.py dashboard running?');
     } finally {
       setLaunching(false);
     }
   };
 
   const stopScan = async () => {
-    try { await apiFetch('/api/v1/scans/stop', { method: 'POST' }); } catch {}
+    try {
+      await apiFetch(DASHBOARD_API.stopScan.path, { method: DASHBOARD_API.stopScan.method });
+    } catch {}
   };
 
   const togglePause = async () => {
     try {
-      await apiFetch(`/api/v1/control/${isPaused ? 'resume' : 'pause'}`, { method: 'POST' });
+      const endpoint = isPaused ? DASHBOARD_API.resumeScan : DASHBOARD_API.pauseScan;
+      await apiFetch(endpoint.path, { method: endpoint.method });
     } catch {}
   };
 
@@ -328,7 +412,8 @@ const AutomatedScans = ({ authToken }) => {
     if (!scanId || !window.confirm(`Delete scan ${scanId} from dashboard history?`)) return;
     setDeleteError('');
     try {
-      const res = await apiFetch(`/api/v1/scans/${encodeURIComponent(scanId)}`, { method: 'DELETE' });
+      const path = DASHBOARD_API.deleteScan.path.replace('{scan_id}', encodeURIComponent(scanId));
+      const res = await apiFetch(path, { method: DASHBOARD_API.deleteScan.method });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         setDeleteError(data.detail || `Delete failed (${res.status})`);
@@ -420,11 +505,41 @@ const AutomatedScans = ({ authToken }) => {
             <Button
               variant="primary"
               onClick={initiateScan}
-              disabled={!target.trim() || !!activeScan || launching}
+              disabled={!target.trim() || (scanType === 'vapt' && !networkTarget.trim()) || (scanMode === 'whitebox' && scanType !== 'net' && !sourceRoot.trim()) || !!activeScan || launching}
             >
               {launching ? 'LAUNCHING…' : 'INITIATE SCAN'}
             </Button>
-          </div>
+            </div>
+
+          {scanType === 'vapt' && (
+            <div style={{ marginTop: '12px' }}>
+              <label className="text-muted" style={{ display: 'block', marginBottom: '6px', fontSize: '11px', fontFamily: 'var(--font-mono)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                Separately Approved Network IP
+              </label>
+              <input
+                type="text"
+                placeholder="192.0.2.10 or 2001:db8::10"
+                value={networkTarget}
+                onChange={e => setNetworkTarget(e.target.value)}
+                style={{ width: '100%', boxSizing: 'border-box' }}
+              />
+            </div>
+          )}
+
+          {scanMode === 'whitebox' && scanType !== 'net' && (
+            <div style={{ marginTop: '12px' }}>
+              <label className="text-muted" style={{ display: 'block', marginBottom: '6px', fontSize: '11px', fontFamily: 'var(--font-mono)', textTransform: 'uppercase', letterSpacing: '0.5px' }}>
+                Canonical Whitebox Source Root
+              </label>
+              <input
+                type="text"
+                placeholder="/absolute/path/to/source"
+                value={sourceRoot}
+                onChange={e => setSourceRoot(e.target.value)}
+                style={{ width: '100%', boxSizing: 'border-box' }}
+              />
+            </div>
+          )}
 
           {/* Credentials — shown for greybox / whitebox only */}
           {scanMode !== 'blackbox' && (
@@ -553,6 +668,7 @@ const AutomatedScans = ({ authToken }) => {
                   <th>Finding</th>
                   <th>Target / URL</th>
                   <th>Module</th>
+                  <th>Confidence</th>
                   <th>Time</th>
                 </tr>
               </thead>
@@ -563,6 +679,7 @@ const AutomatedScans = ({ authToken }) => {
                     <td>{f.finding}</td>
                     <td className="font-mono text-muted" style={{ fontSize: '12px' }}>{f.url || f.target}</td>
                     <td className="font-mono text-muted" style={{ fontSize: '12px' }}>{f.module}</td>
+                    <td><Badge severity={f.confidence === 'HIGH' ? 'active' : f.confidence === 'MEDIUM' ? 'medium' : 'info'}>{f.confidence}</Badge></td>
                     <td className="font-mono text-muted" style={{ fontSize: '12px' }}>{f.time}</td>
                   </tr>
                 ))}
@@ -619,13 +736,55 @@ const AutomatedScans = ({ authToken }) => {
                           <div style={{ width: '60px', height: '4px', backgroundColor: 'var(--bg-input)', borderRadius: '2px', overflow: 'hidden' }}>
                             <div style={{ width: `${v.confidence}%`, height: '100%', backgroundColor: verdictColor }} />
                           </div>
-                          <span className="font-mono" style={{ fontSize: '12px', color: verdictColor }}>{v.confidence}%</span>
+                          <span className="font-mono" style={{ fontSize: '12px', color: verdictColor }}>{v.confidenceLabel}</span>
                         </div>
                       </td>
                       <td className="text-muted" style={{ fontSize: '12px' }}>{v.reason}</td>
                     </tr>
                   );
                 })}
+              </tbody>
+            </table>
+          )}
+        </Card>
+
+        {/* ── Chain Actions ── */}
+        <Card
+          title={
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <GitBranch size={16} color="var(--color-medium)" />
+              <span>Kill Chain Actions</span>
+            </div>
+          }
+          noPadding
+        >
+          {chainActions.length === 0 ? (
+            <div style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '13px' }}>
+              Chain suggestions and planner actions will appear here when verified findings unlock follow-on checks.
+            </div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>Chain</th>
+                  <th>Source</th>
+                  <th>Next Module</th>
+                  <th>Mode</th>
+                  <th>Rationale</th>
+                </tr>
+              </thead>
+              <tbody>
+                {chainActions.map((action, i) => (
+                  <tr key={i}>
+                    <td className="font-mono" style={{ fontSize: '12px' }}>{action.chain_type}</td>
+                    <td className="font-mono text-muted" style={{ fontSize: '12px' }}>{action.source_framework || 'planner'}</td>
+                    <td className="font-mono" style={{ fontSize: '12px' }}>
+                      {(action.target_framework || 'auto')}/{action.target_module || 'next'}
+                    </td>
+                    <td><Badge severity={action.auto_execute ? 'high' : 'info'}>{action.auto_execute ? 'AUTO' : 'REVIEW'}</Badge></td>
+                    <td className="text-muted" style={{ fontSize: '12px' }}>{action.rationale}</td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           )}

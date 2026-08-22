@@ -29,8 +29,8 @@ const Scheduling = () => {
               <div />
               {Array.from({ length: 30 }).map((_, i) => {
                 const date = i + 1;
-                const isToday = date === 20;
-                const hasScan = [23, 26, 28].includes(date);
+                const today = new Date();
+                const isToday = date === today.getDate() && today.getMonth() === 5;
                 return (
                   <div key={i} style={{ 
                     aspectRatio: '1', 
@@ -43,7 +43,6 @@ const Scheduling = () => {
                     border: '1px solid var(--border-color)'
                   }}>
                     <span style={{ fontSize: '12px' }}>{date}</span>
-                    {hasScan && <div className="status-dot bg-info" style={{ position: 'absolute', bottom: '4px', width: '4px', height: '4px' }}></div>}
                   </div>
                 )
               })}
@@ -56,19 +55,11 @@ const Scheduling = () => {
           <Card title="Upcoming Scans" noPadding>
             <table>
               <tbody>
-                {[
-                  { date: 'Jun 20 14:30', name: 'Web App Full — web-prod-01', recur: 'Recurring Weekly', op: 'Op_Torres' },
-                  { date: 'Jun 23 03:00', name: 'Network Infra — 10.0.1.0/24', recur: 'Recurring Weekly', op: 'System' },
-                  { date: 'Jun 26 00:00', name: 'Cloud Config — AWS-prod', recur: 'Monthly', op: 'System' },
-                  { date: 'Jun 28 02:00', name: 'API Security — api.corp.com', recur: 'One-time', op: 'Op_Carter' },
-                ].map((row, i) => (
-                  <tr key={i}>
-                    <td className="font-mono text-muted" style={{ width: '120px' }}>{row.date}</td>
-                    <td style={{ fontWeight: 500 }}>{row.name}</td>
-                    <td><Badge>{row.recur}</Badge></td>
-                    <td className="text-muted" style={{ fontSize: '12px', textAlign: 'right' }}>{row.op}</td>
-                  </tr>
-                ))}
+                <tr>
+                  <td colSpan={4} style={{ textAlign: 'center', padding: '48px 0', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', fontSize: '12px' }}>
+                    No scans scheduled — use the form below to schedule one
+                  </td>
+                </tr>
               </tbody>
             </table>
           </Card>
@@ -89,7 +80,7 @@ const Scheduling = () => {
               </div>
               <div>
                 <label className="text-muted" style={{ display: 'block', marginBottom: '8px', fontSize: '12px' }}>Date & Time</label>
-                <input type="text" defaultValue="2026-06-21 00:00" style={{ width: '100%' }} />
+                <input type="text" defaultValue="" placeholder="YYYY-MM-DD HH:MM" style={{ width: '100%' }} />
               </div>
               <div>
                 <label className="text-muted" style={{ display: 'block', marginBottom: '8px', fontSize: '12px' }}>Recurrence</label>

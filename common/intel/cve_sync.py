@@ -83,6 +83,7 @@ def _normalize_severity(cvss_score: float | None, cvss_severity: str | None) -> 
 # ── HTTP helper (stdlib only — no external deps required) ─────────
 
 async def _fetch_json(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
+    raise RuntimeError("outbound_policy_unsupported")
     """Async HTTP GET returning parsed JSON, using urllib (stdlib).
 
     We intentionally avoid requiring `aiohttp` or `httpx` as hard deps.
@@ -161,6 +162,7 @@ class CVESync:
         Returns:
             Dict with records_new, records_updated, records_total counts.
         """
+        raise RuntimeError("outbound_policy_unsupported")
         log.info("CVE sync starting (since=%s, api_key=%s)",
                  since, "yes" if self.api_key else "no")
 

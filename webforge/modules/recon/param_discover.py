@@ -56,10 +56,44 @@ class ParamDiscover(BaseModule):
             urls_to_test = [target]
 
         self.log.info("Parameter discovery on %d URL(s)", min(len(urls_to_test), 20))
+        self._all_discovered: dict[str, list[dict]] = {}  # Collect across all URLs
 
         sem = asyncio.Semaphore(3)
         tasks = [self._probe_url(url, sem) for url in urls_to_test[:20]]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Emit ONE consolidated finding
+        if self._all_discovered:
+            all_params = set()
+            pages_with_params = []
+            for url, params in self._all_discovered.items():
+                path = urlparse(url).path or "/"
+                pages_with_params.append(f"{path} ({len(params)} params)")
+                for p in params:
+                    all_params.add(p["name"])
+
+            self.new_finding(
+                title=f"Hidden Parameters Discovered — {len(all_params)} across {len(self._all_discovered)} pages",
+                severity=Severity.LOW,
+                description=(
+                    f"Hidden parameters found across {len(self._all_discovered)} page(s): "
+                    f"{', '.join(sorted(all_params)[:15])}. "
+                    f"Pages affected: {'; '.join(pages_with_params[:10])}. "
+                    "These parameters were not visible in normal application flow."
+                ),
+                reproduction_steps=[
+                    f"curl '{url}?{list(all_params)[0]}=test'" for url in list(self._all_discovered.keys())[:3]
+                ],
+                remediation=(
+                    "Remove unused/debug parameters from production. "
+                    "Ensure all accepted parameters are documented and validated."
+                ),
+                references=["OWASP A01:2021", "CWE-200"],
+                cvss_v31_vector=CVSS_PARAM,
+                cvss_v40_vector=CVSS40_PARAM,
+                target=self.config.target,
+            )
+
         return self._make_result(start)
 
     async def _probe_url(self, url: str, sem: asyncio.Semaphore) -> None:
@@ -82,36 +116,8 @@ class ParamDiscover(BaseModule):
                 await self.rate_limit()
 
             if found_params:
-                ev = Evidence(
-                    extra={
-                        "url": url,
-                        "found_params": found_params,
-                        "baseline_length": baseline["length"],
-                    }
-                )
-                self.new_finding(
-                    title=f"Hidden Parameters Discovered — {urlparse(url).path}",
-                    severity=Severity.LOW,
-                    description=(
-                        f"Hidden parameter(s) found on {url}: "
-                        f"{', '.join(p['name'] for p in found_params)}. "
-                        "These parameters were not visible in the normal application flow "
-                        "but cause detectable behavior changes."
-                    ),
-                    reproduction_steps=[
-                        f"curl '{url}?{p['name']}=test'" for p in found_params[:3]
-                    ],
-                    remediation=(
-                        "Remove unused/debug parameters from production. "
-                        "Ensure all accepted parameters are documented and validated."
-                    ),
-                    references=["OWASP A01:2021", "CWE-200"],
-                    evidence=ev,
-                    cvss_v31_vector=CVSS_PARAM,
-                    cvss_v40_vector=CVSS40_PARAM,
-                    target=self.config.target,
-                    url=url,
-                )
+                # Collect — consolidated finding emitted in run()
+                self._all_discovered[url] = found_params
 
                 # Store discovered params for injection tests
                 existing = self.config.extra.get("discovered_params", {})

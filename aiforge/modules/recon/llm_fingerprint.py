@@ -153,6 +153,7 @@ class LlmFingerprint(BaseModule):
             max_tokens=self.config.extra.get("max_tokens", 500),
             temperature=0.0,  # Deterministic for fingerprinting
             proxy=self.config.extra.get("proxy"),
+            outbound_policy=self.outbound_policy,
         ) as client:
             # Phase 1: Identity probes
             identity_results = await self._run_identity_probes(client)

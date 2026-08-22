@@ -1,73 +1,166 @@
-# ╔══════════════════════════════════════════════════════════════════════╗
-# ║  Forge Suite v5 APEX — Docker Compose                               ║
-# ║  Full deployment: Dashboard + C2 + Intel DB                          ║
-# ╚══════════════════════════════════════════════════════════════════════╝
+# Forge Suite local deployment.
 #
-# Usage:
-#   docker compose up -d            # Start all services
-#   docker compose up forge-scan    # Run a one-shot scan
-#   docker compose logs -f          # Tail all logs
-#   docker compose down             # Tear down
+# The canonical version must come from VERSION:
+#   export FORGE_VERSION="$(tr -d '\r\n' < VERSION)"
+# A password verifier and operator-owned TLS certificate/key are required for
+# the default dashboard service. Generate the verifier with
+# `python -c 'from common.dashboard.auth import _hash_password; ...'`, then
+# export all three inputs before running Compose.
+
+x-forge-image: &forge-image "${FORGE_IMAGE_NAME:-forge-suite}:${FORGE_VERSION:?Set FORGE_VERSION from the VERSION file}"
+x-forge-build: &forge-build
+  context: .
+  args:
+    FORGE_VERSION: "${FORGE_VERSION:?Set FORGE_VERSION from the VERSION file}"
+    VCS_REF: "${FORGE_VCS_REF:-unknown}"
+x-forge-runtime: &forge-runtime
+  user: "10001:10001"
+  read_only: true
+  init: true
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
 
 services:
-  # ── War Room Dashboard ─────────────────────────────────────────────
   forge-dashboard:
-    build: .
-    image: forge-suite:5.0.0
-    container_name: forge-dashboard
-    command: ["forge.py", "dashboard", "--host", "0.0.0.0", "--port", "1337"]
+    <<: *forge-runtime
+    build: *forge-build
+    image: *forge-image
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        test -n "$${FORGE_DASHBOARD_PASSWORD_HASH:-}" ||
+        { echo 'FORGE_DASHBOARD_PASSWORD_HASH is required for forge-dashboard' >&2; exit 64; };
+        test -s /run/secrets/forge-dashboard-tls-cert.pem ||
+        { echo 'FORGE_DASHBOARD_TLS_CERT_FILE must name a non-empty certificate' >&2; exit 64; };
+        test -s /run/secrets/forge-dashboard-tls-key.pem ||
+        { echo 'FORGE_DASHBOARD_TLS_KEY_FILE must name a non-empty private key' >&2; exit 64; };
+        exec python3 forge.py dashboard --host 0.0.0.0 --port 1337
     ports:
-      - "1337:1337"
+      - "${FORGE_DASHBOARD_BIND:-127.0.0.1}:1337:1337"
     environment:
-      - FORGE_DASHBOARD_PASSWORD=${FORGE_DASHBOARD_PASSWORD:-forge2026}
+      FORGE_DASHBOARD_PASSWORD_HASH: "${FORGE_DASHBOARD_PASSWORD_HASH-}"
+      FORGE_DASHBOARD_PUBLIC_HOST: "${FORGE_DASHBOARD_PUBLIC_HOST:-localhost}"
+      FORGE_DASHBOARD_ROLE: "${FORGE_DASHBOARD_ROLE:-admin}"
+      FORGE_DASHBOARD_TLS_CERT: /run/secrets/forge-dashboard-tls-cert.pem
+      FORGE_DASHBOARD_TLS_KEY: /run/secrets/forge-dashboard-tls-key.pem
+      FORGE_DASHBOARD_USER: "${FORGE_DASHBOARD_USER:-operator}"
+      FORGE_VERSION: "${FORGE_VERSION:?Set FORGE_VERSION from the VERSION file}"
     volumes:
       - forge-results:/opt/forge-suite/results
+      - forge-web-results:/opt/forge-suite/webforge/results
+      - forge-net-results:/opt/forge-suite/netforge/results
+      - forge-ad-results:/opt/forge-suite/adforge/results
+      - forge-ai-results:/opt/forge-suite/aiforge/results
       - forge-intel:/opt/forge-suite/data
-    restart: unless-stopped
+      - forge-state:/opt/forge-suite/state
+      - type: bind
+        source: "${FORGE_DASHBOARD_TLS_CERT_FILE:-/dev/null}"
+        target: /run/secrets/forge-dashboard-tls-cert.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${FORGE_DASHBOARD_TLS_KEY_FILE:-/dev/null}"
+        target: /run/secrets/forge-dashboard-tls-key.pem
+        read_only: true
+        bind:
+          create_host_path: false
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=1777
+      - /home/forge:rw,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700
+    pids_limit: 512
+    mem_limit: "2g"
+    cpus: 2.0
+    shm_size: "512m"
+    # A missing credential or invalid certificate must be a visible terminal
+    # failure, not an unattended restart loop.
+    restart: "no"
     healthcheck:
-      test: ["CMD", "curl", "-fsk", "https://localhost:1337/api/v1/state"]
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--cacert", "/run/secrets/forge-dashboard-tls-cert.pem", "https://localhost:1337/api/v1/health"]
       interval: 30s
       timeout: 5s
+      start_period: 15s
       retries: 3
 
-  # ── C2 Team Server ────────────────────────────────────────────────
+  # Local-lab C2 is never part of the default service set. Compose expands
+  # variables before profile selection, so a shell guard requires the secret
+  # only when this explicitly selected profile is started.
   forge-c2:
-    build: .
-    image: forge-suite:5.0.0
-    container_name: forge-c2
-    command: ["forge.py", "c2", "server", "--bind", "0.0.0.0", "--port", "8443"]
+    <<: *forge-runtime
+    profiles: ["local-lab-c2"]
+    build: *forge-build
+    image: *forge-image
+    entrypoint: ["/bin/sh", "-ec"]
+    # A one-element argv preserves the whole guard as the shell's command
+    # string; Compose otherwise tokenizes a scalar command before `sh -c`.
+    command:
+      - >-
+        test -n "$${FORGE_C2_ADMIN_PW:-}" ||
+        { echo 'FORGE_C2_ADMIN_PW is required for the local-lab-c2 profile' >&2; exit 64; };
+        exec python3 forge.py c2 server --bind 0.0.0.0 --port 8443
     ports:
-      - "8443:8443"     # HTTPS listener
-      - "50050:50050"   # Operator API
-      - "8080:8080"     # HTTP listener (optional)
-      - "53:53/udp"     # DNS listener (optional)
+      - "127.0.0.1:8443:8443"
+      - "127.0.0.1:50050:50050"
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:5353:53/udp"
     environment:
-      - FORGE_C2_ADMIN_PW=${FORGE_C2_ADMIN_PW:-changeme}
+      FORGE_C2_ADMIN_PW: "${FORGE_C2_ADMIN_PW-}"
+      FORGE_VERSION: "${FORGE_VERSION:?Set FORGE_VERSION from the VERSION file}"
     volumes:
-      - forge-c2-data:/opt/forge-suite/forge_c2/data
-    restart: unless-stopped
+      - forge-c2-data:/opt/forge-suite/c2_data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=1777
+      - /home/forge:rw,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0700
+    # The opt-in lab listener retains UDP/53 without granting broader network
+    # administration or host capabilities.
+    cap_add: ["NET_BIND_SERVICE"]
+    pids_limit: 256
+    mem_limit: "1g"
+    cpus: 1.0
+    # A missing local-lab credential must remain a visible terminal failure,
+    # not become an unattended restart loop.
+    restart: "no"
 
-  # ── One-shot scan container (use with docker compose run) ──────────
+  # One-shot scans are opt-in because host networking materially expands the
+  # container's reach. Example: docker compose --profile scan run forge-scan …
   forge-scan:
-    build: .
-    image: forge-suite:5.0.0
-    container_name: forge-scan
-    # Override command at runtime:
-    #   docker compose run forge-scan forge.py net --target 10.0.0.0/24
+    <<: *forge-runtime
+    profiles: ["scan"]
+    build: *forge-build
+    image: *forge-image
     command: ["forge.py", "--help"]
     environment:
-      - FORGE_DASHBOARD_PASSWORD=${FORGE_DASHBOARD_PASSWORD:-forge2026}
+      FORGE_VERSION: "${FORGE_VERSION:?Set FORGE_VERSION from the VERSION file}"
     volumes:
       - forge-results:/opt/forge-suite/results
+      - forge-web-results:/opt/forge-suite/webforge/results
+      - forge-net-results:/opt/forge-suite/netforge/results
+      - forge-ad-results:/opt/forge-suite/adforge/results
+      - forge-ai-results:/opt/forge-suite/aiforge/results
       - forge-intel:/opt/forge-suite/data
+      - forge-state:/opt/forge-suite/state
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,uid=10001,gid=10001,mode=1777
+      - /home/forge:rw,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700
+    # Raw sockets are the only added capability for the explicit scan profile.
+    cap_add: ["NET_RAW"]
+    pids_limit: 1024
+    mem_limit: "4g"
+    cpus: 4.0
+    shm_size: "512m"
     network_mode: host
-    profiles:
-      - scan
 
 volumes:
   forge-results:
-    driver: local
+  forge-web-results:
+  forge-net-results:
+  forge-ad-results:
+  forge-ai-results:
   forge-intel:
-    driver: local
+  forge-state:
   forge-c2-data:
-    driver: local

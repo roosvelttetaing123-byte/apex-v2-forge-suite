@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.framework_params import is_framework_param
 
 CVSS_LDAP = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
 CVSS40_LDAP = "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -120,6 +121,7 @@ class LdapInject(BaseModule):
             async with sem:
                 await self.rate_limit()
                 for input_name in form.get("inputs", ["username"]):
+                    if is_framework_param(input_name): continue
                     data = {i: "testuser" for i in form.get("inputs", ["username", "password"])}
                     data[input_name] = payload
 
@@ -195,6 +197,7 @@ class LdapInject(BaseModule):
         params = parse_qs(parsed.query, keep_blank_values=True)
 
         for param_name in params:
+            if is_framework_param(param_name): continue
             for payload, label in LDAP_PAYLOADS[:4]:
                 await self.rate_limit()
                 test_params = {k: v[0] for k, v in params.items()}

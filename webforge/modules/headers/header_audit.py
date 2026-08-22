@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 REQUIRED_HEADERS: list[dict[str, Any]] = [
     {
@@ -185,12 +186,13 @@ class HeaderAudit(BaseModule):
             return self._make_result(start, skipped=True, skip_reason="out of scope")
 
         self.log.info("Auditing security headers on %s", target)
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         from webforge.core.session import ForgeSession
-        async with ForgeSession(
-            rate=self.config.rate.requests_per_second,
-            proxy=self.config.extra.get("proxy"),
-        ) as session:
+        async with ForgeSession.from_config(self.config) as session:
             try:
                 await self.rate_limit()
                 resp = await session.get(target)
@@ -209,6 +211,9 @@ class HeaderAudit(BaseModule):
         # 1. Required security headers check
         for hdr_def in REQUIRED_HEADERS:
             name     = hdr_def["name"]
+            # Skip HSTS on HTTP-only targets — irrelevant without HTTPS
+            if name == "Strict-Transport-Security" and target.startswith("http://"):
+                continue
             val      = headers_lower.get(name.lower())
             check_fn = hdr_def["check"]
             passed   = False

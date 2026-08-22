@@ -9,13 +9,21 @@ Provides:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
+from common.outbound_policy import (
+    cookie_path_matches,
+    cookie_provenance_matches_destination,
+    normalize_destination,
+)
 from webforge.core.browser_engine import BrowserEngine, BrowserSnapshot
 
 log = logging.getLogger("webforge.auth")
@@ -29,6 +37,9 @@ class AuthReplayResult:
     headers: dict[str, str] | None = None
     cookies: dict[str, str] | None = None
     tokens: dict[str, str] = field(default_factory=dict)
+    credential_origin: str = ""
+    cookie_provenance: dict[str, dict[str, Any]] = field(default_factory=dict)
+    token_provenance: dict[str, str] = field(default_factory=dict)
     snapshot: dict[str, Any] | None = None
     error: str = ""
 
@@ -39,9 +50,222 @@ class AuthReplayResult:
             "headers": self.headers or {},
             "cookies": self.cookies or {},
             "tokens": self.tokens,
+            "credential_origin": self.credential_origin,
+            "cookie_provenance": self.cookie_provenance,
+            "token_provenance": self.token_provenance,
             "snapshot": self.snapshot or {},
             "error": self.error,
         }
+
+
+def _normalized_destination_or_none(url: str) -> Any | None:
+    try:
+        return normalize_destination(str(url))
+    except Exception:
+        return None
+
+
+def _cookie_domain(raw_domain: Any) -> tuple[str, bool] | None:
+    value = str(raw_domain or "").strip().rstrip(".")
+    domain_scoped = value.startswith(".")
+    value = value.lstrip(".")
+    if not value:
+        return None
+    host_value = f"[{value}]" if ":" in value and not value.startswith("[") else value
+    destination = _normalized_destination_or_none(f"https://{host_value}/")
+    if destination is None:
+        return None
+    try:
+        is_ip = bool(ipaddress.ip_address(destination.host))
+    except ValueError:
+        is_ip = False
+    if is_ip and domain_scoped:
+        return None
+    return destination.host, domain_scoped
+
+
+def cookie_provenance_matches_target(
+    provenance: Mapping[str, Any] | None,
+    target_url: str,
+) -> bool:
+    """Revalidate retained cookie scope before flattened state is applied."""
+    return cookie_provenance_matches_destination(provenance, target_url)
+
+
+def filter_cookies_for_target(
+    cookie_records: Any,
+    target_url: str,
+) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    """Retain only unambiguous cookies the browser would send to target_url."""
+    destination = _normalized_destination_or_none(target_url)
+    if destination is None or not isinstance(cookie_records, list):
+        return {}, {}
+    request_path = urlsplit(destination.url).path or "/"
+    candidates: dict[str, set[tuple[str, str, bool, str, bool]]] = {}
+    for raw_cookie in cookie_records:
+        if not isinstance(raw_cookie, Mapping):
+            continue
+        name = str(raw_cookie.get("name", ""))
+        value = str(raw_cookie.get("value", ""))
+        domain_info = _cookie_domain(raw_cookie.get("domain"))
+        if not name or not value or domain_info is None:
+            continue
+        domain, domain_scoped = domain_info
+        if domain_scoped:
+            domain_matches = (
+                destination.host == domain
+                or destination.host.endswith(f".{domain}")
+            )
+        else:
+            domain_matches = destination.host == domain
+        path = str(raw_cookie.get("path") or "/")
+        secure_value = raw_cookie.get("secure", False)
+        if type(secure_value) is not bool:
+            continue
+        secure = secure_value
+        if (
+            not domain_matches
+            or not cookie_path_matches(request_path, path)
+            or (secure and destination.scheme != "https")
+        ):
+            continue
+        candidates.setdefault(name, set()).add(
+            (value, domain, not domain_scoped, path, secure)
+        )
+
+    cookies: dict[str, str] = {}
+    provenance: dict[str, dict[str, Any]] = {}
+    for name in sorted(candidates):
+        records = candidates[name]
+        if len(records) != 1:
+            continue
+        value, domain, host_only, path, secure = next(iter(records))
+        record = {
+            "origin": destination.origin,
+            "domain": domain,
+            "host_only": host_only,
+            "path": path,
+            "secure": secure,
+        }
+        if not cookie_provenance_matches_target(record, target_url):
+            continue
+        cookies[name] = value
+        provenance[name] = record
+    return cookies, provenance
+
+
+def _resolved_token_candidates(
+    candidates: Mapping[str, set[str]],
+) -> dict[str, str]:
+    resolved = {
+        name: next(iter(values))
+        for name, values in candidates.items()
+        if len(values) == 1
+    }
+    jwt = resolved.get("jwt")
+    bearer = resolved.get("bearer")
+    if jwt and bearer:
+        if jwt == bearer:
+            resolved.pop("bearer", None)
+        else:
+            resolved.pop("jwt", None)
+            resolved.pop("bearer", None)
+    return resolved
+
+
+def _token_candidates_from_values(tokens: Any) -> dict[str, set[str]]:
+    candidates: dict[str, set[str]] = {}
+    if not isinstance(tokens, Mapping):
+        return candidates
+    for name in ("jwt", "bearer", "csrf", "session_cookie"):
+        value = tokens.get(name)
+        if value:
+            candidates.setdefault(name, set()).add(str(value))
+    return candidates
+
+
+def filter_captured_session_credentials(
+    session_data: Mapping[str, Any],
+    target_url: str,
+) -> tuple[
+    dict[str, str],
+    dict[str, dict[str, Any]],
+    dict[str, str],
+    dict[str, str],
+]:
+    """Filter a legacy Selenium capture before applying it to an HTTP client."""
+    destination = _normalized_destination_or_none(target_url)
+    if destination is None:
+        return {}, {}, {}, {}
+    cookies, cookie_provenance = filter_cookies_for_target(
+        session_data.get("cookies", []),
+        target_url,
+    )
+    post_login = _normalized_destination_or_none(
+        str(session_data.get("post_login_url", ""))
+    )
+    tokens: dict[str, str] = {}
+    token_provenance: dict[str, str] = {}
+    if post_login is not None and post_login.origin == destination.origin:
+        tokens = _resolved_token_candidates(
+            _token_candidates_from_values(session_data.get("detected_tokens", {}))
+        )
+        token_provenance = {name: destination.origin for name in tokens}
+    return cookies, cookie_provenance, tokens, token_provenance
+
+
+def extract_storage_tokens_for_target(
+    storage_state: Mapping[str, Any],
+    target_url: str,
+    _retained_cookies: Mapping[str, str],
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Extract only exact-origin localStorage token candidates.
+
+    Cookie values remain cookies so their Domain, Path, and Secure provenance
+    cannot be widened into origin-wide authorization or CSRF headers.
+    """
+    destination = _normalized_destination_or_none(target_url)
+    if destination is None:
+        return {}, {}
+    candidates: dict[str, set[str]] = {}
+    token_keys = {
+        "token", "access_token", "auth_token", "jwt", "jwt_token",
+        "id_token", "bearer", "session_token", "api_token", "apikey",
+    }
+    csrf_keys = {
+        "csrf", "csrf_token", "csrftoken", "xsrf", "xsrf_token",
+        "_csrf", "_csrf_token", "x-csrf-token",
+    }
+    origins = storage_state.get("origins", [])
+    if isinstance(origins, list):
+        for raw_origin in origins:
+            if not isinstance(raw_origin, Mapping):
+                continue
+            source = _normalized_destination_or_none(str(raw_origin.get("origin", "")))
+            if source is None or source.origin != destination.origin:
+                continue
+            local_storage = raw_origin.get("localStorage", [])
+            if not isinstance(local_storage, list):
+                continue
+            for item in local_storage:
+                if not isinstance(item, Mapping):
+                    continue
+                key_lower = str(item.get("name", "")).lower()
+                value = str(item.get("value", ""))
+                if not value:
+                    continue
+                if any(key in key_lower for key in csrf_keys):
+                    candidates.setdefault("csrf", set()).add(value)
+                elif any(key in key_lower for key in token_keys):
+                    kind = (
+                        "jwt"
+                        if value.count(".") == 2 and value.startswith("eyJ")
+                        else "bearer"
+                    )
+                    candidates.setdefault(kind, set()).add(value)
+
+    tokens = _resolved_token_candidates(candidates)
+    return tokens, {name: destination.origin for name in tokens}
 
 
 # ── Login sequence steps (for multi-step SSO / MFA flows) ────────────────────
@@ -205,6 +429,7 @@ class AuthRecorder:
         username: str = "",
         password: str = "",
         browser: str = "chromium",
+        target_url: str | None = None,
     ) -> AuthReplayResult:
         if not BrowserEngine.available():
             return AuthReplayResult(
@@ -215,14 +440,24 @@ class AuthRecorder:
             async with BrowserEngine(self.results_dir, browser=browser, proxy=self.proxy) as engine:
                 snap = await engine.login(login_url, username=username, password=password)
             state_path = Path(snap.storage_state_path) if snap.storage_state_path else None
-            headers, cookies = self._headers_cookies_from_state(state_path) if state_path else ({}, {})
-            tokens = self._extract_tokens(state_path) if state_path else {}
+            effective_target = target_url or snap.url
+            (
+                headers,
+                cookies,
+                tokens,
+                credential_origin,
+                cookie_provenance,
+                token_provenance,
+            ) = self._credentials_from_state(state_path, effective_target)
             return AuthReplayResult(
                 authenticated=not bool(snap.error),
                 storage_state_path=snap.storage_state_path,
                 headers=headers,
                 cookies=cookies,
                 tokens=tokens,
+                credential_origin=credential_origin,
+                cookie_provenance=cookie_provenance,
+                token_provenance=token_provenance,
                 snapshot=snap.to_dict(),
                 error=snap.error,
             )
@@ -233,6 +468,7 @@ class AuthRecorder:
         self,
         login_script: list[LoginStep],
         browser: str = "chromium",
+        target_url: str | None = None,
     ) -> AuthReplayResult:
         """Execute a multi-step login script via Playwright."""
         if not BrowserEngine.available():
@@ -254,16 +490,28 @@ class AuthRecorder:
                     self.results_dir.mkdir(parents=True, exist_ok=True)
                     await engine._context.storage_state(path=str(state_path))
 
-                    headers, cookies = self._headers_cookies_from_state(state_path)
-                    tokens = self._extract_tokens(state_path)
                     snap = BrowserSnapshot(url=page.url)
                     snap.storage_state_path = str(state_path)
+                    (
+                        headers,
+                        cookies,
+                        tokens,
+                        credential_origin,
+                        cookie_provenance,
+                        token_provenance,
+                    ) = self._credentials_from_state(
+                        state_path,
+                        target_url or page.url,
+                    )
                     return AuthReplayResult(
                         authenticated=True,
                         storage_state_path=str(state_path),
                         headers=headers,
                         cookies=cookies,
                         tokens=tokens,
+                        credential_origin=credential_origin,
+                        cookie_provenance=cookie_provenance,
+                        token_provenance=token_provenance,
                         snapshot=snap.to_dict(),
                     )
                 finally:
@@ -295,103 +543,133 @@ class AuthRecorder:
         else:
             log.warning("Unknown login step action: %s", step.action)
 
-    def import_storage_state(self, path: Path) -> AuthReplayResult:
-        headers, cookies = self._headers_cookies_from_state(path)
-        tokens = self._extract_tokens(path)
+    def import_storage_state(self, path: Path, target_url: str = "") -> AuthReplayResult:
+        if not path.exists():
+            return AuthReplayResult(
+                authenticated=False,
+                storage_state_path=str(path),
+                error=f"storage state not found: {path}",
+            )
+        if _normalized_destination_or_none(target_url) is None:
+            return AuthReplayResult(
+                authenticated=False,
+                storage_state_path=str(path),
+                error="target origin required for storage-state credential import",
+            )
+        try:
+            (
+                headers,
+                cookies,
+                tokens,
+                credential_origin,
+                cookie_provenance,
+                token_provenance,
+            ) = self._credentials_from_state(path, target_url)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            return AuthReplayResult(
+                authenticated=False,
+                storage_state_path=str(path),
+                error=f"invalid storage state: {exc}",
+            )
         return AuthReplayResult(
-            authenticated=path.exists(),
+            authenticated=True,
             storage_state_path=str(path),
             headers=headers,
             cookies=cookies,
             tokens=tokens,
-            error="" if path.exists() else f"storage state not found: {path}",
+            credential_origin=credential_origin,
+            cookie_provenance=cookie_provenance,
+            token_provenance=token_provenance,
         )
 
-    def _headers_cookies_from_state(self, path: Path | None) -> tuple[dict[str, str], dict[str, str]]:
-        if not path or not path.exists():
-            return {}, {}
+    def _credentials_from_state(
+        self,
+        path: Path | None,
+        target_url: str,
+    ) -> tuple[
+        dict[str, str],
+        dict[str, str],
+        dict[str, str],
+        str,
+        dict[str, dict[str, Any]],
+        dict[str, str],
+    ]:
+        destination = _normalized_destination_or_none(target_url)
+        if not path or not path.exists() or destination is None:
+            return {}, {}, {}, "", {}, {}
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, Mapping):
+            raise ValueError("storage state must be an object")
+        cookies, cookie_provenance = filter_cookies_for_target(
+            data.get("cookies", []),
+            target_url,
+        )
+        tokens, token_provenance = extract_storage_tokens_for_target(
+            data,
+            target_url,
+            cookies,
+        )
+        headers: dict[str, str] = {}
+        if cookies:
+            headers["Cookie"] = "; ".join(
+                f"{name}={value}" for name, value in sorted(cookies.items())
+            )
+        return (
+            headers,
+            cookies,
+            tokens,
+            destination.origin,
+            cookie_provenance,
+            token_provenance,
+        )
+
+    def _headers_cookies_from_state(
+        self,
+        path: Path | None,
+        target_url: str,
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        headers, cookies, *_ = self._credentials_from_state(path, target_url)
+        return headers, cookies
+
+    def _extract_tokens(self, path: Path | None, target_url: str) -> dict[str, str]:
+        """Pull only exact-target-origin tokens from Playwright storage state."""
+        _, _, tokens, *_ = self._credentials_from_state(path, target_url)
+        return tokens
+
+    def build_auth_headers(
+        self,
+        result: AuthReplayResult,
+        target_url: str,
+    ) -> dict[str, str]:
+        """Revalidate credential provenance and build target-bound headers."""
+        destination = _normalized_destination_or_none(target_url)
+        if destination is None or result.credential_origin != destination.origin:
+            return {}
         cookies = {
-            c.get("name", ""): c.get("value", "")
-            for c in data.get("cookies", [])
-            if c.get("name")
+            name: value
+            for name, value in (result.cookies or {}).items()
+            if cookie_provenance_matches_target(
+                result.cookie_provenance.get(name),
+                target_url,
+            )
+        }
+        tokens = {
+            name: value
+            for name, value in result.tokens.items()
+            if result.token_provenance.get(name) == destination.origin
         }
         headers: dict[str, str] = {}
         if cookies:
-            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        return headers, cookies
-
-    def _extract_tokens(self, path: Path | None) -> dict[str, str]:
-        """Pull Bearer, JWT, CSRF tokens from Playwright storage state.
-
-        Checks:
-            1. localStorage for common token keys (auth_token, access_token, jwt, etc.)
-            2. Cookies for known token cookie names (XSRF-TOKEN, csrf_token, etc.)
-        """
-        if not path or not path.exists():
-            return {}
-
-        data = json.loads(path.read_text(encoding="utf-8"))
-        tokens: dict[str, str] = {}
-
-        # localStorage entries
-        token_keys = {
-            "token", "access_token", "auth_token", "jwt", "jwt_token",
-            "id_token", "bearer", "session_token", "api_token", "apiKey",
-        }
-        csrf_keys = {
-            "csrf", "csrf_token", "csrftoken", "xsrf", "xsrf_token",
-            "_csrf", "_csrf_token", "x-csrf-token",
-        }
-
-        for origin in data.get("origins", []):
-            for ls in origin.get("localStorage", []):
-                key_lower = ls.get("name", "").lower()
-                value = ls.get("value", "")
-                if not value:
-                    continue
-                if any(ck in key_lower for ck in csrf_keys):
-                    tokens["csrf"] = value
-                elif any(tk in key_lower for tk in token_keys):
-                    # Detect if it's a JWT
-                    if value.count(".") == 2 and value.startswith("eyJ"):
-                        tokens["jwt"] = value
-                    else:
-                        tokens["bearer"] = value
-
-        # Cookie-based tokens
-        csrf_cookie_names = {"xsrf-token", "csrf_token", "csrftoken", "_csrf"}
-        session_cookie_names = {"session", "sessionid", "connect.sid", "sid", "phpsessid"}
-        for cookie in data.get("cookies", []):
-            cname = cookie.get("name", "").lower()
-            cval = cookie.get("value", "")
-            if cname in csrf_cookie_names:
-                tokens.setdefault("csrf", cval)
-            elif cname in session_cookie_names:
-                tokens.setdefault("session_cookie", cval)
-            # JWT in cookie
-            if cval.count(".") == 2 and cval.startswith("eyJ"):
-                tokens.setdefault("jwt", cval)
-
-        return tokens
-
-    def build_auth_headers(self, result: AuthReplayResult) -> dict[str, str]:
-        """Build HTTP headers from an auth result for use by HTTP-based scanners."""
-        headers: dict[str, str] = {}
-        if result.headers:
-            headers.update(result.headers)
-
-        # Add Bearer/JWT if discovered
-        if result.tokens.get("jwt"):
-            headers["Authorization"] = f"Bearer {result.tokens['jwt']}"
-        elif result.tokens.get("bearer"):
-            headers["Authorization"] = f"Bearer {result.tokens['bearer']}"
-
-        # Add CSRF header if discovered
-        if result.tokens.get("csrf"):
-            headers["X-CSRF-Token"] = result.tokens["csrf"]
-            headers["X-XSRF-Token"] = result.tokens["csrf"]
-
+            headers["Cookie"] = "; ".join(
+                f"{name}={value}" for name, value in sorted(cookies.items())
+            )
+        if tokens.get("jwt"):
+            headers["Authorization"] = f"Bearer {tokens['jwt']}"
+        elif tokens.get("bearer"):
+            headers["Authorization"] = f"Bearer {tokens['bearer']}"
+        if tokens.get("csrf"):
+            headers["X-CSRF-Token"] = tokens["csrf"]
+            headers["X-XSRF-Token"] = tokens["csrf"]
         return headers
 
 
@@ -418,24 +696,29 @@ class TestAuthRecorder:
         path = tmp_path / "state.json"
         path.write_text(json.dumps(state))
         rec = AuthRecorder(tmp_path)
-        tokens = rec._extract_tokens(path)
+        tokens = rec._extract_tokens(path, "https://test.com/")
         assert tokens["jwt"].startswith("eyJ")
         assert tokens["csrf"] == "tok_csrf_abc"
-        assert "session_cookie" in tokens
+        assert "session_cookie" not in tokens
 
     def test_build_auth_headers(self) -> None:
         rec = AuthRecorder(Path("/tmp"))
         result = AuthReplayResult(
             authenticated=True,
             tokens={"jwt": "eyJtest.eyJbody.sig", "csrf": "abc123"},
+            credential_origin="https://test.com:443",
+            token_provenance={
+                "jwt": "https://test.com:443",
+                "csrf": "https://test.com:443",
+            },
         )
-        headers = rec.build_auth_headers(result)
+        headers = rec.build_auth_headers(result, "https://test.com/")
         assert "Authorization" in headers
         assert headers["Authorization"].startswith("Bearer eyJ")
         assert headers["X-CSRF-Token"] == "abc123"
 
     def test_parse_login_script(self) -> None:
-        raw = [
+        raw: list[dict[str, Any]] = [
             {"action": "navigate", "value": "https://app.test.com/login"},
             {"action": "fill", "selector": "input[name=email]", "value": "admin@test.com"},
             {"action": "fill", "selector": "input[type=password]", "value": "secret"},

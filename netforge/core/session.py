@@ -20,6 +20,12 @@ import logging
 import time
 from typing import Any
 
+from common.outbound_policy import (
+    OutboundPolicy,
+    PolicyHttpClient,
+    _normalized_proxy_origin,
+)
+
 log = logging.getLogger("forge.netforge.session")
 
 # Lazy import — opsec may not be initialized yet at import time
@@ -53,44 +59,37 @@ class NetForgeSession:
         max_per_host: int = 5,
         timeout: float = 15.0,
         proxy: str | None = None,
-        verify_ssl: bool = False,
+        verify_ssl: bool = True,
+        outbound_policy: OutboundPolicy | None = None,
     ) -> None:
         self._max_connections = max_connections
         self._max_per_host = max_per_host
         self._timeout = timeout
         self._proxy = proxy
         self._verify_ssl = verify_ssl
+        self._outbound_policy = outbound_policy
         self._session = None
         self._request_count = 0
         self._last_request_time = 0.0
 
     async def _ensure_session(self) -> Any:
-        """Create the aiohttp session lazily — once, then reuse."""
+        """Create the policy client lazily; legacy global clients stay inert."""
         if self._session is None or self._session.closed:
-            try:
-                import aiohttp
-                connector = aiohttp.TCPConnector(
-                    limit=self._max_connections,
-                    limit_per_host=self._max_per_host,
-                    ssl=self._verify_ssl,
-                    ttl_dns_cache=300,     # Cache DNS for 5 min
-                    enable_cleanup_closed=True,
-                )
-                timeout = aiohttp.ClientTimeout(total=self._timeout)
-                # Cookie jar persists across requests — important for
-                # web service auditing where auth tokens are in cookies
-                self._session = aiohttp.ClientSession(
-                    connector=connector,
-                    timeout=timeout,
-                    cookie_jar=aiohttp.CookieJar(unsafe=True),
-                )
-                log.debug(
-                    "HTTP session pool created (max=%d, per_host=%d)",
-                    self._max_connections, self._max_per_host,
-                )
-            except ImportError:
-                log.warning("aiohttp not available — HTTP requests will fail")
+            if self._outbound_policy is None:
+                log.warning("NetForge HTTP disabled: outbound policy authorization is missing")
                 return None
+            if not self._verify_ssl and not self._outbound_policy.context.lab_only_insecure_tls:
+                log.warning("NetForge HTTP disabled: insecure TLS is not authorized")
+                return None
+            if self._proxy:
+                route = self._outbound_policy.context.route
+                if (
+                    route is None
+                    or _normalized_proxy_origin(self._proxy) != route.proxy_url
+                ):
+                    log.warning("NetForge HTTP disabled: approved route mismatch")
+                    return None
+            self._session = PolicyHttpClient(self._outbound_policy)
         return self._session
 
     async def _apply_opsec(self) -> dict[str, str]:
@@ -120,9 +119,7 @@ class NetForgeSession:
         headers = {**opsec_headers, **kwargs.pop("headers", {})}
 
         try:
-            async with session.get(
-                url, proxy=self._proxy, headers=headers, **kwargs
-            ) as resp:
+            async with session.get(url, headers=headers, **kwargs) as resp:
                 body = await resp.text(errors="ignore")
                 self._request_count += 1
                 return resp.status, body, dict(resp.headers)
@@ -139,9 +136,7 @@ class NetForgeSession:
         headers = {**opsec_headers, **kwargs.pop("headers", {})}
 
         try:
-            async with session.post(
-                url, proxy=self._proxy, headers=headers, **kwargs
-            ) as resp:
+            async with session.post(url, headers=headers, **kwargs) as resp:
                 body = await resp.text(errors="ignore")
                 self._request_count += 1
                 return resp.status, body, dict(resp.headers)
@@ -158,9 +153,7 @@ class NetForgeSession:
         headers = {**opsec_headers, **kwargs.pop("headers", {})}
 
         try:
-            async with session.head(
-                url, proxy=self._proxy, headers=headers, **kwargs
-            ) as resp:
+            async with session.head(url, headers=headers, **kwargs) as resp:
                 self._request_count += 1
                 return resp.status, dict(resp.headers)
         except Exception as exc:
@@ -179,7 +172,7 @@ class NetForgeSession:
 
         try:
             async with session.request(
-                method, url, proxy=self._proxy, headers=headers, **kwargs
+                method, url, headers=headers, **kwargs
             ) as resp:
                 body = await resp.text(errors="ignore")
                 self._request_count += 1
@@ -219,7 +212,8 @@ class NetForgeSession:
         max_per_host: int = 5,
         timeout: float = 15.0,
         proxy: str | None = None,
-        verify_ssl: bool = False,
+        verify_ssl: bool = True,
+        outbound_policy: OutboundPolicy | None = None,
     ) -> "NetForgeSession":
         """Factory method — creates and initializes the session."""
         session = cls(
@@ -228,6 +222,7 @@ class NetForgeSession:
             timeout=timeout,
             proxy=proxy,
             verify_ssl=verify_ssl,
+            outbound_policy=outbound_policy,
         )
         await session._ensure_session()
         return session

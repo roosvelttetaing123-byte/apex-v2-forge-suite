@@ -438,6 +438,7 @@ class DirectInject(BaseModule):
             max_tokens=200,
             temperature=0.0,
             proxy=self.config.extra.get("proxy"),
+            outbound_policy=self.outbound_policy,
         ) as client:
             try:
                 await self.rate_limit()

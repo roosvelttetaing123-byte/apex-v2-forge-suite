@@ -36,6 +36,9 @@ class PhaseScheduler:
         """Run a single module coroutine with error isolation."""
         if self.dry_run:
             log.info("[DRY RUN] Would run: %s", name)
+            # Dry-run deliberately does not execute the supplied coroutine, but
+            # it still owns that coroutine object and must close it explicitly.
+            coro.close()
             return TaskResult(name=name, success=True, duration_s=0.0, data="dry-run")
 
         start = time.monotonic()

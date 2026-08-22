@@ -13,6 +13,7 @@ from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
 from common.fp_reducer import FPReducer, Confidence
+from common.framework_params import is_framework_param
 
 # Engine-specific probes: (payload, expected_output_contains, engine_name)
 SSTI_PROBES: list[tuple[str, str, str]] = [
@@ -66,6 +67,7 @@ class SstiScanner(BaseModule):
             return
 
         for param_name in params:
+            if is_framework_param(param_name): continue
             for payload, expected, engine in SSTI_PROBES:
                 await self.rate_limit()
                 test_url = self._inject_param(url, param_name, payload)

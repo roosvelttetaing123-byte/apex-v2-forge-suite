@@ -465,6 +465,22 @@ class IntelEngine:
             log.warning("No valid intel sources to sync")
             return []
 
+        # The legacy source adapters use raw urllib/aiohttp endpoints and have
+        # no update-specific consumed envelope, endpoint pin, or outbound
+        # audit.  Keep the library entry point inert as well as the CLI path;
+        # direct programmatic invocation must not become an implicit updater.
+        log.warning(
+            "Intel sync disabled until pinned update endpoints use the outbound policy"
+        )
+        return [
+            SyncResult(
+                source=key,
+                status=SyncStatus.FAILED,
+                error="outbound_policy_unsupported",
+            )
+            for key in source_keys
+        ]
+
         # Emit sync start event
         self._emit("intel_sync_start", sources=source_keys)
         print(f"\n  ╔══════════════════════════════════════════════════════╗")
@@ -1004,7 +1020,7 @@ class IntelEngine:
     def _get_db_size(self) -> str:
         """Get human-readable database file size."""
         if self.db_path.exists():
-            size = self.db_path.stat().st_size
+            size = float(self.db_path.stat().st_size)
             for unit in ("B", "KB", "MB", "GB"):
                 if size < 1024:
                     return f"{size:.1f} {unit}"
@@ -1380,4 +1396,4 @@ class TestIntelEngine:
         s = str(r)
         assert "CVE-2024-1234" in s
         assert "HIGH" in s or "high" in s.lower()
-        assert "💥" in s
+        assert "[!]" in s

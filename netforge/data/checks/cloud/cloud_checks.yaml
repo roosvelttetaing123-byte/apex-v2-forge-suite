@@ -1,0 +1,546 @@
+id: aws-imds-v1-accessible
+name: "AWS IMDSv1 Accessible — EC2 Credential Theft via SSRF"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:N"
+tags: [cloud, aws, imds, ssrf, credential-theft, iam, internal-only]
+target_ports: [80]
+description: |
+  AWS Instance Metadata Service v1 (IMDSv1) is accessible at 169.254.169.254
+  without requiring a session token (PUT-based token request). IMDSv1 is
+  vulnerable to SSRF-based credential theft — any web vulnerability allowing
+  server-side HTTP requests can be chained to steal EC2 instance role credentials,
+  user data (which may contain secrets), and network configuration.
+  The 2019 CapitalOne breach exploited exactly this vector.
+  POSITIONING REQUIREMENT: 169.254.169.254 is an RFC 3927 link-local address
+  reachable ONLY from within the EC2 instance or via SSRF from a vulnerable
+  application running on that instance. External scanners will never reach this
+  address. This check must be run in one of these modes:
+    (a) From inside the EC2 instance (post-compromise or agent-based scan), or
+    (b) As a secondary check triggered by an SSRF finding on an EC2-hosted target.
+  Do NOT include this check in external perimeter scans — it will never fire and
+  generates misleading zero results.
+  MITRE ATT&CK: T1552.005 (Cloud Instance Metadata API), T1078.004 (Cloud Accounts).
+detection:
+  - type: http
+    method: GET
+    path: "/latest/meta-data/"
+    headers:
+      Host: "169.254.169.254"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(ami-id|instance-id|iam|hostname|local-ipv4)"
+  - type: http
+    method: GET
+    path: "/latest/meta-data/iam/security-credentials/"
+    headers:
+      Host: "169.254.169.254"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(RoleArn|AccessKeyId|SecretAccessKey|Token)"
+    match_all: false
+remediation: |
+  Enforce IMDSv2 on all EC2 instances: aws ec2 modify-instance-metadata-options
+  --instance-id <id> --http-tokens required --http-endpoint enabled.
+  Set hop limit to 1 to prevent SSRF through containers: --http-put-response-hop-limit 1.
+  Apply SCP to prevent launching instances without IMDSv2: deny EC2:RunInstances
+  unless ec2:MetadataHttpTokens = required.
+references:
+  - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html
+  - https://attack.mitre.org/techniques/T1552/005/
+  - https://www.capitalone.com/digital/facts2019/
+---
+id: azure-imds-accessible
+name: "Azure Instance Metadata Service Accessible"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N"
+tags: [cloud, azure, imds, ssrf, credential-theft, managed-identity, internal-only]
+target_ports: [80]
+description: |
+  Azure Instance Metadata Service (IMDS) is accessible at 169.254.169.254.
+  Querying /metadata/identity/oauth2/token returns OAuth access tokens for
+  the VM's assigned Managed Identity. Via SSRF or initial access, an attacker
+  can obtain Azure AD tokens scoped to management.azure.com or other resources,
+  enabling lateral movement within the Azure subscription.
+  POSITIONING REQUIREMENT: 169.254.169.254 is link-local and reachable ONLY
+  from within the Azure VM or via SSRF from a vulnerable application on that VM.
+  This check is not reachable from external network positions. Only use this
+  check from within an Azure VM (agent-based) or as a chained SSRF check.
+  MITRE ATT&CK: T1552.005, T1078.004 (Cloud Accounts).
+detection:
+  - type: http
+    method: GET
+    path: "/metadata/instance?api-version=2021-02-01"
+    headers:
+      Host: "169.254.169.254"
+      Metadata: "true"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(azEnvironment|subscriptionId|resourceGroupName|vmId)"
+  - type: http
+    method: GET
+    path: "/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/"
+    headers:
+      Host: "169.254.169.254"
+      Metadata: "true"
+    match:
+      - status_code: 200
+      - body_regex: "access_token"
+    match_all: false
+remediation: |
+  Restrict Managed Identity permissions to minimum required. Monitor for unexpected
+  metadata service queries via Azure Monitor and Defender for Cloud.
+  Patch all web applications to prevent SSRF. Use Private Endpoints where possible
+  to avoid traffic routing through paths reachable from SSRF.
+references:
+  - https://docs.microsoft.com/en-us/azure/virtual-machines/instance-metadata-service
+  - https://attack.mitre.org/techniques/T1552/005/
+---
+id: gcp-metadata-server-accessible
+name: "GCP Instance Metadata Server Accessible"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N"
+tags: [cloud, gcp, imds, ssrf, credential-theft, service-account, internal-only]
+target_ports: [80]
+description: |
+  Google Cloud Platform Instance Metadata server is accessible at
+  metadata.google.internal (169.254.169.254). Querying
+  /computeMetadata/v1/instance/service-accounts/default/token returns
+  an OAuth 2.0 access token for the attached service account. Via SSRF,
+  attackers can steal GCP service account tokens to pivot within the project.
+  GCP requires the Metadata-Flavor: Google header as a basic SSRF mitigation,
+  but this is bypassable in many real-world SSRF scenarios.
+  POSITIONING REQUIREMENT: metadata.google.internal DNS resolves only inside GCP.
+  169.254.169.254 is link-local, reachable only from within the GCP VM or via
+  SSRF on a vulnerable application hosted on that VM. This check will not fire
+  from external scanner positions. Only use from within a GCP instance (agent-based)
+  or as a chained SSRF check against a GCP-hosted target.
+  MITRE ATT&CK: T1552.005, T1078.004.
+detection:
+  - type: http
+    method: GET
+    path: "/computeMetadata/v1/instance/"
+    headers:
+      Host: "metadata.google.internal"
+      Metadata-Flavor: "Google"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(id|name|zone|machineType|serviceAccounts)"
+  - type: http
+    method: GET
+    path: "/computeMetadata/v1/instance/service-accounts/default/token"
+    headers:
+      Host: "metadata.google.internal"
+      Metadata-Flavor: "Google"
+    match:
+      - status_code: 200
+      - body_contains: "access_token"
+    match_all: false
+remediation: |
+  Bind service accounts to minimum required IAM roles. Enable VPC-SC perimeters.
+  Monitor metadata server access via Cloud Logging (protoPayload.methodName=GetToken).
+  Patch web applications to prevent SSRF. Consider Workload Identity Federation
+  instead of attached service accounts where possible.
+references:
+  - https://cloud.google.com/compute/docs/metadata/overview
+  - https://attack.mitre.org/techniques/T1552/005/
+---
+id: kubernetes-api-unauthenticated
+name: "Kubernetes API Server Unauthenticated Access"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+tags: [kubernetes, k8s, no-auth, container, cloud, api-server]
+target_service: kubernetes
+target_ports: [6443, 8443, 8080]
+description: |
+  Kubernetes API server is accessible without authentication. Port 8080 is
+  the legacy insecure API port (disabled by default in modern K8s). Ports
+  6443/8443 may have anonymous authentication enabled or overly permissive
+  RBAC ClusterRoleBindings (system:anonymous -> cluster-admin).
+  Full unauthenticated access allows: pod deployment for container escape,
+  secret enumeration (kubectl get secrets --all-namespaces), node compromise.
+  MITRE ATT&CK: T1613 (Container and Resource Discovery), T1610 (Deploy Container).
+detection:
+  - type: http
+    method: GET
+    path: "/api/v1/namespaces"
+    match:
+      - status_code: 200
+      - body_contains: "kube-system"
+  - type: http
+    method: GET
+    path: "/version"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(gitVersion|kubernetes|Major)"
+  - type: http
+    method: GET
+    path: "/api/v1/secrets"
+    match:
+      - status_code: 200
+      - body_contains: "items"
+    match_all: false
+remediation: |
+  Disable insecure port 8080: --insecure-port=0 in kube-apiserver config.
+  Disable anonymous authentication: --anonymous-auth=false.
+  Audit RBAC: kubectl get clusterrolebindings -o json | jq '.items[] | select(.subjects[]?.name=="system:anonymous")'.
+  Enable RBAC audit logging. Use network policies to restrict API server access.
+references:
+  - https://kubernetes.io/docs/reference/access-authn-authz/authentication/
+  - https://attack.mitre.org/techniques/T1613/
+---
+id: kubernetes-etcd-exposed
+name: "Kubernetes etcd Exposed Without TLS Client Auth (Port 2379)"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+tags: [kubernetes, k8s, etcd, no-auth, cloud, secrets]
+target_service: etcd
+target_ports: [2379]
+description: |
+  Kubernetes etcd cluster store is accessible on port 2379 without TLS
+  client certificate authentication. etcd contains ALL Kubernetes cluster state:
+  service account tokens, TLS secrets, ConfigMaps with credentials, kubeconfig
+  files, and the base64-encoded data of every Kubernetes Secret object.
+  An unauthenticated attacker with network access can extract all cluster
+  secrets with a single etcdctl command.
+  MITRE ATT&CK: T1552.001 (Credentials in Files), T1613.
+detection:
+  - type: http
+    method: GET
+    path: "/version"
+    match:
+      - status_code: 200
+      - body_contains: "etcdserver"
+  - type: http
+    method: GET
+    path: "/v3/cluster/member/list"
+    match:
+      - status_code: 200
+    match_all: false
+  - type: tcp_probe
+    ports: [2379]
+    match:
+      - banner_regex: "(?i)(etcd|grpc)"
+    match_all: false
+remediation: |
+  Enable mutual TLS (--client-cert-auth=true, --trusted-ca-file, --cert-file, --key-file).
+  Restrict etcd access to kube-apiserver IP only via firewall rules.
+  Rotate all secrets after remediation (assume compromise if exposed).
+  Use etcd encryption at rest: --encryption-provider-config.
+references:
+  - https://etcd.io/docs/v3.5/op-guide/security/
+  - https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/
+---
+id: docker-daemon-exposed
+name: "Docker Daemon Exposed Without Authentication (Port 2375)"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+tags: [docker, container, no-auth, rce, cloud, privileged-escape]
+target_service: docker
+target_ports: [2375, 2376]
+description: |
+  Docker daemon TCP socket is exposed on port 2375 without TLS or authentication.
+  Any remote client can issue Docker API commands: pull and run arbitrary containers,
+  mount host filesystem (docker run -v /:/mnt), execute commands as root,
+  and fully compromise the underlying host. This is a trivial root-level RCE.
+  Port 2376 is TLS-protected Docker but may have weak certificate validation.
+  MITRE ATT&CK: T1610 (Deploy Container), T1611 (Escape to Host).
+detection:
+  - type: http
+    method: GET
+    path: "/version"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(ApiVersion|DockerVersion|docker)"
+  - type: http
+    method: GET
+    path: "/containers/json"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(Id|Image|State|Names)"
+    match_all: false
+remediation: |
+  Never expose Docker daemon on TCP without TLS. Use Unix socket (/var/run/docker.sock)
+  for local management only. If remote access is required, enforce mutual TLS:
+  dockerd --tlsverify --tlscacert=ca.pem --tlscert=server-cert.pem --tlskey=server-key.pem.
+  Block port 2375 at host firewall: iptables -A INPUT -p tcp --dport 2375 -j DROP.
+references:
+  - https://docs.docker.com/engine/security/protect-access/
+  - https://attack.mitre.org/techniques/T1610/
+  - https://attack.mitre.org/techniques/T1611/
+---
+id: prometheus-metrics-exposed
+name: "Prometheus Metrics Endpoint Exposed Without Authentication"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+tags: [misconfig, prometheus, metrics, no-auth, info-disclosure, cloud]
+target_service: prometheus
+target_ports: [9090, 9091]
+description: |
+  Prometheus web UI and metrics API are accessible without authentication.
+  Exposed /metrics endpoints leak infrastructure topology, service names,
+  internal IP addresses, error rates, and potentially credential-related
+  labels. The /api/v1/targets endpoint reveals all scraped targets and their
+  URLs. Federation endpoint (/federate) can expose all metric data from
+  the entire monitoring infrastructure.
+  MITRE ATT&CK: T1046 (Network Service Scanning), T1087 (Account Discovery).
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(Prometheus|prometheus_build_info)"
+  - type: http
+    method: GET
+    path: "/api/v1/targets"
+    match:
+      - status_code: 200
+      - body_contains: "activeTargets"
+    match_all: false
+remediation: |
+  Enable Prometheus basic authentication via web.yml:
+  basic_auth_users: admin: $2b$12$hNf2lSsxfm0.i4a.1kVpSOVyBCfIB51VRjgBUyv6kdnyTlgWj81Ay.
+  Place Prometheus behind a reverse proxy with authentication. Restrict access
+  via network policies or firewall to monitoring/operations subnets only.
+references:
+  - https://prometheus.io/docs/prometheus/latest/configuration/https/
+  - https://cwe.mitre.org/data/definitions/306.html
+---
+id: grafana-default-credentials
+name: "Grafana Default Admin Credentials (admin/admin)"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+tags: [misconfig, grafana, default-creds, cloud, dashboard, ssrf]
+target_service: grafana
+target_ports: [3000]
+description: |
+  Grafana dashboard is accessible with default admin credentials (admin/admin).
+  Full Grafana admin access allows: reading all dashboards with potentially
+  sensitive infrastructure data, modifying data sources (SSRF via HTTP data
+  sources), installing plugins with external execution capability, reading
+  secrets stored in data source configurations (database passwords, API keys).
+  CVE-2021-43798 (Grafana directory traversal) may also be present on
+  unpatched versions < 8.3.1.
+  MITRE ATT&CK: T1078.001 (Default Accounts), T1552 (Unsecured Credentials).
+detection:
+  - type: http
+    method: GET
+    path: "/login"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(Grafana|grafana)"
+  - type: http
+    method: POST
+    path: "/api/login"
+    headers:
+      Content-Type: "application/json"
+    body: "{\"user\":\"admin\",\"password\":\"admin\"}"
+    match:
+      - status_code: 200
+      - body_contains: "Logged in"
+    match_all: false
+remediation: |
+  Change admin password immediately. Disable default admin user if possible.
+  Enable Grafana SMTP + MFA. Restrict Grafana to internal networks.
+  Audit data sources for stored credentials. Upgrade to latest Grafana version.
+references:
+  - https://grafana.com/docs/grafana/latest/administration/user-management/
+  - https://nvd.nist.gov/vuln/detail/CVE-2021-43798
+---
+id: kibana-unauthenticated
+name: "Kibana Dashboard Unauthenticated Access"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+tags: [misconfig, kibana, no-auth, elasticsearch, cloud, data-exposure]
+target_service: kibana
+target_ports: [5601]
+description: |
+  Kibana dashboard is accessible without authentication. Kibana connects to
+  Elasticsearch and provides full read/write access to all indexed data.
+  Via the console panel, attackers can execute Elasticsearch API calls,
+  enumerate all indices, read all documents, and potentially execute
+  Painless script injection for RCE (CVE-2019-7614, CVE-2021-22144).
+  MITRE ATT&CK: T1078.001, T1005 (Data from Local System).
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - status_code: [200, 302]
+      - body_regex: "(?i)(kibana|Elastic)"
+  - type: http
+    method: GET
+    path: "/api/status"
+    match:
+      - status_code: 200
+      - body_contains: "kibana"
+    match_all: false
+remediation: |
+  Enable X-Pack security on Elasticsearch and Kibana. Configure Kibana with
+  kibana.yml: elasticsearch.username / elasticsearch.password.
+  Enable Kibana TLS (server.ssl.enabled: true). Place behind SSO/reverse proxy.
+  Restrict port 5601 to operations/monitoring subnets.
+references:
+  - https://www.elastic.co/guide/en/kibana/current/configuring-tls.html
+  - https://cwe.mitre.org/data/definitions/306.html
+---
+id: minio-admin-unauthenticated
+name: "MinIO Object Storage Admin Interface Unauthenticated or Default Credentials"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [misconfig, minio, s3, object-storage, no-auth, default-creds, cloud]
+target_service: minio
+target_ports: [9000, 9001]
+description: |
+  MinIO object storage API (port 9000) or admin console (port 9001) is accessible
+  with default credentials (minioadmin/minioadmin) or without authentication.
+  Full MinIO admin access allows: listing all buckets and objects, reading/writing
+  all data, creating/deleting service accounts, configuring replication, and in
+  MINIO_VOLUMES mode with host mount, potentially reading all host data.
+  MITRE ATT&CK: T1530 (Data from Cloud Storage Object), T1078.001.
+detection:
+  - type: http
+    method: GET
+    path: "/minio/health/live"
+    match:
+      - status_code: 200
+  - type: http
+    method: GET
+    path: "/login"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(MinIO|minio)"
+  - type: http
+    method: POST
+    path: "/api/v1/login"
+    headers:
+      Content-Type: "application/json"
+    body: "{\"accessKey\":\"minioadmin\",\"secretKey\":\"minioadmin\"}"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(token|sessionId)"
+    match_all: false
+remediation: |
+  Change MinIO credentials immediately: MINIO_ROOT_USER and MINIO_ROOT_PASSWORD
+  environment variables (minimum 8 character alphanumeric password required).
+  Enable MinIO TLS. Use bucket policies to restrict access. Enable MinIO audit logging.
+  Restrict port 9001 console to internal management network.
+references:
+  - https://min.io/docs/minio/linux/administration/identity-access-management.html
+  - https://cwe.mitre.org/data/definitions/1188.html
+---
+id: jupyter-notebook-token-free
+name: "Jupyter Notebook Accessible Without Token Authentication"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [jupyter, rce, no-auth, python, cloud, data-science]
+target_service: jupyter
+target_ports: [8888, 8889]
+description: |
+  Jupyter Notebook server is accessible without token authentication (--NotebookApp.token='').
+  Any unauthenticated user can create notebooks, execute arbitrary Python code
+  as the server process user, access the filesystem, install packages, and
+  exfiltrate data. In cloud environments this is trivially escalated to
+  full cloud account compromise via metadata service credential theft from
+  within a notebook cell.
+  MITRE ATT&CK: T1059.006 (Python), T1190, T1552.005.
+detection:
+  - type: http
+    method: GET
+    path: "/api/kernels"
+    match:
+      - status_code: 200
+      - body_regex: "\\[|\\{.*kernel"
+  - type: http
+    method: GET
+    path: "/tree"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(Jupyter|jupyter|ipython|notebook)"
+    match_all: false
+remediation: |
+  Always configure a strong token or password: jupyter notebook --NotebookApp.token='<random-token>'.
+  Bind to localhost only: --ip=127.0.0.1. Enable TLS: --certfile, --keyfile.
+  Place behind authenticated reverse proxy (OAuth2 Proxy, JupyterHub).
+  Never expose Jupyter directly to the internet or untrusted networks.
+references:
+  - https://jupyter-notebook.readthedocs.io/en/stable/security.html
+  - https://attack.mitre.org/techniques/T1059/006/
+---
+id: argo-cd-dashboard-exposed
+name: "Argo CD Dashboard Exposed Without Authentication"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:N"
+tags: [argocd, kubernetes, gitops, no-auth, cloud, cicd, supply-chain]
+target_service: argocd
+target_ports: [8080, 443]
+description: |
+  Argo CD GitOps continuous delivery dashboard is exposed. Argo CD manages
+  Kubernetes application deployments from Git repositories. Unauthorized access
+  allows an attacker to: deploy malicious applications to Kubernetes clusters,
+  read Kubernetes secrets via application manifests, modify deployment configs,
+  and pivot to cluster compromise. CVE-2022-24348 (path traversal in Helm charts)
+  may be applicable on unpatched versions.
+  MITRE ATT&CK: T1195.002 (Compromise Software Supply Chain), T1610.
+detection:
+  - type: http
+    method: GET
+    path: "/"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(Argo CD|argocd|argo-cd)"
+  - type: http
+    method: GET
+    path: "/api/v1/applications"
+    match:
+      - status_code: 200
+      - body_contains: "items"
+    match_all: false
+remediation: |
+  Enforce authentication in Argo CD. Disable anonymous access: set accounts.anonymous.enabled=false
+  in argocd-cm ConfigMap. Integrate with enterprise SSO (OIDC/LDAP).
+  Apply RBAC policies restricting project/application access. Upgrade to latest Argo CD version.
+  Restrict port 8080/443 to CI/CD and operations subnets only.
+references:
+  - https://argo-cd.readthedocs.io/en/stable/operator-manual/security/
+  - https://nvd.nist.gov/vuln/detail/CVE-2022-24348
+---
+id: vault-ui-unsealed-accessible
+name: "HashiCorp Vault UI Unsealed and Accessible"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N"
+tags: [vault, secrets, no-auth, cloud, misconfig, hashicorp]
+target_service: vault
+target_ports: [8200]
+description: |
+  HashiCorp Vault web UI is accessible and the Vault is unsealed. An exposed
+  Vault with weak authentication policies, misconfigured auth methods, or
+  default root tokens can allow attackers to read all stored secrets. Common
+  misconfigurations include: root token not revoked after initialization,
+  GitHub auth with overly broad org policies, AppRole auth with exposed RoleID/SecretID.
+  Even a sealed Vault exposes the UI which reveals Vault version for targeting.
+  MITRE ATT&CK: T1552 (Unsecured Credentials), T1213 (Data from Information Repositories).
+detection:
+  - type: http
+    method: GET
+    path: "/v1/sys/health"
+    match:
+      - status_code: [200, 429, 472, 473]
+      - body_regex: "(?i)(initialized|sealed|version)"
+  - type: http
+    method: GET
+    path: "/ui/"
+    match:
+      - status_code: 200
+      - body_regex: "(?i)(Vault|HashiCorp)"
+    match_all: false
+remediation: |
+  Revoke root token after initial configuration: vault token revoke <root-token>.
+  Enable audit logging: vault audit enable file file_path=/var/log/vault_audit.log.
+  Use short-lived tokens with appropriate TTLs. Configure network ACLs to restrict
+  port 8200 to application servers and operations subnets. Enable TLS listener.
+  Use Vault Sentinel for fine-grained policy enforcement.
+references:
+  - https://developer.hashicorp.com/vault/docs/configuration/listener/tcp
+  - https://developer.hashicorp.com/vault/docs/concepts/tokens
+  - https://cwe.mitre.org/data/definitions/306.html

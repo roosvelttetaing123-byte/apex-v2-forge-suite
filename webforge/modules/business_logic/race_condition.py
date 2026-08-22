@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
 from common.evidence import Evidence
 from common.finding import Severity
+from common.fp_reducer import FPReducer, Confidence
 
 CVSS_RACE = "CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:L/I:H/A:N"
 CVSS40_RACE = "CVSS:4.0/AV:N/AC:H/AT:N/PR:L/UI:N/VC:L/VI:H/VA:N/SC:N/SI:N/SA:N"
@@ -96,6 +97,10 @@ class RaceCondition(BaseModule):
     ) -> None:
         """Send concurrent requests and look for race condition indicators."""
         self.log.info("Testing race condition on %s (%s)", url, desc)
+        self._fp = FPReducer(
+            collab_client=self.config.extra.get("collab_client"),
+            headers=self.config.extra.get("session_headers", {}),
+        )
 
         # Single rate_limit() counts the entire blast as one logical action
         await self.rate_limit()

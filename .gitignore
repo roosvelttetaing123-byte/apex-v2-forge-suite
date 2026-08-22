@@ -5,6 +5,9 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
 .tox/
 venv/
 .venv/
@@ -12,14 +15,24 @@ env/
 
 # Runtime / database
 *.db
+*.db.schema.lock
 *.sqlite3
 
 # Engagement artefacts (target-specific — keep out of source control)
 *.json
+!apex-ui/config/npm-audit-exceptions.json
 !requirements*.json
+!apex-ui/package.json
+!apex-ui/package-lock.json
+!apex-ui/tsconfig.json
+!contracts/*.json
+!config/*.json
 engagements/
 extracted_images/
 *.html
+.coverage
+.coverage.*
+coverage.xml
 
 # Reports / presentations
 *.pptx
@@ -34,8 +47,10 @@ screenshots/
 # Secrets / env / TLS
 .env
 .env.*
+!.env.example
 secrets.*
 credentials.*
+!common/dashboard/web/static/js/credentials.js
 *.pem
 *.key
 .tls/

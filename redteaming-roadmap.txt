@@ -1,0 +1,448 @@
+Given what your red teams actually find works:
+
+
+
+Order	What	Why
+1	Leak Intelligence Engine	This is what's winning engagements for you. Automate it.
+2	OSINT→Credential→Access Chains	Chain the leaks to actual access (currently manual step)
+3	Shodan/crt.sh/DNS History Enricher	Automate IP-behind-firewall discovery
+4	Internal URL Inference from Configs	Configs leak more than you think — mine them
+5	Automated Credential Testing Matrix	Don't just find creds — test them against everything
+Want me to write the actual implementation plan for the Leak Intelligence Engine — module structure, API integrations, scanner logic, and chain integration with your existing ChainEngine? That would be the fastest path to solving the exact problem your red teams keep hitting.
+
+
+
+
+
+1:53 AM
+rewrite my whole impletmentation with adds on i just talked abt
+1:53 AM
+
+
+Below is your rewritten, complete implementation plan — your original Forge Suite plan with all the additions from our discussion integrated: Cloud/Container, CI/CD/Supply Chain, macOS, Reporting/Opsec/Exfil, and the Leak Intelligence Engine that directly addresses your real-world findings.
+
+Forge Suite — Enterprise Red Team Framework
+Complete implementation plan with original scope + additions from red team operational feedback.
+
+Current Inventory (What We Have)
+
+
+Area	Modules	Status
+Attack Chains	10 chains (SQLi→Spray, XSS→Hijack, SMB→Relay, ADCreds→Lateral, SSRF→Internal, Host→BH, Upload→Shell, SSTI→RCE, XXE→SSRF, DefaultCreds→PrivEsc)	✅ Working
+C2 Tasks	shell, file, screenshot, bof, socks	✅ Working
+C2 Transport	HTTP, TCP, DNS	✅ Working
+C2 Listeners	HTTP, TCP, DNS	✅ Working
+Implants	Windows, Linux, builder, config, stager_factory	✅ Working
+Post-Exploit	PsExec, SMB, SSH, WinRM, WMI laterals + mimikatz, SAM dump, NTDS dump, token steal, persistence (cron/registry/schtask/service), pivot finder, loot parse, tunnel suggest	✅ Working
+Payload Evasion	BYOVD, sandbox detect, string obfuscate	⚠️ Thin
+Payload Encoders	XOR, RC4, AES, UUID, polymorphic	✅ Working
+Payload Delivery	ISO, LNK, ZIP	⚠️ Thin
+AD Attacks	19 attacks (Kerberoast, ASREPRoast, DCSync, DCShadow, Golden/Silver ticket, Pass-the-Hash/Ticket, Zerologon, PetitPotam, PrintSpooler, NoPAC, Certifried, NTLM relay, password spray, etc.)	✅ Solid
+Web Injection	SQLi, XSS, SSTI, XXE, CMDi, CRLF, NoSQL, LDAP, Log4Shell, HPP, Host Header, JSONP	✅ Solid
+Web Advanced	HTTP Smuggling, Cache Deception/Poison, Deserialization, WebSocket, Prototype Pollution, Zip Slip, Account Takeover, HTTP/2	✅ Good
+Brain/Planner	Kill chain phases, autonomous engagement, attack planning, FN sweep, brain-driven module selection	✅ Working
+Process Injection	5 techniques (Early Bird APC, Threadless Callback, Module Stomping, NtQueueApcThread, AtomBombing)	⚠️ Emulation-only metadata
+Rootkit	AMSI bypass, ETW blind, kernel rootkit, process hollow, userland rootkit	✅ Working
+AI Testing	Jailbreak, injection, DoS, exfil, agent, recon, output	✅ Working
+⚠️ CRITICAL NEW AREA: Missing from Original Inventory
+Leak Intelligence Engine (From Red Team Findings)
+
+
+Module	Status
+GitHub/GitLab Secret Scanner (commit history, gists, issues, PRs)	❌ Missing
+Pastebin/Ghostbin/Hastebin Monitor	❌ Missing
+Certificate Transparency Log Scanner (crt.sh)	❌ Missing
+Shodan/Censys Origin IP Enricher	❌ Missing
+DNS History Mining (SecurityTrails, PassiveTotal)	❌ Missing
+Cloud Asset Enumeration (open S3/Azure Blob/GCP Storage)	❌ Missing
+Credential Auto-Tester (test leaks against Azure AD, AWS, VPN, Jira, Confluence)	❌ Missing
+Internal URL Inference Engine (extract domains/IPs from config files)	❌ Missing
+Historical Commit Deep Scan (git log for removed secrets)	❌ Missing
+Secret Pattern ML Detector (rotated keys, JWT tokens, .env, connection strings)	❌ Missing
+NPM/PyPy Registry Metadata Scanner (package.json, setup.py exposing internal URLs)	❌ Missing
+Stack Overflow Snippet Scanner (accidental credential exposure in code questions)	❌ Missing
+Cloud & Container Attack Surface
+
+
+Module	Status
+Cloud API Scanner (AWS/Azure/GCP metadata APIs, KMS, Secrets Manager, S3/Storage/DNS)	❌ Missing
+Cloud IAM Chaining (stolen creds → role enumeration → escalation)	❌ Missing
+Container Escape (cgroup, mount, SYS_PTRACE, /proc escapes)	❌ Missing
+K8s Attack Modules (kubelet auth, etcd access, RBAC abuse, pod exec, SA token theft)	❌ Missing
+Terraform State Poisoning (modify tfstate to backdoor cloud infra)	❌ Missing
+Serverless Injection (Lambda event injection, env var extraction, function manipulation)	❌ Missing
+CI/CD & Supply Chain Modules
+
+
+Module	Status
+Pipeline Poisoner (CI/CD config injection — Jenkins, GitLab CI, GitHub Actions, Azure DevOps)	❌ Missing
+Artifact Backdoor (modify build artifacts — JARs, containers, npm packages — in registries)	❌ Missing
+Secret Scanner Extractor (aggressive repo history + CI variables + cloud env mining)	❌ Missing
+Dependency Confusion Tester (private package names resolve to public registries)	❌ Missing
+Self-Hosted Runner Abuse (runner token extraction → host compromise)	❌ Missing
+Code Review Poisoning (submit PRs with subtle backdoors as simulated insider threat)	❌ Missing
+macOS Implant
+
+
+Module	Status
+macOS Implant (persistent agent, TCC bypass, keychain extraction, Accessibility API abuse)	❌ Missing
+PKG/DMG Builder (macOS payload delivery with code-signing avoidance)	❌ Missing
+Cross-Platform Agent (single codebase → Win/Linux/macOS compile targets)	❌ Missing
+Reporting & Artifacts
+
+
+Module	Status
+Automated Pentest Report Generator (Word/PDF — findings, CVSS, remediation, screenshots)	❌ Missing
+Timeline Viewer (attack timeline visualization for client debriefs)	❌ Missing
+Loot Dashboard (centralized creds, sessions, screenshots, files)	❌ Missing
+Evidence Locker (auto-capture screenshots, command output, PCAPs per finding)	❌ Missing
+Executive Summary Generator ("From initial access to DA in 47 minutes via 3 hops")	❌ Missing
+Remediation KB Integration (auto-link findings to Mitre, CWE, vendor KB articles)	❌ Missing
+Exfiltration Pipeline
+
+
+Module	Status
+Smart Exfil (rate-limited, encrypted, chunked via DNS/HTTP/Cloud API)	❌ Missing
+Data Staging (auto-compress + encrypt loot before exfil)	❌ Missing
+Exfil Tunnel (multi-hop relay: victim → staging → C2 → external drop)	❌ Missing
+Cover Tracks Exfil (selectively wipe traces after exfil complete)	❌ Missing
+Operational Security (Opsec) Engine
+
+
+Module	Status
+Noise Budget Tracker (total SIEM events per engagement; alert at threshold)	❌ Missing
+Timing Controller (randomized intervals via uniform/gaussian/poisson distributions)	❌ Missing
+Cleanup Manager (auto-remove accounts, persistence, registry, event logs)	❌ Missing
+Rollback Capability (clean and vanish on engagement detection)	❌ Missing
+Enterprise Integrations
+
+
+Module	Status
+Full REST/gRPC API (external tool orchestration)	❌ Missing
+SIEM/FEED Integration (output to Splunk/ELK/Sentinel for blue team consumption)	❌ Missing
+Terraform/Ansible Target Provisioning (auto-spin target VMs for repeatable testing)	❌ Missing
+Jira/GitLab Integration (auto-create tickets from findings)	❌ Missing
+Slack Webhook Notifications (real-time engagement alerts to C2 team channel)	❌ Missing
+Edge Case Modules
+
+
+Module	Status
+IPv6 Attack Support (tools functional on IPv6-only networks)	❌ Missing
+Air-Gapped Delivery (USB delivery, offline C2 via QR code/acoustic/screen capture)	❌ Missing
+BYOD/MDM Bypass (Workspace ONE/Intune managed device escape)	❌ Missing
+OT/ICS Protocols (Modbus, S7, BACnet scanners for converged IT/OT)	❌ Missing
+Tier 1 — HIGH IMPACT Offensive Gaps
+1A. Missing Attack Chains
+The ChainEngine has 10 chains. Real enterprise engagements require 25+ chain patterns.
+
+NEW CHAINS (from red team feedback — these are what actually wins):
+
+
+
+#	Chain	Trigger → Next	Why It Matters
+1	Git Leak → Credential → Internal Web App	git_secret_find → credential_tester → internal_web_access	This is what wins engagements. Automate it.
+2	Pastebin Leak → VPN/RDP Credential → Perimeter Access	pastebin_leak → credential_tester → vpn_access	Bypass perimeter with real creds found in public dumps
+3	Certificate Transparency → Hidden Subdomain → Forgotten App	crtsh_find → subdomain_probe → outdated_app_exploit	Forgotten internal apps with default creds exposed publicly
+4	Shodan Origin IP → CDN Bypass → Direct Backend Access	shodan_origin_find → direct_ip_probe → backend_exploit	Bypass WAF/CDN entirely
+5	DNS History → Decommissioned Subdomain → Stale Auth	dns_history → subdomain_probe → stale_cred_exploit	Old SSO pages that still authenticate
+6	LFI → Source Code Leak → Credential Harvest	lfi → source_code_parser → cred_spray	LFI leaks config files with DB creds, API keys
+7	SSRF → Cloud Metadata → IAM Pivot	ssrf → cloud_metadata → iam_escalation	SSRF to 169.254.169.254 is the #1 cloud kill chain
+8	Kerberoast → Crack → Lateral	kerberoast_hash → hash_crack → lateral_movement	Classic AD chain
+9	Password Spray → MFA Bypass → Mailbox	password_spray → mfa_bypass → mailbox_access	O365/Azure AD spray to full compromise
+10	ADCS ESC1-8 → Certificate → Domain Admin	adcs_vuln → cert_request → golden_cert	ADCS abuse — hottest AD attack path
+11	Webshell → Reverse Shell → C2 Beacon	webshell → reverse_shell → beacon_deploy	File upload chains currently stop at webshell
+12	DNS Takeover → Phishing → Credential Harvest	subdomain_takeover → phishing_page → cred_harvest	Subdomain takeover → full auth compromise
+13	GraphQL Introspection → Injection → Data Exfil	graphql_introspection → sqli → data_exfil	API-first attack path
+14	JWT Weak Secret → Token Forge → Admin Access	jwt_weak_secret → jwt_forge → admin_bypass	JWT none-alg / weak-key → full admin
+15	Open Redirect → OAuth Token Theft → Account Takeover	open_redirect → oauth_intercept → account_takeover	OAuth flow abuse
+16	Deserialization → RCE → Beacon	deserialization → rce_exec → beacon_deploy	Java/PHP/Python deser chains
+17	NTLM Relay → ADCS → Domain Admin	ntlm_relay → adcs_relay → domain_admin	ESC8: NTLM relay to ADCS HTTP enrollment
+18	Race Condition → Privilege Escalation	race_condition → priv_esc_check	TOCTOU exploits
+19	Cache Poison → XSS/Redirect → Session Hijack	cache_poison → xss → session_hijack	Web cache attacks chaining to stored XSS
+20	Container Escape → Host Compromise → Cloud Creds	container_escape → host_shell → cloud_metadata_exfil	Break out of container to host, then steal cloud tokens
+21	K8s Pod Access → Service Account → Cluster Admin	kubectl_pod_exec → sa_token_exfil → k8s_admin	From a single pod to cluster compromise
+22	CI/CD Config Leak → Pipeline Injection → Production Backdoor	cicd_config_leak → pipeline_inject → production_deploy	Poison the pipeline; own production
+23	Dependency Confusion → Arbitrary Code Execution in Build	dep_confusion_pkg → malicious_package_resolve → build_server_rce	npm/PyPI/Gem dependency confusion
+24	Self-Hosted Runner Abuse → Runner Token → CI/CD RCE	runner_token_extract → runner_register → job_inject	Abuse CI runners for host access
+1B. Chain Engine Intelligence Upgrades
+The current ChainEngine is reactive only — event waits and pattern-matches. It needs proactive and adaptive intelligence:
+
+
+
+Capability	Current	Proposed
+Multi-hop chains	Single-hop (A→B)	Support A→B→C→D with chain continuation
+Conditional branching	None — linear match	If SSRF reaches metadata → cloud path; if SSRF reaches internal service → pivot path
+Chain scoring	No prioritization	Score chains by impact × probability × stealth; execute highest ROI first
+Failure adaptation	None — chain either fires or doesn't	On chain failure, try alternative paths (PsExec fails → try WinRM → try WMI)
+Chain state machine	No state tracking	Track which chains are in-progress, completed, failed, blocked
+Cross-engine chains	Partially supported	WebForge → ADForge → C2Forge (full cross-engine)
+Chain dependency graph	None	DAG of chain prerequisites so planner identifies which finding unlocks which chains
+Temporal chains	None	Multi-phase chains spanning hours/days (low-and-slow spray, then exploit on success)
+OSINT-driven proactive chains	None	NEW: Chain engine that proactively scans for leaks before any other module fires
+Tier 2 — C2 & Red Team Offensive Gaps
+2A. Missing C2 Tasks
+Currently only: shell, file, screenshot, bof, socks. Missing:
+
+
+
+Task	Description	MITRE
+task_keylogger	Keyboard capture (lab-safe emulation or real)	T1056.001
+task_browser_creds	Extract saved passwords from Chrome/Firefox/Edge credential stores	T1555.003
+task_clipboard	Clipboard monitoring and capture	T1115
+task_mimikatz	In-memory Mimikatz execution via BOF or reflective DLL	T1003.001
+task_registry	Registry read/write/query for persistence and enumeration	T1012
+task_service	Service create/modify/delete for persistence	T1543.003
+task_wmi	WMI command execution and lateral movement	T1047
+task_assembly	In-memory .NET assembly execution (execute-assembly)	T1218
+task_inject	Process injection task (shellcode into target process)	T1055
+task_token	Token impersonation and privilege elevation	T1134
+task_portscan	Beacon-side port scanning for internal recon	T1046
+task_download_exec	Download and execute payload from C2	T1105
+2B. Missing Implant Evasion
+Current evasion: BYOVD, sandbox_detect, string_obfuscate. Missing:
+
+
+
+Technique	Description	Priority
+Sleep mask	Encrypt beacon memory during sleep to evade memory scanners	P0
+Indirect syscalls	Bypass EDR userland hooks via syscall stubs	P0
+Stack spoofing	Fake call stacks during sleep to evade stack walking	P1
+PE stomping	Overwrite PE header post-load to break forensic tools	P1
+Unhooking	Reload clean ntdll.dll to remove EDR hooks	P1
+PPID spoofing	Fake parent process ID for process creation	P1
+ETW patching	Patch EtwEventWrite to blind ETW consumers	P1 (have ETW blind in rootkit, need in implant)
+Timestomping	Modify file timestamps for forensic anti-analysis	P2
+Module overloading	Load beacon into legitimate DLL memory space	P2
+2C. Missing C2 Channels
+Current transports: HTTP, TCP, DNS. Missing:
+
+
+
+Channel	Description	Stealth Level
+DNS-over-HTTPS (DoH)	Tunnel C2 over DoH to blend with legitimate DNS	HIGH
+Slack/Teams C2	Use collab platform APIs as C2 channel	HIGH
+ICMP C2	Tunnel over ICMP echo requests	MEDIUM
+SMB Named Pipe	P2P relay over SMB (currently emulation-only)	HIGH
+WebSocket C2	Persistent WS connection, blends with web traffic	HIGH
+Domain Fronting	CDN-based domain fronting for C2	HIGH
+2D. Missing Delivery Mechanisms
+Current: ISO, LNK, ZIP. Missing:
+
+
+
+Mechanism	Description
+HTA builder	HTML Application payloads
+VBA/Macro builder	Office macro generation
+MSI builder	Windows Installer payloads
+DLL sideloading builder	Generate DLL for legitimate app sideloading
+OneNote builder	.one file with embedded payload
+CHM builder	Compiled HTML Help with payload
+PKG/DMG builder	macOS delivery payloads
+Tier 3 — Smart Thinking & Autonomous Improvements
+3A. Brain Planner Upgrades
+The current planner does kill chain phase tracking and module selection. Missing:
+
+
+
+Feature	Description
+Attack graph modeling	Build real-time attack graph from discovered assets/vulns/creds. Each node = asset state, each edge = attack technique. Enables shortest-path-to-DA calculations
+Probabilistic planning	Weight each technique by P(success) based on target OS, patch level, EDR presence. Choose highest-EV path
+Defensive awareness	If scan detects EDR/AV product, auto-adjust opsec level, select evasion techniques, modify timing
+Objective-driven planning	Set engagement objectives (DA, data exfil, specific server access) and let planner work backward from objective to current position
+Resource-aware scheduling	Track engagement time budget, stealth budget, noise budget. Allocate expensive actions wisely
+Learning from failure	When a technique fails (PsExec blocked), record it and avoid similar techniques on similar targets. Build per-engagement "failure memory"
+Leak-driven prioritization	NEW: If OSINT finds leaked creds, prioritize credential testing chains over everything else
+3B. Engagement Intelligence
+
+
+Feature	Description
+Target profiling	Build composite target profile: OS + patch level + services + EDR + cloud provider + AD role. NEW: Include OSINT discovered leaks, exposed internal URLs, origin IPs
+Threat model matching	Match engagement scope to known threat actor TTPs (APT29, FIN7, etc.) and auto-select matching technique chains
+Detection risk scoring	For each action, estimate detection probability based on known EDR capabilities. Show operator risk/reward matrix
+Automated pivoting logic	When one network segment is compromised, automatically discover and prioritize pivot targets in adjacent segments
+Tier 4 — Scanner Offensive Depth
+4A. Missing Web Attack Modules
+
+
+Module	Description
+graphql_scanner	Full GraphQL security audit (introspection, batching, injection, DoS)
+cors_exploit	CORS misconfiguration exploitation (not just detection)
+ssrf_advanced	Blind SSRF with DNS rebinding, IPv6 bypass, redirect chains
+websocket_inject	WebSocket message injection and hijacking
+http2_smuggling	HTTP/2-specific request smuggling (h2c, CRLF in pseudo-headers)
+grpc_audit	gRPC service enumeration and testing
+path_traversal_advanced	Null byte, double encoding, unicode normalization bypasses
+prototype_pollution_exploit	Exploitation chains from prototype pollution to RCE
+4B. Missing Network Attack Modules
+
+
+Module	Description
+coerce_attacks	Unified PetitPotam/PrinterBug/DFSCoerce/ShadowCoerce with auto-relay
+responder_emulation	LLMNR/NBT-NS/MDNS poisoning detection and emulation
+ipv6_attacks	IPv6 MITM, SLAAC attack, DHCPv6 spoofing
+wifi_audit	802.11 deauth, WPA handshake capture, evil twin
+snmp_exploit	SNMP community string brute + config extraction + RCE
+4C. NEW: Leak Intelligence Engine (From Red Team Feedback)
+
+
+Module	Description
+git_secret_scanner	Full GitHub/GitLab/Bitbucket scan — commit history, gists, issues, PRs, wiki pages
+pastebin_monitor	Scan Pastebin, Ghostbin, Hastebin, Rentry for target-related credentials
+crtsh_scanner	Certificate Transparency log enumeration for hidden subdomains
+shodan_enricher	For each domain, find origin IPs, open ports, service banners, SSL certs
+dns_history_miner	SecurityTrails/PassiveTotal for historical DNS records → decommissioned subdomains
+cloud_asset_enumerator	Scan for open S3 buckets, Azure Blob, GCP Storage with config files
+credential_tester	Auto-test discovered creds against Azure AD, AWS STS, VPN, Jira, Confluence, internal apps
+url_inference_engine	Extract internal URLs, IPs, hostnames from config files, .env, docker-compose
+secret_ml_detector	Rotated API keys, JWT tokens, .env patterns, connection strings, Firebase URLs, Slack tokens
+npm_pypi_scanner	package.json / setup.py registry metadata for internal URL leakage
+stackoverflow_scanner	Code snippets from target domain with embedded credentials
+4D. NEW: Cloud & Container Attack Modules
+
+
+Module	Description
+cloud_api_scanner	AWS/Azure/GCP metadata API enumeration, KMS, Secrets Manager, S3/Storage/DNS
+cloud_iam_chaining	From stolen cloud creds → enumerate roles → assume role → escalate
+container_escape	cgroup, mount, SYS_PTRACE, /proc escape techniques
+k8s_attack	kubelet auth bypass, etcd access, RBAC abuse, pod exec, SA token theft
+tf_state_poisoner	Modify Terraform state files to backdoor cloud resources
+serverless_inject	Lambda event injection, env var extraction, function manipulation
+4E. NEW: CI/CD & Supply Chain Modules
+
+
+Module	Description
+pipeline_poisoner	CI/CD config injection (Jenkinsfile, .gitlab-ci.yml, GitHub Actions, Azure DevOps)
+artifact_backdoor	Modify build artifacts in registries during pipeline runs
+dep_confusion_tester	Test if private package names resolve to public registries
+runner_abuse	Extract self-hosted runner token → register malicious runner → host RCE
+code_review_poisoner	Submit PRs with subtle backdoors for insider threat simulation
+Proposed Implementation Order
+Sprint 0 — Leak Intelligence Engine (CRITICAL — From Red Team Findings)
+git_secret_scanner (GitHub/GitLab/Bitbucket — commits, gists, issues, PRs)
+pastebin_monitor (Pastebin, Ghostbin, Hastebin)
+crtsh_scanner (Certificate Transparency logs)
+shodan_enricher (Origin IP discovery)
+dns_history_miner (Decommissioned subdomains)
+credential_tester (Auto-test leaks against all services)
+url_inference_engine (Extract internal URLs from config files)
+Integrate all into Chain Engine as OSINT-driven chains
+Sprint 1 — Cloud & Container (Enterprise Necessity)
+cloud_api_scanner
+cloud_iam_chaining
+container_escape
+k8s_attack (kubelet + etcd + RBAC + pod exec)
+Add cloud-specific chains (SSRF→metadata, K8s pod→cluster admin)
+Sprint 2 — Chain Engine v2 (Smart Offensive Thinking)
+Multi-hop chain support in ChainEngine
+Chain state machine (in-progress/completed/failed/blocked)
+Add 14 new attack chains (#6-#24 above)
+Conditional branching + failure adaptation
+Chain scoring (impact × probability × stealth)
+Chain dependency DAG
+Sprint 3 — C2 Task Expansion
+task_assembly (execute-assembly — core red team need)
+task_keylogger, task_browser_creds, task_clipboard
+task_registry, task_service, task_wmi
+task_inject, task_token
+task_portscan, task_download_exec
+Sprint 4 — Implant Evasion Layer
+Sleep mask encryption
+Indirect syscalls
+Stack spoofing
+Unhooking (ntdll reload)
+PPID spoofing
+PE stomping + module overloading
+Sprint 5 — CI/CD + Supply Chain
+pipeline_poisoner
+dep_confusion_tester
+runner_abuse
+Add CI/CD chains (config leak→pipeline inject, dep confusion→RCE)
+Sprint 6 — Brain Intelligence
+Attack graph model
+Defensive awareness (EDR-adaptive planning)
+Objective-driven planning
+Detection risk scoring
+Threat model matching (APT emulation profiles)
+Sprint 7 — macOS Implant
+macOS persistent agent
+TCC bypass + keychain extraction + Accessibility API abuse
+PKG/DMG builder
+Cross-platform codebase merge
+Sprint 8 — Transport & Delivery Expansion
+DoH transport
+WebSocket C2
+Slack/Teams C2
+SMB named pipe (real, not emulation)
+HTA, VBA/Macro, MSI, DLL sideloading, CHM delivery builders
+Sprint 9 — Reporting, Opsec & Exfiltration
+Automated pentest report generator (Word/PDF)
+Timeline viewer + loot dashboard + evidence locker
+Executive summary generator + remediation KB integration
+Noise budget tracker + timing controller
+Cleanup manager + rollback capability
+Smart exfil + data staging + exfil tunnel + cover tracks
+Sprint 10 — Enterprise Integrations & Edge Cases
+Full REST/gRPC API
+SIEM/Splunk/ELK/Sentinel output
+Jira/GitLab ticket auto-creation
+Slack webhook notifications
+IPv6 support audit
+Air-gapped delivery modules
+BYOD/MDM bypass modules
+OT/ICS protocol scanners
+Sprint 11 — Scanner Offensive Depth (Lowest ROI — Fill Last)
+GraphQL scanner
+Advanced SSRF (DNS rebinding, redirect chains)
+gRPC audit
+Coerce attack unification
+Responder emulation
+Architecture: Leak Intelligence Engine (NEW — Highest Priority)
+
+
+
+forge_suite/
+├── modules/
+│   └── leak_intel/                          # NEW MODULE
+│       ├── __init__.py
+│       ├── scanners/
+│       │   ├── github_scanner.py            # GitHub API: commits, gists, issues, PRs, wiki
+│       │   ├── gitlab_scanner.py            # GitLab API: same + snippets
+│       │   ├── bitbucket_scanner.py         # Bitbucket API
+│       │   ├── pastebin_scanner.py          # Pastebin, Ghostbin, Hastebin, Rentry
+│       │   ├── crtsh_scanner.py             # Certificate Transparency logs
+│       │   ├── shodan_enricher.py           # Shodan API: origin IP, ports, services
+│       │   ├── dns_history.py               # SecurityTrails, PassiveTotal
+│       │   ├── cloud_asset_enum.py          # S3/Azure Blob/GCP Storage
+│       │   ├── npm_pypi_scanner.py          # Registry metadata
+│       │   └── stackoverflow_scanner.py     # Code snippet search
+│       ├── parsers/
+│       │   ├── env_parser.py                # .env file extraction
+│       │   ├── aws_key_detector.py          # AKIA pattern + STS validation
+│       │   ├── jwt_detector.py              # eyJ... patterns
+│       │   ├── url_extractor.py             # Internal URL/IP/hostname extraction
+│       │   └── credential_tester.py         # Auto-test against all services
+│       ├── chains/
+│       │   ├── leak_to_internal.py          # Chain: leak → internal URL → app access
+│       │   ├── leak_to_cloud.py             # Chain: leak → cloud console access
+│       │   ├── leak_to_perimeter.py         # Chain: leak → VPN/RDP access
+│       │   ├── leak_to_cicd.py              # Chain: leak → CI/CD config → pipeline inject
+│       │   └── osint_to_origin_ip.py        # Chain: OSINT → bypass WAF/CDN
+│       └── db/
+│           ├── leak_models.py
+│           └── enrichment_cache.py
+├── chains/
+│   ├── chain_engine.py                      # (upgraded for multi-hop, state machine, scoring)
+│   └── chain_definitions.py                 # All 24+ chains
+├── c2/
+│   ├── tasks/                               # +12 new tasks
+│   └── transports/                          # +6 new transports
+├── evasion/                                 # +9 new techniques
+├── delivery/                                # +7 new builders (incl. macOS)
+├── cloud/                                   # NEW: cloud + container modules
+├── cicd/                                    # NEW: CI/CD + supply chain modules
+├── implant/
+│   └── macos/                               # NEW: macOS agent
+├── reporting/                               # NEW: report gen, timelines, dashboards
+├── opsec/                                   # NEW: noise budget, cleanup, timing
+├── exfil/                                   # NEW: exfil pipeline
+└── integrations/                            # NEW: REST API, SIEM, Jira, Slack

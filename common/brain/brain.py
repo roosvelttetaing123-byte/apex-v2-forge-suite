@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -35,6 +36,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
+
+from common.version import PRODUCT_LABEL
 
 log = logging.getLogger("forge.brain")
 
@@ -333,8 +336,12 @@ class ForgeBrain:
                              Override via FORGE_BRAIN_TIMEOUT env var.
         """
         self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-        self._model = model or os.environ.get("FORGE_BRAIN_MODEL", "claude-opus-4-8")
-        self._fast_model = fast_model or os.environ.get("FORGE_BRAIN_FAST_MODEL", "claude-haiku-4-5-20251001")
+        self._model: str = model or os.environ.get(
+            "FORGE_BRAIN_MODEL", "claude-opus-4-8"
+        ) or "claude-opus-4-8"
+        self._fast_model: str = fast_model or os.environ.get(
+            "FORGE_BRAIN_FAST_MODEL", "claude-haiku-4-5-20251001"
+        ) or "claude-haiku-4-5-20251001"
         self._rpm = rate_per_minute or int(os.environ.get("FORGE_BRAIN_RPM", "20"))
         self._max_memory = max_memory or int(os.environ.get("FORGE_BRAIN_MAX_MEMORY", "100"))
         self._timeout = api_timeout or float(os.environ.get("FORGE_BRAIN_TIMEOUT", "60"))
@@ -344,11 +351,12 @@ class ForgeBrain:
         self._cache = _ResponseCache()
         self.memory = EngagementMemory(self._max_memory)
         self._total_calls = 0
+        self._seed_built_in_knowledge()
 
         # Initialize API client if key available
         if self._api_key:
             try:
-                from anthropic import AsyncAnthropic
+                AsyncAnthropic = importlib.import_module("anthropic").AsyncAnthropic
                 self._client = AsyncAnthropic(api_key=self._api_key)
                 log.info(
                     "ForgeBrain initialized — model=%s, fast=%s, rpm=%d",
@@ -364,6 +372,26 @@ class ForgeBrain:
                 "No ANTHROPIC_API_KEY set — ForgeBrain running in rule-based fallback mode. "
                 "All tools work, but AI-powered analysis is disabled."
             )
+
+    def _seed_built_in_knowledge(self) -> None:
+        """Pre-seed engagement memory with anonymized built-in TTP knowledge."""
+        try:
+            from common.brain.built_in_knowledge import (
+                LESSONS, ATTACK_CHAINS, FALSE_NEGATIVES,
+                EVASION_TECHNIQUES, ERROR_SIGNATURES,
+            )
+        except ImportError:
+            return
+        for item in LESSONS:
+            self.memory.add("lesson", item.get("framework", "manual"), item)
+        for item in ATTACK_CHAINS:
+            self.memory.add("attack_chain", item.get("framework", "manual"), item)
+        for item in FALSE_NEGATIVES:
+            self.memory.add("fn_hint", "import", item)
+        for item in EVASION_TECHNIQUES:
+            self.memory.add("evasion", "import", item)
+        for item in ERROR_SIGNATURES:
+            self.memory.add("error_sig", "import", item)
 
     @property
     def available(self) -> bool:
@@ -450,7 +478,7 @@ class ForgeBrain:
     def _default_system(self) -> str:
         """Default system prompt for the brain."""
         return (
-            "You are ForgeBrain, the AI reasoning engine for Forge Suite v5 APEX — "
+            f"You are ForgeBrain, the AI reasoning engine for {PRODUCT_LABEL} — "
             "an enterprise offensive security platform. You analyze vulnerability findings, "
             "plan attack chains, detect false positives/negatives, advise on evasion, "
             "and write executive summaries. You are precise, technical, and think like an "
@@ -744,7 +772,7 @@ class ForgeBrain:
         if not self.available:
             return self._rule_based_exec_summary(findings, target, engagement_name)
 
-        severity_counts = {}
+        severity_counts: dict[str, int] = {}
         for f in findings:
             sev = f.get("severity", "Informational")
             severity_counts[sev] = severity_counts.get(sev, 0) + 1
@@ -1307,12 +1335,14 @@ class TestForgeBrain:
 
     def test_engagement_memory(self) -> None:
         brain = ForgeBrain(api_key="")
+        seeded_entries = brain.memory.size
         brain.memory.add("finding", "webforge", {"title": "SQLi"})
         brain.memory.add("finding", "netforge", {"title": "Open SSH"})
-        assert brain.memory.size == 2
-        ctx = brain.memory.get_context(last_n=5)
+        assert brain.memory.size == seeded_entries + 2
+        ctx = brain.memory.get_context(last_n=2)
         assert len(ctx) == 2
         assert ctx[0]["framework"] == "webforge"
+        assert ctx[1]["framework"] == "netforge"
 
     def test_cache_dedup(self) -> None:
         cache = _ResponseCache(max_size=10)

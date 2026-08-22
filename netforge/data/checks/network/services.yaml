@@ -1,0 +1,563 @@
+id: CVE-2024-6387-openssh-regresshion
+cve: CVE-2024-6387
+name: "OpenSSH regreSSHion — Signal Handler Race Condition RCE"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, ssh, cisa-kev, race-condition]
+target_service: ssh
+target_ports: [22, 2222, 22222]
+description: |
+  OpenSSH server signal handler race condition allowing unauthenticated
+  RCE on glibc-based Linux systems. Affects OpenSSH 8.5p1 through 9.7p1.
+  Regression of CVE-2006-5051. ~14 million exposed servers.
+detection:
+  - type: banner
+    ports: [22, 2222, 22222]
+    match:
+      - banner_regex: "OpenSSH_(8\\.[5-9]p|9\\.[0-7]p)"
+remediation: "Upgrade to OpenSSH 9.8p1+. Set LoginGraceTime to 0 as temporary mitigation."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2024-6387
+  - https://www.qualys.com/2024/07/01/cve-2024-6387/regresshion.txt
+---
+id: CVE-2023-38408-openssh-agent
+cve: CVE-2023-38408
+name: "OpenSSH Agent Remote Code Execution"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, ssh, agent-forwarding]
+target_service: ssh
+target_ports: [22, 2222]
+description: |
+  OpenSSH ssh-agent before 9.3p2 allows RCE via a crafted PKCS#11
+  provider when agent forwarding is enabled.
+detection:
+  - type: banner
+    ports: [22, 2222]
+    match:
+      - banner_regex: "OpenSSH_([0-8]\\.|9\\.[0-2]p|9\\.3p1)"
+remediation: "Upgrade to OpenSSH 9.3p2+. Disable agent forwarding if not needed."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-38408
+---
+id: openssh-weak-kex
+name: "OpenSSH Weak Key Exchange Algorithms"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N"
+tags: [crypto, ssh, weak-kex]
+target_service: ssh
+target_ports: [22, 2222]
+description: |
+  SSH server supports weak key exchange algorithms vulnerable to
+  downgrade attacks or known cryptographic weaknesses.
+detection:
+  - type: banner
+    ports: [22, 2222]
+    match:
+      - banner_regex: "SSH-2\\.0-"
+remediation: "Disable weak KEX algorithms: diffie-hellman-group1-sha1, diffie-hellman-group-exchange-sha1."
+references:
+  - https://www.ssh.com/academy/ssh/keyx
+---
+id: CVE-2020-14145-openssh-mitm
+cve: CVE-2020-14145
+name: "OpenSSH Observable Discrepancy (MitM)"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N"
+tags: [crypto, ssh, mitm]
+target_service: ssh
+detection:
+  - type: banner
+    ports: [22, 2222]
+    match:
+      - banner_regex: "OpenSSH_([5-7]\\.|8\\.[0-3]p)"
+remediation: "Upgrade to OpenSSH 8.4p1+."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2020-14145
+---
+id: CVE-2017-0144-eternalblue
+cve: CVE-2017-0144
+cves:
+  - CVE-2017-0143
+  - CVE-2017-0144
+  - CVE-2017-0145
+name: "EternalBlue — SMBv1 Remote Code Execution"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, smb, windows, cisa-kev, wormable, ransomware]
+target_service: smb
+target_ports: [445, 139]
+description: |
+  Windows SMBv1 buffer overflow allowing unauthenticated RCE.
+  Used by WannaCry and NotPetya ransomware. Still found on
+  thousands of internet-exposed hosts.
+detection:
+  - type: banner
+    ports: [445, 139]
+    match:
+      - banner_regex: "(?i)(SMB|Windows)"
+    match_all: false
+remediation: "Disable SMBv1. Apply MS17-010. Block port 445 at the perimeter."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2017-0144
+  - https://docs.microsoft.com/en-us/security-updates/securitybulletins/2017/ms17-010
+---
+id: CVE-2014-0160-heartbleed
+cve: CVE-2014-0160
+name: "Heartbleed — OpenSSL TLS Heartbeat Memory Disclosure"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+tags: [info-disclosure, ssl, openssl, cisa-kev]
+target_ports: [443, 8443, 993, 995, 465, 636]
+description: |
+  OpenSSL 1.0.1 through 1.0.1f TLS heartbeat extension allows
+  remote attackers to read 64KB of server memory per request.
+  Can leak private keys, session tokens, passwords.
+detection:
+  - type: version
+    cpe_vendor: "openssl"
+    cpe_product: "openssl"
+    version_range: ">=1.0.1,<1.0.1g"
+remediation: "Upgrade OpenSSL to 1.0.1g+. Revoke and reissue all TLS certificates."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2014-0160
+  - https://heartbleed.com/
+---
+id: ftp-anonymous-login
+name: "FTP Anonymous Login Enabled"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [misconfig, ftp, anonymous]
+target_service: ftp
+target_ports: [21, 2121]
+description: |
+  FTP server allows anonymous login, potentially exposing sensitive
+  files and directories to unauthenticated users.
+detection:
+  - type: banner
+    ports: [21, 2121]
+    send: "USER anonymous\r\nPASS anonymous@\r\n"
+    match:
+      - banner_regex: "230|Anonymous access granted"
+    match_all: false
+remediation: "Disable anonymous FTP access. Use SFTP instead of FTP."
+references:
+  - https://cwe.mitre.org/data/definitions/284.html
+---
+id: CVE-2011-2523-vsftpd-backdoor
+cve: CVE-2011-2523
+name: "vsftpd 2.3.4 Backdoor"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [backdoor, ftp, cisa-kev]
+target_service: ftp
+target_ports: [21]
+description: |
+  vsftpd 2.3.4 contains a backdoor — username ending in :) opens
+  a root shell on port 6200.
+detection:
+  - type: banner
+    ports: [21]
+    match:
+      - banner_contains: "vsftpd 2.3.4"
+remediation: "Upgrade vsftpd immediately. Investigate for compromise."
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2011-2523
+---
+id: telnet-cleartext
+name: "Telnet Service Detected (Cleartext Protocol)"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+tags: [misconfig, telnet, cleartext]
+target_service: telnet
+target_ports: [23, 2323]
+description: |
+  Telnet transmits all data including credentials in cleartext.
+  Should be replaced with SSH for all remote administration.
+detection:
+  - type: banner
+    ports: [23, 2323]
+    match:
+      - banner_regex: "(?i)(login:|telnet|BusyBox|console)"
+    match_all: false
+remediation: "Disable telnet. Use SSH for remote access."
+references:
+  - https://cwe.mitre.org/data/definitions/319.html
+---
+id: rdp-nla-disabled
+name: "RDP Network Level Authentication Not Enforced"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [misconfig, rdp, nla]
+target_service: rdp
+target_ports: [3389]
+description: |
+  RDP server does not require Network Level Authentication (NLA),
+  allowing pre-auth connections that increase attack surface for
+  vulnerabilities like BlueKeep.
+detection:
+  - type: tcp_probe
+    ports: [3389]
+    send: "\x03\x00\x00\x13\x0e\xe0\x00\x00\x00\x00\x00\x01\x00\x08\x00\x00\x00\x00\x00"
+    match:
+      - body_regex: "\\x03\\x00"
+    match_all: false
+remediation: "Enable NLA in Remote Desktop settings. Restrict RDP access to VPN."
+references:
+  - https://docs.microsoft.com/en-us/windows-server/remote/remote-desktop-services/rds-plan-and-design
+---
+id: snmp-default-community
+name: "SNMP Default Community Strings"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:L/A:N"
+tags: [misconfig, snmp, default-creds]
+target_service: snmp
+target_ports: [161]
+description: |
+  SNMP service using default community strings (public/private),
+  allowing unauthenticated read/write access to device configuration.
+detection:
+  - type: udp_probe
+    ports: [161]
+    match:
+      - body_regex: "(?i)(public|private|community)"
+    match_all: false
+remediation: "Change SNMP community strings. Use SNMPv3 with authentication."
+references:
+  - https://cwe.mitre.org/data/definitions/798.html
+---
+id: CVE-2023-4911-glibc-looney-tunables
+cve: CVE-2023-4911
+name: "Glibc Looney Tunables — Local Privilege Escalation via GLIBC_TUNABLES"
+severity: high
+cvss: "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"
+tags: [privesc, linux, glibc, local, cisa-kev]
+target_service: ssh
+target_ports: [22, 2222]
+description: |
+  A buffer overflow in the GNU C Library (glibc) dynamic loader ld.so when
+  processing the GLIBC_TUNABLES environment variable. Affects glibc 2.34
+  through 2.38. Exploitable by any local user to gain root privileges.
+  Affects RHEL 8/9, Ubuntu 22.04 LTS, Fedora 37/38, Debian 12.
+  Detection is performed via SSH banner combined with OS version fingerprinting.
+  MITRE ATT&CK: T1068 (Exploitation for Privilege Escalation).
+detection:
+  - type: banner
+    ports: [22, 2222]
+    match:
+      - banner_regex: "OpenSSH_[0-9]"
+  - type: version
+    cpe_vendor: "gnu"
+    cpe_product: "glibc"
+    version_range: ">=2.34,<=2.38"
+remediation: |
+  Apply vendor security updates immediately. RHEL: yum update glibc.
+  Ubuntu: apt-get update && apt-get upgrade libc6.
+  As an interim workaround, remove SUID bit from executables that
+  process GLIBC_TUNABLES if patching is delayed.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-4911
+  - https://www.qualys.com/2023/10/03/cve-2023-4911/looney-tunables-local-privilege-escalation-glibc-ld-so.txt
+  - https://access.redhat.com/security/cve/cve-2023-4911
+---
+id: CVE-2023-32784-keepass-masterkey
+cve: CVE-2023-32784
+name: "KeePass 2.x Master Password Extraction from Process Memory"
+severity: critical
+cvss: "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N"
+tags: [info-disclosure, keepass, memory, credentials, local]
+target_ports: []
+description: |
+  KeePass 2.x before 2.54 allows an attacker with local access to recover
+  the master password from process memory or a memory dump. The password
+  appears as cleartext strings in heap memory due to the use of a custom
+  SecureTextBoxEx control that retains characters in memory.
+  Tools like keepass-dump-masterkey can recover all but the first character.
+  MITRE ATT&CK: T1003 (OS Credential Dumping).
+detection:
+  - type: banner
+    ports: [445]
+    match:
+      - banner_regex: "(?i)(Windows)"
+  - type: version
+    cpe_vendor: "keepass"
+    cpe_product: "keepass"
+    version_range: ">=2.0,<2.54"
+remediation: |
+  Upgrade KeePass to 2.54 or later. Consider enterprise password managers
+  with hardware-backed key storage. Restrict physical and remote access
+  to systems running KeePass. Enable memory protection via Windows Credential Guard.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2023-32784
+  - https://github.com/vdohney/keepass-password-dumper
+---
+id: nfs-world-readable-export
+name: "NFS World-Readable Export with no_root_squash"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+tags: [misconfig, nfs, no-auth, linux, privilege-escalation]
+target_service: nfs
+target_ports: [2049, 111]
+description: |
+  NFS server exports filesystems world-readable (*(rw,no_root_squash)) or
+  without authentication. The no_root_squash option allows remote root users
+  to act as root on mounted shares, enabling privilege escalation by placing
+  SUID binaries. Detection via rpcinfo/showmount query to portmapper.
+  MITRE ATT&CK: T1005 (Data from Local System), T1068 (Exploitation for Privesc).
+detection:
+  - type: tcp_probe
+    ports: [111]
+    send: "\x80\x00\x00\x28\x72\xfe\x1d\x13\x00\x00\x00\x00\x00\x00\x00\x02\x00\x01\x86\xa0\x00\x00\x00\x02\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    read_bytes: 1024
+    match:
+      - banner_regex: "(?i)(mount|nfs|portmap)"
+    match_all: false
+  - type: udp_probe
+    ports: [2049]
+    match:
+      - body_regex: "(?i)(nfs|mount)"
+    match_all: false
+remediation: |
+  Audit /etc/exports and remove world-readable entries. Replace *(rw,no_root_squash)
+  with explicit host/network ACLs and root_squash. Use NFSv4 with Kerberos
+  authentication (sec=krb5p) for sensitive shares. Firewall port 2049 at perimeter.
+references:
+  - https://cwe.mitre.org/data/definitions/284.html
+  - https://linux.die.net/man/5/exports
+  - https://www.tenable.com/plugins/nessus/11356
+---
+id: rsync-unauthenticated-access
+name: "rsync Service Unauthenticated Access"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+tags: [misconfig, rsync, no-auth, data-exfil]
+target_service: rsync
+target_ports: [873]
+description: |
+  rsync daemon running on port 873 without authentication allows any
+  unauthenticated client to list modules and read/write files depending
+  on module configuration. Attackers can exfiltrate data or upload
+  malicious files for RCE via cron/authorized_keys injection.
+  MITRE ATT&CK: T1048 (Exfiltration Over Alternative Protocol), T1105 (Ingress Tool Transfer).
+detection:
+  - type: banner
+    ports: [873]
+    match:
+      - banner_regex: "@RSYNCD:"
+  - type: tcp_probe
+    ports: [873]
+    send: "@RSYNCD: 31.0\n#list\n"
+    read_bytes: 4096
+    match:
+      - banner_regex: "(?i)(path|comment|module)"
+    match_all: false
+remediation: |
+  Require authentication for all rsync modules in /etc/rsyncd.conf
+  (auth users = , secrets file = ). Restrict hosts with hosts allow =.
+  Disable rsync daemon if not required. Use SSH-tunneled rsync instead.
+references:
+  - https://cwe.mitre.org/data/definitions/306.html
+  - https://linux.die.net/man/5/rsyncd.conf
+  - https://www.rapid7.com/db/modules/auxiliary/scanner/rsync/modules_list/
+---
+id: rpcbind-exposed
+name: "Rpcbind/Portmapper Service Exposed"
+severity: medium
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [exposure, rpc, portmapper, reconnaissance]
+target_service: rpc
+target_ports: [111]
+description: |
+  Rpcbind (portmapper) is exposed on port 111, allowing remote enumeration
+  of all RPC services registered on the host including NFS, NIS, and custom
+  RPC services. Provides attackers a detailed map of running services and
+  their actual ports. Also exposes the host to RPC-based amplification attacks.
+  MITRE ATT&CK: T1046 (Network Service Scanning), T1135 (Network Share Discovery).
+detection:
+  - type: udp_probe
+    ports: [111]
+    match:
+      - body_regex: "(?i)(portmap|rpcbind)"
+    match_all: false
+  - type: tcp_probe
+    ports: [111]
+    match:
+      - banner_regex: "(?i)(portmap|rpcbind|nfs|mount)"
+    match_all: false
+remediation: |
+  Block port 111 TCP/UDP at the firewall from internet exposure.
+  If NFS is not required, disable rpcbind: systemctl disable rpcbind --now.
+  Use TCP wrappers (/etc/hosts.allow) to restrict access to trusted networks.
+references:
+  - https://www.tenable.com/plugins/nessus/10223
+  - https://cwe.mitre.org/data/definitions/200.html
+---
+id: finger-service-exposed
+name: "Finger Service Exposed (Port 79)"
+severity: low
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N"
+tags: [exposure, finger, reconnaissance, user-enum]
+target_service: finger
+target_ports: [79]
+description: |
+  The finger service is accessible on port 79, enabling remote user
+  enumeration including login names, last login times, home directories,
+  and current activity. This information is directly useful for targeted
+  attacks and social engineering. The protocol has no authentication
+  and should not be exposed on any modern system.
+  MITRE ATT&CK: T1087 (Account Discovery).
+detection:
+  - type: tcp_probe
+    ports: [79]
+    send: "\r\n"
+    read_bytes: 1024
+    match:
+      - banner_regex: "(?i)(login|name|home|shell|last|no one logged)"
+    match_all: false
+remediation: |
+  Disable the finger service: systemctl disable fingerd --now.
+  Remove the finger package from the system. Block port 79 at all
+  perimeter and host-based firewalls.
+references:
+  - https://www.tenable.com/plugins/nessus/10068
+  - https://cwe.mitre.org/data/definitions/200.html
+---
+id: x11-display-exposed
+name: "X11 Display Server Exposed (Port 6000)"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N"
+tags: [misconfig, x11, display, remote-access, screenshot]
+target_service: x11
+target_ports: [6000, 6001, 6002, 6003]
+description: |
+  X11 display server is accessible on port 6000 (or 6001+ for multiple
+  displays) without host-based access control. This allows remote attackers
+  to capture screenshots of the running desktop, inject keystrokes, record
+  keystrokes (xspy/xinput), and execute arbitrary programs on the display.
+  Trivially exploitable with xspy, xwd, or xinput.
+  MITRE ATT&CK: T1113 (Screen Capture), T1056.001 (Keylogging).
+detection:
+  - type: tcp_probe
+    ports: [6000, 6001, 6002, 6003]
+    send: "\x6c\x00\x0b\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+    read_bytes: 1024
+    match:
+      - banner_regex: "(?i)(MIT-MAGIC-COOKIE|XFree86|X.Org|failed to authenticate)"
+    match_all: false
+remediation: |
+  Enable X11 access control: xhost - (disable all access), then whitelist
+  specific hosts with xhost +hostname. Prefer SSH X11 forwarding instead of
+  direct TCP exposure. Block ports 6000-6063 at the firewall.
+references:
+  - https://www.tenable.com/plugins/nessus/10407
+  - https://cwe.mitre.org/data/definitions/284.html
+---
+id: CVE-2019-0708-bluekeep-indicator
+cve: CVE-2019-0708
+name: "BlueKeep — RDP Pre-Auth RCE Version Fingerprint Indicator"
+severity: critical
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rce, rdp, windows, cisa-kev, wormable, pre-auth]
+target_service: rdp
+target_ports: [3389]
+description: |
+  CVE-2019-0708 (BlueKeep) is a pre-authentication use-after-free
+  vulnerability in Windows Remote Desktop Services on Windows 7, Server 2003,
+  Server 2008, and Server 2008 R2. Allows unauthenticated RCE — NSA and CISA
+  both rated it wormable. Detection is via RDP negotiation response indicating
+  vulnerable Windows version (NLA not enforced + CredSSP version fingerprint).
+  MITRE ATT&CK: T1190 (Exploit Public-Facing Application).
+detection:
+  - type: tcp_probe
+    ports: [3389]
+    send: "\x03\x00\x00\x13\x0e\xe0\x00\x00\x00\x00\x00\x01\x00\x08\x00\x00\x00\x00\x00"
+    read_bytes: 1024
+    match:
+      - banner_regex: "\\x03\\x00\\x00\\x13\\x0e\\xd0"
+    match_all: false
+  - type: version
+    cpe_vendor: "microsoft"
+    cpe_product: "windows_server_2008"
+    version_range: ">=6.0,<=6.1"
+remediation: |
+  Apply Microsoft security update MS19-0708 (KB4499175, KB4499180, KB4500331).
+  Enable Network Level Authentication (NLA). Disable RDP if not required.
+  Block port 3389 at perimeter. Isolate Windows 7/Server 2008 hosts.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2019-0708
+  - https://portal.msrc.microsoft.com/en-US/security-guidance/advisory/CVE-2019-0708
+  - https://www.cisa.gov/known-exploited-vulnerabilities-catalog
+---
+id: CVE-2013-4786-ipmi-rakp-hash
+cve: CVE-2013-4786
+name: "IPMI 2.0 RAKP Authentication Hash Disclosure"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+tags: [info-disclosure, ipmi, hash, credentials, bmc]
+target_service: ipmi
+target_ports: [623]
+description: |
+  IPMI 2.0 RAKP authentication protocol discloses a HMAC-SHA1 hash of
+  the BMC password in response to an authentication initiation request.
+  This allows remote attackers to perform offline dictionary attacks
+  against the IPMI admin password without completing authentication.
+  Affects all IPMI 2.0 compliant BMCs (Supermicro, HP iLO, Dell iDRAC, IBM).
+  Tool: ipmitool + hashcat/john can crack common passwords in minutes.
+  MITRE ATT&CK: T1110.002 (Password Cracking), T1552 (Unsecured Credentials).
+detection:
+  - type: udp_probe
+    ports: [623]
+    match:
+      - body_regex: "(?i)(RMCP|IPMI|RAKP)"
+    match_all: false
+  - type: banner
+    ports: [623]
+    match:
+      - banner_regex: "(?i)(RMCP)"
+    match_all: false
+remediation: |
+  Use complex, unique IPMI passwords (>20 characters). Restrict IPMI access
+  to dedicated out-of-band management network. Enable IPMI VLAN segmentation.
+  Disable IPMI over LAN (IPMI-over-LAN) if BMC remote management is not needed.
+  Use stronger authentication mechanisms where supported (IPMI 2.0 with RAKP4).
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2013-4786
+  - https://www.rapid7.com/db/modules/auxiliary/scanner/ipmi/ipmi_dumphashes/
+  - https://fish2.com/ipmi/who-else-is-using-your-bmc.pdf
+---
+id: CVE-2003-0352-dcom-rpc-exposure
+cve: CVE-2003-0352
+name: "MS-RPC DCOM Interface Exposed — Buffer Overflow Indicator (Port 135)"
+severity: high
+cvss: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+tags: [rpc, dcom, windows, exposure, ms03-026, reconnaissance]
+target_service: msrpc
+target_ports: [135]
+description: |
+  The Microsoft RPC Endpoint Mapper / DCOM interface is exposed on port 135.
+  CVE-2003-0352 (MS Blaster worm) is a buffer overflow in the RPCSS service
+  via DCOM. While this specific CVE targets older Windows versions, port 135
+  exposure indicates: (1) DCOM is enabled, (2) the endpoint mapper can be
+  queried for all registered RPC endpoints, (3) potential attack surface for
+  DCE/RPC-based attacks including PrintNightmare, PetitPotam, and DCOM lateral
+  movement (T1021.003). Detection is passive — port exposure indicates risk.
+  MITRE ATT&CK: T1021.003 (Distributed Component Object Model), T1046.
+detection:
+  - type: tcp_probe
+    ports: [135]
+    match:
+      - banner_regex: "(?i)(MSRPC|\\x05\\x00\\x0d\\x03)"
+    match_all: false
+  - type: banner
+    ports: [135]
+    match:
+      - banner_regex: "(?i)(Microsoft|Windows|RPC|DCOM)"
+    match_all: false
+remediation: |
+  Block port 135 TCP/UDP at the perimeter firewall — no external access required.
+  Disable DCOM if not in use via dcomcnfg.exe or Group Policy.
+  Apply all Windows security updates. Monitor for lateral movement via T1021.003.
+references:
+  - https://nvd.nist.gov/vuln/detail/CVE-2003-0352
+  - https://docs.microsoft.com/en-us/security-updates/securitybulletins/2003/ms03-026
+  - https://attack.mitre.org/techniques/T1021/003/
