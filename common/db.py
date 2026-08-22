@@ -991,6 +991,13 @@ def create_db(db_path: Path) -> Session:
 
             Base.metadata.create_all(engine)
             _migrate_sqlite_schema(engine)
+            # Task 101 canonical contracts are additive to the legacy ORM
+            # tables.  Keep the migration runner separate so existing callers
+            # retain their models while new adapters receive explicit
+            # tenant-scoped foreign-key lineage and reversible schema state.
+            from common.schema_migrations import MigrationManager
+
+            MigrationManager(engine).upgrade()
         return _engine_bound_session(engine, autocommit=False, autoflush=False)
     except _DatabaseArtifactError:
         if engine is not None:
@@ -2004,15 +2011,91 @@ def _has_valid_scan_job_authorization(
     return False
 
 
+def _canonical_context_marker(value: Any) -> Any:
+    """Validate an explicit Task 101 context marker for legacy writers.
+
+    The legacy ORM writers remain available for Gate 0 compatibility, but a
+    caller that opts into canonical persistence must provide the full trusted
+    context.  This helper is lazy-imported to keep ``common.db`` independent
+    from the contract module at import time.
+    """
+    if value is None:
+        return None
+    from common.canonical import CanonicalContext, MissingCanonicalContextError
+
+    if isinstance(value, CanonicalContext):
+        context = value
+    elif isinstance(value, dict):
+        try:
+            context = CanonicalContext(
+                tenant_id=value.get("tenant_id"),
+                engagement_id=value.get("engagement_id"),
+                job_id=value.get("job_id"),
+                module_version_id=value.get("module_version_id"),
+                asset_id=value.get("asset_id"),
+                action_id=value.get("action_id"),
+            )
+        except TypeError as exc:
+            raise MissingCanonicalContextError("canonical context must be an object") from exc
+    else:
+        raise MissingCanonicalContextError("canonical context must be a Task 101 context")
+    context.validate()
+    return context
+
+
+def _assert_canonical_payload_context(
+    payload: dict[str, Any],
+    context: Any,
+    *,
+    include_job_id: bool,
+) -> None:
+    """Require the persisted payload to carry the same trusted context."""
+    from common.canonical import MissingCanonicalContextError
+
+    names = ("tenant_id", "engagement_id", "job_id", "module_version_id", "asset_id")
+    for name in names:
+        if not payload.get(name) or payload.get(name) != getattr(context, name):
+            raise MissingCanonicalContextError(
+                f"canonical payload {name} does not match trusted context"
+            )
+    if include_job_id and str(payload.get("id")) != str(context.job_id):
+        raise MissingCanonicalContextError("scan job ID does not match canonical context")
+
+
 def save_scan_job(
     session: Session,
     job_dict: dict[str, Any],
     *,
     commit: bool = True,
+    allow_legacy_compat: bool = True,
 ) -> None:
-    """Persist or replace a dashboard scan job record."""
+    """Persist or replace a dashboard scan job record.
+
+    ``save_scan_job`` is the pre-Task-101 Gate-0 ORM compatibility writer.
+    New adapters must pass ``allow_legacy_compat=False`` and provide a full
+    ``canonical_context`` marker; otherwise the call fails before any row is
+    written.  Existing callers retain the explicit legacy path while they are
+    migrated to :class:`common.canonical.CanonicalAdapter`.
+    """
     if "id" not in job_dict:
         raise ValueError("scan job id is required")
+    # Legacy dashboard jobs do not carry the complete canonical graph.  Do
+    # not let a strict adapter manufacture a tenant-only orphan; canonical
+    # adapters must be used whenever the Task 101 context is available.
+    canonical_context = _canonical_context_marker(job_dict.get("canonical_context"))
+    if not allow_legacy_compat and canonical_context is None:
+        from common.canonical import MissingCanonicalContextError
+
+        raise MissingCanonicalContextError(
+            "canonical scan-job adapters require tenant, engagement, job, module version, and asset context"
+        )
+    if canonical_context is not None:
+        _assert_canonical_payload_context(job_dict, canonical_context, include_job_id=True)
+        from common.canonical import MissingCanonicalContextError
+
+        raise MissingCanonicalContextError(
+            "legacy scan-job writer cannot persist canonical context; use CanonicalAdapter"
+        )
 
     existing = session.get(ScanJobModel, job_dict["id"])
     if existing is not None:
@@ -2363,9 +2446,36 @@ def update_finding_retest(session: Session, retest_id: str, **updates: Any) -> F
     return model
 
 
-def save_finding(session: Session, finding_dict: dict[str, Any], run_id: str | None = None) -> None:
-    """Persist a Finding.to_dict() result to the database."""
+def save_finding(
+    session: Session,
+    finding_dict: dict[str, Any],
+    run_id: str | None = None,
+    *,
+    allow_legacy_compat: bool = True,
+) -> None:
+    """Persist a Finding.to_dict() result to the database.
+
+    The strict adapter path fails closed before touching the legacy findings
+    table when the complete Task 101 context marker is absent.  The default
+    remains the named Gate-0 compatibility path for old fixture/report code;
+    production adapters use ``allow_legacy_compat=False`` until they emit a
+    :class:`common.canonical.CanonicalAdapter` graph.
+    """
     safe_finding = normalise_finding(dict(finding_dict))
+    canonical_context = _canonical_context_marker(finding_dict.get("canonical_context"))
+    if not allow_legacy_compat and canonical_context is None:
+        from common.canonical import MissingCanonicalContextError
+
+        raise MissingCanonicalContextError(
+            "canonical finding adapters require tenant, engagement, job, module version, and asset context"
+        )
+    if canonical_context is not None:
+        _assert_canonical_payload_context(finding_dict, canonical_context, include_job_id=False)
+        from common.canonical import MissingCanonicalContextError
+
+        raise MissingCanonicalContextError(
+            "legacy finding writer cannot persist canonical context; use CanonicalAdapter"
+        )
     for field in ("title", "target", "url", "description", "remediation"):
         if safe_finding.get(field) is not None:
             safe_finding[field] = redact_text(str(safe_finding[field]))

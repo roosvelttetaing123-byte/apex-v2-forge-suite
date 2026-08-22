@@ -136,6 +136,7 @@ def _is_safe_reference(key: str, value: Any) -> bool:
         key.strip().lower() in _SAFE_REFERENCE_FIELDS
         and isinstance(value, str)
         and bool(_SAFE_REFERENCE.fullmatch(value))
+        and redact_text(value) == value
     )
 
 
@@ -152,7 +153,13 @@ def redact_text(value: str) -> str:
     if not value:
         return value
     if _SAFE_REFERENCE.fullmatch(value):
-        return value
+        # An opaque-looking handle is safe only when it does not contain a
+        # registered runtime canary.  Check configured literals before the
+        # early return so ``cred:<canary>`` cannot bypass the redaction
+        # boundary merely by matching the reference grammar.
+        with _configuration_lock:
+            if not any(literal and literal in value for literal in _configured_values):
+                return value
 
     rendered = value
     with _configuration_lock:

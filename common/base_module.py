@@ -24,6 +24,7 @@ from common.evidence import Evidence
 from common.finding import Finding, Severity, cvss31_score
 from common.scope import Scope, ScopeViolation
 
+from common.canonical import MissingCanonicalContextError
 
 class _UnsetConfidence:
     pass
@@ -159,10 +160,34 @@ class BaseModule(ABC):
             return
         self._seen_finding_keys[_dedup_key] = 1
         self.findings.append(finding)
+        canonical_required = bool(
+            self.config.extra.get("canonical_context_required")
+            or self.config.extra.get("canonical_context") is not None
+        )
+        persisted = True
         try:
-            save_finding(self.db, finding.to_dict(), run_id=self.run_id)
+            save_finding(
+                self.db,
+                finding.to_dict(),
+                run_id=self.run_id,
+                allow_legacy_compat=not canonical_required,
+            )
+        except MissingCanonicalContextError:
+            if canonical_required:
+                self.findings.pop()
+                self._seen_finding_keys.pop(_dedup_key, None)
+                global_keys = getattr(BaseModule, "_global_finding_keys", None)
+                if isinstance(global_keys, set):
+                    global_keys.discard(_dedup_key)
+                raise
+            persisted = False
+            self.log.warning(
+                "Finding retained in memory only; canonical context is unavailable"
+            )
         except Exception as exc:
             self.log.error("Failed to save finding to DB: %s", exc)
+        if not persisted:
+            return
         self.log.info(
             "[FINDING] %s | %s | %s",
             finding.severity.value,
@@ -212,7 +237,7 @@ class BaseModule(ABC):
             # Re-save enriched finding
             try:
                 from common.db import save_finding
-                save_finding(self.db, finding.to_dict(), run_id=self.run_id)
+                save_finding(self.db, finding.to_dict(), run_id=self.run_id, allow_legacy_compat=False)
             except Exception as exc:
                 self.log.debug("Failed to update finding after analysis: %s", exc)
 

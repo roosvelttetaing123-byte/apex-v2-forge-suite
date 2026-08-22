@@ -1818,7 +1818,15 @@ def authorize_and_link_scan_job(
         persisted_job["authorization_state"] = AuthorizationOutcome.ALLOW.value
         persisted_job["authorization_decision_id"] = issued.envelope.decision_id
         persisted_job["authorization_action_id"] = issued.envelope.action_id
-        save_scan_job(session, persisted_job, commit=False)
+        # This pre-Task-101 handoff row is deliberately explicit legacy
+        # compatibility.  Canonical job/finding adapters must provide the
+        # complete tenant/engagement/module/asset context instead.
+        save_scan_job(
+            session,
+            persisted_job,
+            commit=False,
+            allow_legacy_compat=True,
+        )
         session.commit()
         return consumed
     except Exception:

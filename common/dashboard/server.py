@@ -7760,7 +7760,15 @@ class DashboardServer:
                     "authorization_decision_id": primary.decision_id,
                     "authorization_action_id": primary.action_id,
                 }
-                save_scan_job(session, persisted_job, commit=False)
+                # The dashboard handoff still owns a Gate-0 compatibility job
+                # row; it has no module-version/asset graph yet.  Keep that
+                # exception explicit and fail closed on canonical adapters.
+                save_scan_job(
+                    session,
+                    persisted_job,
+                    commit=False,
+                    allow_legacy_compat=True,
+                )
                 session.commit()
                 return children
             except HTTPException:
@@ -8028,6 +8036,7 @@ class DashboardServer:
                         authorization.action_id if authorization is not None else None
                     ),
                 },
+                allow_legacy_compat=True,
             )
 
         try:
