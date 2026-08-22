@@ -7767,7 +7767,11 @@ class DashboardServer:
                     session,
                     persisted_job,
                     commit=False,
-                    allow_legacy_compat=True,
+                    # The handoff has no complete canonical engagement /
+                    # module-version / asset graph.  Fail typed before
+                    # persisting an orphan job; Task 103 owns the durable
+                    # state-machine adapter.
+                    allow_legacy_compat=False,
                 )
                 session.commit()
                 return children
@@ -8036,7 +8040,8 @@ class DashboardServer:
                         authorization.action_id if authorization is not None else None
                     ),
                 },
-                allow_legacy_compat=True,
+                # A dashboard refresh cannot manufacture canonical lineage.
+                allow_legacy_compat=False,
             )
 
         try:

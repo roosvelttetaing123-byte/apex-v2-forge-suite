@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from common.canonical import (
     ArtifactReference,
@@ -31,6 +32,7 @@ from common.evidence_custody import (
     ArtifactTransactionError,
     CustodyError,
     EvidenceCustodyStore,
+    make_original_authorization,
 )
 from common.redaction import clear_sensitive_values, register_sensitive_values
 
@@ -161,6 +163,55 @@ def test_text_redaction_is_case_insensitive_and_cannot_be_disabled(tmp_path: Pat
         assert manifest.redaction_state == "redacted"
     finally:
         clear_sensitive_values()
+
+
+def test_original_authorization_is_typed_and_source_target_is_hashed_after_redaction(
+    tmp_path: Path,
+) -> None:
+    register_sensitive_values(["TASK102_SOURCE_CANARY"])
+    try:
+        store = EvidenceCustodyStore(tmp_path, "tenant-a")
+        with pytest.raises(CustodyError):
+            store.store_artifact(
+                b"fixture",
+                source_observation_id="observation-1",
+                collector_id="collector-1",
+                retain_original=True,
+                protected_original_authorization_ref="admin",
+            )
+        manifest = store.store_artifact(
+            b"fixture",
+            source_observation_id="observation-1",
+            collector_id="collector-1",
+            source_target="https://TASK102_SOURCE_CANARY.example.test/path",
+            retain_original=True,
+            protected_original_authorization_ref="authorization:review-1",
+        )
+        assert "TASK102_SOURCE_CANARY" not in (manifest.source_target or "")
+        assert manifest.source_target is not None
+        assert manifest.manifest_digest == store.verify(manifest.artifact_id).manifest_digest
+        with pytest.raises(CustodyError):
+            make_original_authorization(
+                tenant_id="tenant-a",
+                artifact_id=manifest.artifact_id,
+                authorization_ref="admin",
+                operator_id="operator-1",
+                reason="fixture",
+            )
+    finally:
+        clear_sensitive_values()
+
+
+def test_manifest_paths_are_server_bound(tmp_path: Path) -> None:
+    store = EvidenceCustodyStore(tmp_path, "tenant-a")
+    manifest = store.store_artifact(
+        b"fixture",
+        source_observation_id="observation-1",
+        collector_id="collector-1",
+        media_type="application/octet-stream",
+    )
+    with pytest.raises(CustodyError):
+        replace(manifest, derivative_relative_path="../outside.bin")
 
 
 def test_tenant_namespace_and_path_traversal_are_isolated(tmp_path: Path) -> None:
@@ -367,6 +418,47 @@ def test_legacy_unknown_integrity_and_manifest_persistence(tmp_path: Path) -> No
         session.close()
 
 
+def test_artifact_source_asset_is_tenant_bound_at_database_boundary(tmp_path: Path) -> None:
+    session = create_db(tmp_path / "source-asset-lineage.db")
+    try:
+        store = CanonicalStore(session)
+        tenant_a = Tenant(name="tenant-a")
+        tenant_b = Tenant(name="tenant-b")
+        graph_a = _lineage_graph(session, tenant=tenant_a)
+        graph_b = _lineage_graph(session, tenant=tenant_b, route="/other")
+        _persist_graph(store, graph_a)
+        _persist_graph(store, graph_b)
+        with pytest.raises(IntegrityError):
+            session.execute(
+                text(
+                    "INSERT INTO canonical_artifact_refs "
+                    "(id,tenant_id,observation_id,schema_version,reference,digest,media_type,size,"
+                    "redaction_state,encryption_state,collected_at,created_at,source_asset_id) "
+                    "VALUES (:id,:tenant_id,:observation_id,:schema_version,:reference,:digest,:media_type,:size,"
+                    ":redaction_state,:encryption_state,:collected_at,:created_at,:asset_id)"
+                ),
+                {
+                    "id": "artifact:cross-tenant-source",
+                    "observation_id": graph_a["observation"].id,
+                    "schema_version": "forge-canonical-v1",
+                    "reference": "artifact:cross-tenant-source",
+                    "digest": "sha256:" + "b" * 64,
+                    "media_type": "text/plain",
+                    "size": 1,
+                    "redaction_state": "redacted",
+                    "encryption_state": "reference_only",
+                    "collected_at": "2026-01-01T00:00:00Z",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "asset_id": graph_b["asset"].id,
+                    "tenant_id": tenant_a.id,
+                },
+            )
+            session.commit()
+        session.rollback()
+    finally:
+        session.close()
+
+
 def test_canonical_manifest_round_trip_is_verified_and_tenant_scoped(tmp_path: Path) -> None:
     session = create_db(tmp_path / "canonical-manifest.db")
     try:
@@ -379,6 +471,8 @@ def test_canonical_manifest_round_trip_is_verified_and_tenant_scoped(tmp_path: P
             source_observation_id=graph["observation"].id,
             collector_id="fixture-collector",
             media_type="text/plain",
+            source_target=graph["artifact"].source_target,
+            source_asset_id=graph["artifact"].source_asset_id,
             artifact_id=graph["artifact"].id,
         )
         graph["artifact"] = replace(
@@ -391,12 +485,20 @@ def test_canonical_manifest_round_trip_is_verified_and_tenant_scoped(tmp_path: P
 
         store.persist_artifact_manifest(
             manifest.to_dict(),
+            custody_store=custody,
             artifact=graph["artifact"],
             observation=graph["observation"],
         )
         restored = store.get_artifact_manifest(manifest.artifact_id, tenant.id)
         assert restored is not None
         assert restored.manifest_digest == manifest.manifest_digest
+        assert session.execute(
+            text(
+                "SELECT manifest_digest FROM canonical_artifact_refs "
+                "WHERE tenant_id=:tenant_id AND id=:artifact_id"
+            ),
+            {"tenant_id": tenant.id, "artifact_id": graph["artifact"].id},
+        ).scalar_one() == manifest.manifest_digest
         assert store.list_artifact_manifests(tenant.id) == [restored]
         assert store.get_artifact_manifest(manifest.artifact_id, "tenant-b") is None
 
@@ -412,5 +514,66 @@ def test_canonical_manifest_round_trip_is_verified_and_tenant_scoped(tmp_path: P
                 access_kind="protected_original",
                 authorization_ref="not-an-authorization-handle",
             )
+    finally:
+        session.close()
+
+
+def test_canonical_manifest_requires_custody_verification_and_binds_protected_auth(
+    tmp_path: Path,
+) -> None:
+    session = create_db(tmp_path / "canonical-protected.db")
+    try:
+        canonical = CanonicalStore(session)
+        tenant = Tenant(name="tenant-a")
+        graph = _lineage_graph(session, tenant=tenant)
+        custody = EvidenceCustodyStore(tmp_path / "custody", tenant.id)
+        manifest = custody.store_artifact(
+            b"protected-proof",
+            source_observation_id=graph["observation"].id,
+            collector_id="fixture-collector",
+            media_type="text/plain",
+            source_target=graph["artifact"].source_target,
+            source_asset_id=graph["artifact"].source_asset_id,
+            retain_original=True,
+            protected_original_authorization_ref="authorization:review-1",
+            artifact_id=graph["artifact"].id,
+        )
+        graph["artifact"] = replace(
+            graph["artifact"],
+            digest=manifest.sha256,
+            size=manifest.byte_size,
+            media_type=manifest.media_type,
+            protected_original_authorization_ref=manifest.protected_original_authorization_ref,
+        )
+        _persist_graph(canonical, graph)
+        with pytest.raises(CanonicalContractError, match="custody_store"):
+            canonical.persist_artifact_manifest(
+                manifest,
+                artifact=graph["artifact"],
+                observation=graph["observation"],
+            )
+        canonical.persist_artifact_manifest(
+            manifest,
+            custody_store=custody,
+            artifact=graph["artifact"],
+            observation=graph["observation"],
+        )
+        assert canonical.get_artifact_manifest(manifest.artifact_id, tenant.id) is not None
+        with pytest.raises(CanonicalContractError):
+            canonical.record_evidence_access(
+                tenant_id=tenant.id,
+                artifact_id=manifest.artifact_id,
+                observation_id=graph["observation"].id,
+                access_kind="protected_original",
+                authorization_ref="authorization:wrong",
+            )
+        audit_id = canonical.record_evidence_access(
+            tenant_id=tenant.id,
+            artifact_id=manifest.artifact_id,
+            observation_id=graph["observation"].id,
+            access_kind="protected_original",
+            authorization_ref="authorization:review-1",
+        )
+        assert audit_id
     finally:
         session.close()

@@ -816,6 +816,7 @@ def test_bruteforce_logs_and_raw_findings_use_only_protected_references(
             "spray_users": ["operator"],
             "spray_passwords": [secret],
             "spray_delay_seconds": 0,
+            "allow_legacy_compat": True,
         }
     )
     scope = Scope(["127.0.0.1"])
@@ -867,6 +868,7 @@ def test_bruteforce_metadata_cannot_disclose_a_password_fragment(
     secret = "z4n8c2v6b0m5-long-password"
     fragment = secret[:8]
     config = BaseForgeConfig(target="127.0.0.1")
+    config.extra["allow_legacy_compat"] = True
     scope = Scope(["127.0.0.1"])
     modules = (
         CredSpray(
@@ -957,7 +959,12 @@ def test_logs_events_findings_database_audit_reports_and_exports_redact_before_b
 
     db_path = tmp_path / "ordinary.db"
     session = create_db(db_path)
-    save_finding(session, finding_dict, run_id="run-wp007")
+    save_finding(
+        session,
+        finding_dict,
+        run_id="run-wp007",
+        allow_legacy_compat=True,
+    )
     save_audit_log(
         session,
         {

@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import time
 import weakref
+from collections.abc import Mapping
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1066,7 +1067,9 @@ def _legacy_finding_snapshot(row: Any) -> dict[str, Any]:
         "tags": _json("tags", []),
         "confidence": str(_value("confidence", "UNVERIFIED")),
         "status": str(_value("status", "open")),
-        "verification": _json("verification", {}),
+        "verification": _strip_legacy_raw_evidence(
+            _json("verification", {})
+        ),
         "verification_state": str(_value("verification_state", "unknown")),
         "proof_type": str(_value("proof_type", "unknown")),
         "maturity": str(_value("maturity", "experimental")),
@@ -1079,11 +1082,17 @@ def _legacy_finding_snapshot(row: Any) -> dict[str, Any]:
         "days_open": int(_value("days_open", 0) or 0),
         "priority": _value("priority"),
         "evidence": {
-            "request_raw": _value("request_raw"),
-            "response_raw": _value("response_raw"),
-            "screenshot_path": _value("screenshot_path"),
-            "console_capture_path": _value("console_capture_path"),
-            "pcap_path": _value("pcap_path"),
+            # Evidence bytes and caller-controlled paths are not part of an
+            # immutable run-membership snapshot.  Legacy rows may still have
+            # the historical columns while a database is being upgraded, but
+            # snapshots must never copy those values into another mutable JSON
+            # surface.  Canonical adapters attach custody manifest references
+            # separately.
+            "request_raw": None,
+            "response_raw": None,
+            "screenshot_path": None,
+            "console_capture_path": None,
+            "pcap_path": None,
         },
     }
     canonical_dedup = str(snapshot["dedup_key"] or "").strip().lower()
@@ -2067,15 +2076,16 @@ def save_scan_job(
     job_dict: dict[str, Any],
     *,
     commit: bool = True,
-    allow_legacy_compat: bool = True,
+    allow_legacy_compat: bool = False,
 ) -> None:
     """Persist or replace a dashboard scan job record.
 
     ``save_scan_job`` is the pre-Task-101 Gate-0 ORM compatibility writer.
-    New adapters must pass ``allow_legacy_compat=False`` and provide a full
-    ``canonical_context`` marker; otherwise the call fails before any row is
-    written.  Existing callers retain the explicit legacy path while they are
-    migrated to :class:`common.canonical.CanonicalAdapter`.
+    New adapters must provide a full ``canonical_context`` marker; otherwise
+    the default strict boundary fails before any row is written.  A migration
+    or inert Gate-0 fixture may opt into the legacy path explicitly with
+    ``allow_legacy_compat=True`` while it is migrated to
+    :class:`common.canonical.CanonicalAdapter`.
     """
     if "id" not in job_dict:
         raise ValueError("scan job id is required")
@@ -2321,13 +2331,140 @@ def _canonical_port(finding_dict: dict[str, Any]) -> str:
     return ""
 
 
+def _dimension_value(
+    finding_dict: dict[str, Any],
+    *names: str,
+    nested_names: tuple[str, ...] = (),
+) -> str:
+    """Return one canonical observation dimension from legacy payload shapes.
+
+    The Gate-0 ``Finding`` object predates the canonical observation contract,
+    so callers have historically placed route/check identity in a mixture of
+    top-level fields, ``metadata``/``observation`` mappings, and evidence
+    extras.  Resolve those aliases here without treating arbitrary evidence
+    text as identity.  Identity values are deliberately normalized but are not
+    redacted into the literal ``<redacted>`` marker (which would collapse
+    otherwise unrelated observations).
+    """
+    containers: list[Any] = [finding_dict]
+    for container_name in nested_names:
+        value = finding_dict.get(container_name)
+        if isinstance(value, Mapping) or value is not None:
+            containers.append(value)
+    metadata = finding_dict.get("metadata")
+    if isinstance(metadata, Mapping):
+        containers.append(metadata)
+    evidence = finding_dict.get("evidence")
+    if isinstance(evidence, Mapping):
+        extra = evidence.get("extra")
+        if isinstance(extra, Mapping):
+            containers.append(extra)
+    for container in containers:
+        for name in names:
+            if isinstance(container, Mapping):
+                value = container.get(name)
+            else:
+                value = getattr(container, name, None)
+            if value is None:
+                continue
+            rendered = _normalize_token(value)
+            if rendered:
+                return rendered
+    return ""
+
+
+def _canonical_route_path(finding_dict: dict[str, Any]) -> str:
+    """Resolve the route/path identity without conflating distinct checks.
+
+    Explicit canonical observation fields win.  A specific ``url`` is a safe
+    legacy fallback because it is the only pre-contract field intended to
+    identify a route; the broad ``target`` remains host-scoped for compatibility
+    with older Gate-0 findings that used a target such as ``host/path`` merely
+    as a display label.
+    """
+    explicit = _dimension_value(
+        finding_dict,
+        "route",
+        "path",
+        "endpoint",
+        "uri",
+        nested_names=("observation", "canonical_observation"),
+    )
+    if explicit:
+        return explicit
+    raw_url = finding_dict.get("url") or finding_dict.get("target")
+    if not raw_url:
+        return ""
+    parsed = urlparse(str(raw_url) if "://" in str(raw_url) else f"//{raw_url}")
+    # A pre-contract caller often placed ``host/path`` in ``target``.  Keep
+    # the host in the target dimension but retain a non-root path here so
+    # distinct route observations cannot overwrite one another.
+    path = parsed.path or ""
+    return _normalize_token(path) if path and path != "/" else ""
+
+
 def finding_dedup_key(finding_dict: dict[str, Any]) -> str:
-    """Return a stable key for same vulnerability + target + port findings."""
+    """Return a stable key for one canonical finding identity.
+
+    Legacy rows are mutable workflow summaries, so their identity must carry
+    the same dimensions as the canonical observation contract.  In particular,
+    title/host/port alone are insufficient: two routes, parameters, identities,
+    checks, modules, or tenants must never overwrite one another.  The version
+    marker is included in the material while the public key remains a 64-byte
+    digest for the existing SQLite schema and run-membership contract.
+    """
+    check_identity = _dimension_value(
+        finding_dict,
+        "check_id",
+        "check",
+        "check_name",
+        "finding_key",
+        "vulnerability_id",
+        "rule_id",
+        nested_names=("observation", "canonical_observation"),
+    ) or _normalize_token(finding_dict.get("title"))
+    route_path = _canonical_route_path(finding_dict)
+    parameter = _dimension_value(
+        finding_dict,
+        "parameter",
+        "param",
+        "field",
+        nested_names=("observation", "canonical_observation"),
+    )
+    location = _dimension_value(
+        finding_dict,
+        "location",
+        "in_location",
+        "source_location",
+        nested_names=("observation", "canonical_observation"),
+    )
+    identity = _dimension_value(
+        finding_dict,
+        "identity_ref",
+        "identity",
+        "principal",
+        "account",
+        "user",
+        nested_names=("observation", "canonical_observation"),
+    )
     material = "\x1f".join(
         [
-            _normalize_token(finding_dict.get("title")),
+            "finding-v2",
+            _normalize_token(finding_dict.get("tenant_id") or "default"),
+            _dimension_value(
+                finding_dict,
+                "module",
+                "module_id",
+                "module_version_id",
+                nested_names=("observation", "canonical_observation"),
+            ),
+            check_identity,
             _canonical_target(finding_dict.get("target") or finding_dict.get("url")),
             _canonical_port(finding_dict),
+            route_path,
+            parameter,
+            location,
+            identity,
         ]
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
@@ -2376,6 +2513,199 @@ def _json_list(value: Any) -> list[Any]:
         except json.JSONDecodeError:
             return []
     return []
+
+
+_LEGACY_RAW_EVIDENCE_FIELDS = frozenset(
+    {
+        "request_raw",
+        "response_raw",
+        "screenshot_path",
+        "console_capture_path",
+        "pcap_path",
+        "console_capture",
+        "pcap",
+    }
+)
+
+
+def _strip_legacy_raw_evidence(value: Any) -> Any:
+    """Remove raw/path evidence keys from mutable compatibility JSON."""
+    if isinstance(value, dict):
+        return {
+            str(key): _strip_legacy_raw_evidence(item)
+            for key, item in value.items()
+            if str(key).strip().lower() not in _LEGACY_RAW_EVIDENCE_FIELDS
+        }
+    if isinstance(value, list):
+        return [_strip_legacy_raw_evidence(item) for item in value]
+    if isinstance(value, tuple):
+        return [_strip_legacy_raw_evidence(item) for item in value]
+    return value
+
+
+def _legacy_custody_root(
+    finding_dict: dict[str, Any],
+    evidence: dict[str, Any],
+    explicit_root: str | os.PathLike[str] | None,
+) -> Path | None:
+    """Resolve an explicit filesystem custody root for legacy evidence.
+
+    A legacy writer has no trusted canonical context from which to infer a
+    store location.  Production adapters therefore pass the root explicitly;
+    silently defaulting to the process working directory would make artifact
+    ownership and cleanup ambiguous.  The evidence ``extra`` aliases remain
+    for old integrations but are never persisted themselves.
+    """
+    candidate: Any = explicit_root
+    if candidate is None:
+        for key in ("custody_root", "evidence_store", "evidence_root"):
+            if evidence.get(key) is not None:
+                candidate = evidence.get(key)
+                break
+    extra = evidence.get("extra")
+    if candidate is None and isinstance(extra, dict):
+        for key in ("custody_root", "evidence_store", "evidence_root"):
+            if extra.get(key) is not None:
+                candidate = extra.get(key)
+                break
+    if candidate is None:
+        return None
+    try:
+        rendered = Path(os.fspath(candidate))
+    except (TypeError, ValueError, OSError):
+        return None
+    # A relative root is intentionally rejected.  Custody paths must be
+    # anchored to a server-owned result namespace and may not follow the
+    # caller's changing working directory.
+    if not rendered.is_absolute():
+        return None
+    return rendered
+
+
+def _legacy_custody_identifier(seed: str, prefix: str) -> str:
+    """Derive a bounded, opaque custody identifier from legacy values."""
+    return f"{prefix}-{hashlib.sha256(seed.encode('utf-8')).hexdigest()[:48]}"
+
+
+def _legacy_evidence_payloads(evidence: dict[str, Any]) -> list[tuple[str, bytes, str]]:
+    """Extract legacy evidence bytes without retaining caller-controlled paths."""
+    payloads: list[tuple[str, bytes, str]] = []
+    for field, media_type in (
+        ("request_raw", "text/plain"),
+        ("response_raw", "text/plain"),
+    ):
+        value = evidence.get(field)
+        if isinstance(value, str) and value:
+            payloads.append((field, value.encode("utf-8"), media_type))
+    path_fields = (
+        ("screenshot_path", "image/png"),
+        ("console_capture_path", "text/html"),
+        ("pcap_path", "application/vnd.tcpdump.pcap"),
+    )
+    try:
+        from common.artifact_io import ArtifactBoundaryError, read_verified_regular_file
+    except Exception:  # pragma: no cover - import failure is fail-closed below
+        return payloads
+    for field, media_type in path_fields:
+        value = evidence.get(field)
+        if not isinstance(value, (str, os.PathLike)) or not os.fspath(value):
+            continue
+        try:
+            payload = read_verified_regular_file(
+                value,
+                require_owner_only_mode=True,
+            )
+        except (ArtifactBoundaryError, OSError, ValueError):
+            # A missing, symlinked, or caller-owned path is not evidence.  Do
+            # not copy the path into a mutable row or fail the finding write.
+            continue
+        payloads.append((field, payload, media_type))
+    return payloads
+
+
+def _persist_legacy_custody(
+    finding_dict: dict[str, Any],
+    evidence: dict[str, Any],
+    *,
+    custody_root: Any,
+    tenant_id: str,
+    run_id: str | None,
+) -> tuple[Any, list[dict[str, str]]]:
+    """Stage available legacy evidence in the immutable custody store.
+
+    The returned manifests are references only; no bytes or source paths are
+    returned to the caller.  Originals are deliberately not retained because
+    this compatibility path cannot prove a protected-original authorization.
+    Callers must roll back the returned artifacts if their database transaction
+    fails.
+    """
+    store = (
+        custody_root
+        if custody_root is not None
+        and callable(getattr(custody_root, "store_artifact", None))
+        else None
+    )
+    root = None if store is not None else _legacy_custody_root(
+        finding_dict,
+        evidence,
+        custody_root,
+    )
+    payloads = _legacy_evidence_payloads(evidence)
+    if (root is None and store is None) or not payloads:
+        return None, []
+    if store is None:
+        try:
+            from common.evidence_custody import EvidenceCustodyStore
+        except Exception as exc:  # pragma: no cover - package is required in production
+            raise ValueError("immutable evidence custody is unavailable") from exc
+        store = EvidenceCustodyStore(cast(Path, root), tenant_id)
+    elif str(getattr(store, "tenant_id", tenant_id)) != tenant_id:
+        raise ValueError("immutable evidence custody tenant does not match finding")
+    finding_id = str(finding_dict.get("id") or "legacy-finding")
+    source_seed = "\x1f".join((tenant_id, str(run_id or "legacy"), finding_id))
+    observation_id = _legacy_custody_identifier(source_seed, "legacy-observation")
+    collector = _normalize_token(finding_dict.get("module")) or "legacy-db"
+    collector = _legacy_custody_identifier(collector, "collector")
+    source_target = str(finding_dict.get("target") or finding_dict.get("url") or "")[:2000] or None
+    staged: list[dict[str, str]] = []
+    try:
+        for field, payload, media_type in payloads:
+            manifest = store.store_artifact(
+                payload,
+                source_observation_id=observation_id,
+                collector_id=collector,
+                media_type=media_type,
+                source_target=source_target,
+                redaction_required=True,
+                retain_original=False,
+                metadata={
+                    "legacy": True,
+                    "field": field,
+                    "module": _normalize_token(finding_dict.get("module")),
+                    "run_id": str(run_id or "legacy"),
+                },
+            )
+            staged.append(
+                {
+                    "artifact_id": manifest.artifact_id,
+                    "manifest_digest": manifest.manifest_digest,
+                    "field": field,
+                }
+            )
+    except Exception:
+        # Compensate any earlier artifacts created by this call.  The custody
+        # store verifies each manifest before removing it and refuses broad
+        # deletion, so failed writes cannot leave an orphan namespace behind.
+        for item in reversed(staged):
+            try:
+                store.rollback_artifact(
+                    item["artifact_id"],
+                    expected_manifest_digest=item["manifest_digest"],
+                )
+            except Exception:
+                pass
+        raise
+    return store, staged
 
 
 def save_finding_retest(session: Session, retest_dict: dict[str, Any]) -> None:
@@ -2451,15 +2781,20 @@ def save_finding(
     finding_dict: dict[str, Any],
     run_id: str | None = None,
     *,
-    allow_legacy_compat: bool = True,
+    allow_legacy_compat: bool = False,
+    evidence_store: str | os.PathLike[str] | None = None,
 ) -> None:
     """Persist a Finding.to_dict() result to the database.
 
     The strict adapter path fails closed before touching the legacy findings
-    table when the complete Task 101 context marker is absent.  The default
-    remains the named Gate-0 compatibility path for old fixture/report code;
-    production adapters use ``allow_legacy_compat=False`` until they emit a
-    :class:`common.canonical.CanonicalAdapter` graph.
+    table when the complete Task 101 context marker is absent.  Strict mode is
+    the default; an inert migration or Gate-0 fixture must opt into the named
+    compatibility path with ``allow_legacy_compat=True`` until it emits a
+    :class:`common.canonical.CanonicalAdapter` graph.  When a compatibility
+    caller supplies ``evidence_store`` (or an ``EvidenceCustodyStore``), raw
+    legacy evidence is staged as redacted derivative artifacts and only their
+    immutable manifest references are retained in ``verification``; the
+    historical findings evidence columns are always written as ``NULL``.
     """
     safe_finding = normalise_finding(dict(finding_dict))
     canonical_context = _canonical_context_marker(finding_dict.get("canonical_context"))
@@ -2481,15 +2816,20 @@ def save_finding(
             safe_finding[field] = redact_text(str(safe_finding[field]))
     for field in ("reproduction_steps", "references", "mitre_attack", "tags"):
         safe_finding[field] = redact_value(safe_finding.get(field, []))
-    safe_finding["verification"] = redact_value(
-        safe_finding.get("verification") or {}
+    safe_finding["verification"] = _strip_legacy_raw_evidence(
+        redact_value(safe_finding.get("verification") or {})
     )
     safe_finding["evidence"] = redact_value(safe_finding.get("evidence") or {})
     finding_dict = safe_finding
     ev = finding_dict.get("evidence", {})
     now = datetime.now(timezone.utc)
     seen_at = _parse_datetime(finding_dict.get("discovered_at")) or now
-    dedup_key = finding_dict.get("dedup_key") or finding_dedup_key(finding_dict)
+    # Caller-supplied legacy keys were generated from title/host/port and can
+    # therefore merge unrelated canonical observations.  Always derive the
+    # key from the complete tenant/check/route/parameter/location/identity
+    # dimensions above; an incoming key is retained only by immutable legacy
+    # migration paths, never by this writer.
+    dedup_key = finding_dedup_key(finding_dict)
     tenant_id = str(finding_dict.get("tenant_id") or "default").strip() or "default"
     # This API has always been a committing persistence boundary.  End any
     # caller-side deferred read transaction before taking SQLite's write lock;
@@ -2523,6 +2863,30 @@ def save_finding(
             .one_or_none()
         )
         if prior_membership is not None:
+            if existing is not None:
+                # A retry may encounter a row written by an older adapter
+                # before the custody boundary was enforced.  Clean the
+                # nullable compatibility columns even when this run is already
+                # represented; never preserve stale raw/path material merely
+                # because dedup made the operation idempotent.
+                for field_name in (
+                    "request_raw",
+                    "response_raw",
+                    "screenshot_path",
+                    "console_capture_path",
+                    "pcap_path",
+                ):
+                    setattr(existing, field_name, None)
+                try:
+                    prior = json.loads(str(existing.verification or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    prior = {}
+                setattr(existing, "verification", json.dumps(
+                    _strip_legacy_raw_evidence(prior)
+                    if isinstance(prior, dict)
+                    else {},
+                ))
+                session.flush()
             if started_immediate:
                 session.commit()
             return
@@ -2548,6 +2912,54 @@ def save_finding(
     seen_runs = _json_list(existing.seen_runs if existing else None)
     if current_run and current_run not in seen_runs:
         seen_runs.append(current_run)
+    staged_custody_store: Any = None
+    staged_custody_artifacts: list[dict[str, str]] = []
+    try:
+        staged_custody_store, staged_custody_artifacts = _persist_legacy_custody(
+            finding_dict,
+            ev,
+            custody_root=evidence_store,
+            tenant_id=tenant_id,
+            run_id=str(current_run) if current_run else None,
+        )
+    except Exception:
+        if started_immediate:
+            session.rollback()
+        raise
+    prior_verification: dict[str, Any] = {}
+    if existing is not None:
+        try:
+            decoded_verification = json.loads(str(existing.verification or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            decoded_verification = {}
+        if isinstance(decoded_verification, dict):
+            prior_verification = decoded_verification
+    verification_value = finding_dict.get("verification") or {}
+    verification = dict(verification_value) if isinstance(verification_value, dict) else {}
+    prior_artifacts = prior_verification.get("custody_artifacts")
+    if isinstance(prior_artifacts, list):
+        verification["custody_artifacts"] = list(prior_artifacts)
+    if staged_custody_artifacts:
+        current_artifacts = verification.get("custody_artifacts")
+        if not isinstance(current_artifacts, list):
+            current_artifacts = []
+        # Manifest identities are immutable.  De-duplicate only an exact
+        # artifact reference; different runs and fields remain separate.
+        known = {
+            str(item.get("artifact_id"))
+            for item in current_artifacts
+            if isinstance(item, dict) and item.get("artifact_id")
+        }
+        for item in staged_custody_artifacts:
+            if item["artifact_id"] not in known:
+                current_artifacts.append(item)
+                known.add(item["artifact_id"])
+        verification["custody_artifacts"] = current_artifacts
+    finding_dict["verification"] = (
+        _strip_legacy_raw_evidence(redact_value(verification))
+        if verification
+        else {}
+    )
     model = FindingModel(
         id                   = existing.id if existing else finding_dict["id"],
         tenant_id            = tenant_id,
@@ -2567,11 +2979,15 @@ def save_finding(
         cvss_v40_vector      = finding_dict.get("cvss_v40_vector"),
         cvss_v40_score       = finding_dict.get("cvss_v40_score"),
         mitre_attack         = json.dumps(finding_dict.get("mitre_attack", [])),
-        screenshot_path      = ev.get("screenshot_path"),
-        request_raw          = ev.get("request_raw"),
-        response_raw         = ev.get("response_raw"),
-        console_capture_path = ev.get("console_capture_path"),
-        pcap_path            = ev.get("pcap_path"),
+        # These columns remain nullable for schema compatibility with old
+        # databases, but the legacy writer intentionally leaves them empty.
+        # Evidence bytes/paths belong in the immutable custody boundary, not
+        # in a mutable finding summary row.
+        screenshot_path      = None,
+        request_raw          = None,
+        response_raw         = None,
+        console_capture_path = None,
+        pcap_path            = None,
         operator_confirmed   = finding_dict.get("operator_confirmed", False),
         tags                 = json.dumps(finding_dict.get("tags", [])),
         confidence           = finding_dict.get("confidence", "UNVERIFIED"),
@@ -2608,6 +3024,15 @@ def save_finding(
         session.commit()
     except Exception:
         session.rollback()
+        if staged_custody_store is not None:
+            for item in reversed(staged_custody_artifacts):
+                try:
+                    staged_custody_store.rollback_artifact(
+                        item["artifact_id"],
+                        expected_manifest_digest=item["manifest_digest"],
+                    )
+                except Exception:
+                    pass
         raise
 
 
@@ -2641,7 +3066,9 @@ def finding_to_dict(model: FindingModel) -> dict[str, Any]:
         "status": model.status or "open",
         "vpr_score": model.vpr_score,
         "vpr_priority": model.vpr_priority,
-        "verification": json.loads(cast(str | None, model.verification) or "{}"),
+        "verification": _strip_legacy_raw_evidence(
+            json.loads(cast(str | None, model.verification) or "{}")
+        ),
         "verification_state": model.verification_state or "unknown",
         "proof_type": model.proof_type or "unknown",
         "maturity": model.maturity or "experimental",
@@ -2654,11 +3081,14 @@ def finding_to_dict(model: FindingModel) -> dict[str, Any]:
         "days_open": model.days_open or 0,
         "priority": model.priority,
         "evidence": {
-            "request_raw": model.request_raw,
-            "response_raw": model.response_raw,
-            "screenshot_path": model.screenshot_path,
-            "console_capture_path": model.console_capture_path,
-            "pcap_path": model.pcap_path,
+            # The old ORM columns are intentionally not read back.  They are
+            # retained only as nullable migration shims; ordinary consumers
+            # must resolve redacted derivatives through canonical custody.
+            "request_raw": None,
+            "response_raw": None,
+            "screenshot_path": None,
+            "console_capture_path": None,
+            "pcap_path": None,
         },
     }
     safe = redact_value(normalise_finding(row))
@@ -3954,7 +4384,11 @@ class TestDb:
             remediation="Use parameterized queries",
             references=["CWE-89"],
         )
-        save_finding(session, f.to_dict())
+        # This embedded Gate-0 regression fixture has no canonical tenant /
+        # engagement / module-version / asset graph.  Opt into the explicit
+        # compatibility writer so the strict production default remains
+        # fail-closed.
+        save_finding(session, f.to_dict(), allow_legacy_compat=True)
         result = session.query(FindingModel).filter_by(id=f.id).first()
         assert result is not None
         assert result.title == "Test SQL Injection"

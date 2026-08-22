@@ -36,6 +36,7 @@ def test_scan_job_can_persist_and_update(tmp_path):
             "logs": {"events": ["created", "started"]},
             "started_at": started_at,
         },
+        allow_legacy_compat=True,
     )
 
     job = session.query(ScanJobModel).filter_by(id="job-1").one()
@@ -58,6 +59,7 @@ def test_scan_job_can_persist_and_update(tmp_path):
             "status": "running",
             "pid": 5150,
         },
+        allow_legacy_compat=True,
     )
     session.refresh(job)
     assert job.created_at == created_at
@@ -517,6 +519,7 @@ def test_scan_job_migration_adds_missing_columns(tmp_path):
             "modules": [],
             "logs": {},
         },
+        allow_legacy_compat=True,
     )
 
     job = session.query(ScanJobModel).filter_by(id="job-legacy").one()
@@ -536,6 +539,7 @@ def test_update_scan_job_rejects_unknown_fields(tmp_path):
             "status": "pending",
             "target": "https://example.test",
         },
+        allow_legacy_compat=True,
     )
 
     with pytest.raises(ValueError, match="unknown scan job fields"):
@@ -556,6 +560,7 @@ def test_scan_job_tenant_linkage_filters_reads_and_updates(tmp_path):
             "status": "pending",
             "target": "http://127.0.0.1:8080/fixture",
         },
+        allow_legacy_compat=True,
     )
 
     assert get_scan_job(session, "job-tenant-a", tenant_id="tenant-a") is not None
@@ -581,6 +586,7 @@ def test_scan_job_tenant_linkage_filters_reads_and_updates(tmp_path):
                 "tenant_id": "tenant-b",
                 "target": "http://127.0.0.1:8080/fixture",
             },
+            allow_legacy_compat=True,
         )
 
     session.close()
@@ -601,6 +607,7 @@ def test_scan_job_cannot_claim_allow_without_consumed_authorization(tmp_path):
                 "authorization_decision_id": "client-decision",
                 "authorization_action_id": "client-action",
             },
+            allow_legacy_compat=True,
         )
     assert session.query(ScanJobModel).filter_by(id="client-job").one_or_none() is None
     session.close()
@@ -814,16 +821,18 @@ def test_finding_save_deduplicates_and_tracks_aging(tmp_path):
             discovered_at=first_seen.isoformat(),
         ),
         run_id="run-previous",
+        allow_legacy_compat=True,
     )
     save_finding(
         session,
         _finding(
             "finding-new",
             " tls   weak cipher ",
-            "app.example.test/login",
+            "app.example.test",
             discovered_at=datetime.now(timezone.utc).isoformat(),
         ),
         run_id="run-current",
+        allow_legacy_compat=True,
     )
 
     rows = session.query(FindingModel).all()
@@ -835,6 +844,177 @@ def test_finding_save_deduplicates_and_tracks_aging(tmp_path):
     assert finding.days_open >= 45
     assert finding.priority == "CRITICAL"
     assert finding.dedup_key
+    session.close()
+
+
+def test_legacy_finding_writer_clears_mutable_evidence_and_uses_observation_identity(
+    tmp_path,
+):
+    """Legacy compatibility rows never retain raw evidence or weak dedup keys."""
+    from common.db import FindingModel, create_db, finding_to_dict, save_finding
+
+    session = create_db(tmp_path / "legacy-evidence-boundary.db")
+    base = {
+        "title": "Input validation finding",
+        "severity": "High",
+        "target": "fixture.example",
+        "port": 443,
+        "module": "web.checks",
+        "check_id": "web.input-validation",
+        "route": "/search",
+        "parameter": "q",
+        "location": "query",
+        "identity_ref": "principal:analyst",
+        "description": "fixture",
+        "remediation": "fix",
+        "evidence": {
+            "request_raw": "GET /search?q=fixture-canary HTTP/1.1",
+            "response_raw": "HTTP/1.1 200 OK\\n\\nfixture-canary",
+            "screenshot_path": "/caller/controlled/screenshot.png",
+            "console_capture_path": "/caller/controlled/console.html",
+            "pcap_path": "/caller/controlled/capture.pcap",
+        },
+    }
+
+    save_finding(
+        session,
+        {**base, "id": "legacy-evidence-1"},
+        run_id="run-a",
+        allow_legacy_compat=True,
+    )
+    # A changed body/path must update workflow state without reintroducing the
+    # mutable evidence fields or creating a second finding for the same source
+    # identity.
+    save_finding(
+        session,
+        {
+            **base,
+            "id": "legacy-evidence-2",
+            "evidence": {
+                "request_raw": "POST /search HTTP/1.1\\n\\nq=other-canary",
+                "response_raw": "HTTP/1.1 500 Internal Server Error",
+            },
+        },
+        run_id="run-b",
+        allow_legacy_compat=True,
+    )
+    # Canonical observation dimensions keep a different route separate even
+    # when title/host/port/module/check are identical.
+    save_finding(
+        session,
+        {**base, "id": "legacy-evidence-3", "route": "/admin"},
+        run_id="run-c",
+        allow_legacy_compat=True,
+    )
+
+    rows = session.query(FindingModel).order_by(FindingModel.id).all()
+    assert len(rows) == 2
+    first = rows[0]
+    assert first.times_seen == 2
+    assert first.request_raw is None
+    assert first.response_raw is None
+    assert first.screenshot_path is None
+    assert first.console_capture_path is None
+    assert first.pcap_path is None
+    rendered = finding_to_dict(first)
+    assert rendered["evidence"] == {
+        "request_raw": None,
+        "response_raw": None,
+        "screenshot_path": None,
+        "console_capture_path": None,
+        "pcap_path": None,
+    }
+    assert all(
+        "canary" not in str(value).lower()
+        for value in rendered["evidence"].values()
+    )
+    session.close()
+
+
+def test_legacy_finding_writer_can_stage_text_evidence_in_immutable_custody(
+    tmp_path,
+):
+    import json
+
+    from common.db import FindingModel, create_db, save_finding
+    from common.evidence_custody import EvidenceCustodyStore
+
+    session = create_db(tmp_path / "legacy-custody.db")
+    custody_root = tmp_path / "custody"
+    save_finding(
+        session,
+        {
+            "id": "legacy-custody-1",
+            "title": "Custodied finding",
+            "severity": "High",
+            "target": "fixture.example",
+            "module": "fixture.module",
+            "description": "fixture",
+            "remediation": "fix",
+            "evidence": {
+                "request_raw": "GET /fixture HTTP/1.1\\n\\nAuthorization: Bearer fixture-canary",
+                "response_raw": "HTTP/1.1 200 OK\\n\\nfixture-canary",
+            },
+        },
+        run_id="run-custody",
+        evidence_store=custody_root,
+        allow_legacy_compat=True,
+    )
+    row = session.query(FindingModel).one()
+    assert row.request_raw is None
+    assert row.response_raw is None
+    verification = json.loads(row.verification or "{}")
+    artifacts = verification["custody_artifacts"]
+    assert len(artifacts) == 2
+    store = EvidenceCustodyStore(custody_root, "default")
+    for item in artifacts:
+        manifest = store.verify(item["artifact_id"])
+        assert manifest.manifest_digest == item["manifest_digest"]
+        rendered = store.read(item["artifact_id"])
+        assert b"fixture-canary" not in rendered
+        assert b"<redacted>" in rendered
+    session.close()
+
+
+def test_legacy_finding_dedup_separates_check_parameter_identity_and_tenant(
+    tmp_path,
+):
+    from common.db import FindingModel, create_db, save_finding
+
+    session = create_db(tmp_path / "legacy-observation-identity.db")
+    base = {
+        "title": "Same display title",
+        "severity": "Medium",
+        "target": "fixture.example",
+        "port": 443,
+        "module": "shared.module",
+        "check_id": "check-a",
+        "route": "/item",
+        "parameter": "id",
+        "location": "query",
+        "identity_ref": "principal:a",
+        "description": "fixture",
+        "remediation": "fix",
+        "evidence": {},
+    }
+    payloads = [
+        ("finding-a", "tenant-a", {}),
+        ("finding-b", "tenant-a", {"check_id": "check-b"}),
+        ("finding-c", "tenant-a", {"parameter": "name"}),
+        ("finding-d", "tenant-a", {"identity_ref": "principal:b"}),
+        ("finding-e", "tenant-b", {}),
+    ]
+    for finding_id, tenant_id, updates in payloads:
+        save_finding(
+            session,
+            {**base, **updates, "id": finding_id, "tenant_id": tenant_id},
+            run_id=f"run-{finding_id}",
+            allow_legacy_compat=True,
+        )
+    rows = session.query(FindingModel).all()
+    assert len(rows) == len(payloads)
+    assert len({row.dedup_key for row in rows}) == len(payloads)
+    assert {row.tenant_id for row in rows} == {"tenant-a", "tenant-b"}
     session.close()
 
 
@@ -881,6 +1061,7 @@ def test_concurrent_tenant_dedup_is_database_enforced_and_preserves_other_rows(
                     "tenant_id": "tenant-a",
                 },
                 run_id="run-a",
+                allow_legacy_compat=True,
             )
         finally:
             session.close()
@@ -1074,10 +1255,10 @@ def test_persisted_finding_delta_reports_new_fixed_remaining(
     from common.reporting.delta_report import build_persisted_finding_delta
 
     session = create_db(tmp_path / "delta.db")
-    save_finding(session, _finding("fixed-1", "Exposed Admin", "10.0.0.10", port=8443), run_id="run-a")
-    save_finding(session, _finding("remaining-1", "Missing HSTS", "10.0.0.11", port=443), run_id="run-a")
-    save_finding(session, _finding("remaining-2", "Missing HSTS", "https://10.0.0.11", port=443), run_id="run-b")
-    save_finding(session, _finding("new-1", "Default Credential", "10.0.0.12", port=22), run_id="run-b")
+    save_finding(session, _finding("fixed-1", "Exposed Admin", "10.0.0.10", port=8443), run_id="run-a", allow_legacy_compat=True)
+    save_finding(session, _finding("remaining-1", "Missing HSTS", "10.0.0.11", port=443), run_id="run-a", allow_legacy_compat=True)
+    save_finding(session, _finding("remaining-2", "Missing HSTS", "https://10.0.0.11", port=443), run_id="run-b", allow_legacy_compat=True)
+    save_finding(session, _finding("new-1", "Default Credential", "10.0.0.12", port=22), run_id="run-b", allow_legacy_compat=True)
     policy, signer = _configured_run_truth_signer(monkeypatch)
     append_run_collection_truth(
         session,
@@ -1134,6 +1315,7 @@ def test_failed_or_incomplete_delta_does_not_claim_fixed(
         session,
         _finding("previous", "Exposed Admin", "10.0.0.10"),
         run_id="run-a",
+        allow_legacy_compat=True,
     )
     policy, signer = _configured_run_truth_signer(monkeypatch)
     append_run_collection_truth(

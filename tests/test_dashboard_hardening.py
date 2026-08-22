@@ -419,6 +419,7 @@ def test_dashboard_scan_job_reads_and_deletes_are_tenant_filtered(
                     "status": "pending",
                     "target": LAB_URL,
                 },
+                allow_legacy_compat=True,
             )
     finally:
         session.close()
@@ -931,7 +932,7 @@ class TestDashboardHardeningApi(unittest.IsolatedAsyncioTestCase):
         resolve.assert_not_called()
         control.assert_not_called()
 
-    async def test_plain_web_launch_never_resolves_or_launches_netforge(self) -> None:
+    async def test_plain_web_launch_without_canonical_lineage_fails_closed(self) -> None:
         from common.dashboard.server import DashboardServer
         from common.db import (
             AuthorizationConsumptionModel,
@@ -977,42 +978,24 @@ class TestDashboardHardeningApi(unittest.IsolatedAsyncioTestCase):
                     },
                 )
 
-        assert response.status_code == 200, response.text
-        assert response.json()["frameworks"] == ["web"]
-        popen.assert_called_once()
+        assert response.status_code == 500, response.text
+        assert response.json()["detail"] == (
+            "Authorization handoff persistence failed; execution denied"
+        )
+        popen.assert_not_called()
         resolve.assert_not_called()
-        control.assert_called_once()
-        argv = popen.call_args.args[0]
-        child_env = popen.call_args.kwargs["env"]
-        assert "--auto-confirm" not in argv
-        assert ["--scope", "127.0.0.1/32"] == argv[argv.index("--scope"):argv.index("--scope") + 2]
-        assert ["--exclude", "127.0.0.2/32"] == argv[argv.index("--exclude"):argv.index("--exclude") + 2]
-        assert LAUNCH_CONFIRMATIONS_ENV in child_env
-        assert response.json()["client_job_id"] == "web-only"
-        assert child_env[LAUNCH_JOB_ID_ENV] == response.json()["scan_id"]
-        assert child_env[LAUNCH_JOB_ID_ENV].startswith("job-")
-        assert child_env[LAUNCH_JOB_ID_ENV] != "web-only"
-        assert child_env[LAUNCH_ACTION_ENV] == "scan"
-        assert "FORGE_PASSWORD" not in child_env
-        assert "FORGE_AGENT_REGISTRATION_TOKEN" not in child_env
-        assert "THIRD_PARTY_PASSWORD" not in child_env
+        control.assert_not_called()
         session = create_db(srv._scan_jobs_db_path)
         try:
-            job = session.query(ScanJobModel).one()
-            allows = session.query(AuthorizationDecisionModel).filter_by(
+            assert session.query(ScanJobModel).count() == 0
+            assert session.query(AuthorizationDecisionModel).filter_by(
                 decision_outcome="allow"
-            ).all()
-            consumptions = session.query(AuthorizationConsumptionModel).all()
+            ).count() == 0
+            assert session.query(AuthorizationConsumptionModel).count() == 0
         finally:
             session.close()
-        assert job.id == response.json()["scan_id"]
-        assert job.authorization_state == "allow"
-        child = next(row for row in allows if row.action_kind == "engine.execute")
-        assert job.authorization_decision_id == child.decision_id
-        assert len(allows) == 2
-        assert len(consumptions) == 1
 
-    async def test_direct_net_launch_accepts_hostname_and_cidr_targets(self) -> None:
+    async def test_direct_net_launch_without_canonical_lineage_fails_closed(self) -> None:
         from common.dashboard.server import DashboardServer
 
         cases = (
@@ -1058,13 +1041,12 @@ class TestDashboardHardeningApi(unittest.IsolatedAsyncioTestCase):
                             },
                         )
 
-                assert response.status_code == 200, response.text
-                assert response.json()["frameworks"] == ["net"]
+                assert response.status_code == 500, response.text
+                assert response.json()["detail"] == (
+                    "Authorization handoff persistence failed; execution denied"
+                )
                 resolve.assert_not_called()
-                popen.assert_called_once()
-                argv = popen.call_args.args[0]
-                assert argv[argv.index("--target") + 1] == target
-                assert "--auto-confirm" not in argv
+                popen.assert_not_called()
 
     async def test_pending_authorization_handoff_failure_blocks_subprocess(self) -> None:
         from common.dashboard.server import DashboardServer
@@ -1169,7 +1151,7 @@ class TestDashboardHardeningApi(unittest.IsolatedAsyncioTestCase):
         ]
         assert (allows, consumptions, jobs) == (0, 0, 0)
 
-    async def test_separately_approved_exact_loopback_escalation_launches_both_actions(self) -> None:
+    async def test_separately_approved_escalation_without_canonical_lineage_fails_closed(self) -> None:
         from common.dashboard.server import DashboardServer
 
         srv = DashboardServer(auth=False)
@@ -1223,37 +1205,12 @@ class TestDashboardHardeningApi(unittest.IsolatedAsyncioTestCase):
                     },
                 )
 
-        assert response.status_code == 200, response.text
-        assert response.json()["frameworks"] == ["web", "net"]
-        assert popen.call_count == 2
+        assert response.status_code == 500, response.text
+        assert response.json()["detail"] == (
+            "Authorization handoff persistence failed; execution denied"
+        )
+        assert popen.call_count == 0
         resolve.assert_called_once_with("app.example.test")
-        web_call, net_call = popen.call_args_list
-        assert "webforge.py" in " ".join(web_call.args[0])
-        assert "netforge.py" in " ".join(net_call.args[0])
-        web_scope_index = [
-            index for index, value in enumerate(web_call.args[0]) if value == "--scope"
-        ]
-        net_scope_index = [
-            index for index, value in enumerate(net_call.args[0]) if value == "--scope"
-        ]
-        assert [web_call.args[0][index + 1] for index in web_scope_index] == [
-            "app.example.test"
-        ]
-        assert [net_call.args[0][index + 1] for index in net_scope_index] == [
-            "127.0.0.1/32"
-        ]
-        web_context = load_launch_confirmations(web_call.kwargs["env"])
-        net_context = load_launch_confirmations(net_call.kwargs["env"])
-        assert [(item.engine, item.action) for item in web_context] == [("webforge", "scan")]
-        assert [(item.engine, item.action) for item in net_context] == [
-            ("netforge", "web_to_network")
-        ]
-        assert response.json()["client_job_id"] == "approved-escalation"
-        assert web_call.kwargs["env"][LAUNCH_JOB_ID_ENV] == response.json()["scan_id"]
-        assert web_call.kwargs["env"][LAUNCH_ACTION_ENV] == "scan"
-        assert net_call.kwargs["env"][LAUNCH_JOB_ID_ENV] == response.json()["scan_id"]
-        assert response.json()["scan_id"].startswith("job-")
-        assert net_call.kwargs["env"][LAUNCH_ACTION_ENV] == "web_to_network"
 
     async def test_changed_dns_answer_denies_combined_launch_before_any_process(self) -> None:
         from common.dashboard.server import DashboardServer

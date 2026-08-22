@@ -516,6 +516,7 @@ class TestFindingStatusPersistence(unittest.IsolatedAsyncioTestCase):
                         "evidence": {},
                     },
                     run_id="run-1",
+                    allow_legacy_compat=True,
                 )
             finally:
                 session.close()

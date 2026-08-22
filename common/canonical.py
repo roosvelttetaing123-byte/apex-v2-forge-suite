@@ -53,10 +53,19 @@ _RELATIONSHIP_KEYS = {
     "scope_decision_id",
     "job_id",
     "action_id",
+    "authorization_decision_id",
+    "run_id",
+    "execution_id",
+    "attempt_id",
     "module_version_id",
     "module_execution_id",
+    "intelligence_snapshot_id",
+    "feed_snapshot_id",
+    "check_pack_snapshot_id",
     "asset_id",
+    "source_asset_id",
     "observation_id",
+    "source_observation_id",
     "artifact_id",
     "finding_id",
     "retest_id",
@@ -64,6 +73,9 @@ _RELATIONSHIP_KEYS = {
     "export_id",
     "source_id",
     "provenance_id",
+    "manifest_id",
+    "actor_id",
+    "created_by",
     "parent_id",
 }
 
@@ -71,7 +83,11 @@ _RELATIONSHIP_KEYS = {
 def _is_relationship_metadata_key(key: str) -> bool:
     """Recognize relationship-shaped metadata keys across casing styles."""
     normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key).replace("-", "_").lower()
-    return normalized in _RELATIONSHIP_KEYS
+    # Any ``*_id`` value is structurally relationship-shaped.  Keeping a
+    # short explicit set is useful for non-suffixed historical names, but the
+    # suffix guard prevents new contracts (attempt_id, execution_id,
+    # manifest_id, check_id, etc.) from silently becoming JSON-only links.
+    return normalized in _RELATIONSHIP_KEYS or normalized.endswith("_id")
 _SECRET_KEYS = re.compile(
     r"(?:password|passwd|pwd|secret|token|cookie|credential|private[_-]?key|"
     r"api[_-]?key|access[_-]?key|passphrase|hash(?:es)?|authorization)",
@@ -441,7 +457,15 @@ def _authorization_ref(value: Any, field_name: str = "authorization_ref") -> str
     """
     if value is None:
         return None
-    rendered = _text(value, field_name, max_length=300)
+    if not isinstance(value, str):
+        raise CanonicalContractError(f"{field_name} must be an opaque authorization reference")
+    # Authorization handles are typed opaque bindings, not request/response
+    # text.  Running them through the emergency redactor would turn a valid
+    # ``authorization:review-1`` binding into ``authorization:<redacted>`` and
+    # make protected-original manifests impossible to reopen.
+    rendered = value.strip()
+    if not rendered or len(rendered) > 300:
+        raise CanonicalContractError(f"{field_name} must be an opaque authorization reference")
     if not _AUTHORIZATION_REF_RE.fullmatch(rendered):
         raise CanonicalContractError(f"{field_name} must be an opaque authorization reference")
     return rendered
@@ -1035,10 +1059,14 @@ class ArtifactReference(_Contract):
         if self.retention_expires_at is not None:
             object.__setattr__(self, "retention_expires_at", ensure_utc(self.retention_expires_at))
         if self.protected_original_authorization_ref is not None:
-            ref = _text(self.protected_original_authorization_ref, "protected_original_authorization_ref", max_length=300)
-            if not re.fullmatch(r"(?:authz|authorization):[A-Za-z0-9._:@/+\-]{1,240}", ref):
-                raise CanonicalContractError("protected original authorization reference is invalid")
-            object.__setattr__(self, "protected_original_authorization_ref", ref)
+            object.__setattr__(
+                self,
+                "protected_original_authorization_ref",
+                _authorization_ref(
+                    self.protected_original_authorization_ref,
+                    "protected_original_authorization_ref",
+                ),
+            )
         if self.derivative_reference is not None:
             ref = _text(self.derivative_reference, "derivative_reference", max_length=2_000).lower()
             if not (_REFERENCE_RE.fullmatch(ref) or _DIGEST_RE.fullmatch(ref)):
@@ -1733,6 +1761,7 @@ class CanonicalStore:
         self,
         manifest: ArtifactManifest | Mapping[str, Any],
         *,
+        custody_store: Any | None = None,
         artifact: ArtifactReference | None = None,
         observation: Observation | None = None,
         role: str = "primary",
@@ -1741,11 +1770,17 @@ class CanonicalStore:
         """Persist one verified custody manifest and its source link.
 
         Bytes remain in :mod:`common.evidence_custody`; this method stores
-        only the normalized, tenant-bound manifest metadata.  Mapping inputs
-        are accepted only as a wire-format convenience and are reconstructed
+        only the normalized, tenant-bound manifest metadata.  A custody store
+        is mandatory so this persistence boundary cannot register metadata
+        for bytes that were never verified on disk. Mapping inputs are
+        accepted only as a wire-format convenience and are reconstructed
         through ``ArtifactManifest.from_dict`` so every field and the
         manifest digest are verified before anything reaches the database.
         """
+        if custody_store is None:
+            raise CanonicalContractError(
+                "custody_store is required to persist an artifact manifest"
+            )
         try:
             if isinstance(manifest, ArtifactManifest):
                 typed_manifest = manifest
@@ -1754,6 +1789,12 @@ class CanonicalStore:
                 typed_manifest = ArtifactManifest.from_dict(manifest)
             else:
                 raise CanonicalContractError("artifact manifest must be an ArtifactManifest object")
+            verifier = getattr(custody_store, "verify", None)
+            if not callable(verifier):
+                raise CanonicalContractError("custody store does not expose verification")
+            verified = verifier(typed_manifest.artifact_id)
+            if not isinstance(verified, ArtifactManifest) or verified.manifest_digest != typed_manifest.manifest_digest:
+                raise CanonicalContractError("custody manifest does not match stored artifact")
         except CanonicalContractError:
             raise
         except Exception as exc:
@@ -1782,20 +1823,41 @@ class CanonicalStore:
         # merely because both identifiers happen to be well formed.
         artifact_row = self.session.execute(
             text(
-                "SELECT observation_id, digest, media_type, size, manifest_digest "
-                "FROM canonical_artifact_refs WHERE tenant_id=:tenant_id AND id=:artifact_id"
+                "SELECT observation_id, digest, media_type, size, source_target, "
+                "source_asset_id, manifest_digest FROM canonical_artifact_refs "
+                "WHERE tenant_id=:tenant_id AND id=:artifact_id"
             ),
             {"tenant_id": tenant_id, "artifact_id": artifact_id},
         ).mappings().first()
-        if artifact_row is not None:
-            if str(artifact_row["observation_id"]) != observation_id:
-                raise CanonicalLineageError("artifact manifest observation does not match artifact reference")
-            if artifact_row["digest"] != typed_manifest.sha256 or int(artifact_row["size"]) != typed_manifest.byte_size:
-                raise CanonicalLineageError("artifact manifest bytes do not match artifact reference")
-            if str(artifact_row["media_type"]) != typed_manifest.media_type:
-                raise CanonicalLineageError("artifact manifest media type does not match artifact reference")
-            if artifact_row["manifest_digest"] is not None and artifact_row["manifest_digest"] != typed_manifest.manifest_digest:
-                raise CanonicalLineageError("artifact manifest digest conflicts with artifact reference")
+        if artifact_row is None:
+            raise CanonicalLineageError(
+                "artifact manifest requires a persisted canonical artifact reference"
+            )
+        observation_row = self.session.execute(
+            text(
+                "SELECT asset_id FROM canonical_observations "
+                "WHERE tenant_id=:tenant_id AND id=:observation_id"
+            ),
+            {"tenant_id": tenant_id, "observation_id": observation_id},
+        ).mappings().first()
+        if observation_row is None:
+            raise CanonicalLineageError(
+                "artifact manifest requires a persisted source observation"
+            )
+        if str(artifact_row["observation_id"]) != observation_id:
+            raise CanonicalLineageError("artifact manifest observation does not match artifact reference")
+        if artifact_row["digest"] != typed_manifest.sha256 or int(artifact_row["size"]) != typed_manifest.byte_size:
+            raise CanonicalLineageError("artifact manifest bytes do not match artifact reference")
+        if str(artifact_row["media_type"]) != typed_manifest.media_type:
+            raise CanonicalLineageError("artifact manifest media type does not match artifact reference")
+        if artifact_row["source_target"] != typed_manifest.source_target:
+            raise CanonicalLineageError("artifact manifest source target does not match artifact reference")
+        if artifact_row["source_asset_id"] != typed_manifest.source_asset_id:
+            raise CanonicalLineageError("artifact manifest source asset does not match artifact reference")
+        if typed_manifest.source_asset_id is not None and str(observation_row["asset_id"]) != typed_manifest.source_asset_id:
+            raise CanonicalLineageError("artifact manifest source asset is inconsistent with observation")
+        if artifact_row["manifest_digest"] is not None and artifact_row["manifest_digest"] != typed_manifest.manifest_digest:
+            raise CanonicalLineageError("artifact manifest digest conflicts with artifact reference")
         with self._atomic():
             existing_row = self.session.execute(
                 text(
@@ -1858,6 +1920,22 @@ class CanonicalStore:
                     "metadata_json": _metadata_json(cast(Mapping[str, Any], values["metadata"])),
                 },
             )
+            # Bind the immutable manifest digest back to the canonical artifact
+            # reference.  The v2 custody trigger permits exactly one
+            # NULL -> sha256 binding and rejects every later identity change.
+            if artifact_row["manifest_digest"] is None:
+                self.session.execute(
+                    text(
+                        "UPDATE canonical_artifact_refs "
+                        "SET manifest_digest=:manifest_digest "
+                        "WHERE tenant_id=:tenant_id AND id=:artifact_id"
+                    ),
+                    {
+                        "manifest_digest": typed_manifest.manifest_digest,
+                        "tenant_id": tenant_id,
+                        "artifact_id": artifact_id,
+                    },
+                )
             self.session.execute(
                 text(
                     "INSERT OR IGNORE INTO canonical_observation_artifacts "
@@ -1915,6 +1993,7 @@ class CanonicalStore:
         try:
             self.persist_artifact_manifest(
                 typed_manifest,
+                custody_store=custody_store,
                 artifact=artifact,
                 observation=observation,
                 role=role,
@@ -1958,12 +2037,33 @@ class CanonicalStore:
         authorization_ref = _authorization_ref(authorization_ref)
         if access_kind == "protected_original" and authorization_ref is None:
             raise CanonicalContractError("protected original access requires an authorization reference")
+        manifest_ref = self.session.execute(
+            text(
+                "SELECT protected_original_authorization_ref "
+                "FROM canonical_artifact_manifests "
+                "WHERE tenant_id=:tenant_id AND artifact_id=:artifact_id "
+                "AND observation_id=:observation_id"
+            ),
+            {
+                "tenant_id": tenant_id,
+                "artifact_id": artifact_id,
+                "observation_id": observation_id,
+            },
+        ).scalar_one_or_none()
         if access_kind == "protected_original":
-            manifest_ref = self.session.execute(
+            if manifest_ref is None:
+                raise CanonicalContractError(
+                    "protected original access requires a persisted protected manifest"
+                )
+            if manifest_ref != authorization_ref:
+                raise CanonicalContractError("authorization reference does not match the artifact manifest")
+        elif manifest_ref is None:
+            # Redacted access is also an append-only read of a canonical
+            # artifact; do not create audit rows for an unbound artifact ID.
+            artifact_exists = self.session.execute(
                 text(
-                    "SELECT protected_original_authorization_ref "
-                    "FROM canonical_artifact_manifests "
-                    "WHERE tenant_id=:tenant_id AND artifact_id=:artifact_id "
+                    "SELECT 1 FROM canonical_artifact_refs "
+                    "WHERE tenant_id=:tenant_id AND id=:artifact_id "
                     "AND observation_id=:observation_id"
                 ),
                 {
@@ -1972,8 +2072,10 @@ class CanonicalStore:
                     "observation_id": observation_id,
                 },
             ).scalar_one_or_none()
-            if manifest_ref is not None and manifest_ref != authorization_ref:
-                raise CanonicalContractError("authorization reference does not match the artifact manifest")
+            if artifact_exists is None:
+                raise CanonicalContractError(
+                    "evidence access requires a persisted canonical artifact"
+                )
         audit_id = server_id()
         with self._atomic():
             self.session.execute(

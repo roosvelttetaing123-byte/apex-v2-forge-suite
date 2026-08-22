@@ -100,6 +100,10 @@ def _authorized_module_config(
     finally:
         session.close()
     cfg.extra["authorized_module_envelopes"] = {module_id: issued.envelope}
+    # These source-root tests exercise traversal and redaction in isolation;
+    # they do not construct the canonical module-version / asset graph.  Keep
+    # persistence compatibility explicit so production adapters stay strict.
+    cfg.extra["allow_legacy_compat"] = True
     return cfg, run_id
 
 

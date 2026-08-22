@@ -36,6 +36,34 @@ def test_ordered_upgrade_downgrade_and_idempotence(tmp_path: Path) -> None:
         session.close()
 
 
+def test_targeted_v1_upgrade_does_not_apply_later_evidence_schema(
+    tmp_path: Path,
+) -> None:
+    session = create_db(tmp_path / "target-boundary.db")
+    try:
+        manager = MigrationManager(session.get_bind())
+        assert manager.downgrade() is None
+        assert manager.upgrade(target=CURRENT_SCHEMA_VERSION) == CURRENT_SCHEMA_VERSION
+        tables = {
+            str(row[0])
+            for row in session.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).all()
+        }
+        assert "canonical_observations" in tables
+        assert "canonical_finding_observations" not in tables
+        assert "canonical_artifact_manifests" not in tables
+        columns = {
+            str(row[1])
+            for row in session.execute(
+                text("PRAGMA table_info(canonical_findings)")
+            ).all()
+        }
+        assert "dedup_key" not in columns
+    finally:
+        session.close()
+
+
 def test_interrupted_migration_is_journaled_and_recoverable(tmp_path: Path) -> None:
     session = create_db(tmp_path / "interrupted.db")
     try:
@@ -74,7 +102,7 @@ def test_legacy_gate0_records_migrate_to_unknown_reduced_claims(tmp_path: Path) 
         normalized = session.execute(text(
             "SELECT outcome FROM canonical_scope_decisions"
         )).scalars().all()
-        assert normalized == ["allow"]
+        assert normalized == ["unknown"]
         finding = session.execute(text(
             "SELECT status FROM canonical_findings WHERE id LIKE 'legacy-finding-%'"
         )).scalar_one()

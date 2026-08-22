@@ -93,6 +93,9 @@ def _authorized_config(
             **(extra or {}),
             "allowed_scope": allowed_scope,
             "excluded_scope": [],
+            # The fixture exercises CIS evaluation with a lightweight in-memory
+            # database and intentionally has no canonical asset graph.
+            "allow_legacy_compat": True,
             "authorized_module_envelopes": {
                 "cis_benchmark": issued.envelope,
             },

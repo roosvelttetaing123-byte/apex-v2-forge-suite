@@ -325,6 +325,7 @@ class TestModuleToReporterPipeline:
                 return await self.fixture_run()
 
         cfg = BaseForgeConfig(target="https://demo.forge.local")
+        cfg.extra["allow_legacy_compat"] = True
         scope = Scope(["demo.forge.local"])
         session = create_db(tmp_path / "test.db")
         return SqliModule(cfg, scope, session, tmp_path), session
@@ -380,6 +381,7 @@ class TestModuleToReporterPipeline:
                 return await self.fixture_run()
 
         cfg = BaseForgeConfig(target="https://example.com")
+        cfg.extra["allow_legacy_compat"] = True
         scope = Scope(["example.com"])
         session = create_db(tmp_path / "test.db")
         mod = DupModule(cfg, scope, session, tmp_path)

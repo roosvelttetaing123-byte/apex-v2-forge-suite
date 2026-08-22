@@ -110,7 +110,7 @@ class TestModeWhitelisting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Invalid mode", resp.json()["detail"])
 
-    async def test_valid_modes_accepted(self):
+    async def test_valid_modes_reach_strict_handoff_boundary(self):
         from common.dashboard.server import DashboardServer
 
         srv = DashboardServer(auth=False)
@@ -146,7 +146,12 @@ class TestModeWhitelisting(unittest.IsolatedAsyncioTestCase):
                         "/api/v1/scans/start",
                         json=request,
                     )
-                self.assertEqual(resp.status_code, 200, resp.text)
+                self.assertEqual(resp.status_code, 500, resp.text)
+                self.assertEqual(
+                    resp.json()["detail"],
+                    "Authorization handoff persistence failed; execution denied",
+                )
+                mock_popen.assert_not_called()
 
     async def test_invalid_scan_type_returns_400(self):
         from common.dashboard.server import DashboardServer
@@ -201,7 +206,7 @@ class TestModeWhitelisting(unittest.IsolatedAsyncioTestCase):
         self.assertIn("source_root", resp.text)
         mock_popen.assert_not_called()
 
-    async def test_whitebox_forwards_one_canonical_source_root_argument(self):
+    async def test_whitebox_source_root_reaches_strict_handoff_boundary(self):
         from common.dashboard.server import DashboardServer
 
         srv = DashboardServer(auth=False)
@@ -234,10 +239,12 @@ class TestModeWhitelisting(unittest.IsolatedAsyncioTestCase):
                         **_web_launch_contract("whitebox-canonical-root"),
                     },
                 )
-        self.assertEqual(resp.status_code, 200, resp.text)
-        argv = mock_popen.call_args[0][0]
-        self.assertEqual(argv.count("--source-root"), 1)
-        self.assertEqual(argv[argv.index("--source-root") + 1], source_root)
+        self.assertEqual(resp.status_code, 500, resp.text)
+        self.assertEqual(
+            resp.json()["detail"],
+            "Authorization handoff persistence failed; execution denied",
+        )
+        mock_popen.assert_not_called()
 
 
 class TestDashboardAuthHardening(unittest.TestCase):
@@ -827,7 +834,7 @@ class TestDashboardConnectivity(unittest.IsolatedAsyncioTestCase):
         self.assertIn("net", tool_ids)
         self.assertIn("payload", tool_ids)
 
-    async def test_launch_response_and_status_include_dashboard_url(self):
+    async def test_launch_without_canonical_lineage_fails_closed(self):
         from common.dashboard.server import DashboardServer
 
         srv = DashboardServer(auth=False)
@@ -854,15 +861,15 @@ class TestDashboardConnectivity(unittest.IsolatedAsyncioTestCase):
                 )
                 status = await client.get("/api/v1/scans/status")
 
-        self.assertEqual(resp.status_code, 200, resp.text)
-        body = resp.json()
-        self.assertIn("dashboard_url", body)
-        self.assertEqual(body["dashboard_url"], "http://127.0.0.1:1337")
+        self.assertEqual(resp.status_code, 500, resp.text)
+        self.assertEqual(
+            resp.json()["detail"],
+            "Authorization handoff persistence failed; execution denied",
+        )
+        mock_popen.assert_not_called()
         self.assertEqual(status.status_code, 200)
-        processes = status.json()["running"] + status.json()["completed"]
-        self.assertTrue(processes)
-        self.assertIn("dashboard_url", processes[0])
-        self.assertIn("control_file", processes[0])
+        self.assertEqual(status.json()["running"], [])
+        self.assertEqual(status.json()["completed"], [])
 
     async def test_untracked_running_history_becomes_orphaned(self):
         from common.dashboard.server import DashboardServer

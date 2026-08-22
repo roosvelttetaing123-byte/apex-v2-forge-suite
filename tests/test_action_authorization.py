@@ -39,6 +39,7 @@ from common.action_authorization import (
     validate_consumed_authorization,
 )
 from common.confirm_gate import ActionConfirmation
+from common.canonical import MissingCanonicalContextError
 from common.db import (
     AuthorizationConsumptionModel,
     AuthorizationDecisionModel,
@@ -848,53 +849,24 @@ def test_allow_uses_server_ids_and_links_job_action_without_client_outcome(tmp_p
         action=context.action_kind,
         issued_at=NOW,
     )
-    consumed = authorize_and_link_scan_job(
-        session=session,
-        context=context,
-        confirmation=confirmation,
-        boundary="dashboard.launch",
-        job_record={
-            "id": "client-job",
-            "status": "pending",
-            "target": LAB_URL,
-            "frameworks": ["webforge"],
-            "modules": ["sqli_scanner"],
-        },
-        now=NOW,
-    )
-
-    assert consumed.allowed is True
-    assert consumed.envelope.decision_id != body["decision_id"]
-    assert consumed.envelope.action_id != body["action_id"]
-    assert consumed.envelope.tenant_id == "tenant-lab"
-    assert consumed.envelope.operator_id == "operator-lab"
-    use = session.query(AuthorizationConsumptionModel).one()
-    job = session.get(ScanJobModel, "server-job")
-    assert job is not None
-    assert session.get(ScanJobModel, "client-job") is None
-    assert use.job_id == "server-job"
-    assert use.action_id == consumed.envelope.action_id
-    assert job.authorization_state == AuthorizationOutcome.ALLOW.value
-    assert job.authorization_decision_id == consumed.envelope.decision_id
-    assert job.authorization_action_id == consumed.envelope.action_id
-    with pytest.raises(ValueError, match="unknown scan job fields"):
-        update_scan_job(
-            session,
-            "server-job",
-            tenant_id="tenant-lab",
-            authorization_decision_id="client-rewrite",
-        )
-    with pytest.raises(ValueError, match="authorization linkage is immutable"):
-        save_scan_job(
-            session,
-            {
-                "id": "server-job",
+    with pytest.raises(MissingCanonicalContextError):
+        authorize_and_link_scan_job(
+            session=session,
+            context=context,
+            confirmation=confirmation,
+            boundary="dashboard.launch",
+            job_record={
+                "id": "client-job",
+                "status": "pending",
                 "target": LAB_URL,
-                "authorization_state": AuthorizationOutcome.ALLOW.value,
-                "authorization_decision_id": "client-rewrite",
-                "authorization_action_id": consumed.envelope.action_id,
+                "frameworks": ["webforge"],
+                "modules": ["sqli_scanner"],
             },
+            now=NOW,
         )
+    assert session.query(AuthorizationConsumptionModel).count() == 0
+    assert session.get(ScanJobModel, "server-job") is None
+    assert session.get(ScanJobModel, "client-job") is None
     session.close()
 
 

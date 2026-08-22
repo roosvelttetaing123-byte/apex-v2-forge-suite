@@ -160,10 +160,20 @@ class BaseModule(ABC):
             return
         self._seen_finding_keys[_dedup_key] = 1
         self.findings.append(finding)
-        canonical_required = bool(
-            self.config.extra.get("canonical_context_required")
-            or self.config.extra.get("canonical_context") is not None
+        # Task 101 adapters are strict by default: a module finding may not
+        # silently fall back to the legacy ORM writer and create an orphan
+        # record.  Gate-0 fixtures that genuinely need the compatibility
+        # writer must opt in explicitly; a missing/falsey flag is never
+        # treated as authorization to persist without canonical lineage.
+        canonical_required = not (
+            self.config.extra.get("allow_legacy_compat") is True
+            and self.config.extra.get("canonical_context") is None
         )
+        # A caller that supplies a context marker is always on the canonical
+        # path.  The legacy writer cannot persist that graph, even when a
+        # stale compatibility flag is present in a reused config object.
+        if self.config.extra.get("canonical_context") is not None:
+            canonical_required = True
         persisted = True
         try:
             save_finding(
@@ -171,6 +181,7 @@ class BaseModule(ABC):
                 finding.to_dict(),
                 run_id=self.run_id,
                 allow_legacy_compat=not canonical_required,
+                evidence_store=self.results_dir / "evidence-custody",
             )
         except MissingCanonicalContextError:
             if canonical_required:
@@ -237,7 +248,13 @@ class BaseModule(ABC):
             # Re-save enriched finding
             try:
                 from common.db import save_finding
-                save_finding(self.db, finding.to_dict(), run_id=self.run_id, allow_legacy_compat=False)
+                save_finding(
+                    self.db,
+                    finding.to_dict(),
+                    run_id=self.run_id,
+                    allow_legacy_compat=False,
+                    evidence_store=self.results_dir / "evidence-custody",
+                )
             except Exception as exc:
                 self.log.debug("Failed to update finding after analysis: %s", exc)
 

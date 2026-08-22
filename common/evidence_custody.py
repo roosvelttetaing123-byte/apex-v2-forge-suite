@@ -25,6 +25,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Callable, Mapping
 
 from common.artifact_io import (
@@ -44,6 +45,9 @@ _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+\-/]{0,127}$")
 # but an artifact id must never create a caller-controlled directory tree.
 _ARTIFACT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+\-]{0,127}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_AUTHORIZATION_REF_RE = re.compile(
+    r"^(?:authz|authorization):[A-Za-z0-9][A-Za-z0-9._:@/+\-]{1,240}$"
+)
 _SHA256_PREFIX = "sha256:"
 _MAX_METADATA_BYTES = 16_384
 _MAX_TEXT = 2_000
@@ -115,6 +119,48 @@ def _artifact_id(value: str, field_name: str = "artifact_id") -> str:
     return rendered
 
 
+def _authorization_ref(value: str, field_name: str = "authorization_ref") -> str:
+    """Validate a typed, opaque protected-original authorization handle."""
+    if not isinstance(value, str):
+        raise CustodyError(f"{field_name} must be text")
+    rendered = value.strip()
+    if not _AUTHORIZATION_REF_RE.fullmatch(rendered):
+        raise CustodyError(
+            f"{field_name} must be a typed authz:/authorization: reference"
+        )
+    if re.search(r"(?i)(?:password|secret|token|canary|private[_-]?key)", rendered):
+        raise CustodyError(f"{field_name} contains secret-like material")
+    return rendered
+
+
+def _relative_artifact_path(
+    value: str | None,
+    *,
+    tenant_id: str,
+    artifact_id: str,
+    filename: str,
+    required: bool,
+) -> str | None:
+    """Validate the exact server-generated relative path for one artifact."""
+    if value is None:
+        if required:
+            raise CustodyError(f"{filename} relative path is required")
+        return None
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise CustodyError(f"{filename} relative path is unsafe")
+    path = PurePosixPath(value)
+    expected = (
+        "tenants",
+        hashlib.sha256(tenant_id.encode("utf-8")).hexdigest(),
+        "artifacts",
+        artifact_id,
+        filename,
+    )
+    if path.is_absolute() or path.parts != expected:
+        raise CustodyError(f"{filename} relative path is outside custody namespace")
+    return value
+
+
 def _text(value: str | None, field_name: str, *, required: bool = False, limit: int = _MAX_TEXT) -> str | None:
     if value is None:
         if required:
@@ -183,7 +229,11 @@ class ProtectedOriginalAuthorization:
     def __post_init__(self) -> None:
         object.__setattr__(self, "tenant_id", _id(self.tenant_id, "tenant_id"))
         object.__setattr__(self, "artifact_id", _artifact_id(self.artifact_id))
-        object.__setattr__(self, "authorization_ref", _id(self.authorization_ref, "authorization_ref"))
+        object.__setattr__(
+            self,
+            "authorization_ref",
+            _authorization_ref(self.authorization_ref, "authorization_ref"),
+        )
         object.__setattr__(self, "operator_id", _id(self.operator_id, "operator_id"))
         object.__setattr__(self, "reason", _text(self.reason, "reason", required=True, limit=500) or "")
         object.__setattr__(self, "expires_at", _iso(self.expires_at))
@@ -249,13 +299,52 @@ class ArtifactManifest:
             object.__setattr__(self, name, _text(str(getattr(self, name)), name, required=True, limit=100) or "")
         object.__setattr__(self, "retention_expires_at", _iso(self.retention_expires_at))
         if self.protected_original_authorization_ref is not None:
-            object.__setattr__(self, "protected_original_authorization_ref", _id(self.protected_original_authorization_ref, "protected_original_authorization_ref"))
+            object.__setattr__(
+                self,
+                "protected_original_authorization_ref",
+                _authorization_ref(
+                    self.protected_original_authorization_ref,
+                    "protected_original_authorization_ref",
+                ),
+            )
         object.__setattr__(self, "metadata", _metadata(self.metadata))
         if self.schema_version != EVIDENCE_SCHEMA_VERSION:
             raise CustodyError("unsupported evidence manifest schema version")
         object.__setattr__(self, "derivative_artifact_id", _artifact_id(self.derivative_artifact_id, "derivative_artifact_id"))
-        if not self.derivative_relative_path or not self.derivative_artifact_id:
-            raise CustodyError("a redacted derivative is required")
+        object.__setattr__(
+            self,
+            "original_relative_path",
+            _relative_artifact_path(
+                self.original_relative_path,
+                tenant_id=self.tenant_id,
+                artifact_id=self.artifact_id,
+                filename="original.bin",
+                required=self.protection_state == "protected_original",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "derivative_relative_path",
+            _relative_artifact_path(
+                self.derivative_relative_path,
+                tenant_id=self.tenant_id,
+                artifact_id=self.artifact_id,
+                filename="derivative.bin",
+                required=True,
+            ),
+        )
+        if self.protection_state == "protected_original":
+            if self.original_relative_path is None or self.protected_original_authorization_ref is None:
+                raise CustodyError(
+                    "protected originals require an original path and authorization reference"
+                )
+        elif self.protection_state == "not_retained":
+            if self.original_relative_path is not None or self.protected_original_authorization_ref is not None:
+                raise CustodyError(
+                    "non-retained artifacts cannot bind an original path or authorization"
+                )
+        elif self.protection_state != "legacy_unknown":
+            raise CustodyError("unsupported protection state")
         if not _DIGEST_RE.fullmatch(self.manifest_digest):
             raise CustodyError("manifest_digest must be sha256:<64 lowercase hex>")
 
@@ -454,7 +543,7 @@ class EvidenceCustodyStore:
                 "retaining a protected original requires an explicit authorization reference"
             )
         if protected_original_authorization_ref is not None:
-            protected_original_authorization_ref = _id(
+            protected_original_authorization_ref = _authorization_ref(
                 protected_original_authorization_ref,
                 "protected_original_authorization_ref",
             )
@@ -486,7 +575,10 @@ class EvidenceCustodyStore:
                 "media_type": media,
                 "collected_at": _iso(_utc_now()),
                 "collector_id": collector,
-                "source_target": source_target,
+                # ArtifactManifest applies the same mandatory redaction.  Use
+                # the normalized value before hashing so secret-bearing
+                # source metadata cannot invalidate its own manifest.
+                "source_target": _text(source_target, "source_target", limit=2_000),
                 "source_asset_id": source_asset_id,
                 "redaction_state": "redacted" if redaction_applied else "not_applicable",
                 "redaction_version": self.redaction_version,
@@ -576,10 +668,12 @@ class EvidenceCustodyStore:
             audit_actor = authorization.operator_id
             reason = authorization.reason
         else:
+            candidate_ref: str | None = None
+            if isinstance(authorization, str):
+                candidate_ref = _authorization_ref(authorization)
             authorized = bool(
-                isinstance(authorization, str)
-                and authorization
-                and authorization == manifest.protected_original_authorization_ref
+                candidate_ref
+                and candidate_ref == manifest.protected_original_authorization_ref
             )
             audit_actor = actor_id
             reason = "exact authorization reference"
@@ -649,7 +743,7 @@ def make_original_authorization(
     return ProtectedOriginalAuthorization(
         tenant_id=tenant_id,
         artifact_id=artifact_id,
-        authorization_ref=authorization_ref,
+        authorization_ref=_authorization_ref(authorization_ref),
         operator_id=operator_id,
         reason=reason,
         expires_at=_iso(expires_at),

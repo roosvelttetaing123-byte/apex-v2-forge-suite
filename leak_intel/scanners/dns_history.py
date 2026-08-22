@@ -157,12 +157,20 @@ class DnsHistoryScanner(BaseModule):
 
     async def _query_passivetotal(self, session: Any, domain: str) -> None:
         """Query PassiveTotal/RiskIQ for passive DNS data."""
-        headers = {
-            "Authorization": aiohttp.encode_basic_auth(
+        # aiohttp 3.14 exposes the non-deprecated encoder; older supported
+        # releases only expose ``BasicAuth``.  Prefer the encoder so the
+        # locked runtime does not promote its BasicAuth deprecation warning to
+        # an exception, while retaining compatibility with the older fixture
+        # environment.
+        encode_basic_auth = getattr(aiohttp, "encode_basic_auth", None)
+        if callable(encode_basic_auth):
+            authorization = encode_basic_auth(self._pt_user, self._pt_key)
+        else:
+            authorization = aiohttp.BasicAuth(
                 self._pt_user,
                 self._pt_key,
-            )
-        }
+            ).encode()
+        headers = {"Authorization": authorization}
         url = "https://api.passivetotal.org/v2/enrichment/subdomains"
         params = {"query": f"*.{domain}"}
 

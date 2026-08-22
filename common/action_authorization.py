@@ -1825,7 +1825,10 @@ def authorize_and_link_scan_job(
             session,
             persisted_job,
             commit=False,
-            allow_legacy_compat=True,
+            # Authorization alone does not supply the canonical job/module /
+            # asset lineage.  Refuse an orphan compatibility row until the
+            # durable job adapter owns this handoff.
+            allow_legacy_compat=False,
         )
         session.commit()
         return consumed

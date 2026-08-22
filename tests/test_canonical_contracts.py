@@ -281,6 +281,49 @@ def test_relationship_ids_cannot_hide_in_metadata_and_secrets_are_redacted(tmp_p
         clear_sensitive_values()
 
 
+@pytest.mark.parametrize(
+    "relationship_key",
+    [
+        "run_id",
+        "execution_id",
+        "attempt_id",
+        "intelligence_snapshot_id",
+        "check_pack_snapshot_id",
+        "manifest_id",
+        "source_observation_id",
+        "source_asset_id",
+        "authorization_decision_id",
+    ],
+)
+def test_all_canonical_relationship_ids_are_rejected_from_metadata(
+    relationship_key: str,
+) -> None:
+    with pytest.raises(ValueError, match="relationship"):
+        Tenant(name="x", metadata={relationship_key: "forged"})
+
+
+def test_registered_reference_canary_never_enters_canonical_metadata(tmp_path: Path) -> None:
+    register_sensitive_values(["TASK101_CANARY_SECRET"])
+    session = create_db(tmp_path / "metadata-redaction.db")
+    try:
+        tenant = Tenant(
+            name="metadata fixture",
+            metadata={"credential_ref": "cred:TASK101_CANARY_SECRET"},
+        )
+        CanonicalStore(session).insert(tenant)
+        session.commit()
+        stored = session.execute(
+            text("SELECT metadata_json FROM canonical_tenants WHERE id=:id"),
+            {"id": tenant.id},
+        ).scalar_one()
+        assert "TASK101_CANARY_SECRET" not in stored
+        assert "<redacted>" in stored
+    finally:
+        session.rollback()
+        session.close()
+        clear_sensitive_values()
+
+
 def test_lineage_constraint_failure_rolls_back_every_insert(tmp_path: Path) -> None:
     session, store, graph = _graph(tmp_path)
     try:
@@ -639,7 +682,6 @@ def test_strict_legacy_writer_boundary_rejects_missing_context(tmp_path: Path) -
             save_scan_job(
                 session,
                 {"id": "strict-job", "target": "fixture"},
-                allow_legacy_compat=False,
             )
         with pytest.raises(MissingCanonicalContextError):
             save_finding(
@@ -652,7 +694,6 @@ def test_strict_legacy_writer_boundary_rejects_missing_context(tmp_path: Path) -
                     "module": "fixture",
                     "description": "fixture",
                 },
-                allow_legacy_compat=False,
             )
         assert session.query(ScanJobModel).count() == 0
         assert session.query(FindingModel).count() == 0

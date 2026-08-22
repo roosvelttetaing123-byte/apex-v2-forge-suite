@@ -188,7 +188,7 @@ def _source_run(
     )
     session.commit()
     for finding in findings:
-        save_finding(session, finding, run_id=run_id)
+        save_finding(session, finding, run_id=run_id, allow_legacy_compat=True)
     return session
 
 

@@ -24,7 +24,7 @@ class LdapClient:
         self.nt_hash      = nt_hash
         self.use_kerberos = use_kerberos
         self.timeout      = timeout
-        self._conn        = None
+        self._conn: Any = None
         self._base_dn     = self._make_base_dn(domain)
 
     def _make_base_dn(self, domain: str) -> str:
@@ -83,9 +83,13 @@ class LdapClient:
         if not self._conn:
             return []
         try:
-            from ldap3 import SUBTREE, BASE, LEVEL
-            _scope_map = {"SUBTREE": SUBTREE, "BASE": BASE, "LEVEL": LEVEL}
-            scope = _scope_map.get(search_scope.upper(), SUBTREE)
+            # ldap3 exposes these scope constants as the corresponding wire
+            # strings.  Importing the package here emits its deprecated
+            # ``tagMap`` warning under the repository's warnings-as-errors
+            # test policy, so keep the bounded values local and avoid turning
+            # a valid fixture search into an empty result.
+            _scope_map = {"SUBTREE": "SUBTREE", "BASE": "BASE", "LEVEL": "LEVEL"}
+            scope = _scope_map.get(search_scope.upper(), "SUBTREE")
             self._conn.search(
                 search_base=base_dn or self._base_dn,
                 search_filter=search_filter,

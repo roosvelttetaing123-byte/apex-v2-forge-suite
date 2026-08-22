@@ -158,8 +158,10 @@ def test_base_module_accepts_null_confidence_without_promotion(tmp_path: Path) -
             return self._make_result(time.monotonic())
 
     session = create_db(tmp_path / "module.db")
+    config = BaseForgeConfig(target="https://fixture.invalid")
+    config.extra["allow_legacy_compat"] = True
     module = FixtureModule(
-        BaseForgeConfig(target="https://fixture.invalid"),
+        config,
         Scope(["fixture.invalid"]),
         session,
         tmp_path,
@@ -196,7 +198,8 @@ def test_base_module_accepts_null_confidence_without_promotion(tmp_path: Path) -
     assert finding.confidence == "UNVERIFIED"
     assert finding.status == "open"
     assert derived.confidence == "HIGH"
-    assert derived.status == "verified"
+    assert derived.status == "open"
+    assert derived.verification_state != "verified"
     assert malformed.confidence == "UNVERIFIED"
     assert malformed.status == "open"
     engine = session.get_bind()
@@ -213,7 +216,7 @@ def test_database_persists_invalid_confidence_as_unverified(
     if value is not MISSING:
         finding["confidence"] = value
 
-    save_finding(session, finding)
+    save_finding(session, finding, allow_legacy_compat=True)
     stored = session.get(FindingModel, "db-finding")
 
     assert stored is not None
@@ -229,7 +232,7 @@ def test_database_canonicalises_nested_verification_confidence(tmp_path: Path) -
     finding["verification"] = {"confidence": "UNKNOWN", "probe_count": 1}
     finding["evidence"] = "raw evidence"
 
-    save_finding(session, finding)
+    save_finding(session, finding, allow_legacy_compat=True)
     stored = session.get(FindingModel, "db-verification")
 
     assert stored is not None

@@ -65,7 +65,7 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not-a-module", resp.json()["detail"])
         mock_popen.assert_not_called()
 
-    async def test_launch_records_requested_and_actual_modules(self):
+    async def test_launch_without_canonical_lineage_fails_closed(self):
         from common.dashboard.server import DashboardServer
 
         srv = DashboardServer(auth=False)
@@ -101,29 +101,15 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                     },
                 )
 
-            history = json.loads(history_path.read_text(encoding="utf-8"))
+        self.assertEqual(resp.status_code, 500, resp.text)
+        self.assertEqual(
+            resp.json()["detail"],
+            "Authorization handoff persistence failed; execution denied",
+        )
+        self.assertFalse(history_path.exists())
+        mock_popen.assert_not_called()
 
-        self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(resp.json()["requested_modules"], ["sqli", "xss", "jwt"])
-        self.assertEqual(
-            resp.json()["actual_modules"],
-            ["sqli_scanner", "xss_scanner", "jwt_audit"],
-        )
-        self.assertEqual(history[0]["requested_modules"], ["sqli", "xss", "jwt"])
-        self.assertEqual(
-            history[0]["actual_modules"],
-            ["sqli_scanner", "xss_scanner", "jwt_audit"],
-        )
-        mock_popen.assert_called_once()
-        child_env = mock_popen.call_args.kwargs["env"]
-        envelopes = load_authorization_envelopes(child_env)
-        self.assertEqual(len(envelopes), 1)
-        self.assertEqual(
-            envelopes[0].module_id,
-            module_set_binding(["sqli_scanner", "xss_scanner", "jwt_audit"]),
-        )
-
-    async def test_launch_persists_durable_scan_job_and_logs(self):
+    async def test_launch_without_canonical_lineage_does_not_persist_job(self):
         from common.dashboard.server import DashboardServer
         from common.db import ScanJobModel, create_db
 
@@ -174,32 +160,20 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                             **_web_launch_contract("scanbuilder-durable"),
                         },
                     )
-                    scan_id = resp.json()["scan_id"]
-                    (logs_dir / f"{scan_id}_web.log").write_text(
-                        "line1\nline2\n",
-                        encoding="utf-8",
-                    )
-                    (logs_dir / f"{scan_id}_web.log").chmod(0o600)
-                    detail = await client.get(f"/api/v1/scans/{scan_id}")
-                    logs = await client.get(f"/api/v1/scans/{scan_id}/logs")
 
+            self.assertEqual(resp.status_code, 500, resp.text)
+            self.assertEqual(
+                resp.json()["detail"],
+                "Authorization handoff persistence failed; execution denied",
+            )
+            self.assertFalse(history_path.exists())
+            self.assertFalse(any(logs_dir.iterdir()))
+            mock_proc.assert_not_called()
             session = create_db(scan_jobs_db)
             try:
-                job = session.query(ScanJobModel).filter_by(id=scan_id).one()
-                self.assertEqual(job.status, "running")
-                self.assertEqual(job.target, "http://127.0.0.1:8080")
-                self.assertEqual(json.loads(job.frameworks), ["web"])
-                self.assertEqual(json.loads(job.modules), ["sqli_scanner"])
-                self.assertEqual(json.loads(job.logs), {f"{scan_id}_web": str(logs_dir / f"{scan_id}_web.log")})
+                self.assertEqual(session.query(ScanJobModel).count(), 0)
             finally:
                 session.close()
-
-        self.assertEqual(resp.status_code, 200, resp.text)
-        self.assertEqual(detail.status_code, 200, detail.text)
-        self.assertEqual(logs.status_code, 200, logs.text)
-        self.assertEqual(detail.json()["return_code"], None)
-        self.assertEqual(logs.json()["logs"][0]["process_id"], f"{scan_id}_web")
-        self.assertIn("line2", logs.json()["logs"][0]["tail"])
 
     async def test_retest_finding_persists_plan_without_spawning_dry_run_job(self):
         from common.dashboard.event_bus import Event, EventType
@@ -287,7 +261,7 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
             finally:
                 session.close()
 
-    async def test_active_retest_requires_exact_confirmation_before_process(self):
+    async def test_active_retest_without_canonical_lineage_fails_closed(self):
         from common.dashboard.event_bus import Event, EventType
         from common.dashboard.server import DashboardServer
 
@@ -344,14 +318,12 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                         },
                     )
 
-        self.assertEqual(response.status_code, 200, response.text)
-        popen.assert_called_once()
-        argv = popen.call_args.args[0]
-        child_env = popen.call_args.kwargs["env"]
-        self.assertNotIn("--auto-confirm", argv)
-        self.assertIn("--scope", argv)
-        self.assertEqual(argv[argv.index("--scope") + 1], "127.0.0.1/32")
-        self.assertIn(LAUNCH_CONFIRMATIONS_ENV, child_env)
+        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "Authorization handoff persistence failed; execution denied",
+        )
+        popen.assert_not_called()
 
     def test_retest_completion_updates_persisted_record(self):
         from common.dashboard.server import DashboardServer

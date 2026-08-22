@@ -460,6 +460,7 @@ def test_a_b_c_snapshots_remain_historical_and_tenant_isolated(tmp_path) -> None
             description="run A observation",
         ),
         run_id="run-a",
+        allow_legacy_compat=True,
     )
     save_finding(
         session,
@@ -469,6 +470,7 @@ def test_a_b_c_snapshots_remain_historical_and_tenant_isolated(tmp_path) -> None
             description="run B observation",
         ),
         run_id="run-b",
+        allow_legacy_compat=True,
     )
     save_finding(
         session,
@@ -478,6 +480,7 @@ def test_a_b_c_snapshots_remain_historical_and_tenant_isolated(tmp_path) -> None
             description="run C observation",
         ),
         run_id="run-c",
+        allow_legacy_compat=True,
     )
     save_finding(
         session,
@@ -487,6 +490,7 @@ def test_a_b_c_snapshots_remain_historical_and_tenant_isolated(tmp_path) -> None
             description="tenant B observation",
         ),
         run_id="run-a",
+        allow_legacy_compat=True,
     )
 
     assert list_findings_for_run(
@@ -514,6 +518,7 @@ def test_a_b_c_snapshots_remain_historical_and_tenant_isolated(tmp_path) -> None
                 "title": "Different finding",
             },
             run_id="run-b",
+            allow_legacy_compat=True,
         )
     session.close()
 
@@ -543,6 +548,7 @@ def test_post_finalization_membership_mutation_is_rejected(
             description="finalized observation",
         ),
         run_id="run-a",
+        allow_legacy_compat=True,
     )
     record = _signed_truth(
         "run-a",
@@ -567,6 +573,7 @@ def test_post_finalization_membership_mutation_is_rejected(
                 "title": "Late finding",
             },
             run_id="run-a",
+            allow_legacy_compat=True,
         )
     with pytest.raises(DatabaseError, match="security records are append-only"):
         session.execute(
@@ -784,6 +791,7 @@ def test_multi_finding_legacy_membership_migration_is_stable_on_reopen(
                 "target": target,
             },
             run_id="legacy-run",
+            allow_legacy_compat=True,
         )
     source.execute(text("DROP TRIGGER finding_run_membership_no_update"))
     source.execute(text("DROP TRIGGER finding_run_membership_no_delete"))

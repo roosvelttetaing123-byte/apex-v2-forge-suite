@@ -118,6 +118,7 @@ def _make_module(tmp_path: Path):
             return await self.fixture_run()
 
     cfg = BaseForgeConfig(target="https://example.com")
+    cfg.extra["allow_legacy_compat"] = True
     scope = Scope(["example.com"])
     session = create_db(tmp_path / "test.db")
     return DummyModule(cfg, scope, session, tmp_path), session

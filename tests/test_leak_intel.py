@@ -24,6 +24,21 @@ from typing import Any
 import pytest
 
 
+def _legacy_fixture_config(target: str):
+    """Build an explicitly opted-in config for scanner-only fixture tests.
+
+    Scanner unit tests exercise redaction and parsing directly, without the
+    canonical run/tenant authorization graph used by production dispatch.  The
+    explicit compatibility marker keeps those findings available in memory
+    while leaving the production adapter's strict default unchanged.
+    """
+    from common.config import BaseForgeConfig
+
+    config = BaseForgeConfig(target=target)
+    config.extra["allow_legacy_compat"] = True
+    return config
+
+
 class TestLeakIntelImports:
     """Verify all leak_intel modules import without errors."""
 
@@ -80,7 +95,7 @@ class TestScannerBaseModuleInterface:
         from common.scope import Scope
         from common.db import create_db
 
-        cfg = BaseForgeConfig(target="https://example.com")
+        cfg = _legacy_fixture_config("https://example.com")
         scope = Scope(["example.com"])
         session = create_db(tmp_path / "test.db")
         return scanner_class(cfg, scope, session, tmp_path)
@@ -239,7 +254,7 @@ class TestAWSKeyDetector:
         from leak_intel.scanners.stackoverflow_scanner import StackOverflowScanner
 
         secret = "AKIA0123456789ABCDEF"
-        cfg = BaseForgeConfig(target="https://example.test")
+        cfg = _legacy_fixture_config("https://example.test")
         scope = Scope(["example.test"])
         stackoverflow = StackOverflowScanner(
             cfg,
@@ -906,7 +921,7 @@ def test_detected_secret_fragments_are_removed_from_scanner_metadata(
 
     access_key = "AKIAABCDEFGHIJKLMNOP"
     access_prefix = access_key[:8]
-    config = BaseForgeConfig(target="https://example.test")
+    config = _legacy_fixture_config("https://example.test")
     scope = Scope(["example.test"])
     github = GitHubScanner(
         config,
@@ -1093,7 +1108,7 @@ def test_remaining_scanner_exception_logs_omit_remote_exception_text(
     from leak_intel.scanners.shodan_enricher import ShodanEnricher
 
     exception_secret = "opaque-scanner-exception-f7b1bfe9"
-    config = BaseForgeConfig(target="https://example.test")
+    config = _legacy_fixture_config("https://example.test")
     scope = Scope(["example.test"])
 
     async def no_rate_limit(*_args: object, **_kwargs: object) -> None:
