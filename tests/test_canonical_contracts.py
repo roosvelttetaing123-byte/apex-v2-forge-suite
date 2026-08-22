@@ -191,6 +191,49 @@ def test_cross_tenant_and_orphan_links_fail_at_application_and_db_layers(tmp_pat
         session.close()
 
 
+def test_sha256_artifact_reference_round_trips_through_database(tmp_path: Path) -> None:
+    session, store, graph = _graph(tmp_path)
+    try:
+        reference = "sha256:" + "d" * 64
+        artifact = ArtifactReference(
+            tenant_id=graph["tenant"].id,
+            observation_id=graph["observation"].id,
+            reference=reference,
+            digest="sha256:" + "e" * 64,
+            media_type="application/octet-stream",
+            size=0,
+        )
+        finding = Finding(
+            tenant_id=graph["tenant"].id,
+            observation_id=graph["observation"].id,
+            artifact_id=artifact.id,
+            title="Digest reference",
+            severity=FindingSeverity.LOW,
+            description="An opaque digest reference is accepted by the canonical database guard.",
+        )
+        store.create_lineage(
+            tenant=graph["tenant"],
+            client=graph["client"],
+            project=graph["project"],
+            engagement=graph["engagement"],
+            job=graph["job"],
+            module_version=graph["module"],
+            asset=graph["asset"],
+            observation=graph["observation"],
+            artifact=artifact,
+            finding=finding,
+        )
+        session.commit()
+        row = session.execute(
+            text("SELECT reference FROM canonical_artifact_refs WHERE id=:id"),
+            {"id": artifact.id},
+        ).scalar_one()
+        assert row == reference
+    finally:
+        session.rollback()
+        session.close()
+
+
 def test_orphan_artifact_finding_retest_membership_and_export_fail(tmp_path: Path) -> None:
     session, _store, graph = _graph(tmp_path)
     try:

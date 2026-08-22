@@ -847,10 +847,15 @@ def _opaque_reference_guard(value: str) -> str:
     prefix = f"substr({value}, 1, instr({value}, ':') - 1)"
     suffix = f"substr({value}, instr({value}, ':') + 1)"
     return (
-        f"instr({value}, ':') > 0 AND length({suffix}) BETWEEN 1 AND 240 "
+        f"instr({value}, ':') > 0 AND ("
+        f"(length({suffix}) BETWEEN 1 AND 240 "
         f"AND {prefix} IN ('artifact','credential','cred','secret','source') "
         f"AND {suffix} GLOB '[-A-Za-z0-9._:+/]*' "
-        f"AND {suffix} NOT GLOB '*[^-A-Za-z0-9._:+/]*'"
+        f"AND {suffix} NOT GLOB '*[^-A-Za-z0-9._:+/]*') "
+        f"OR ({prefix} = 'sha256' AND length({suffix}) = 64 "
+        f"AND {suffix} GLOB '[0-9a-f]*' "
+        f"AND {suffix} NOT GLOB '*[^0-9a-f]*')"
+        f")"
     )
 
 
