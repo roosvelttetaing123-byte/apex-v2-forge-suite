@@ -9,21 +9,157 @@ and can restore state from DB when attaching to a running session.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
-from common.confidence_policy import normalise_finding
 from common.dashboard.event_bus import Event, EventBus, EventType
 from common.dashboard.kill_chain import KillChainState
 from common.dashboard.metrics import MetricsCollector, MetricsSnapshot
 
 log = logging.getLogger("forge.dashboard.state")
+
+_STATE_TENANT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$")
+
+
+def _validated_state_tenant_id(value: str) -> str:
+    """Return the canonical tenant used by persistent dashboard state."""
+    if not isinstance(value, str):
+        raise ValueError("invalid dashboard state tenant identifier")
+    tenant_id = value.strip()
+    if not _STATE_TENANT_ID_RE.fullmatch(tenant_id):
+        raise ValueError("invalid dashboard state tenant identifier")
+    return tenant_id
+
+
+def _sqlite_state_record_id(tenant_id: str, run_id: str) -> str:
+    """Bind the exact tenant/run tuple without delimiter ambiguity."""
+    binding = json.dumps(
+        [tenant_id, run_id],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"forge-dashboard-state:v2:{binding}",
+        )
+    )
+
+
+class StateBackend:
+    """Persistence adapter for dashboard snapshots."""
+
+    name = "memory"
+
+    def save(self, run_id: str, snapshot: dict[str, Any]) -> None:
+        return None
+
+    def load(self, run_id: str) -> dict[str, Any] | None:
+        return None
+
+
+class SQLiteStateBackend(StateBackend):
+    """SQLite-backed StateStore persistence adapter."""
+
+    name = "sqlite"
+
+    def __init__(self, db_session: Any, tenant_id: str = "default") -> None:
+        self.db_session = db_session
+        self.tenant_id = tenant_id
+
+    def save(self, run_id: str, snapshot: dict[str, Any]) -> None:
+        from common.db import DashboardStateModel
+
+        model = DashboardStateModel(
+            id=_sqlite_state_record_id(self.tenant_id, run_id),
+            tenant_id=self.tenant_id,
+            run_id=run_id,
+            state_json=json.dumps(snapshot, default=str),
+            updated_at=datetime.now(timezone.utc),
+        )
+        self.db_session.merge(model)
+        self.db_session.commit()
+
+    def load(self, run_id: str) -> dict[str, Any] | None:
+        from common.db import DashboardStateModel
+
+        model = (
+            self.db_session.query(DashboardStateModel)
+            .filter_by(tenant_id=self.tenant_id, run_id=run_id)
+            .order_by(DashboardStateModel.updated_at.desc())
+            .first()
+        )
+        if not model:
+            return None
+        return json.loads(model.state_json)
+
+
+class RedisStateBackend(StateBackend):
+    """Redis-backed StateStore adapter used when redis-py is available."""
+
+    name = "redis"
+
+    def __init__(
+        self,
+        redis_url: str,
+        key_prefix: str = "forge:dashboard:state",
+        *,
+        tenant_id: str = "default",
+    ) -> None:
+        self.tenant_id = _validated_state_tenant_id(tenant_id)
+        self._tenant_digest = hashlib.sha256(self.tenant_id.encode("utf-8")).hexdigest()
+        import redis
+
+        self.client = redis.from_url(redis_url)
+        self.key_prefix = key_prefix.rstrip(":")
+
+    def _key(self, run_id: str) -> str:
+        if not isinstance(run_id, str):
+            raise ValueError("invalid dashboard state run identifier")
+        run_digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+        return (
+            f"{self.key_prefix}:tenant-sha256:{self._tenant_digest}"
+            f":run-sha256:{run_digest}"
+        )
+
+    def save(self, run_id: str, snapshot: dict[str, Any]) -> None:
+        self.client.set(self._key(run_id), json.dumps(snapshot, default=str))
+
+    def load(self, run_id: str) -> dict[str, Any] | None:
+        raw = self.client.get(self._key(run_id))
+        if not raw:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        return json.loads(raw)
+
+
+def make_state_backend(
+    kind: str = "memory",
+    *,
+    db_session: Any = None,
+    redis_url: str = "",
+    tenant_id: str = "default",
+) -> StateBackend:
+    """Create a dashboard state backend from configuration."""
+    normalized = (kind or "memory").strip().lower()
+    if normalized == "sqlite":
+        if db_session is None:
+            raise ValueError("SQLite state backend requires db_session")
+        return SQLiteStateBackend(db_session, tenant_id=tenant_id)
+    if normalized == "redis":
+        if not redis_url:
+            raise ValueError("Redis state backend requires redis_url")
+        return RedisStateBackend(redis_url, tenant_id=tenant_id)
+    return StateBackend()
 
 
 @dataclass
@@ -47,35 +183,72 @@ class FindingEntry:
     vpr_score:   float | None = None
     vpr_priority: str = ""
     verification: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        confidence_fields = normalise_finding({
-            "confidence": self.confidence,
-            "verification": self.verification,
-            "evidence": self.evidence,
-        })
-        self.confidence = confidence_fields["confidence"]
-        self.verification = confidence_fields["verification"] or {}
-        self.evidence = confidence_fields.get("evidence") or {}
+    verification_state: str = "unknown"
+    proof_type: str = "unknown"
+    maturity: str = "experimental"
 
     def to_dict(self) -> dict[str, Any]:
-        confidence_fields = normalise_finding({
-            "confidence": self.confidence,
-            "verification": self.verification,
-            "evidence": self.evidence,
-        })
-        evidence = confidence_fields.get("evidence") or {}
         return {
             "id": self.id, "title": self.title, "severity": self.severity,
             "module": self.module, "target": self.target,
             "cvss_score": self.cvss_score, "timestamp": self.timestamp,
             "url": self.url, "port": self.port, "service": self.service,
             "description": self.description, "mitre": self.mitre,
-            "evidence": evidence,
-            "confidence": confidence_fields["confidence"],
+            "evidence": self.evidence, "confidence": self.confidence,
             "status": self.status, "vpr_score": self.vpr_score,
-            "vpr_priority": self.vpr_priority,
-            "verification": confidence_fields["verification"] or {},
+            "vpr_priority": self.vpr_priority, "verification": self.verification,
+            "verification_state": self.verification_state,
+            "proof_type": self.proof_type, "maturity": self.maturity,
+        }
+
+
+@dataclass
+class BrainVerdictEntry:
+    """ForgeBrain analysis verdict for a finding."""
+    finding_id: str
+    finding: str = ""
+    verdict: str = "LIKELY"
+    confidence: str = "UNVERIFIED"
+    reasoning: str = ""
+    severity_adjustment: str = ""
+    timestamp: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "finding_id": self.finding_id,
+            "finding": self.finding,
+            "verdict": self.verdict,
+            "confidence": self.confidence,
+            "reasoning": self.reasoning,
+            "severity_adjustment": self.severity_adjustment,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
+class ChainActionEntry:
+    """Cross-framework chain action emitted by EngagementBus or planner."""
+    chain_type: str = ""
+    source_finding: str = ""
+    source_framework: str = ""
+    target_framework: str = ""
+    target_module: str = ""
+    target: str = ""
+    rationale: str = ""
+    auto_execute: bool = False
+    timestamp: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "chain_type": self.chain_type,
+            "source_finding": self.source_finding,
+            "source_framework": self.source_framework,
+            "target_framework": self.target_framework,
+            "target_module": self.target_module,
+            "target": self.target,
+            "rationale": self.rationale,
+            "auto_execute": self.auto_execute,
+            "timestamp": self.timestamp,
         }
 
 
@@ -204,12 +377,30 @@ class StateStore:
         run_id: str = "",
         target: str = "",
         persist_db: Any = None,
+        backend: StateBackend | None = None,
+        backend_kind: str = "",
+        redis_url: str = "",
+        tenant_id: str = "default",
     ) -> None:
         self._bus = event_bus
         self.framework = framework
         self.run_id = run_id
         self.target = target
         self._db = persist_db
+        self.tenant_id = tenant_id
+        if backend is not None:
+            self._backend = backend
+        elif backend_kind:
+            self._backend = make_state_backend(
+                backend_kind,
+                db_session=persist_db,
+                redis_url=redis_url,
+                tenant_id=tenant_id,
+            )
+        elif persist_db:
+            self._backend = SQLiteStateBackend(persist_db, tenant_id=tenant_id)
+        else:
+            self._backend = StateBackend()
         self._lock = threading.RLock()
 
         # ── State containers ──
@@ -219,6 +410,8 @@ class StateStore:
         self.targets:     dict[str, TargetStatus] = {}
         self.credentials: list[CredentialEntry] = []
         self.sessions:    list[ShellSession] = []
+        self.brain_verdicts: list[BrainVerdictEntry] = []
+        self.chain_actions: list[ChainActionEntry] = []
         self.kill_chain   = KillChainState()
         self.metrics      = MetricsCollector()
         self.timeline:    list[dict[str, Any]] = []
@@ -235,30 +428,44 @@ class StateStore:
 
         # Start persistence timer
         self._persist_timer: threading.Timer | None = None
-        if persist_db:
+        if self._backend.name != "memory":
             self._schedule_persist()
 
     def _subscribe(self) -> None:
         """Register handlers for all event types."""
-        self._bus.subscribe(EventType.SCAN_START, self._on_scan_start)
-        self._bus.subscribe(EventType.SCAN_COMPLETE, self._on_scan_complete)
-        self._bus.subscribe(EventType.SCAN_INTERRUPTED, self._on_scan_interrupted)
-        self._bus.subscribe(EventType.PHASE_START, self._on_phase_start)
-        self._bus.subscribe(EventType.PHASE_COMPLETE, self._on_phase_complete)
-        self._bus.subscribe(EventType.MODULE_START, self._on_module_start)
-        self._bus.subscribe(EventType.MODULE_PROGRESS, self._on_module_progress)
-        self._bus.subscribe(EventType.MODULE_COMPLETE, self._on_module_complete)
-        self._bus.subscribe(EventType.MODULE_FAIL, self._on_module_fail)
-        self._bus.subscribe(EventType.MODULE_SKIP, self._on_module_skip)
-        self._bus.subscribe(EventType.FINDING_NEW, self._on_finding)
-        self._bus.subscribe(EventType.REQUEST_SENT, self._on_request)
-        self._bus.subscribe(EventType.REQUEST_ERROR, self._on_request_error)
-        self._bus.subscribe(EventType.WAF_BLOCK, self._on_waf_block)
-        self._bus.subscribe(EventType.RATE_LIMIT_HIT, self._on_rate_limit)
-        self._bus.subscribe(EventType.CREDENTIAL_FOUND, self._on_credential)
-        self._bus.subscribe(EventType.TARGET_DISCOVERED, self._on_target_discovered)
-        self._bus.subscribe(EventType.TARGET_PWNED, self._on_target_pwned)
-        self._bus.subscribe(EventType.SHELL_SESSION, self._on_shell_session)
+        def guarded(handler: Callable[[Event], None]) -> Callable[[Event], None]:
+            def receive(event: Event) -> None:
+                event_tenant = event.data.get("tenant_id")
+                if event_tenant is not None and (
+                    not isinstance(event_tenant, str)
+                    or event_tenant != self.tenant_id
+                ):
+                    return
+                handler(event)
+
+            return receive
+
+        self._bus.subscribe(EventType.SCAN_START, guarded(self._on_scan_start))
+        self._bus.subscribe(EventType.SCAN_COMPLETE, guarded(self._on_scan_complete))
+        self._bus.subscribe(EventType.SCAN_INTERRUPTED, guarded(self._on_scan_interrupted))
+        self._bus.subscribe(EventType.PHASE_START, guarded(self._on_phase_start))
+        self._bus.subscribe(EventType.PHASE_COMPLETE, guarded(self._on_phase_complete))
+        self._bus.subscribe(EventType.MODULE_START, guarded(self._on_module_start))
+        self._bus.subscribe(EventType.MODULE_PROGRESS, guarded(self._on_module_progress))
+        self._bus.subscribe(EventType.MODULE_COMPLETE, guarded(self._on_module_complete))
+        self._bus.subscribe(EventType.MODULE_FAIL, guarded(self._on_module_fail))
+        self._bus.subscribe(EventType.MODULE_SKIP, guarded(self._on_module_skip))
+        self._bus.subscribe(EventType.FINDING_NEW, guarded(self._on_finding))
+        self._bus.subscribe(EventType.REQUEST_SENT, guarded(self._on_request))
+        self._bus.subscribe(EventType.REQUEST_ERROR, guarded(self._on_request_error))
+        self._bus.subscribe(EventType.WAF_BLOCK, guarded(self._on_waf_block))
+        self._bus.subscribe(EventType.RATE_LIMIT_HIT, guarded(self._on_rate_limit))
+        self._bus.subscribe(EventType.CREDENTIAL_FOUND, guarded(self._on_credential))
+        self._bus.subscribe(EventType.TARGET_DISCOVERED, guarded(self._on_target_discovered))
+        self._bus.subscribe(EventType.TARGET_PWNED, guarded(self._on_target_pwned))
+        self._bus.subscribe(EventType.SHELL_SESSION, guarded(self._on_shell_session))
+        self._bus.subscribe(EventType.BRAIN_VERDICT, guarded(self._on_brain_verdict))
+        self._bus.subscribe(EventType.CHAIN_ACTION_NEW, guarded(self._on_chain_action))
 
     # ── Event handlers ────────────────────────────────────────────────
 
@@ -272,6 +479,8 @@ class StateStore:
             self.timeline.clear()
             self.credentials.clear()
             self.sessions.clear()
+            self.brain_verdicts.clear()
+            self.chain_actions.clear()
             self.kill_chain = KillChainState()
             self.metrics = MetricsCollector()
 
@@ -371,8 +580,16 @@ class StateStore:
             )
 
     def _on_finding(self, event: Event) -> None:
-        d = event.data
-        normalised = normalise_finding(d)
+        from common.confidence_policy import normalise_finding
+
+        # Normalize the mutable event payload before constructing state.  The
+        # same Event instance is subsequently observed by the dashboard's
+        # wildcard/WebSocket subscriber, so publication and the StateStore
+        # snapshot share one authoritative set of truth fields instead of
+        # independently serializing attacker-supplied claims.
+        d = normalise_finding(dict(event.data))
+        event.data.clear()
+        event.data.update(d)
         entry = FindingEntry(
             id=d.get("id", str(uuid.uuid4())[:8]),
             title=d.get("title", "Untitled"),
@@ -386,12 +603,15 @@ class StateStore:
             service=d.get("service", ""),
             description=d.get("description", ""),
             mitre=d.get("mitre_attack", []),
-            evidence=normalised.get("evidence") or {},
-            confidence=normalised["confidence"],
-            status=normalised.get("status", "open"),
+            evidence=d.get("evidence", {}),
+            confidence=d.get("confidence", "UNVERIFIED"),
+            status=d.get("status", "open"),
             vpr_score=d.get("vpr_score"),
             vpr_priority=d.get("vpr_priority", ""),
-            verification=normalised.get("verification") or {},
+            verification=d.get("verification", {}),
+            verification_state=d.get("verification_state", "unknown"),
+            proof_type=d.get("proof_type", "unknown"),
+            maturity=d.get("maturity", "experimental"),
         )
         with self._lock:
             self.findings.append(entry)
@@ -495,6 +715,54 @@ class StateStore:
                 self.targets[target].shell = True
                 self.targets[target].pwned = True
 
+    def _on_brain_verdict(self, event: Event) -> None:
+        d = event.data
+        finding_id = d.get("finding_id", "")
+        finding_title = d.get("finding", "")
+        if not finding_title and finding_id:
+            with self._lock:
+                match = next((f for f in self.findings if f.id == finding_id), None)
+                finding_title = match.title if match else finding_id
+        entry = BrainVerdictEntry(
+            finding_id=finding_id,
+            finding=finding_title,
+            verdict=d.get("verdict", "LIKELY"),
+            confidence=d.get("confidence", "UNVERIFIED"),
+            reasoning=d.get("reasoning", d.get("reason", "")),
+            severity_adjustment=d.get("severity_adjustment", ""),
+            timestamp=event.timestamp,
+        )
+        with self._lock:
+            self.brain_verdicts.append(entry)
+            self.brain_verdicts = self.brain_verdicts[-100:]
+            self._add_timeline(
+                "brain_verdict",
+                f"Brain verdict: {entry.verdict} for {entry.finding}",
+                event.source,
+            )
+
+    def _on_chain_action(self, event: Event) -> None:
+        d = event.data
+        entry = ChainActionEntry(
+            chain_type=d.get("chain_type", d.get("phase", "planner_action")),
+            source_finding=d.get("source_finding", ""),
+            source_framework=d.get("source_framework", d.get("framework", "")),
+            target_framework=d.get("target_framework", d.get("framework", "")),
+            target_module=d.get("target_module", d.get("module", "")),
+            target=d.get("target", ""),
+            rationale=d.get("rationale", ""),
+            auto_execute=bool(d.get("auto_execute", False)),
+            timestamp=event.timestamp,
+        )
+        with self._lock:
+            self.chain_actions.append(entry)
+            self.chain_actions = self.chain_actions[-200:]
+            self._add_timeline(
+                "chain_action",
+                f"Chain action: {entry.target_framework}/{entry.target_module}",
+                event.source,
+            )
+
     # ── Timeline ──────────────────────────────────────────────────────
 
     def _add_timeline(self, event_type: str, message: str, source: str) -> None:
@@ -520,6 +788,7 @@ class StateStore:
             metrics = self.metrics.snapshot()
             return {
                 "framework":   self.framework,
+                "tenant_id":   self.tenant_id,
                 "run_id":      self.run_id,
                 "target":      self.target,
                 "scan_status": self.scan_status,
@@ -533,6 +802,8 @@ class StateStore:
                 "targets":     {t: s.to_dict() for t, s in self.targets.items()},
                 "credentials": [c.to_dict() for c in self.credentials],
                 "sessions":    [s.to_dict() for s in self.sessions],
+                "brain_verdicts": [v.to_dict() for v in self.brain_verdicts],
+                "chain_actions": [a.to_dict() for a in self.chain_actions],
                 "kill_chain":  self.kill_chain.to_dict(),
                 "metrics":     metrics.to_dict(),
                 "timeline":    self.timeline[-100:],
@@ -556,7 +827,7 @@ class StateStore:
 
     def _schedule_persist(self) -> None:
         """Schedule periodic state persistence to SQLite."""
-        if not self._db:
+        if self._backend.name == "memory":
             return
         self._persist_timer = threading.Timer(5.0, self._persist_and_reschedule)
         self._persist_timer.daemon = True
@@ -573,27 +844,21 @@ class StateStore:
 
     def _persist_state(self) -> None:
         """Write state snapshot to SQLite for crash recovery."""
-        if not self._db:
+        if self._backend.name == "memory":
             return
         try:
-            from common.db import DashboardStateModel
-            snapshot_json = json.dumps(self.snapshot(), default=str)
-            model = DashboardStateModel(
-                id=self.run_id,
-                run_id=self.run_id,
-                state_json=snapshot_json,
-                updated_at=datetime.now(timezone.utc),
-            )
-            self._db.merge(model)
-            self._db.commit()
-        except ImportError:
-            pass  # DB models not yet available
+            self._backend.save(self.run_id, self.snapshot())
         except Exception as exc:
             log.debug("State persistence error: %s", exc)
 
     @classmethod
     def restore_from_db(
-        cls, db_session: Any, run_id: str, event_bus: EventBus,
+        cls,
+        db_session: Any,
+        run_id: str,
+        event_bus: EventBus,
+        *,
+        tenant_id: str = "default",
     ) -> "StateStore" | None:
         """Restore state from SQLite for --attach mode.
 
@@ -606,28 +871,41 @@ class StateStore:
             Restored StateStore, or None if not found.
         """
         try:
-            from common.db import DashboardStateModel
-            model = db_session.query(DashboardStateModel).filter_by(
-                run_id=run_id,
-            ).first()
-            if not model:
+            backend = SQLiteStateBackend(db_session, tenant_id=tenant_id)
+            data = backend.load(run_id)
+            if not data:
                 return None
-            data = json.loads(model.state_json)
+            if str(data.get("tenant_id") or "default") != tenant_id:
+                return None
             store = cls(
                 event_bus=event_bus,
                 framework=data.get("framework", "forge"),
                 run_id=run_id,
                 target=data.get("target", ""),
                 persist_db=db_session,
+                backend=backend,
+                tenant_id=tenant_id,
             )
-            # Restore findings
+            # Restore findings through the same truth normalizer used for live events.
+            from common.confidence_policy import normalise_finding
             for fd in data.get("findings", []):
+                normalized = normalise_finding(dict(fd))
                 store.findings.append(FindingEntry(**{
-                    k: v for k, v in fd.items()
+                    k: v for k, v in {**fd, **normalized}.items()
                     if k in FindingEntry.__dataclass_fields__
                 }))
             # Restore timeline
             store.timeline = data.get("timeline", [])
+            for verdict in data.get("brain_verdicts", []):
+                store.brain_verdicts.append(BrainVerdictEntry(**{
+                    k: v for k, v in verdict.items()
+                    if k in BrainVerdictEntry.__dataclass_fields__
+                }))
+            for action in data.get("chain_actions", []):
+                store.chain_actions.append(ChainActionEntry(**{
+                    k: v for k, v in action.items()
+                    if k in ChainActionEntry.__dataclass_fields__
+                }))
             store.scan_status = data.get("scan_status", "unknown")
             log.info("Restored dashboard state for run %s (%d findings)",
                      run_id, len(store.findings))

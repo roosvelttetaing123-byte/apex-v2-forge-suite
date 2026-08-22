@@ -14,6 +14,7 @@ FOR AUTHORIZED PENETRATION TESTING AND RED TEAM OPERATIONS ONLY.
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
@@ -1127,6 +1128,9 @@ class ChainEngine:
         import asyncio
         import inspect
 
+        async def _resolve_awaitable(awaitable: Awaitable[Any]) -> Any:
+            return await awaitable
+
         candidates = [chain.next_module] + list(chain.fallback_modules)
         for module_name in candidates:
             module = self._modules.get(module_name)
@@ -1148,10 +1152,11 @@ class ChainEngine:
                 if inspect.isawaitable(result):
                     try:
                         loop = asyncio.get_running_loop()
-                        loop.create_task(result)
                     except RuntimeError:
                         # No running loop — run synchronously as last resort
-                        asyncio.run(result)
+                        asyncio.run(_resolve_awaitable(result))
+                    else:
+                        loop.create_task(_resolve_awaitable(result))
                 record["auto_executed"] = True
                 record["executed_module"] = module_name
                 return True

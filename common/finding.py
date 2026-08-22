@@ -6,10 +6,11 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, TypedDict
 
 from common.confidence_policy import normalise_finding
 from common.evidence import Evidence  # noqa: F401 — re-exported for callers
+from common.redaction import redact_value
 
 
 class Severity(str, Enum):
@@ -59,27 +60,39 @@ class Finding:
     vpr_score:           float | None            = None
     vpr_priority:        str | None              = None
     vpr:                 str | None              = None   # CRITICAL/HIGH/MEDIUM/LOW/INFO
-    verification:        dict[str, Any] | None   = None   # VerificationResult.to_dict()
+    verification:        dict[str, Any] | None   = None   # Verification decision and evidence
+    proof_type:          str                     = "unknown"
+    maturity:            str                     = "experimental"
+    verification_state:  str                     = "unknown"
 
     def __post_init__(self) -> None:
-        confidence_fields = normalise_finding({
-            "confidence": self.confidence,
-            "verification": self.verification,
-        })
-        self.confidence = confidence_fields["confidence"]
-        self.verification = confidence_fields["verification"]
         if self.cvss_v31_score is None and self.cvss_v31_vector:
             self.cvss_v31_score = cvss31_score(self.cvss_v31_vector)
         if self.cvss_v40_score is None and self.cvss_v40_vector:
             self.cvss_v40_score = cvss40_score(self.cvss_v40_vector)
+        truth = normalise_finding(
+            {
+                "id": self.id,
+                "severity": self.severity.value,
+                "confidence": self.confidence,
+                "status": self.status,
+                "verification_state": self.verification_state,
+                "proof_type": self.proof_type,
+                "maturity": self.maturity,
+                "verification": self.verification,
+                "evidence": self.evidence.to_dict(),
+            }
+        )
+        self.confidence = truth["confidence"]
+        self.status = truth["status"]
+        self.verification_state = truth["verification_state"]
+        self.proof_type = truth["proof_type"]
+        self.maturity = truth["maturity"]
+        self.verification = truth["verification"]
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a plain dict for JSON export."""
-        confidence_fields = normalise_finding({
-            "confidence": self.confidence,
-            "verification": self.verification,
-        })
-        return {
+        return redact_value(normalise_finding({
             "id":                  self.id,
             "title":               self.title,
             "severity":            self.severity.value,
@@ -100,12 +113,15 @@ class Finding:
             "discovered_at":       self.discovered_at.isoformat(),
             "operator_confirmed":  self.operator_confirmed,
             "tags":                self.tags,
-            "confidence":          confidence_fields["confidence"],
+            "confidence":          self.confidence,
             "status":              self.status,
             "vpr_score":           self.vpr_score,
             "vpr_priority":        self.vpr_priority or self.vpr,
             "vpr":                 self.vpr,
-            "verification":        confidence_fields["verification"],
+            "verification":        self.verification,
+            "verification_state":  self.verification_state,
+            "proof_type":          self.proof_type,
+            "maturity":            self.maturity,
             "evidence": {
                 "request_raw":          self.evidence.request_raw,
                 "response_raw":         self.evidence.response_raw,
@@ -114,12 +130,23 @@ class Finding:
                 "pcap_path":            self.evidence.pcap_path,
                 "extra":                self.evidence.extra,
             },
-        }
+        }))
 
 
 # ── CVSS 3.1 Base Score Calculator ───────────────────────────────────────────
 
-_CVSS31_METRIC_WEIGHTS: dict[str, dict[str, float]] = {
+class _CVSS31MetricWeights(TypedDict):
+    AV: dict[str, float]
+    AC: dict[str, float]
+    PR: dict[str, dict[str, float]]
+    UI: dict[str, float]
+    S: dict[str, float]
+    C: dict[str, float]
+    I: dict[str, float]
+    A: dict[str, float]
+
+
+_CVSS31_METRIC_WEIGHTS: _CVSS31MetricWeights = {
     "AV": {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.2},
     "AC": {"L": 0.77, "H": 0.44},
     "PR": {
@@ -156,8 +183,11 @@ def cvss31_score(vector: str) -> float:
 
         av  = w["AV"].get(metrics.get("AV", "N"), 0.85)
         ac  = w["AC"].get(metrics.get("AC", "L"), 0.77)
-        pr_map = w["PR"].get(metrics.get("PR", "N"), {"U": 0.85, "C": 0.85})
-        pr  = pr_map.get(scope, 0.85) if isinstance(pr_map, dict) else 0.85
+        pr_map = w["PR"].get(
+            metrics.get("PR", "N"),
+            {"U": 0.85, "C": 0.85},
+        )
+        pr  = pr_map.get(scope, 0.85)
         ui  = w["UI"].get(metrics.get("UI", "N"), 0.85)
         ci  = w["C"].get(metrics.get("C", "N"), 0.00)
         ii  = w["I"].get(metrics.get("I", "N"), 0.00)

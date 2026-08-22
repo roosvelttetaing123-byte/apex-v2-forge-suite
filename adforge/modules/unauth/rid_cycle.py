@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -99,16 +100,28 @@ class RidCycle(BaseModule):
     def _try_impacket_smb(self, host: str) -> bool:
         """Use impacket SMBConnection with empty credentials."""
         try:
+            with socket.create_connection((host, 445), timeout=1):
+                pass
+        except OSError:
+            return False
+        smb = None
+        try:
             from impacket.smbconnection import SMBConnection
-            smb = SMBConnection(host, host, timeout=10)
+            smb = SMBConnection(host, host, timeout=10, manualNegotiate=True)
+            smb.negotiateSession()
             smb.login("", "")  # null session: empty username + empty password
-            smb.logoff()
             self.log.info("Null SMB session established on %s", host)
             return True
         except ImportError:
             self.log.debug("impacket not installed — cannot test SMB null session")
         except Exception as exc:
             self.log.debug("impacket null session failed: %s", exc)
+        finally:
+            if smb is not None:
+                try:
+                    smb.close()
+                except Exception:
+                    pass
         return False
 
     def _try_rpcclient(self, host: str) -> bool:
@@ -195,6 +208,11 @@ class RidCycle(BaseModule):
         end: int = 5000,
     ) -> list[dict]:
         """Resolve RIDs start..end concurrently (max _MAX_THREADS)."""
+        try:
+            with socket.create_connection((host, 445), timeout=1):
+                pass
+        except OSError:
+            return []
         found: list[dict] = []
         rids   = list(range(start, end + 1))
         lookup = self._lookup_rid_impacket if self._has_impacket() else self._lookup_rid_rpcclient
@@ -225,6 +243,7 @@ class RidCycle(BaseModule):
 
     def _lookup_rid_impacket(self, host: str, domain_sid: str, rid: int) -> dict | None:
         """Look up a single RID via impacket SAMR."""
+        dce = None
         try:
             from impacket.dcerpc.v5 import transport as imp_transport, samr
             from impacket.dcerpc.v5.dtypes import MAXIMUM_ALLOWED
@@ -251,11 +270,15 @@ class RidCycle(BaseModule):
                 name     = str(names[0])
                 obj_type = int(types[0]) if types else 0
                 type_str = {1: "user", 2: "group", 4: "alias", 5: "well_known"}.get(obj_type, "unknown")
-                dce.disconnect()
                 return {"rid": rid, "username": name, "type": type_str, "sid": full_sid_str}
-            dce.disconnect()
         except Exception:
             pass
+        finally:
+            if dce is not None:
+                try:
+                    dce.disconnect()
+                except Exception:
+                    pass
         return None
 
     def _lookup_rid_rpcclient(self, host: str, domain_sid: str, rid: int) -> dict | None:

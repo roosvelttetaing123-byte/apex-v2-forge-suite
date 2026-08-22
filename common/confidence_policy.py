@@ -70,11 +70,18 @@ def normalise_finding(
     if "evidence" in row:
         row["evidence"] = evidence
 
-    cvss = row.get("cvss_v31_score") or row.get("cvss_score") or 0.0
-    row.setdefault("vpr_score", cvss or 0.0)
-    if not row.get("vpr_priority") and not row.get("vpr"):
-        row["vpr_priority"] = _priority_from_score(float(row.get("vpr_score") or 0.0))
-        row["vpr"] = row["vpr_priority"]
+    score_value = row.get("vpr_score")
+    if score_value is None:
+        score_value = row.get("cvss_v31_score")
+    if score_value is None:
+        score_value = row.get("cvss_score")
+    if score_value is not None:
+        row.setdefault("vpr_score", score_value)
+        if not row.get("vpr_priority") and not row.get("vpr"):
+            row["vpr_priority"] = _priority_from_score(
+                float(row.get("vpr_score") or 0.0)
+            )
+            row["vpr"] = row["vpr_priority"]
 
     verification_value = row.get("verification")
     verification = dict(verification_value) if isinstance(verification_value, Mapping) else {}
@@ -93,6 +100,9 @@ def normalise_finding(
                 "probe_hits": extra.get("fp_probe_hits", 0),
             }
     row["verification"] = verification or None
+    from common.verification_policy import normalise_finding_truth
+
+    row.update(normalise_finding_truth(row))
     return row
 
 

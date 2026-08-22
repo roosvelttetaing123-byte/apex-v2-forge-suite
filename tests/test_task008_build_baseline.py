@@ -52,8 +52,8 @@ def test_production_regression_inventory_has_no_execution_exception() -> None:
     failures.extend(inventory_production_tests.validate_policy(rows))
     rendered = inventory_production_tests.render(rows)
     assert not failures
-    assert len(rows) == 1444
-    assert rendered.count(",COLLECT_AND_EXECUTE,") == 1444
+    assert len(rows) == 1645
+    assert rendered.count(",COLLECT_AND_EXECUTE,") == 1645
     assert ",DO_NOT_EXECUTE," not in rendered
 
 

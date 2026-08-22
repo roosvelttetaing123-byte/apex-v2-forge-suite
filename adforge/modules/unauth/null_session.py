@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
+import socket
 import struct
 import sys
 import time
@@ -108,17 +109,29 @@ class NullSession(BaseModule):
     def _try_smb_null(self, host: str) -> bool:
         """Attempt SMB null session; return True when listShares() succeeds."""
         try:
+            with socket.create_connection((host, 445), timeout=1):
+                pass
+        except OSError:
+            return False
+        smb = None
+        try:
             from impacket.smbconnection import SMBConnection
-            smb = SMBConnection(host, host, timeout=10)
+            smb = SMBConnection(host, host, timeout=10, manualNegotiate=True)
+            smb.negotiateSession()
             smb.login("", "")  # empty credentials = null session
             smb.listShares()   # raises if access denied
-            smb.logoff()
             self.log.info("SMB null session established on %s", host)
             return True
         except ImportError:
             self.log.debug("impacket not installed — cannot probe SMB null session")
         except Exception as exc:
             self.log.debug("SMB null session failed on %s: %s", host, exc)
+        finally:
+            if smb is not None:
+                try:
+                    smb.close()
+                except Exception:
+                    pass
         return False
 
     # ------------------------------------------------------------------

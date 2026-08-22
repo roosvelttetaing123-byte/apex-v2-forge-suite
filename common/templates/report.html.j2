@@ -54,8 +54,8 @@
 <table>
   <thead>
     <tr>
-      <th>#</th><th>Vulnerability</th><th>Severity</th><th>Confidence</th><th>CVSS</th>
-      <th>Target</th><th>Port</th><th>Module</th>
+      <th>#</th><th>Vulnerability</th><th>Severity</th><th>CVSS</th>
+      <th>Target</th><th>Port</th><th>Module</th><th>Verification / Proof</th>
     </tr>
   </thead>
   <tbody>
@@ -69,14 +69,19 @@
     <td style="background:{{ color }};color:{{ tc }};text-align:center;font-weight:bold">
       {{ sev | e }}
     </td>
-    <td><code>{{ f.confidence | default('UNVERIFIED') | e }}</code></td>
     <td>{{ f.cvss_v31_score | default('') }}</td>
     <td>{{ f.target | default('') | e }}</td>
     <td>{{ f.port | default('') }}</td>
     <td>{{ f.module | default('') | e }}</td>
+    <td>
+      {{ f.verification_state | default('unknown') | e }}<br>
+      {{ f.proof_type | default('unknown') | e }} / {{ f.maturity | default('experimental') | e }}
+    </td>
   </tr>
   <tr>
     <td colspan="8" class="detail">
+      <strong>Workflow status:</strong> {{ f.status | default('open') | e }} &nbsp;|&nbsp;
+      <strong>Confidence:</strong> {{ f.confidence | default('UNVERIFIED') | e }}<br>
       <strong>Description:</strong> {{ f.description | e }}<br>
       <strong>Reproduction:</strong>
       <ol>
