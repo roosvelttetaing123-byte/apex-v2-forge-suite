@@ -10,6 +10,7 @@ packages; this store records references and lineage only.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import uuid
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ from urllib.parse import urlsplit, urlunsplit
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from common.evidence_custody import ArtifactManifest
 from common.redaction import redact_text, redact_value
 
 
@@ -37,6 +39,9 @@ _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,127}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REFERENCE_RE = re.compile(
     r"^(?:credential|cred|artifact|secret|source):[A-Za-z0-9._:+/\-]{1,240}$"
+)
+_AUTHORIZATION_REF_RE = re.compile(
+    r"^(?:authz|authorization):[A-Za-z0-9._:@/+\-]{1,240}$"
 )
 _RELATIONSHIP_KEYS = {
     "tenant_id",
@@ -208,6 +213,24 @@ class RedactionState(str, Enum):
     UNKNOWN = "unknown"
 
 
+class CollectionStatus(str, Enum):
+    """Collection truth for one immutable observation."""
+
+    COLLECTED = "collected"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    NOT_TESTED = "not_tested"
+    CANCELED = "canceled"
+    NOT_AUTHORIZED = "not_authorized"
+    UNKNOWN = "unknown"
+
+
+class ArtifactIntegrityState(str, Enum):
+    VERIFIED = "sha256_verified"
+    UNKNOWN = "unknown"
+    FAILED = "failed"
+
+
 class ProvenanceSourceType(str, Enum):
     """Supported normalized provenance source kinds.
 
@@ -317,6 +340,8 @@ class _Contract:
                 "status",
                 "severity",
                 "redaction_state",
+                "collection_status",
+                "integrity_state",
                 "level",
             }:
                 enum_type = _enum_type_for_name(item.name)
@@ -400,6 +425,41 @@ def _text(value: Any, field_name: str, *, max_length: int = 2_000, required: boo
     return rendered
 
 
+def _optional_text(value: Any, field_name: str, *, max_length: int = 300) -> str | None:
+    if value is None:
+        return None
+    return _text(value, field_name, max_length=max_length)
+
+
+def _authorization_ref(value: Any, field_name: str = "authorization_ref") -> str | None:
+    """Validate an opaque protected-original authorization handle.
+
+    Authorization references are deliberately narrower than generic IDs.  A
+    caller may provide a handle such as ``authorization:review-123`` but not
+    a free-form role, token, path, or explanatory text that could be replayed
+    or echoed into an audit row.
+    """
+    if value is None:
+        return None
+    rendered = _text(value, field_name, max_length=300)
+    if not _AUTHORIZATION_REF_RE.fullmatch(rendered):
+        raise CanonicalContractError(f"{field_name} must be an opaque authorization reference")
+    return rendered
+
+
+def _optional_digest(value: Any, field_name: str, *, allow_unknown: bool = False) -> str | None:
+    if value is None:
+        if allow_unknown:
+            return None
+        raise CanonicalContractError(f"{field_name} is required")
+    if not isinstance(value, str):
+        raise CanonicalContractError(f"{field_name} must be sha256:<hex>")
+    rendered = value.strip().lower()
+    if not _DIGEST_RE.fullmatch(rendered):
+        raise CanonicalContractError(f"{field_name} must be sha256:<hex>")
+    return rendered
+
+
 def _enum_type_for_name(name: str) -> type[Enum] | None:
     return {
         "kind": AssetKind,
@@ -407,6 +467,8 @@ def _enum_type_for_name(name: str) -> type[Enum] | None:
         "status": None,
         "severity": FindingSeverity,
         "redaction_state": RedactionState,
+        "collection_status": CollectionStatus,
+        "integrity_state": ArtifactIntegrityState,
         "source_type": ProvenanceSourceType,
     }.get(name)
 
@@ -491,7 +553,15 @@ def _bounded(value: Any, depth: int = 0) -> Any:
                 if key.lower().endswith("_ref") and isinstance(item, str) and (
                     _REFERENCE_RE.fullmatch(item) or _DIGEST_RE.fullmatch(item)
                 ):
-                    result[key] = item
+                    # Opaque references are normally safe handles, but a
+                    # registered runtime canary can be embedded in an
+                    # otherwise valid-looking handle.  Run the same
+                    # redaction boundary used by serialization before the
+                    # value is retained in bounded metadata, because this
+                    # representation is also written directly to the
+                    # canonical metadata_json column.
+                    sanitized = redact_text(item)
+                    result[key] = sanitized if sanitized != item else item
                 else:
                     result[key] = "<redacted>"
             else:
@@ -872,7 +942,15 @@ class Observation(_Contract):
     id: str = field(default_factory=server_id)
     schema_version: str = CANONICAL_SCHEMA_VERSION
     observed_at: datetime = field(default_factory=utc_now)
+    created_at: datetime = field(default_factory=utc_now)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    proof_type: str = "unknown"
+    collection_status: CollectionStatus = CollectionStatus.UNKNOWN
+    check_id: str | None = None
+    route: str | None = None
+    parameter: str | None = None
+    location: str | None = None
+    identity_ref: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("tenant_id", "engagement_id", "job_id", "module_version_id", "asset_id"):
@@ -882,6 +960,12 @@ class Observation(_Contract):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _identifier(value, name))
+        object.__setattr__(self, "proof_type", _text(self.proof_type, "proof_type", max_length=100))
+        object.__setattr__(self, "collection_status", CollectionStatus(self.collection_status))
+        for name in ("check_id", "route", "parameter", "location", "identity_ref"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _text(value, name, max_length=1_000))
         self._validate_common()
 
 
@@ -890,7 +974,7 @@ class ArtifactReference(_Contract):
     tenant_id: str
     observation_id: str
     reference: str
-    digest: str
+    digest: str | None
     media_type: str
     size: int
     redaction_state: RedactionState = RedactionState.REDACTED
@@ -898,7 +982,21 @@ class ArtifactReference(_Contract):
     id: str = field(default_factory=server_id)
     schema_version: str = CANONICAL_SCHEMA_VERSION
     collected_at: datetime = field(default_factory=utc_now)
+    created_at: datetime = field(default_factory=utc_now)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    collector_id: str = "unknown"
+    collector_version: str = "unknown"
+    source_target: str = "unknown"
+    source_asset_id: str | None = None
+    redaction_version: str = "unknown"
+    protection_state: str = "reference_only"
+    signer_state: str = "unsigned"
+    integrity_state: ArtifactIntegrityState = ArtifactIntegrityState.VERIFIED
+    retention_class: str = "default"
+    retention_expires_at: datetime | None = None
+    protected_original_authorization_ref: str | None = None
+    derivative_reference: str | None = None
+    manifest_digest: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("tenant_id", "observation_id"):
@@ -907,13 +1005,47 @@ class ArtifactReference(_Contract):
         if not (_REFERENCE_RE.fullmatch(reference) or _DIGEST_RE.fullmatch(reference)):
             raise CanonicalContractError("artifact reference must be an opaque handle")
         object.__setattr__(self, "reference", reference)
-        if not _DIGEST_RE.fullmatch(self.digest):
+        if self.digest is not None:
+            object.__setattr__(self, "digest", self.digest.strip().lower())
+        if self.digest is None:
+            if self.integrity_state not in {ArtifactIntegrityState.UNKNOWN, "unknown"}:
+                raise CanonicalContractError("artifact digest is required when integrity is verified")
+        elif not _DIGEST_RE.fullmatch(self.digest):
             raise CanonicalContractError("artifact digest must be sha256:<hex>")
         object.__setattr__(self, "media_type", _text(self.media_type, "media_type", max_length=200))
         if not isinstance(self.size, int) or self.size < 0 or self.size > 2**63 - 1:
             raise CanonicalContractError("artifact size is invalid")
         object.__setattr__(self, "redaction_state", RedactionState(self.redaction_state))
         object.__setattr__(self, "encryption_state", _text(self.encryption_state, "encryption_state", max_length=40))
+        for name in ("collector_id", "collector_version", "source_target", "redaction_version", "protection_state", "signer_state", "retention_class"):
+            object.__setattr__(self, name, _text(getattr(self, name), name, max_length=300))
+        integrity_value = self.integrity_state.value if isinstance(self.integrity_state, ArtifactIntegrityState) else str(self.integrity_state)
+        # The filesystem custody manifest uses the human-readable
+        # ``verified`` state; canonical artifact references retain the more
+        # explicit wire value.  Accept the former at this adapter boundary so
+        # callers cannot accidentally downgrade a verified artifact to
+        # ``unknown`` merely while translating the manifest.
+        if integrity_value == "verified":
+            integrity_value = ArtifactIntegrityState.VERIFIED.value
+        object.__setattr__(self, "integrity_state", ArtifactIntegrityState(integrity_value))
+        for name in ("source_asset_id",):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _identifier(value, name))
+        if self.retention_expires_at is not None:
+            object.__setattr__(self, "retention_expires_at", ensure_utc(self.retention_expires_at))
+        if self.protected_original_authorization_ref is not None:
+            ref = _text(self.protected_original_authorization_ref, "protected_original_authorization_ref", max_length=300)
+            if not re.fullmatch(r"(?:authz|authorization):[A-Za-z0-9._:@/+\-]{1,240}", ref):
+                raise CanonicalContractError("protected original authorization reference is invalid")
+            object.__setattr__(self, "protected_original_authorization_ref", ref)
+        if self.derivative_reference is not None:
+            ref = _text(self.derivative_reference, "derivative_reference", max_length=2_000).lower()
+            if not (_REFERENCE_RE.fullmatch(ref) or _DIGEST_RE.fullmatch(ref)):
+                raise CanonicalContractError("derivative reference must be an opaque handle")
+            object.__setattr__(self, "derivative_reference", ref)
+        if self.manifest_digest is not None:
+            object.__setattr__(self, "manifest_digest", _optional_digest(self.manifest_digest, "manifest_digest"))
         self._validate_common()
 
 
@@ -931,6 +1063,7 @@ class Finding(_Contract):
     schema_version: str = CANONICAL_SCHEMA_VERSION
     created_at: datetime = field(default_factory=utc_now)
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    dedup_key: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("tenant_id", "observation_id", "artifact_id"):
@@ -941,6 +1074,11 @@ class Finding(_Contract):
         object.__setattr__(self, "status", FindingStatus(self.status))
         if self.finding_key is not None:
             object.__setattr__(self, "finding_key", _text(self.finding_key, "finding_key", max_length=300))
+        if self.dedup_key is not None:
+            dedup = _text(self.dedup_key, "dedup_key", max_length=300)
+            if not re.fullmatch(r"finding-v[0-9]+:[0-9a-f]{64}", dedup):
+                raise CanonicalContractError("dedup_key must be finding-vN:<64 lowercase hex>")
+            object.__setattr__(self, "dedup_key", dedup)
         self._validate_common()
 
 
@@ -1109,6 +1247,51 @@ def _iso(value: datetime) -> str:
     return isoformat_utc(value)
 
 
+def finding_identity_key(
+    *,
+    tenant_id: str,
+    module_version_id: str,
+    asset_id: str,
+    finding_key: str | None = None,
+    title: str = "",
+    route: str | None = None,
+    parameter: str | None = None,
+    location: str | None = None,
+    identity_ref: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> str:
+    """Return the versioned, explainable identity used for finding grouping.
+
+    Run/job/observation IDs are intentionally excluded: repeated executions
+    append source observations to the same mutable workflow summary while all
+    proof remains attached to the immutable source rows.  Tenant, check/module,
+    asset, and family-specific route/parameter/location/identity dimensions are
+    mandatory parts of the key so title/host-only collisions cannot merge
+    unrelated findings.
+    """
+    tenant = _identifier(tenant_id, "tenant_id")
+    module = _identifier(module_version_id, "module_version_id")
+    asset = _identifier(asset_id, "asset_id")
+    metadata_map = dict(metadata or {})
+    def _dimension(name: str, explicit: str | None) -> str:
+        value = explicit if explicit is not None else metadata_map.get(name)
+        return str(value or "").strip()
+    material = {
+        "version": "finding-v1",
+        "tenant_id": tenant,
+        "module_version_id": module,
+        "asset_id": asset,
+        "check_identity": str(finding_key or metadata_map.get("check_id") or title or "").strip().lower(),
+        "route": _dimension("route", route),
+        "path": _dimension("path", None),
+        "parameter": _dimension("parameter", parameter),
+        "location": _dimension("location", location),
+        "identity_ref": _dimension("identity_ref", identity_ref),
+    }
+    canonical = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return "finding-v1:" + hashlib.sha256(canonical).hexdigest()
+
+
 class CanonicalStore:
     """Transactional repository for the normalized canonical graph."""
 
@@ -1230,11 +1413,11 @@ class CanonicalStore:
         if isinstance(record, Asset):
             return base | {"kind": record.kind.value, "identity_key": record.identity_key, "display_name": record.display_name, "canonical_uri": record.canonical_uri}
         if isinstance(record, Observation):
-            return base | {"engagement_id": record.engagement_id, "job_id": record.job_id, "module_version_id": record.module_version_id, "module_execution_id": record.module_execution_id, "asset_id": record.asset_id, "action_id": record.action_id, "intelligence_snapshot_id": record.intelligence_snapshot_id, "provenance_id": record.provenance_id, "status": record.status.value, "observed_at": _iso(record.observed_at)}
+            return base | {"engagement_id": record.engagement_id, "job_id": record.job_id, "module_version_id": record.module_version_id, "module_execution_id": record.module_execution_id, "asset_id": record.asset_id, "action_id": record.action_id, "intelligence_snapshot_id": record.intelligence_snapshot_id, "provenance_id": record.provenance_id, "status": record.status.value, "observed_at": _iso(record.observed_at), "proof_type": record.proof_type, "collection_status": record.collection_status.value, "check_id": record.check_id, "route": record.route, "parameter": record.parameter, "location": record.location, "identity_ref": record.identity_ref}
         if isinstance(record, ArtifactReference):
-            return base | {"observation_id": record.observation_id, "reference": record.reference, "digest": record.digest, "media_type": record.media_type, "size": record.size, "redaction_state": record.redaction_state.value, "encryption_state": record.encryption_state, "collected_at": _iso(record.collected_at)}
+            return base | {"observation_id": record.observation_id, "reference": record.reference, "digest": record.digest, "media_type": record.media_type, "size": record.size, "redaction_state": record.redaction_state.value, "encryption_state": record.encryption_state, "collected_at": _iso(record.collected_at), "collector_id": record.collector_id, "collector_version": record.collector_version, "source_target": record.source_target, "source_asset_id": record.source_asset_id, "redaction_version": record.redaction_version, "protection_state": record.protection_state, "signer_state": record.signer_state, "integrity_state": record.integrity_state.value, "retention_class": record.retention_class, "retention_expires_at": _iso(record.retention_expires_at) if record.retention_expires_at else None, "protected_original_authorization_ref": record.protected_original_authorization_ref, "derivative_reference": record.derivative_reference, "manifest_digest": record.manifest_digest}
         if isinstance(record, Finding):
-            return base | {"observation_id": record.observation_id, "artifact_id": record.artifact_id, "title": record.title, "severity": record.severity.value, "description": record.description, "status": record.status.value, "finding_key": record.finding_key}
+            return base | {"observation_id": record.observation_id, "artifact_id": record.artifact_id, "title": record.title, "severity": record.severity.value, "description": record.description, "status": record.status.value, "finding_key": record.finding_key, "dedup_key": record.dedup_key}
         if isinstance(record, Retest):
             return base | {"finding_id": record.finding_id, "source_observation_id": record.source_observation_id, "job_id": record.job_id, "status": record.status.value}
         if isinstance(record, Report):
@@ -1334,6 +1517,22 @@ class CanonicalStore:
         for label, (actual, expected) in expected_links.items():
             if actual != expected:
                 raise CanonicalLineageError(f"{label} link is inconsistent")
+        # The workflow summary identity intentionally excludes this run's
+        # observation/job IDs.  Populate it once at the canonical boundary so
+        # every downstream reader has the same explainable grouping key.
+        dedup_key = finding.dedup_key or finding_identity_key(
+            tenant_id=tenant_id,
+            module_version_id=module_version.id,
+            asset_id=asset.id,
+            finding_key=finding.finding_key,
+            title=finding.title,
+            route=observation.route,
+            parameter=observation.parameter,
+            location=observation.location,
+            identity_ref=observation.identity_ref,
+            metadata=finding.metadata,
+        )
+        object.__setattr__(finding, "dedup_key", dedup_key)
         if module_execution is not None:
             if observation.module_execution_id != module_execution.id:
                 raise CanonicalLineageError("observation module execution link is inconsistent")
@@ -1400,10 +1599,79 @@ class CanonicalStore:
                            module_execution, asset, report):
                 if record is not None:
                     self._insert_or_validate_existing(record)
-            for child_record in (observation, artifact, finding, retest,
-                                 report_membership, export):
-                if child_record is not None:
-                    self._insert(child_record)
+            # Observations and artifacts are the immutable source records.  A
+            # finding summary is resolved/created before inserting any
+            # downstream retest/report/export rows because those rows carry a
+            # foreign key to the finding identity.
+            for source_record in (observation, artifact):
+                if source_record is not None:
+                    self._insert(source_record)
+            existing_finding = self.session.execute(
+                text("SELECT id FROM canonical_findings WHERE tenant_id=:tenant_id AND dedup_key=:dedup_key ORDER BY created_at, id LIMIT 1"),
+                {"tenant_id": tenant_id, "dedup_key": dedup_key},
+            ).scalar_one_or_none()
+            if existing_finding is None:
+                self._insert(finding)
+                existing_finding = finding.id
+            else:
+                # Findings are mutable workflow summaries.  Updating their
+                # presentation/status is allowed, but the original source
+                # observation and artifact remain untouched in their own
+                # append-only rows.
+                self.session.execute(
+                    text("UPDATE canonical_findings SET title=:title, severity=:severity, description=:description, status=:status WHERE tenant_id=:tenant_id AND id=:id"),
+                    {"tenant_id": tenant_id, "id": existing_finding, "title": finding.title, "severity": finding.severity.value, "description": finding.description, "status": finding.status.value},
+                )
+                # The caller's Finding object represents the workflow summary
+                # returned by this operation.  Keep its identity aligned with
+                # the deduplicated row rather than returning an unpersisted
+                # synthetic ID.
+                object.__setattr__(finding, "id", existing_finding)
+            link_time = _iso(utc_now())
+            # Include every append-only source dimension.  The earlier
+            # six-column insert was silently ignored by SQLite once the v2
+            # table added NOT NULL identity/first/last-seen fields, dropping
+            # the very lineage Task 102 is meant to preserve.
+            self.session.execute(
+                text(
+                    "INSERT OR IGNORE INTO canonical_finding_observations "
+                    "(tenant_id,finding_id,observation_id,artifact_id,identity_key,"
+                    "first_seen_at,last_seen_at,created_at,metadata_json) "
+                    "VALUES (:tenant_id,:finding_id,:observation_id,:artifact_id,:identity_key,"
+                    ":first_seen_at,:last_seen_at,:created_at,:metadata_json)"
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "finding_id": existing_finding,
+                    "observation_id": observation.id,
+                    "artifact_id": artifact.id,
+                    "identity_key": dedup_key,
+                    "first_seen_at": _iso(observation.observed_at),
+                    "last_seen_at": _iso(observation.observed_at),
+                    "created_at": link_time,
+                    "metadata_json": _metadata_json({"identity_version": "finding-v1"}),
+                },
+            )
+            # Keep a normalized observation-to-artifact set even when future
+            # collectors attach supporting artifacts.  The primary artifact
+            # link is idempotent and remains immutable after insertion.
+            self.session.execute(
+                text(
+                    "INSERT OR IGNORE INTO canonical_observation_artifacts "
+                    "(tenant_id,observation_id,artifact_id,role,sequence,created_at,metadata_json) "
+                    "VALUES (:tenant_id,:observation_id,:artifact_id,'primary',0,:created_at,:metadata_json)"
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "observation_id": observation.id,
+                    "artifact_id": artifact.id,
+                    "created_at": link_time,
+                    "metadata_json": _metadata_json({"source": "canonical_lineage"}),
+                },
+            )
+            for downstream_record in (retest, report_membership, export):
+                if downstream_record is not None:
+                    self._insert(downstream_record)
         result: dict[str, _Contract] = {"tenant": tenant, "engagement": engagement, "job": job, "module_version": module_version, "asset": asset, "observation": observation, "artifact": artifact, "finding": finding}
         if client is not None:
             result["client"] = client
@@ -1431,7 +1699,365 @@ class CanonicalStore:
             ),
             {"tenant_id": tenant_id, "finding_id": finding_id},
         ).mappings().first()
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        result = dict(row)
+        # The legacy primary observation/artifact columns remain for
+        # compatibility, while consumers that need evidence history receive
+        # the complete append-only source set as a deterministic child list.
+        result["source_observations"] = self.list_finding_observations(finding_id, tenant_id)
+        return result
+
+    def list_finding_observations(self, finding_id: str, tenant_id: str) -> list[dict[str, Any]]:
+        """Return every immutable observation/artifact linked to a summary."""
+        finding_id = _identifier(finding_id, "finding_id")
+        tenant_id = _identifier(tenant_id, "tenant_id")
+        rows = self.session.execute(
+            text(
+                "SELECT fo.finding_id, fo.observation_id, fo.artifact_id, fo.created_at, "
+                "o.engagement_id, o.job_id, o.module_version_id, o.asset_id, "
+                "o.proof_type, o.collection_status, o.check_id, o.route, o.parameter, "
+                "o.location, o.identity_ref, a.reference, a.digest, a.size, "
+                "a.media_type, a.redaction_state, a.integrity_state, a.manifest_digest "
+                "FROM canonical_finding_observations fo "
+                "JOIN canonical_observations o ON o.tenant_id=fo.tenant_id AND o.id=fo.observation_id "
+                "JOIN canonical_artifact_refs a ON a.tenant_id=fo.tenant_id AND a.id=fo.artifact_id "
+                "WHERE fo.tenant_id=:tenant_id AND fo.finding_id=:finding_id "
+                "ORDER BY fo.created_at, fo.observation_id"
+            ),
+            {"tenant_id": tenant_id, "finding_id": finding_id},
+        ).mappings().all()
+        return [dict(row) for row in rows]
+
+    def persist_artifact_manifest(
+        self,
+        manifest: ArtifactManifest | Mapping[str, Any],
+        *,
+        artifact: ArtifactReference | None = None,
+        observation: Observation | None = None,
+        role: str = "primary",
+        sequence: int = 0,
+    ) -> None:
+        """Persist one verified custody manifest and its source link.
+
+        Bytes remain in :mod:`common.evidence_custody`; this method stores
+        only the normalized, tenant-bound manifest metadata.  Mapping inputs
+        are accepted only as a wire-format convenience and are reconstructed
+        through ``ArtifactManifest.from_dict`` so every field and the
+        manifest digest are verified before anything reaches the database.
+        """
+        try:
+            if isinstance(manifest, ArtifactManifest):
+                typed_manifest = manifest
+                typed_manifest.verify()
+            elif isinstance(manifest, Mapping):
+                typed_manifest = ArtifactManifest.from_dict(manifest)
+            else:
+                raise CanonicalContractError("artifact manifest must be an ArtifactManifest object")
+        except CanonicalContractError:
+            raise
+        except Exception as exc:
+            raise CanonicalContractError("artifact manifest failed integrity verification") from exc
+        values = typed_manifest.to_dict()
+        tenant_id = _identifier(typed_manifest.tenant_id, "tenant_id")
+        artifact_id = _identifier(typed_manifest.artifact_id, "artifact_id")
+        observation_id = _identifier(typed_manifest.source_observation_id, "source_observation_id")
+        if artifact is not None and (artifact.id != artifact_id or artifact.observation_id != observation_id or artifact.tenant_id != tenant_id):
+            raise CanonicalLineageError("artifact manifest lineage is inconsistent")
+        if observation is not None and (observation.id != observation_id or observation.tenant_id != tenant_id):
+            raise CanonicalLineageError("artifact manifest observation is inconsistent")
+        if typed_manifest.protection_state == "protected_original" and typed_manifest.protected_original_authorization_ref is None:
+            raise CanonicalContractError("protected original manifests require an authorization reference")
+        protected_authorization_ref = _authorization_ref(
+            typed_manifest.protected_original_authorization_ref,
+            "protected_original_authorization_ref",
+        )
+        if role not in {"primary", "supporting", "derivative", "legacy"}:
+            raise CanonicalContractError("unsupported artifact manifest link role")
+        if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+            raise CanonicalContractError("artifact manifest link sequence must be a non-negative integer")
+        # Bind the custody manifest to the canonical artifact reference before
+        # opening the write transaction. This prevents a valid manifest for a
+        # different byte stream from being attached to an immutable reference
+        # merely because both identifiers happen to be well formed.
+        artifact_row = self.session.execute(
+            text(
+                "SELECT observation_id, digest, media_type, size, manifest_digest "
+                "FROM canonical_artifact_refs WHERE tenant_id=:tenant_id AND id=:artifact_id"
+            ),
+            {"tenant_id": tenant_id, "artifact_id": artifact_id},
+        ).mappings().first()
+        if artifact_row is not None:
+            if str(artifact_row["observation_id"]) != observation_id:
+                raise CanonicalLineageError("artifact manifest observation does not match artifact reference")
+            if artifact_row["digest"] != typed_manifest.sha256 or int(artifact_row["size"]) != typed_manifest.byte_size:
+                raise CanonicalLineageError("artifact manifest bytes do not match artifact reference")
+            if str(artifact_row["media_type"]) != typed_manifest.media_type:
+                raise CanonicalLineageError("artifact manifest media type does not match artifact reference")
+            if artifact_row["manifest_digest"] is not None and artifact_row["manifest_digest"] != typed_manifest.manifest_digest:
+                raise CanonicalLineageError("artifact manifest digest conflicts with artifact reference")
+        with self._atomic():
+            existing_row = self.session.execute(
+                text(
+                    "SELECT * FROM canonical_artifact_manifests "
+                    "WHERE tenant_id=:tenant_id AND artifact_id=:artifact_id"
+                ),
+                {"tenant_id": tenant_id, "artifact_id": artifact_id},
+            ).mappings().first()
+            if existing_row is not None:
+                existing_manifest = _artifact_manifest_from_row(cast(Mapping[str, Any], existing_row))
+                if existing_manifest.to_dict() != typed_manifest.to_dict():
+                    raise CanonicalContractError("artifact manifest identity is immutable")
+            self.session.execute(
+                text(
+                    "INSERT OR IGNORE INTO canonical_artifact_manifests "
+                    "(id,tenant_id,artifact_id,observation_id,schema_version,sha256,byte_size,"
+                    "media_type,collected_at,collector_id,source_target,source_asset_id,"
+                    "redaction_state,redaction_version,protection_state,encryption_state,"
+                    "signer_state,integrity_state,retention_class,retention_expires_at,"
+                    "protected_original_authorization_ref,original_relative_path,"
+                    "derivative_relative_path,derivative_artifact_id,derivative_sha256,"
+                    "derivative_size,manifest_digest,created_at,metadata_json) VALUES "
+                    "(:id,:tenant_id,:artifact_id,:observation_id,:schema_version,:sha256,:byte_size,"
+                    ":media_type,:collected_at,:collector_id,:source_target,:source_asset_id,"
+                    ":redaction_state,:redaction_version,:protection_state,:encryption_state,"
+                    ":signer_state,:integrity_state,:retention_class,:retention_expires_at,"
+                    ":protected_original_authorization_ref,:original_relative_path,"
+                    ":derivative_relative_path,:derivative_artifact_id,:derivative_sha256,"
+                    ":derivative_size,:manifest_digest,:created_at,:metadata_json)"
+                ),
+                {
+                    "id": artifact_id,
+                    "tenant_id": tenant_id,
+                    "artifact_id": artifact_id,
+                    "observation_id": observation_id,
+                    "schema_version": typed_manifest.schema_version,
+                    "sha256": typed_manifest.sha256,
+                    "byte_size": typed_manifest.byte_size,
+                    "media_type": typed_manifest.media_type,
+                    "collected_at": typed_manifest.collected_at,
+                    "collector_id": typed_manifest.collector_id,
+                    "source_target": typed_manifest.source_target,
+                    "source_asset_id": typed_manifest.source_asset_id,
+                    "redaction_state": typed_manifest.redaction_state,
+                    "redaction_version": typed_manifest.redaction_version,
+                    "protection_state": typed_manifest.protection_state,
+                    "encryption_state": typed_manifest.encryption_state,
+                    "signer_state": typed_manifest.signer_state,
+                    "integrity_state": typed_manifest.integrity_state,
+                    "retention_class": typed_manifest.retention_class,
+                    "retention_expires_at": typed_manifest.retention_expires_at,
+                    "protected_original_authorization_ref": protected_authorization_ref,
+                    "original_relative_path": typed_manifest.original_relative_path,
+                    "derivative_relative_path": typed_manifest.derivative_relative_path,
+                    "derivative_artifact_id": typed_manifest.derivative_artifact_id,
+                    "derivative_sha256": typed_manifest.derivative_sha256,
+                    "derivative_size": typed_manifest.derivative_size,
+                    "manifest_digest": typed_manifest.manifest_digest,
+                    "created_at": typed_manifest.collected_at,
+                    "metadata_json": _metadata_json(cast(Mapping[str, Any], values["metadata"])),
+                },
+            )
+            self.session.execute(
+                text(
+                    "INSERT OR IGNORE INTO canonical_observation_artifacts "
+                    "(tenant_id,observation_id,artifact_id,role,sequence,created_at,metadata_json) "
+                    "VALUES (:tenant_id,:observation_id,:artifact_id,:role,:sequence,:created_at,:metadata_json)"
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "observation_id": observation_id,
+                    "artifact_id": artifact_id,
+                    "role": role,
+                    "sequence": sequence,
+                    "created_at": typed_manifest.collected_at,
+                    "metadata_json": _metadata_json({"manifest_digest": typed_manifest.manifest_digest}),
+                },
+            )
+
+    def persist_custodied_manifest(
+        self,
+        manifest: ArtifactManifest | Mapping[str, Any],
+        *,
+        custody_store: Any,
+        artifact: ArtifactReference | None = None,
+        observation: Observation | None = None,
+        role: str = "primary",
+        sequence: int = 0,
+        rollback_on_failure: bool = True,
+    ) -> ArtifactManifest:
+        """Bridge one newly stored file artifact into canonical storage.
+
+        The custody store is verified before the database write, and a failed
+        database transaction compensates the exact newly staged artifact when
+        ``rollback_on_failure`` is enabled.  Callers that are reopening an
+        already-committed artifact can disable compensation explicitly; new
+        ``store_artifact`` writes should leave it enabled.
+        """
+        try:
+            typed_manifest = (
+                manifest
+                if isinstance(manifest, ArtifactManifest)
+                else ArtifactManifest.from_dict(manifest)
+            )
+            typed_manifest.verify()
+            verifier = getattr(custody_store, "verify", None)
+            if not callable(verifier):
+                raise CanonicalContractError("custody store does not expose verification")
+            verified = verifier(typed_manifest.artifact_id)
+            if not isinstance(verified, ArtifactManifest) or verified.manifest_digest != typed_manifest.manifest_digest:
+                raise CanonicalContractError("custody manifest does not match stored artifact")
+        except CanonicalContractError:
+            raise
+        except Exception as exc:
+            raise CanonicalContractError("custody artifact verification failed") from exc
+
+        try:
+            self.persist_artifact_manifest(
+                typed_manifest,
+                artifact=artifact,
+                observation=observation,
+                role=role,
+                sequence=sequence,
+            )
+        except Exception as exc:
+            if rollback_on_failure:
+                rollback = getattr(custody_store, "rollback_artifact", None)
+                if not callable(rollback):
+                    raise CanonicalContractError(
+                        "database transaction failed and custody rollback is unavailable"
+                    ) from exc
+                try:
+                    rollback(
+                        typed_manifest.artifact_id,
+                        expected_manifest_digest=typed_manifest.manifest_digest,
+                    )
+                except Exception as rollback_exc:
+                    raise CanonicalContractError(
+                        "database transaction failed and custody rollback did not complete"
+                    ) from rollback_exc
+            raise
+        return typed_manifest
+
+    def record_evidence_access(
+        self,
+        *,
+        tenant_id: str,
+        artifact_id: str,
+        observation_id: str,
+        access_kind: str,
+        authorization_ref: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> str:
+        """Append one tenant-bound redacted/original access audit row."""
+        tenant_id = _identifier(tenant_id, "tenant_id")
+        artifact_id = _identifier(artifact_id, "artifact_id")
+        observation_id = _identifier(observation_id, "observation_id")
+        if access_kind not in {"redacted_derivative", "protected_original"}:
+            raise CanonicalContractError("unsupported evidence access kind")
+        authorization_ref = _authorization_ref(authorization_ref)
+        if access_kind == "protected_original" and authorization_ref is None:
+            raise CanonicalContractError("protected original access requires an authorization reference")
+        if access_kind == "protected_original":
+            manifest_ref = self.session.execute(
+                text(
+                    "SELECT protected_original_authorization_ref "
+                    "FROM canonical_artifact_manifests "
+                    "WHERE tenant_id=:tenant_id AND artifact_id=:artifact_id "
+                    "AND observation_id=:observation_id"
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "artifact_id": artifact_id,
+                    "observation_id": observation_id,
+                },
+            ).scalar_one_or_none()
+            if manifest_ref is not None and manifest_ref != authorization_ref:
+                raise CanonicalContractError("authorization reference does not match the artifact manifest")
+        audit_id = server_id()
+        with self._atomic():
+            self.session.execute(
+                text(
+                    "INSERT INTO canonical_evidence_access_audit "
+                    "(id,tenant_id,artifact_id,observation_id,access_kind,authorization_ref,accessed_at,metadata_json) "
+                    "VALUES (:id,:tenant_id,:artifact_id,:observation_id,:access_kind,:authorization_ref,:accessed_at,:metadata_json)"
+                ),
+                {
+                    "id": audit_id,
+                    "tenant_id": tenant_id,
+                    "artifact_id": artifact_id,
+                    "observation_id": observation_id,
+                    "access_kind": access_kind,
+                    "authorization_ref": authorization_ref,
+                    "accessed_at": _iso(utc_now()),
+                    "metadata_json": _metadata_json(metadata or {}),
+                },
+            )
+        return audit_id
+
+    def get_observation(self, observation_id: str, tenant_id: str) -> Observation | None:
+        observation_id = _identifier(observation_id, "observation_id")
+        tenant_id = _identifier(tenant_id, "tenant_id")
+        row = self.session.execute(
+            text("SELECT * FROM canonical_observations WHERE tenant_id=:tenant_id AND id=:id"),
+            {"tenant_id": tenant_id, "id": observation_id},
+        ).mappings().first()
+        return cast(Observation | None, _contract_from_row(Observation, cast(Mapping[str, Any], row))) if row else None
+
+    def get_artifact(self, artifact_id: str, tenant_id: str) -> ArtifactReference | None:
+        artifact_id = _identifier(artifact_id, "artifact_id")
+        tenant_id = _identifier(tenant_id, "tenant_id")
+        row = self.session.execute(
+            text("SELECT * FROM canonical_artifact_refs WHERE tenant_id=:tenant_id AND id=:id"),
+            {"tenant_id": tenant_id, "id": artifact_id},
+        ).mappings().first()
+        return cast(ArtifactReference | None, _contract_from_row(ArtifactReference, cast(Mapping[str, Any], row))) if row else None
+
+    def get_artifact_manifest(self, artifact_id: str, tenant_id: str) -> ArtifactManifest | None:
+        """Return one verified manifest only within the requested tenant."""
+        artifact_id = _identifier(artifact_id, "artifact_id")
+        tenant_id = _identifier(tenant_id, "tenant_id")
+        row = self.session.execute(
+            text(
+                "SELECT * FROM canonical_artifact_manifests "
+                "WHERE tenant_id=:tenant_id AND artifact_id=:artifact_id"
+            ),
+            {"tenant_id": tenant_id, "artifact_id": artifact_id},
+        ).mappings().first()
+        if row is None:
+            return None
+        return _artifact_manifest_from_row(cast(Mapping[str, Any], row))
+
+    def list_artifact_manifests(
+        self,
+        tenant_id: str,
+        observation_id: str | None = None,
+    ) -> list[ArtifactManifest]:
+        """List verified manifests scoped to one tenant and optional observation."""
+        tenant_id = _identifier(tenant_id, "tenant_id")
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        clause = ""
+        if observation_id is not None:
+            observation_id = _identifier(observation_id, "observation_id")
+            clause = " AND observation_id=:observation_id"
+            params["observation_id"] = observation_id
+        rows = self.session.execute(
+            text(
+                "SELECT * FROM canonical_artifact_manifests "
+                "WHERE tenant_id=:tenant_id" + clause + " ORDER BY collected_at, artifact_id"
+            ),
+            params,
+        ).mappings().all()
+        return [_artifact_manifest_from_row(cast(Mapping[str, Any], row)) for row in rows]
+
+    # Compatibility names used by custody/database adapters.
+    get_manifest = get_artifact_manifest
+    list_manifests = list_artifact_manifests
+
+    # Explicit aliases keep the append-only boundary discoverable to existing
+    # adapters without creating a second persistence schema.
+    append_observation = create_lineage
+    persist_observation = create_lineage
 
     def count(self, table: str, *, tenant_id: str | None = None) -> int:
         if not re.fullmatch(r"canonical_[a-z_]+", table):
@@ -1538,6 +2164,58 @@ def _row_metadata(row: Mapping[str, Any]) -> dict[str, Any]:
     return bounded_metadata(value if isinstance(value, Mapping) else {})
 
 
+def _artifact_manifest_from_row(row: Mapping[str, Any]) -> ArtifactManifest:
+    """Rebuild and verify a custody manifest read from canonical storage."""
+    if str(row.get("id") or "") != str(row.get("artifact_id") or ""):
+        raise CanonicalContractError("artifact manifest identity is inconsistent")
+    try:
+        metadata_value = json.loads(str(row.get("metadata_json") or "{}"))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise CanonicalContractError("artifact manifest metadata is malformed") from exc
+    if not isinstance(metadata_value, Mapping):
+        raise CanonicalContractError("artifact manifest metadata must be an object")
+    values: dict[str, Any] = {
+        "artifact_id": row.get("artifact_id"),
+        "tenant_id": row.get("tenant_id"),
+        "source_observation_id": row.get("observation_id"),
+        "schema_version": row.get("schema_version"),
+        "sha256": row.get("sha256"),
+        "byte_size": row.get("byte_size"),
+        "media_type": row.get("media_type"),
+        "collected_at": row.get("collected_at"),
+        "collector_id": row.get("collector_id"),
+        "source_target": row.get("source_target"),
+        "source_asset_id": row.get("source_asset_id"),
+        "redaction_state": row.get("redaction_state"),
+        "redaction_version": row.get("redaction_version"),
+        "protection_state": row.get("protection_state"),
+        "encryption_state": row.get("encryption_state"),
+        "signer_state": row.get("signer_state"),
+        "integrity_state": row.get("integrity_state"),
+        "retention_class": row.get("retention_class"),
+        "retention_expires_at": row.get("retention_expires_at"),
+        "protected_original_authorization_ref": row.get("protected_original_authorization_ref"),
+        "original_relative_path": row.get("original_relative_path"),
+        "derivative_relative_path": row.get("derivative_relative_path"),
+        "derivative_artifact_id": row.get("derivative_artifact_id"),
+        "derivative_sha256": row.get("derivative_sha256"),
+        "derivative_size": row.get("derivative_size"),
+        "manifest_digest": row.get("manifest_digest"),
+        "metadata": dict(metadata_value),
+    }
+    try:
+        manifest = ArtifactManifest.from_dict(values)
+        if manifest.protection_state == "protected_original" and manifest.protected_original_authorization_ref is None:
+            raise CanonicalContractError("protected original manifests require an authorization reference")
+        _authorization_ref(
+            manifest.protected_original_authorization_ref,
+            "protected_original_authorization_ref",
+        )
+        return manifest
+    except Exception as exc:
+        raise CanonicalContractError("artifact manifest failed integrity verification") from exc
+
+
 def _asset_from_row(row: Mapping[str, Any]) -> Asset:
     return Asset(id=str(row["id"]), tenant_id=str(row["tenant_id"]), kind=AssetKind(str(row["kind"])), identity_key=str(row["identity_key"]), display_name=str(row["display_name"]), canonical_uri=row.get("canonical_uri"), schema_version=str(row["schema_version"]), created_at=parse_utc(str(row["created_at"])), metadata=_row_metadata(row))
 
@@ -1592,6 +2270,65 @@ def _contract_from_row(cls: type[_Contract], row: Mapping[str, Any]) -> _Contrac
         return ModuleVersion(module_id=str(row["module_id"]), version=str(row["version"]), module_kind=str(row["module_kind"]), manifest_digest=row.get("manifest_digest"), policy_version=row.get("policy_version"), intelligence_snapshot_id=row.get("intelligence_snapshot_id"), check_pack_snapshot_id=row.get("check_pack_snapshot_id"), provenance_id=row.get("provenance_id"), **common)
     if cls is ModuleExecution:
         return ModuleExecution(job_id=str(row["job_id"]), module_version_id=str(row["module_version_id"]), status=ModuleExecutionStatus(str(row["status"])), intelligence_snapshot_id=row.get("intelligence_snapshot_id"), check_pack_snapshot_id=row.get("check_pack_snapshot_id"), provenance_id=row.get("provenance_id"), **common)
+    if cls is Observation:
+        return Observation(
+            engagement_id=str(row["engagement_id"]),
+            job_id=str(row["job_id"]),
+            module_version_id=str(row["module_version_id"]),
+            module_execution_id=row.get("module_execution_id"),
+            asset_id=str(row["asset_id"]),
+            action_id=row.get("action_id"),
+            intelligence_snapshot_id=row.get("intelligence_snapshot_id"),
+            provenance_id=row.get("provenance_id"),
+            status=ObservationStatus(str(row["status"])),
+            observed_at=parse_utc(str(row["observed_at"])),
+            proof_type=str(row.get("proof_type") or "unknown"),
+            collection_status=CollectionStatus(str(row.get("collection_status") or "unknown")),
+            check_id=row.get("check_id"),
+            route=row.get("route"),
+            parameter=row.get("parameter"),
+            location=row.get("location"),
+            identity_ref=row.get("identity_ref"),
+            **common,
+        )
+    if cls is ArtifactReference:
+        retention = row.get("retention_expires_at")
+        return ArtifactReference(
+            observation_id=str(row["observation_id"]),
+            reference=str(row["reference"]),
+            digest=row.get("digest"),
+            media_type=str(row["media_type"]),
+            size=int(row["size"]),
+            redaction_state=RedactionState(str(row.get("redaction_state") or "unknown")),
+            encryption_state=str(row.get("encryption_state") or "reference_only"),
+            collected_at=parse_utc(str(row["collected_at"])),
+            collector_id=str(row.get("collector_id") or "unknown"),
+            collector_version=str(row.get("collector_version") or "unknown"),
+            source_target=str(row.get("source_target") or "unknown"),
+            source_asset_id=row.get("source_asset_id"),
+            redaction_version=str(row.get("redaction_version") or "unknown"),
+            protection_state=str(row.get("protection_state") or "reference_only"),
+            signer_state=str(row.get("signer_state") or "unsigned"),
+            integrity_state=ArtifactIntegrityState(str(row.get("integrity_state") or ("unknown" if row.get("digest") is None else "sha256_verified"))),
+            retention_class=str(row.get("retention_class") or "default"),
+            retention_expires_at=parse_utc(str(retention)) if retention else None,
+            protected_original_authorization_ref=row.get("protected_original_authorization_ref"),
+            derivative_reference=row.get("derivative_reference"),
+            manifest_digest=row.get("manifest_digest"),
+            **common,
+        )
+    if cls is Finding:
+        return Finding(
+            observation_id=str(row["observation_id"]),
+            artifact_id=str(row["artifact_id"]),
+            title=str(row["title"]),
+            severity=FindingSeverity(str(row["severity"])),
+            description=str(row["description"]),
+            status=FindingStatus(str(row["status"])),
+            finding_key=row.get("finding_key"),
+            dedup_key=row.get("dedup_key"),
+            **common,
+        )
     raise CanonicalContractError(f"row conversion for {cls.__name__} is not exposed")
 
 

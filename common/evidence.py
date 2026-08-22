@@ -27,7 +27,28 @@ from common.artifact_io import (
 )
 from common.redaction import redact_text, redact_value
 
+# Task 102 custody is kept in a focused module so legacy ``Evidence`` callers
+# remain source-compatible.  Re-export the typed custody API here because
+# existing engines import their evidence boundary from this module.
+from common.evidence_custody import (  # noqa: E402
+    ArtifactAccessDenied,
+    ArtifactIntegrityError,
+    ArtifactManifest,
+    ArtifactNotFound,
+    ArtifactScopeError,
+    ArtifactTransactionError,
+    CustodyError,
+    EVIDENCE_SCHEMA_VERSION,
+    EvidenceCustodyStore,
+    ProtectedOriginalAuthorization,
+    REDACTION_VERSION,
+    make_original_authorization,
+)
 
+EvidenceAuthorizationError = ArtifactAccessDenied
+EvidenceIntegrityError = ArtifactIntegrityError
+EvidenceManifest = ArtifactManifest
+EvidenceCustodyError = CustodyError
 _SAFE_FINDING_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
@@ -337,6 +358,17 @@ def immutable_evidence_exists(evidence_ref: str, store_dir: Path) -> bool:
                 os.close(directory_fd)
             except Exception:
                 pass
+
+
+
+# Friendly aliases used by adapters and acceptance fixtures.
+# Keep the legacy ``Evidence`` dataclass in this module, but expose exactly one
+# custody implementation.  The focused module owns tenant namespaces,
+# append-only manifests, redacted/default reads, and protected-original
+# authorization; the compatibility block above is intentionally not part of
+# the public API.
+EvidenceStore = EvidenceCustodyStore
+verify_evidence_manifest = EvidenceCustodyStore.verify
 
 
 @dataclass

@@ -181,6 +181,10 @@ def _canonical_legacy_key(value: Any, *, kind: str, tenant_id: str) -> str:
 
 CANONICAL_MIGRATION_PREFIX = "canonical"
 CANONICAL_SCHEMA_VERSION = "forge-canonical-v1"
+# Evidence custody is an additive, reversible boundary.  Canonical contract
+# rows remain on ``forge-canonical-v1`` so existing adapters do not silently
+# change their wire version when custody is upgraded.
+EVIDENCE_SCHEMA_VERSION = "forge-evidence-v1"
 CURRENT_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
 JOURNAL_TABLE = "canonical_migration_journal"
 
@@ -667,11 +671,14 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
         )
         artifact_id = _canonical_legacy_key(f"{finding_id}:artifact", kind="artifact", tenant_id=tenant)
         artifact_ids[(tenant, finding_id)] = artifact_id
-        digest = _legacy_digest(data)
+        # Legacy rows do not provide durable artifact bytes.  Do not invent a
+        # digest for the redacted metadata payload; preserve the artifact
+        # reference while explicitly recording unknown integrity/protection.
+        digest = None
         connection.exec_driver_sql(
             "INSERT OR IGNORE INTO canonical_artifact_refs"
-            "(id,tenant_id,observation_id,schema_version,reference,digest,media_type,size,redaction_state,encryption_state,collected_at,created_at,metadata_json)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "(id,tenant_id,observation_id,schema_version,reference,digest,media_type,size,redaction_state,encryption_state,collected_at,created_at,integrity_state,protection_state,metadata_json)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 artifact_id,
                 tenant,
@@ -681,10 +688,12 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
                 digest,
                 "application/json",
                 0,
-                "redacted",
-                "reference_only",
+                "unknown",
+                "unknown",
                 _legacy_timestamp(data.get("discovered_at")),
                 _legacy_timestamp(data.get("discovered_at")),
+                "unknown",
+                "unknown",
                 json.dumps({"legacy": True, "claim_state": "complete" if complete else "reduced"}, separators=(",", ":")),
             ),
         )
@@ -713,6 +722,26 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
                 json.dumps({"legacy": True, "claim_state": "complete" if complete else "reduced"}, separators=(",", ":")),
             ),
         )
+        # The source-link table belongs to the Task 102 migration.  Task 101
+        # can be replayed from an older database before that table exists, so
+        # defer this optional link until the additive migration has installed
+        # it.  The canonical observation/artifact/finding rows above remain
+        # fully transactional and are never dropped.
+        if connection.exec_driver_sql(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canonical_finding_observations'"
+        ).fetchone() is not None:
+            connection.exec_driver_sql(
+                "INSERT OR IGNORE INTO canonical_finding_observations"
+                "(tenant_id,finding_id,observation_id,artifact_id,created_at,metadata_json) VALUES(?,?,?,?,?,?)",
+                (
+                    tenant,
+                    finding_id,
+                    obs_id,
+                    artifact_id,
+                    _legacy_timestamp(data.get("discovered_at")),
+                    json.dumps({"legacy": True, "integrity_state": "unknown"}, separators=(",", ":")),
+                ),
+            )
 
     # Audit rows become canonical events.  If an audit event has no usable job
     # relationship, a reduced synthetic job is created so the event remains
@@ -901,6 +930,8 @@ def _runtime_guard_sql() -> tuple[str, ...]:
         ("canonical_feed_snapshots", "feed snapshot"),
         ("canonical_check_pack_snapshots", "check-pack snapshot"),
     )
+
+
     statements: list[str] = [
         _MODULE_VERSION_IMMUTABILITY_GUARD,
         _immutable_update_guard(
@@ -985,18 +1016,147 @@ def _runtime_guard_sql() -> tuple[str, ...]:
             """
             CREATE TRIGGER IF NOT EXISTS canonical_artifact_digest_guard_insert
             BEFORE INSERT ON canonical_artifact_refs
-            WHEN NOT (""" + _sha256_guard("NEW.digest") + """)
+            WHEN NEW.digest IS NOT NULL AND NOT (""" + _sha256_guard("NEW.digest") + """)
             BEGIN SELECT RAISE(ABORT, 'artifact digest must be sha256:<64 lowercase hex>'); END
             """,
             """
             CREATE TRIGGER IF NOT EXISTS canonical_artifact_digest_guard_update
             BEFORE UPDATE OF digest ON canonical_artifact_refs
-            WHEN NOT (""" + _sha256_guard("NEW.digest") + """)
+            WHEN NEW.digest IS NOT NULL AND NOT (""" + _sha256_guard("NEW.digest") + """)
             BEGIN SELECT RAISE(ABORT, 'artifact digest must be sha256:<64 lowercase hex>'); END
             """,
         )
     )
     return tuple(statements)
+
+
+def _task102_schema_repair(connection: Connection) -> None:
+    """Add Task 102 custody columns/tables to already-applied v1 databases."""
+    def columns(table: str) -> set[str]:
+        return {str(row[1]) for row in connection.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()}
+
+    additions: dict[str, tuple[tuple[str, str], ...]] = {
+        "canonical_observations": (
+            ("proof_type", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("collection_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("check_id", "TEXT"), ("route", "TEXT"), ("parameter", "TEXT"),
+            ("location", "TEXT"), ("identity_ref", "TEXT"),
+        ),
+        "canonical_artifact_refs": (
+            ("collector_id", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("collector_version", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("source_target", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("source_asset_id", "TEXT"), ("redaction_version", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("protection_state", "TEXT NOT NULL DEFAULT 'reference_only'"),
+            ("signer_state", "TEXT NOT NULL DEFAULT 'unsigned'"),
+            ("integrity_state", "TEXT NOT NULL DEFAULT 'sha256_verified'"),
+            ("retention_class", "TEXT NOT NULL DEFAULT 'default'"),
+            ("retention_expires_at", "TEXT"),
+            ("protected_original_authorization_ref", "TEXT"),
+            ("derivative_reference", "TEXT"), ("manifest_digest", "TEXT"),
+        ),
+        "canonical_findings": (("dedup_key", "TEXT"),),
+    }
+    existing_tables = {str(row[0]) for row in connection.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    for table, table_columns in additions.items():
+        if table not in existing_tables:
+            continue
+        known = columns(table)
+        for name, declaration in table_columns:
+            if name not in known:
+                connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+    connection.exec_driver_sql("""
+        CREATE TABLE IF NOT EXISTS canonical_finding_observations (
+            tenant_id TEXT NOT NULL, finding_id TEXT NOT NULL, observation_id TEXT NOT NULL,
+            artifact_id TEXT, created_at TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY(tenant_id, finding_id, observation_id),
+            UNIQUE(tenant_id, finding_id, observation_id, artifact_id),
+            FOREIGN KEY(tenant_id, finding_id) REFERENCES canonical_findings(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, observation_id) REFERENCES canonical_observations(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, artifact_id, observation_id) REFERENCES canonical_artifact_refs(tenant_id, id, observation_id) ON DELETE RESTRICT
+        )
+    """)
+    # Older Task 102 candidates created the source-link table with only the
+    # minimal six columns.  Repair it in place before creating indexes or
+    # backfilling links so replays remain idempotent and never reference a
+    # missing column.
+    link_columns = columns("canonical_finding_observations")
+    for name, declaration in (
+        ("identity_key", "TEXT NOT NULL DEFAULT ''"),
+        ("first_seen_at", "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'"),
+        ("last_seen_at", "TEXT NOT NULL DEFAULT '1970-01-01T00:00:00Z'"),
+    ):
+        if name not in link_columns:
+            connection.exec_driver_sql(
+                f"ALTER TABLE canonical_finding_observations ADD COLUMN {name} {declaration}"
+            )
+    # Preserve links for canonical rows that pre-date the additive table.  A
+    # missing digest or legacy artifact is represented by its existing opaque
+    # reference; no new evidence bytes or fabricated integrity is created.
+    connection.exec_driver_sql(
+        """
+        INSERT OR IGNORE INTO canonical_finding_observations
+          (tenant_id, finding_id, observation_id, artifact_id, identity_key,
+           first_seen_at, last_seen_at, created_at, metadata_json)
+        SELECT f.tenant_id, f.id, f.observation_id, f.artifact_id,
+               COALESCE(f.dedup_key, 'finding-v1:legacy'),
+               f.created_at, f.created_at, f.created_at,
+               '{"legacy":true,"integrity_state":"unknown"}'
+        FROM canonical_findings f
+        """
+    )
+    connection.exec_driver_sql("""
+        CREATE TABLE IF NOT EXISTS canonical_evidence_access_audit (
+            id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, artifact_id TEXT NOT NULL, observation_id TEXT NOT NULL,
+            access_kind TEXT NOT NULL CHECK(access_kind IN ('redacted_derivative','protected_original')),
+            authorization_ref TEXT, accessed_at TEXT NOT NULL, metadata_json TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY(tenant_id, artifact_id, observation_id) REFERENCES canonical_artifact_refs(tenant_id, id, observation_id) ON DELETE RESTRICT
+        )
+    """)
+    for statement in (
+        "CREATE INDEX IF NOT EXISTS ix_canonical_finding_dedup ON canonical_findings(tenant_id, dedup_key)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_finding_observation_lineage ON canonical_finding_observations(tenant_id, finding_id, observation_id)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_finding_observation_seen ON canonical_finding_observations(tenant_id, finding_id, last_seen_at)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_evidence_audit ON canonical_evidence_access_audit(tenant_id, artifact_id, accessed_at)",
+    ):
+        connection.exec_driver_sql(statement)
+    immutable: dict[str, tuple[str, ...]] = {
+        "canonical_observations": ("id", "tenant_id", "engagement_id", "job_id", "module_version_id", "module_execution_id", "asset_id", "action_id", "intelligence_snapshot_id", "provenance_id", "schema_version", "status", "observed_at", "created_at", "proof_type", "collection_status", "check_id", "route", "parameter", "location", "identity_ref", "metadata_json"),
+        "canonical_artifact_refs": ("id", "tenant_id", "observation_id", "schema_version", "reference", "digest", "media_type", "size", "redaction_state", "encryption_state", "collected_at", "created_at", "collector_id", "collector_version", "source_target", "source_asset_id", "redaction_version", "protection_state", "signer_state", "integrity_state", "retention_class", "retention_expires_at", "protected_original_authorization_ref", "derivative_reference", "manifest_digest", "metadata_json"),
+    }
+    for table, fields in immutable.items():
+        comparisons = " OR ".join(f"NEW.{field} IS NOT OLD.{field}" for field in fields)
+        connection.exec_driver_sql(f"CREATE TRIGGER IF NOT EXISTS {table}_custody_immutable_update BEFORE UPDATE ON {table} WHEN {comparisons} BEGIN SELECT RAISE(ABORT, 'immutable custody record is immutable'); END")
+        connection.exec_driver_sql(f"CREATE TRIGGER IF NOT EXISTS {table}_custody_no_delete BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT, 'immutable custody record cannot be deleted'); END")
+    connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS canonical_finding_observations_no_update BEFORE UPDATE ON canonical_finding_observations BEGIN SELECT RAISE(ABORT, 'finding observation links are immutable'); END")
+    connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS canonical_finding_observations_no_delete BEFORE DELETE ON canonical_finding_observations BEGIN SELECT RAISE(ABORT, 'finding observation links cannot be deleted'); END")
+    connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS canonical_evidence_access_audit_no_update BEFORE UPDATE ON canonical_evidence_access_audit BEGIN SELECT RAISE(ABORT, 'evidence access audit is append-only'); END")
+    connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS canonical_evidence_access_audit_no_delete BEFORE DELETE ON canonical_evidence_access_audit BEGIN SELECT RAISE(ABORT, 'evidence access audit cannot be deleted'); END")
+    if "canonical_artifact_manifests" in existing_tables:
+        connection.exec_driver_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS canonical_artifact_manifest_digest_guard_insert
+            BEFORE INSERT ON canonical_artifact_manifests
+            WHEN NOT ({sha256} AND {derivative} AND {manifest})
+            BEGIN SELECT RAISE(ABORT, 'artifact manifest digest must be sha256:<64 lowercase hex>'); END
+            """.format(
+                sha256=_sha256_guard("NEW.sha256"),
+                derivative=_sha256_guard("NEW.derivative_sha256"),
+                manifest=_sha256_guard("NEW.manifest_digest"),
+            )
+        )
+        connection.exec_driver_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS canonical_artifact_manifest_digest_guard_update
+            BEFORE UPDATE OF sha256, derivative_sha256, manifest_digest ON canonical_artifact_manifests
+            WHEN NOT ({sha256} AND {derivative} AND {manifest})
+            BEGIN SELECT RAISE(ABORT, 'artifact manifest digest must be sha256:<64 lowercase hex>'); END
+            """.format(
+                sha256=_sha256_guard("NEW.sha256"),
+                derivative=_sha256_guard("NEW.derivative_sha256"),
+                manifest=_sha256_guard("NEW.manifest_digest"),
+            )
+        )
 
 
 def _table_sql() -> tuple[str, ...]:
@@ -1267,6 +1427,13 @@ def _table_sql() -> tuple[str, ...]:
             status TEXT NOT NULL CHECK(status IN ('observed','no_finding','not_applicable','not_tested','partial','failed','canceled','not_authorized')),
             observed_at TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            proof_type TEXT NOT NULL DEFAULT 'unknown' CHECK(length(proof_type) BETWEEN 1 AND 100),
+            collection_status TEXT NOT NULL DEFAULT 'unknown' CHECK(collection_status IN ('collected','partial','failed','not_tested','canceled','not_authorized','unknown')),
+            check_id TEXT,
+            route TEXT,
+            parameter TEXT,
+            location TEXT,
+            identity_ref TEXT,
             metadata_json TEXT NOT NULL DEFAULT '{}',
             UNIQUE(tenant_id, id),
             UNIQUE(tenant_id, id, module_version_id),
@@ -1295,13 +1462,26 @@ def _table_sql() -> tuple[str, ...]:
                  reference GLOB 'cred:*' OR reference GLOB 'secret:*' OR
                  reference GLOB 'source:*' OR reference GLOB 'sha256:*')
             ),
-            digest TEXT NOT NULL CHECK(digest GLOB 'sha256:*'),
+            digest TEXT CHECK(digest IS NULL OR (length(digest)=71 AND digest GLOB 'sha256:*')),
             media_type TEXT NOT NULL CHECK(length(media_type) BETWEEN 1 AND 200),
             size INTEGER NOT NULL CHECK(size >= 0),
             redaction_state TEXT NOT NULL CHECK(redaction_state IN ('redacted','not_applicable','unknown')),
             encryption_state TEXT NOT NULL CHECK(length(encryption_state) BETWEEN 1 AND 40),
             collected_at TEXT NOT NULL,
             created_at TEXT NOT NULL,
+            collector_id TEXT NOT NULL DEFAULT 'unknown',
+            collector_version TEXT NOT NULL DEFAULT 'unknown',
+            source_target TEXT NOT NULL DEFAULT 'unknown',
+            source_asset_id TEXT,
+            redaction_version TEXT NOT NULL DEFAULT 'unknown',
+            protection_state TEXT NOT NULL DEFAULT 'reference_only',
+            signer_state TEXT NOT NULL DEFAULT 'unsigned',
+            integrity_state TEXT NOT NULL DEFAULT 'sha256_verified' CHECK(integrity_state IN ('sha256_verified','unknown','failed')),
+            retention_class TEXT NOT NULL DEFAULT 'default',
+            retention_expires_at TEXT,
+            protected_original_authorization_ref TEXT,
+            derivative_reference TEXT,
+            manifest_digest TEXT,
             metadata_json TEXT NOT NULL DEFAULT '{}',
             UNIQUE(tenant_id, id),
             UNIQUE(tenant_id, id, observation_id),
@@ -1320,11 +1500,25 @@ def _table_sql() -> tuple[str, ...]:
             description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 8000),
             status TEXT NOT NULL CHECK(status IN ('open','verified','false_positive','remediated','unknown')),
             finding_key TEXT,
+            dedup_key TEXT,
             created_at TEXT NOT NULL,
             metadata_json TEXT NOT NULL DEFAULT '{}',
             UNIQUE(tenant_id, id),
             UNIQUE(tenant_id, id, observation_id),
             FOREIGN KEY(tenant_id, observation_id) REFERENCES canonical_observations(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, artifact_id, observation_id) REFERENCES canonical_artifact_refs(tenant_id, id, observation_id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_evidence_access_audit (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            observation_id TEXT NOT NULL,
+            access_kind TEXT NOT NULL CHECK(access_kind IN ('redacted_derivative','protected_original')),
+            authorization_ref TEXT,
+            accessed_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
             FOREIGN KEY(tenant_id, artifact_id, observation_id) REFERENCES canonical_artifact_refs(tenant_id, id, observation_id) ON DELETE RESTRICT
         )
         """,
@@ -1441,6 +1635,8 @@ def _table_sql() -> tuple[str, ...]:
         """,
         "CREATE INDEX IF NOT EXISTS ix_canonical_observation_lineage ON canonical_observations(tenant_id, engagement_id, job_id, module_version_id, asset_id)",
         "CREATE INDEX IF NOT EXISTS ix_canonical_finding_lineage ON canonical_findings(tenant_id, observation_id, artifact_id)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_finding_dedup ON canonical_findings(tenant_id, dedup_key)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_evidence_audit ON canonical_evidence_access_audit(tenant_id, artifact_id, accessed_at)",
         "CREATE INDEX IF NOT EXISTS ix_canonical_asset_identity ON canonical_assets(tenant_id, kind, identity_key)",
         "CREATE INDEX IF NOT EXISTS ix_canonical_legacy_kind ON canonical_legacy_records(tenant_id, record_kind)",
         """
@@ -1697,6 +1893,7 @@ def _drop_sql() -> tuple[str, ...]:
         for table in (
             "canonical_logs", "canonical_events", "canonical_exports",
             "canonical_report_memberships", "canonical_reports", "canonical_retests",
+            "canonical_evidence_access_audit", "canonical_finding_observations",
             "canonical_findings", "canonical_artifact_refs", "canonical_observations",
             "canonical_assets", "canonical_module_executions", "canonical_module_versions",
             "canonical_check_pack_snapshots", "canonical_feed_snapshots", "canonical_provenance",
@@ -1708,6 +1905,256 @@ def _drop_sql() -> tuple[str, ...]:
     )
 
 
+def _evidence_table_sql() -> tuple[str, ...]:
+    """Create the append-only custody and source-link tables.
+
+    Artifact bytes never enter these tables.  They hold only integrity-bound
+    manifests and normalized ownership links; the local custody store owns the
+    protected original and redacted derivative files.
+    """
+    return (
+        """
+        ALTER TABLE canonical_findings ADD COLUMN dedup_key TEXT
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_artifact_manifests (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            observation_id TEXT NOT NULL,
+            schema_version TEXT NOT NULL CHECK(schema_version='forge-evidence-v1'),
+            sha256 TEXT NOT NULL CHECK(length(sha256)=71 AND substr(sha256,1,7)='sha256:'),
+            byte_size INTEGER NOT NULL CHECK(byte_size >= 0),
+            media_type TEXT NOT NULL CHECK(length(media_type) BETWEEN 1 AND 200),
+            collected_at TEXT NOT NULL,
+            collector_id TEXT NOT NULL CHECK(length(collector_id) BETWEEN 1 AND 200),
+            source_target TEXT,
+            source_asset_id TEXT,
+            redaction_state TEXT NOT NULL CHECK(redaction_state IN ('redacted','not_applicable','unknown')),
+            redaction_version TEXT NOT NULL,
+            protection_state TEXT NOT NULL CHECK(protection_state IN ('protected_original','not_retained','legacy_unknown')),
+            encryption_state TEXT NOT NULL,
+            signer_state TEXT NOT NULL,
+            integrity_state TEXT NOT NULL CHECK(integrity_state IN ('verified','unknown','failed')),
+            retention_class TEXT NOT NULL,
+            retention_expires_at TEXT,
+            protected_original_authorization_ref TEXT,
+            original_relative_path TEXT,
+            derivative_relative_path TEXT NOT NULL,
+            derivative_artifact_id TEXT NOT NULL,
+            derivative_sha256 TEXT NOT NULL CHECK(length(derivative_sha256)=71 AND substr(derivative_sha256,1,7)='sha256:'),
+            derivative_size INTEGER NOT NULL CHECK(derivative_size >= 0),
+            manifest_digest TEXT NOT NULL CHECK(length(manifest_digest)=71 AND substr(manifest_digest,1,7)='sha256:'),
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(tenant_id, artifact_id),
+            UNIQUE(tenant_id, id),
+            FOREIGN KEY(tenant_id, artifact_id) REFERENCES canonical_artifact_refs(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, observation_id) REFERENCES canonical_observations(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, source_asset_id) REFERENCES canonical_assets(tenant_id, id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_observation_artifacts (
+            tenant_id TEXT NOT NULL,
+            observation_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('primary','supporting','derivative','legacy')),
+            sequence INTEGER NOT NULL DEFAULT 0 CHECK(sequence >= 0),
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY(tenant_id, observation_id, artifact_id),
+            FOREIGN KEY(tenant_id, observation_id) REFERENCES canonical_observations(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, artifact_id) REFERENCES canonical_artifact_refs(tenant_id, id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_finding_observations (
+            tenant_id TEXT NOT NULL,
+            finding_id TEXT NOT NULL,
+            observation_id TEXT NOT NULL,
+            artifact_id TEXT,
+            identity_key TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            PRIMARY KEY(tenant_id, finding_id, observation_id),
+            FOREIGN KEY(tenant_id, finding_id) REFERENCES canonical_findings(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, observation_id) REFERENCES canonical_observations(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, artifact_id) REFERENCES canonical_artifact_refs(tenant_id, id) ON DELETE RESTRICT
+        )
+        """,
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_canonical_finding_dedup ON canonical_findings(tenant_id, dedup_key) WHERE dedup_key IS NOT NULL",
+        # Keep the migration replay-safe for databases that already contain
+        # the early six-column source-link table.  The repair phase adds the
+        # first/last-seen dimensions and its richer index after the DDL step.
+        "CREATE INDEX IF NOT EXISTS ix_canonical_finding_observation_source ON canonical_finding_observations(tenant_id, finding_id, observation_id)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_observation_artifact_source ON canonical_observation_artifacts(tenant_id, observation_id, sequence)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_artifact_manifest_observation ON canonical_artifact_manifests(tenant_id, observation_id)",
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_artifact_manifest_digest_guard_insert
+        BEFORE INSERT ON canonical_artifact_manifests
+        WHEN NOT ({sha256} AND {derivative} AND {manifest})
+        BEGIN SELECT RAISE(ABORT, 'artifact manifest digest must be sha256:<64 lowercase hex>'); END
+        """.format(
+            sha256=_sha256_guard("NEW.sha256"),
+            derivative=_sha256_guard("NEW.derivative_sha256"),
+            manifest=_sha256_guard("NEW.manifest_digest"),
+        ),
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_artifact_manifest_digest_guard_update
+        BEFORE UPDATE OF sha256, derivative_sha256, manifest_digest ON canonical_artifact_manifests
+        WHEN NOT ({sha256} AND {derivative} AND {manifest})
+        BEGIN SELECT RAISE(ABORT, 'artifact manifest digest must be sha256:<64 lowercase hex>'); END
+        """.format(
+            sha256=_sha256_guard("NEW.sha256"),
+            derivative=_sha256_guard("NEW.derivative_sha256"),
+            manifest=_sha256_guard("NEW.manifest_digest"),
+        ),
+        # Observation and artifact identity is append-only.  Findings remain
+        # mutable workflow summaries, but identity and source lineage cannot
+        # be rewritten or deleted underneath a report/retest.
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_observations_append_only_update
+        BEFORE UPDATE ON canonical_observations
+        BEGIN SELECT RAISE(ABORT, 'canonical observations are immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_observations_append_only_delete
+        BEFORE DELETE ON canonical_observations
+        BEGIN SELECT RAISE(ABORT, 'canonical observations cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_artifact_refs_append_only_update
+        BEFORE UPDATE ON canonical_artifact_refs
+        BEGIN SELECT RAISE(ABORT, 'canonical artifact references are immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_artifact_refs_append_only_delete
+        BEFORE DELETE ON canonical_artifact_refs
+        BEGIN SELECT RAISE(ABORT, 'canonical artifact references cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_artifact_manifests_append_only_update
+        BEFORE UPDATE ON canonical_artifact_manifests
+        BEGIN SELECT RAISE(ABORT, 'artifact manifests are immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_artifact_manifests_append_only_delete
+        BEFORE DELETE ON canonical_artifact_manifests
+        BEGIN SELECT RAISE(ABORT, 'artifact manifests cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_observation_artifacts_append_only_update
+        BEFORE UPDATE ON canonical_observation_artifacts
+        BEGIN SELECT RAISE(ABORT, 'observation artifact links are immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_observation_artifacts_append_only_delete
+        BEFORE DELETE ON canonical_observation_artifacts
+        BEGIN SELECT RAISE(ABORT, 'observation artifact links cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_finding_observations_append_only_update
+        BEFORE UPDATE ON canonical_finding_observations
+        BEGIN SELECT RAISE(ABORT, 'finding observation links are immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_finding_observations_append_only_delete
+        BEFORE DELETE ON canonical_finding_observations
+        BEGIN SELECT RAISE(ABORT, 'finding observation links cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_evidence_access_audit_append_only_update
+        BEFORE UPDATE ON canonical_evidence_access_audit
+        BEGIN SELECT RAISE(ABORT, 'evidence access audit is append-only'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_evidence_access_audit_append_only_delete
+        BEFORE DELETE ON canonical_evidence_access_audit
+        BEGIN SELECT RAISE(ABORT, 'evidence access audit cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_findings_identity_guard_update
+        BEFORE UPDATE ON canonical_findings
+        WHEN NEW.id IS NOT OLD.id OR NEW.tenant_id IS NOT OLD.tenant_id
+          OR NEW.observation_id IS NOT OLD.observation_id OR NEW.artifact_id IS NOT OLD.artifact_id
+          OR NEW.schema_version IS NOT OLD.schema_version OR NEW.finding_key IS NOT OLD.finding_key
+          OR NEW.dedup_key IS NOT OLD.dedup_key OR NEW.created_at IS NOT OLD.created_at
+        BEGIN SELECT RAISE(ABORT, 'canonical finding identity is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_findings_lineage_guard_delete
+        BEFORE DELETE ON canonical_findings
+        BEGIN SELECT RAISE(ABORT, 'canonical findings cannot be deleted; close workflow state instead'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_artifact_manifest_tenant_guard
+        BEFORE INSERT ON canonical_artifact_manifests
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_artifact_refs a
+          WHERE a.tenant_id=NEW.tenant_id AND a.id=NEW.artifact_id
+            AND a.observation_id=NEW.observation_id)
+        BEGIN SELECT RAISE(ABORT, 'artifact manifest lineage mismatch'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_observation_artifact_tenant_guard
+        BEFORE INSERT ON canonical_observation_artifacts
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_artifact_refs a
+          WHERE a.tenant_id=NEW.tenant_id AND a.id=NEW.artifact_id
+            AND a.observation_id=NEW.observation_id)
+        BEGIN SELECT RAISE(ABORT, 'observation artifact lineage mismatch'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_finding_observation_tenant_guard
+        BEFORE INSERT ON canonical_finding_observations
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_findings f
+          WHERE f.tenant_id=NEW.tenant_id AND f.id=NEW.finding_id)
+          OR NOT EXISTS(
+          SELECT 1 FROM canonical_observations o
+          WHERE o.tenant_id=NEW.tenant_id AND o.id=NEW.observation_id)
+        BEGIN SELECT RAISE(ABORT, 'finding observation tenant lineage mismatch'); END
+        """,
+    )
+
+
+def _evidence_drop_sql() -> tuple[str, ...]:
+    return (
+        "DROP TRIGGER IF EXISTS canonical_finding_observation_tenant_guard",
+        "DROP TRIGGER IF EXISTS canonical_observation_artifact_tenant_guard",
+        "DROP TRIGGER IF EXISTS canonical_artifact_manifest_tenant_guard",
+        "DROP TRIGGER IF EXISTS canonical_artifact_manifest_digest_guard_update",
+        "DROP TRIGGER IF EXISTS canonical_artifact_manifest_digest_guard_insert",
+        "DROP TRIGGER IF EXISTS canonical_findings_lineage_guard_delete",
+        "DROP TRIGGER IF EXISTS canonical_findings_identity_guard_update",
+        "DROP TRIGGER IF EXISTS canonical_finding_observations_append_only_delete",
+        "DROP TRIGGER IF EXISTS canonical_finding_observations_append_only_update",
+        "DROP TRIGGER IF EXISTS canonical_evidence_access_audit_append_only_delete",
+        "DROP TRIGGER IF EXISTS canonical_evidence_access_audit_append_only_update",
+        "DROP TRIGGER IF EXISTS canonical_observation_artifacts_append_only_delete",
+        "DROP TRIGGER IF EXISTS canonical_observation_artifacts_append_only_update",
+        "DROP TRIGGER IF EXISTS canonical_artifact_manifests_append_only_delete",
+        "DROP TRIGGER IF EXISTS canonical_artifact_manifests_append_only_update",
+        "DROP TRIGGER IF EXISTS canonical_artifact_refs_append_only_delete",
+        "DROP TRIGGER IF EXISTS canonical_artifact_refs_append_only_update",
+        "DROP TRIGGER IF EXISTS canonical_observations_append_only_delete",
+        "DROP TRIGGER IF EXISTS canonical_observations_append_only_update",
+        "DROP INDEX IF EXISTS ix_canonical_artifact_manifest_observation",
+        "DROP INDEX IF EXISTS ix_canonical_observation_artifact_source",
+        "DROP INDEX IF EXISTS ix_canonical_finding_observation_source",
+        "DROP INDEX IF EXISTS ux_canonical_finding_dedup",
+        "DROP TABLE IF EXISTS canonical_finding_observations",
+        "DROP TABLE IF EXISTS canonical_observation_artifacts",
+        "DROP TABLE IF EXISTS canonical_artifact_manifests",
+        # SQLite cannot DROP COLUMN on all supported versions.  The dedup
+        # column is harmless on downgrade and remains nullable/unused; this
+        # keeps the reverse migration safe for existing v1 databases.
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=CANONICAL_SCHEMA_VERSION,
@@ -1715,6 +2162,13 @@ MIGRATIONS: tuple[Migration, ...] = (
         upgrade_sql=_table_sql(),
         downgrade_sql=_drop_sql(),
         description="Task 101 canonical tenant-safe data contracts",
+    ),
+    Migration(
+        version=EVIDENCE_SCHEMA_VERSION,
+        order=102,
+        upgrade_sql=_evidence_table_sql(),
+        downgrade_sql=_evidence_drop_sql(),
+        description="Task 102 immutable observations and evidence custody",
     ),
 )
 
@@ -1790,7 +2244,15 @@ class MigrationManager:
             row = connection.exec_driver_sql(
                 f"SELECT version FROM {JOURNAL_TABLE} WHERE state='applied' ORDER BY rowid DESC LIMIT 1"
             ).fetchone()
-            return str(row[0]) if row else None
+            if not row:
+                return None
+            # ``CURRENT_SCHEMA_VERSION`` is the canonical contract wire
+            # version retained for existing callers.  Evidence custody is an
+            # additive migration and must not make v1 contract serializers
+            # claim a new payload version merely because its tables exist.
+            if str(row[0]) == EVIDENCE_SCHEMA_VERSION:
+                return CANONICAL_SCHEMA_VERSION
+            return str(row[0])
         finally:
             if owned:
                 connection.close()
@@ -1864,6 +2326,7 @@ class MigrationManager:
             if connection.in_transaction():
                 connection.commit()
             with connection.begin():
+                _task102_schema_repair(connection)
                 for statement in _runtime_guard_sql():
                     connection.exec_driver_sql(statement)
             return self.current_version()
@@ -1938,6 +2401,19 @@ class MigrationManager:
                         }
                         referenced = {name for name in ("findings", "scan_jobs", "audit_logs", "authorization_decisions") if name in lowered}
                         if referenced - legacy_tables:
+                            continue
+                    # SQLite has no ``ADD COLUMN IF NOT EXISTS``.  The
+                    # journal can legitimately record an interrupted v2
+                    # migration after the column DDL committed, so replay it
+                    # only when the column is genuinely absent.
+                    if lowered.strip().startswith("alter table canonical_findings add column dedup_key"):
+                        finding_columns = {
+                            str(row[1])
+                            for row in connection.exec_driver_sql(
+                                "PRAGMA table_info(canonical_findings)"
+                            ).fetchall()
+                        }
+                        if "dedup_key" in finding_columns:
                             continue
                     connection.exec_driver_sql(statement)
                     if fail_after is not None and index >= fail_after:
@@ -2030,7 +2506,7 @@ def migration_versions() -> tuple[str, ...]:
 
 
 __all__ = [
-    "CANONICAL_MIGRATION_PREFIX", "CANONICAL_SCHEMA_VERSION", "CURRENT_SCHEMA_VERSION",
+    "CANONICAL_MIGRATION_PREFIX", "CANONICAL_SCHEMA_VERSION", "CURRENT_SCHEMA_VERSION", "EVIDENCE_SCHEMA_VERSION",
     "JOURNAL_TABLE", "MIGRATIONS", "Migration", "MigrationError", "MigrationInterruptedError",
     "MigrationManager", "UnsupportedMigrationError", "current_version", "downgrade", "migration_versions",
     "archive_legacy_records", "recover", "upgrade",
