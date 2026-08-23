@@ -110,6 +110,26 @@ _DEDUP_DIMENSION_ALIASES: dict[str, tuple[str, ...]] = {
     "parameter": ("query", "parameter", "param", "field"),
     "location": ("location", "in_location", "source_location"),
     "identity": ("identity", "identity_ref", "principal", "account", "user"),
+    "check": (
+        "check_id",
+        "check",
+        "check_name",
+        "finding_key",
+        "vulnerability_id",
+        "rule_id",
+    ),
+    "asset": (
+        "asset_id",
+        "asset",
+        "asset_key",
+        "source_asset_id",
+    ),
+    "module_version": (
+        "module_version_id",
+        "module_version",
+        "module_id",
+        "check_pack_snapshot_id",
+    ),
 }
 _DEDUP_NESTED_KEYS = (
     "observation",
@@ -174,6 +194,9 @@ def _dedup_containers(finding: Finding) -> list[Any]:
             + _DEDUP_DIMENSION_ALIASES["parameter"]
             + _DEDUP_DIMENSION_ALIASES["location"]
             + _DEDUP_DIMENSION_ALIASES["identity"]
+            + _DEDUP_DIMENSION_ALIASES["check"]
+            + _DEDUP_DIMENSION_ALIASES["asset"]
+            + _DEDUP_DIMENSION_ALIASES["module_version"]
         ):
             continue
         seen.add(id(current))
@@ -222,6 +245,9 @@ def _finding_observation_identity(finding: Finding) -> str:
         _dedup_dimension(finding, _DEDUP_DIMENSION_ALIASES["parameter"]),
         _dedup_dimension(finding, _DEDUP_DIMENSION_ALIASES["location"]),
         _dedup_dimension(finding, _DEDUP_DIMENSION_ALIASES["identity"]),
+        _dedup_dimension(finding, _DEDUP_DIMENSION_ALIASES["check"]),
+        _dedup_dimension(finding, _DEDUP_DIMENSION_ALIASES["asset"]),
+        _dedup_dimension(finding, _DEDUP_DIMENSION_ALIASES["module_version"]),
     )
     encoded = "\x1f".join(material).encode("utf-8", errors="replace")
     return hashlib.sha256(encoded).hexdigest()

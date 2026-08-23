@@ -220,6 +220,48 @@ class TestBaseModule:
         assert session.query(FindingModel).count() == 2
         session.close()
 
+    def test_dedup_preserves_check_asset_and_module_dimensions(self, tmp_path):
+        from common.db import FindingModel
+        from common.evidence import Evidence
+        from common.finding import Severity
+
+        mod, session = _make_module(tmp_path)
+        common = dict(
+            title="Same display finding",
+            severity=Severity.HIGH,
+            description="same title and URL",
+            reproduction_steps=[],
+            remediation="fix",
+            references=[],
+            url="https://example.com/item?q=x",
+        )
+        for check_id, asset_id, module_version_id in (
+            ("check-one", "asset-one", "module-one"),
+            ("check-two", "asset-one", "module-one"),
+            ("check-one", "asset-two", "module-one"),
+            ("check-one", "asset-one", "module-two"),
+        ):
+            mod.new_finding(
+                **common,
+                evidence=Evidence(
+                    extra={
+                        "observation": {
+                            "route": "/item",
+                            "parameter": "q",
+                            "location": "query",
+                            "identity_ref": "principal:a",
+                            "check_id": check_id,
+                            "asset_id": asset_id,
+                            "module_version_id": module_version_id,
+                        },
+                    }
+                ),
+            )
+
+        assert len(mod.findings) == 4
+        assert session.query(FindingModel).count() == 4
+        session.close()
+
     def test_scope_check_returns_bool(self, tmp_path):
         mod, session = _make_module(tmp_path)
         assert mod.check_scope("https://example.com/path") is True

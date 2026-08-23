@@ -2488,18 +2488,33 @@ def finding_dedup_key(finding_dict: dict[str, Any]) -> str:
         "user",
         nested_names=("observation", "canonical_observation"),
     )
+    asset_identity = _dimension_value(
+        finding_dict,
+        "asset_id",
+        "asset",
+        "asset_key",
+        "source_asset_id",
+        nested_names=("observation", "canonical_observation"),
+    )
+    module_version_identity = _dimension_value(
+        finding_dict,
+        "module_version_id",
+        "module_version",
+        "module_id",
+        "check_pack_snapshot_id",
+        nested_names=("observation", "canonical_observation"),
+    ) or _dimension_value(
+        finding_dict,
+        "module",
+        nested_names=("observation", "canonical_observation"),
+    )
     material = "\x1f".join(
         [
             "finding-v2",
             _normalize_token(finding_dict.get("tenant_id") or "default"),
-            _dimension_value(
-                finding_dict,
-                "module",
-                "module_id",
-                "module_version_id",
-                nested_names=("observation", "canonical_observation"),
-            ),
+            module_version_identity,
             check_identity,
+            asset_identity,
             _canonical_target(finding_dict.get("target") or finding_dict.get("url")),
             _canonical_port(finding_dict),
             route_path,
