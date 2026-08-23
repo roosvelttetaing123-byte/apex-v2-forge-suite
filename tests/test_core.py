@@ -198,6 +198,7 @@ class TestBaseModule:
         session.close()
 
     def test_dedup_suppresses_duplicate(self, tmp_path):
+        from common.db import FindingModel
         from common.finding import Severity
         mod, session = _make_module(tmp_path)
         mod.new_finding(
@@ -210,7 +211,13 @@ class TestBaseModule:
             description="d", reproduction_steps=[], remediation="r", references=[],
             url="https://example.com/login",
         )
-        assert len(mod.findings) == 1
+        mod.new_finding(
+            title="SQLi", severity=Severity.CRITICAL,
+            description="d", reproduction_steps=[], remediation="r", references=[],
+            url="https://example.com/login?id=1",
+        )
+        assert len(mod.findings) == 2
+        assert session.query(FindingModel).count() == 2
         session.close()
 
     def test_scope_check_returns_bool(self, tmp_path):

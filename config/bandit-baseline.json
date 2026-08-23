@@ -23,6 +23,17 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
+      "confidence": "MEDIUM",
+      "filename": "netforge/modules/vuln/nuclei_runner.py",
+      "fingerprint": "08b89507aaa1466b15bfac708ac6ae589fd59d3eebe59e64464c7527a1dde3a9",
+      "issue": "Probable insecure usage of temp file/directory.",
+      "occurrence": 1,
+      "severity": "MEDIUM",
+      "source_sha256": "d9b190472371dce7ae3c4f9064235871a1d093c3ad7e09fe7358b58837d13158",
+      "test_id": "B108",
+      "test_name": "hardcoded_tmp_directory"
+    },
+    {
       "confidence": "HIGH",
       "filename": "netforge/modules/bruteforce/native_brute.py",
       "fingerprint": "0a0039b6b6cfcc5ce16e148538c17f8106aa0f9230f2aa6ab7724ca635ac14dd",
@@ -43,6 +54,17 @@
       "source_sha256": "727b9e0ea332c8687add73e64a80276d3c1516172031cc6b7c385554786e423b",
       "test_id": "B601",
       "test_name": "paramiko_calls"
+    },
+    {
+      "confidence": "MEDIUM",
+      "filename": "netforge/modules/vuln/nuclei_runner.py",
+      "fingerprint": "0fa7afd7a92daadc6d31d64243328e53ff1916499505563a3a3a6d86d9633fb5",
+      "issue": "Probable insecure usage of temp file/directory.",
+      "occurrence": 1,
+      "severity": "MEDIUM",
+      "source_sha256": "529d2d6b277483ded6b0b9459da0c4ce5ad3221396f48e309c8d6f6a3deab540",
+      "test_id": "B108",
+      "test_name": "hardcoded_tmp_directory"
     },
     {
       "confidence": "MEDIUM",
@@ -123,6 +145,17 @@
     },
     {
       "confidence": "MEDIUM",
+      "filename": "netforge/modules/vuln/nuclei_runner.py",
+      "fingerprint": "1ea4633bbb8c9ef3d3e60ce4738df0790fba5d266320c645a0901d8b2bfb1d5d",
+      "issue": "Probable insecure usage of temp file/directory.",
+      "occurrence": 1,
+      "severity": "MEDIUM",
+      "source_sha256": "a6475eb47ea1052472da81ed586cf4663618cf4a5ca56f2c1afa339e6c48067d",
+      "test_id": "B108",
+      "test_name": "hardcoded_tmp_directory"
+    },
+    {
+      "confidence": "MEDIUM",
       "filename": "webforge/modules/advanced/zip_slip.py",
       "fingerprint": "1fa7b8b9a508b9359729235f7e7fb6bca375d91c140ffdae9e6e58e17f60a8e5",
       "issue": "Probable insecure usage of temp file/directory.",
@@ -197,6 +230,17 @@
       "source_sha256": "e3ea3567a2a4bdb5c22a91f04b4f4ace1b890f95adaa43bdc4df43a9b2fb0b34",
       "test_id": "B324",
       "test_name": "hashlib"
+    },
+    {
+      "confidence": "HIGH",
+      "filename": "netforge/modules/discovery/topology_map.py",
+      "fingerprint": "333e5189907ed5765aa059096b87da20d869c27eb9c22bd6e62ec358528b204e",
+      "issue": "Audit url open for permitted schemes. Allowing use of file:/ or custom schemes is often unexpected.",
+      "occurrence": 1,
+      "severity": "MEDIUM",
+      "source_sha256": "6a5dee7c01b75a222911aea8e3a7de3c2133170a47361a9a91065a81e62c2302",
+      "test_id": "B310",
+      "test_name": "blacklist"
     },
     {
       "confidence": "MEDIUM",
@@ -683,6 +727,17 @@
       "test_name": "hardcoded_sql_expressions"
     },
     {
+      "confidence": "MEDIUM",
+      "filename": "netforge/modules/vuln/nuclei_runner.py",
+      "fingerprint": "b8f9f42b67b381ca1deb0f15d0262bbf909d3db0eff37e6521cece89f7d228f2",
+      "issue": "Probable insecure usage of temp file/directory.",
+      "occurrence": 2,
+      "severity": "MEDIUM",
+      "source_sha256": "d9b190472371dce7ae3c4f9064235871a1d093c3ad7e09fe7358b58837d13158",
+      "test_id": "B108",
+      "test_name": "hardcoded_tmp_directory"
+    },
+    {
       "confidence": "HIGH",
       "filename": "netforge/modules/reporting/network_diagram.py",
       "fingerprint": "bc9a1b8d7f98e037b279e13c9a385f19d9efab1f5c01ed82197794117e173205",
@@ -692,6 +747,17 @@
       "source_sha256": "a05b8a85131610c3501cfa9ba8eaaa8dd28cb35c726a2ad41c4f597eb4cc6aa0",
       "test_id": "B324",
       "test_name": "hashlib"
+    },
+    {
+      "confidence": "MEDIUM",
+      "filename": "aiforge/modules/injection/direct_inject.py",
+      "fingerprint": "bf8b04be347a657f3e85b621524e331c04176a51c3787f211c4216ea7ef99351",
+      "issue": "A Python source file contains bidirectional control characters ('\\u202c').",
+      "occurrence": 1,
+      "severity": "HIGH",
+      "source_sha256": "2e4a004117e109527000e2a8ef3a01de1962f037fe38d0660c975fa19655eef5",
+      "test_id": "B613",
+      "test_name": "trojansource"
     },
     {
       "confidence": "MEDIUM",
@@ -725,6 +791,17 @@
       "source_sha256": "69bf17fb3ea25ecc2ffe39c9f80d89b58fa6c7ddcaaaae1504b5e5b96c3ca0bd",
       "test_id": "B104",
       "test_name": "hardcoded_bind_all_interfaces"
+    },
+    {
+      "confidence": "HIGH",
+      "filename": "netforge/modules/discovery/os_detect.py",
+      "fingerprint": "c802d2c8b84571827138721e47975ce9df5b02ec62aa390e738961b983390524",
+      "issue": "Audit url open for permitted schemes. Allowing use of file:/ or custom schemes is often unexpected.",
+      "occurrence": 1,
+      "severity": "MEDIUM",
+      "source_sha256": "79a71ad4dbf16a602e1eac5e593f32c1e496861ef3035824353d077d50d346d3",
+      "test_id": "B310",
+      "test_name": "blacklist"
     },
     {
       "confidence": "MEDIUM",
@@ -791,6 +868,28 @@
       "source_sha256": "d63132fe02561f766e25682cedcb99bbd738d6c5ee1f4c84c572be497d8d1e10",
       "test_id": "B509",
       "test_name": "snmp_crypto_check"
+    },
+    {
+      "confidence": "HIGH",
+      "filename": "netforge/modules/discovery/port_scanner.py",
+      "fingerprint": "d3ea24ead042a5c5ae8c6d857c84d87e53b0f5c155613a81bf79e47a7a6884f2",
+      "issue": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+      "occurrence": 1,
+      "severity": "MEDIUM",
+      "source_sha256": "60f9e329a93d4a3fe46bdece2c9f2ebd4b08d5150037747c83763f6ecff69990",
+      "test_id": "B314",
+      "test_name": "blacklist"
+    },
+    {
+      "confidence": "HIGH",
+      "filename": "netforge/modules/discovery/os_detect.py",
+      "fingerprint": "d4d000ea66a6fdd2d7fd8cc3fa9a85060e6e53a045a7412cfc16ffaab6ef5086",
+      "issue": "Using xml.etree.ElementTree.fromstring to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.fromstring with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+      "occurrence": 1,
+      "severity": "MEDIUM",
+      "source_sha256": "8a1fe966988b05100a81142864e7ee08e36df02f5da9b37109ebabadd9ad1917",
+      "test_id": "B314",
+      "test_name": "blacklist"
     },
     {
       "confidence": "MEDIUM",

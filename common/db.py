@@ -2331,6 +2331,16 @@ def _canonical_port(finding_dict: dict[str, Any]) -> str:
     return ""
 
 
+_DIMENSION_METADATA_KEYS = (
+    "observation",
+    "canonical_observation",
+    "observations",
+    "metadata",
+    "dimensions",
+    "context",
+)
+
+
 def _dimension_value(
     finding_dict: dict[str, Any],
     *names: str,
@@ -2349,16 +2359,38 @@ def _dimension_value(
     containers: list[Any] = [finding_dict]
     for container_name in nested_names:
         value = finding_dict.get(container_name)
-        if isinstance(value, Mapping) or value is not None:
+        if isinstance(value, Mapping):
             containers.append(value)
     metadata = finding_dict.get("metadata")
     if isinstance(metadata, Mapping):
         containers.append(metadata)
+    verification = finding_dict.get("verification")
+    if isinstance(verification, Mapping):
+        containers.append(verification)
     evidence = finding_dict.get("evidence")
     if isinstance(evidence, Mapping):
         extra = evidence.get("extra")
         if isinstance(extra, Mapping):
             containers.append(extra)
+
+    # Observation dimensions may be nested under evidence/verification by
+    # adapters that predate the canonical fields.  Walk only named metadata
+    # containers; arbitrary evidence payloads must not become identity fields.
+    pending = list(containers)
+    seen: set[int] = set()
+    containers = []
+    nested_aliases = tuple(dict.fromkeys((*nested_names, *_DIMENSION_METADATA_KEYS)))
+    while pending:
+        container = pending.pop(0)
+        if not isinstance(container, Mapping) or id(container) in seen:
+            continue
+        seen.add(id(container))
+        containers.append(container)
+        for nested_name in nested_aliases:
+            child = container.get(nested_name)
+            if isinstance(child, Mapping):
+                pending.append(child)
+
     for container in containers:
         for name in names:
             if isinstance(container, Mapping):
@@ -2400,7 +2432,16 @@ def _canonical_route_path(finding_dict: dict[str, Any]) -> str:
     # the host in the target dimension but retain a non-root path here so
     # distinct route observations cannot overwrite one another.
     path = parsed.path or ""
-    return _normalize_token(path) if path and path != "/" else ""
+    if not path or path == "/":
+        path = ""
+    # Query names and values are part of the legacy adapter's only available
+    # observation identity when no explicit canonical parameter is supplied.
+    # Preserve them so ``/item?id=1`` and ``/item?name=x`` cannot overwrite
+    # one another before Task 102 custody sees the records.
+    query = parsed.query
+    if query:
+        path = f"{path}?{query}"
+    return _normalize_token(path)
 
 
 def finding_dedup_key(finding_dict: dict[str, Any]) -> str:

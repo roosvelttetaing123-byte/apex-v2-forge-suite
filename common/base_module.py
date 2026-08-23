@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 import logging
 import math
 import re
@@ -11,6 +12,7 @@ import time
 import uuid
 import weakref
 from abc import ABC, ABCMeta, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import FunctionType
@@ -98,6 +100,139 @@ _MODULE_SHARED_OUTPUT_KEYS = frozenset(
 _BASE_MODULE_EXECUTION_AUTHORITIES: dict[int, tuple[Any, ...]] = {}
 _BASE_MODULE_OUTBOUND_AUTHORITIES: dict[int, tuple[Any, ...]] = {}
 _GUARDED_RUN_AUTHORITIES: dict[int, tuple[Any, ...]] = {}
+
+
+# These aliases mirror the canonical observation contract and the legacy
+# payloads emitted by adapters.  Keep the values in the adapter identity even
+# though ``Finding`` predates first-class route/parameter fields.
+_DEDUP_DIMENSION_ALIASES: dict[str, tuple[str, ...]] = {
+    "route": ("route", "path", "endpoint", "uri"),
+    "parameter": ("query", "parameter", "param", "field"),
+    "location": ("location", "in_location", "source_location"),
+    "identity": ("identity", "identity_ref", "principal", "account", "user"),
+}
+_DEDUP_NESTED_KEYS = (
+    "observation",
+    "canonical_observation",
+    "observations",
+    "metadata",
+    "dimensions",
+    "context",
+)
+
+
+def _dedup_identity_value(value: Any) -> str:
+    """Render one identity value deterministically without exposing it.
+
+    Observation dimensions are generally strings, but adapters occasionally
+    provide structured query/identity metadata.  Canonical JSON keeps those
+    shapes stable; the resulting material is hashed before it enters a key.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, Mapping):
+        normalized = {
+            str(key): _dedup_identity_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+        return json.dumps(normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    if isinstance(value, (list, tuple)):
+        return json.dumps(
+            [_dedup_identity_value(item) for item in value],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    if isinstance(value, (set, frozenset)):
+        return json.dumps(
+            sorted(_dedup_identity_value(item) for item in value),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    return " ".join(str(value).strip().split())
+
+
+def _dedup_containers(finding: Finding) -> list[Any]:
+    """Return finding metadata containers that may carry observation fields."""
+    pending: list[Any] = [finding]
+    evidence = getattr(finding, "evidence", None)
+    verification = getattr(finding, "verification", None)
+    if evidence is not None:
+        pending.append(evidence)
+        pending.append(getattr(evidence, "extra", None))
+    if verification is not None:
+        pending.append(verification)
+
+    containers: list[Any] = []
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        if current is not finding and not isinstance(current, Mapping) and not any(
+            hasattr(current, name)
+            for name in _DEDUP_DIMENSION_ALIASES["route"]
+            + _DEDUP_DIMENSION_ALIASES["parameter"]
+            + _DEDUP_DIMENSION_ALIASES["location"]
+            + _DEDUP_DIMENSION_ALIASES["identity"]
+        ):
+            continue
+        seen.add(id(current))
+        containers.append(current)
+        for name in _DEDUP_NESTED_KEYS:
+            if isinstance(current, Mapping):
+                child = current.get(name)
+            else:
+                child = getattr(current, name, None)
+            if child is not None:
+                pending.append(child)
+        if isinstance(current, Mapping):
+            extra = current.get("extra")
+            if extra is not None:
+                pending.append(extra)
+        else:
+            extra = getattr(current, "extra", None)
+            if extra is not None:
+                pending.append(extra)
+    return containers
+
+
+def _dedup_dimension(finding: Finding, aliases: tuple[str, ...]) -> str:
+    """Read the first non-empty dimension from all supported payload shapes."""
+    for container in _dedup_containers(finding):
+        for name in aliases:
+            if isinstance(container, Mapping):
+                value = container.get(name)
+            else:
+                value = getattr(container, name, None)
+            rendered = _dedup_identity_value(value)
+            if rendered:
+                return rendered
+    return ""
+
+
+def _finding_observation_identity(finding: Finding) -> str:
+    """Return a non-secret digest for every adapter-level observation dimension."""
+    url = _dedup_identity_value(
+        getattr(finding, "url", None) or getattr(finding, "target", None) or ""
+    )
+    material = (
+        "finding-observation-v2",
+        url,
+        _dedup_dimension(finding, _DEDUP_DIMENSION_ALIASES["route"]),
+        _dedup_dimension(finding, _DEDUP_DIMENSION_ALIASES["parameter"]),
+        _dedup_dimension(finding, _DEDUP_DIMENSION_ALIASES["location"]),
+        _dedup_dimension(finding, _DEDUP_DIMENSION_ALIASES["identity"]),
+    )
+    encoded = "\x1f".join(material).encode("utf-8", errors="replace")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _dedup_log_target(value: Any) -> str:
+    """Return a query-safe target label for duplicate warnings."""
+    rendered = _dedup_identity_value(value)
+    if "?" in rendered:
+        return rendered.split("?", 1)[0] + "?<redacted>"
+    return rendered
 
 
 def merge_module_output_extra(
@@ -652,9 +787,9 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         self._authorized_outbound_policy_binding: tuple[Any, ...] | None = None
         self._authorized_outbound_context_binding: tuple[Any, ...] | None = None
         self._outbound_denied_reason = ""
-        # Deduplication guard — tracks (module, title, url) tuples already emitted.
-        # Prevents per-origin / per-payload / per-probe-variant inflation where the
-        # same vulnerability fires N times because an inner loop wasn't broken early.
+        # Deduplication guard — tracks module/title plus an opaque observation
+        # identity already emitted.  This prevents per-origin / per-payload /
+        # per-probe-variant inflation without dropping distinct route dimensions.
         # Initialize it before the local-only authorization path returns without
         # constructing any network transport context.
         self._seen_finding_keys: dict[str, int] = {}
@@ -933,23 +1068,25 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         """Record a finding, persist to DB, emit to dashboard, and log it.
 
         Duplicate suppression: if this module has already emitted a finding with
-        the same title at the same URL/target, the second call is dropped and a
-        warning is logged.  This catches per-payload / per-probe-variant inflation
-        (e.g. testing 4 evil origins against the same URL, all returning wildcard
-        CORS) without requiring every module to track dedup state manually.
+        the same title and observation identity, the second call is dropped and
+        a warning is logged.  The identity includes route/query, parameter,
+        location, and principal dimensions so per-payload / per-probe-variant
+        inflation is suppressed without merging distinct observations.
         """
         _url = finding.url or finding.target or ""
-        # Normalize: strip query params so same-page findings dedup correctly
-        # e.g. /ReadNews.aspx?id=3&NewsAd=PAYLOAD → /ReadNews.aspx
-        _dedup_url = _url.split("?")[0] if "?" in _url else _url
-        _dedup_key = f"{self.NAME}\x00{finding.title}\x00{_dedup_url}"
+        # Preserve all observation dimensions before canonical persistence.
+        # The digest keeps query/identity values out of logs and opaque key
+        # material while still making distinct routes, parameters, locations,
+        # and principals independently observable.
+        _dedup_identity = _finding_observation_identity(finding)
+        _dedup_key = f"{self.NAME}\x00{finding.title}\x00{_dedup_identity}"
         if _dedup_key in self._seen_finding_keys:
             self._seen_finding_keys[_dedup_key] += 1
             self.log.warning(
                 "[DEDUP] Suppressed duplicate finding (occurrence %d): '%s' at '%s'",
                 self._seen_finding_keys[_dedup_key],
                 finding.title,
-                _url,
+                _dedup_log_target(_url),
             )
             return
         self._seen_finding_keys[_dedup_key] = 1
@@ -963,7 +1100,7 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
             else "default"
         )
         _global_key = (
-            f"{_tenant_id}\x00{self.run_id}\x00{_norm_title}\x00{_dedup_url}"
+            f"{_tenant_id}\x00{self.run_id}\x00{_norm_title}\x00{_dedup_identity}"
         )
         if _global_key in BaseModule._global_finding_keys:
             self.log.warning(
