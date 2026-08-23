@@ -33,7 +33,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, NoReturn, cast
+from typing import Any, Iterable, Mapping, NoReturn, cast
 from urllib.parse import quote, urlsplit
 
 log = logging.getLogger("forge.dashboard.server")
@@ -131,6 +131,15 @@ from common.db import (
     save_scan_job,
     update_finding_retest,
     update_scan_job,
+)
+from common.job_state import (
+    IdempotencyConflict,
+    InvalidTransition,
+    JobState,
+    JobStateService,
+    LeaseError,
+    ProcessIdentity,
+    ProcessIdentityError,
 )
 
 # ── Paths ─────────────────────────────────────────────────────────────
@@ -286,6 +295,9 @@ DASHBOARD_API_ROUTE_POLICY: dict[tuple[str, str], tuple[str, Role | None]] = {
     ("POST", "/api/v1/scans/rate-adapt"): ("dashboard_identity", Role.OPERATOR),
     ("GET", "/api/v1/scans/{scan_id}"): ("dashboard_identity", Role.VIEWER),
     ("GET", "/api/v1/scans/{scan_id}/logs"): ("dashboard_identity", Role.VIEWER),
+    ("POST", "/api/v1/scans/{scan_id}/pause"): ("dashboard_identity", Role.OPERATOR),
+    ("POST", "/api/v1/scans/{scan_id}/resume"): ("dashboard_identity", Role.OPERATOR),
+    ("POST", "/api/v1/scans/{scan_id}/cancel"): ("dashboard_identity", Role.OPERATOR),
     ("DELETE", "/api/v1/scans/{scan_id}"): ("dashboard_identity", Role.OPERATOR),
     ("GET", "/api/v1/scan/templates"): ("dashboard_identity", Role.VIEWER),
     ("POST", "/api/v1/scan/templates"): ("dashboard_identity", Role.OPERATOR),
@@ -355,6 +367,9 @@ DASHBOARD_MUTATION_ROUTE_TEMPLATES = frozenset(
         ("POST", "/api/v1/scans/fingerprints/plan"),
         ("POST", "/api/v1/scans/fingerprints/record"),
         ("POST", "/api/v1/scans/rate-adapt"),
+        ("POST", "/api/v1/scans/{scan_id}/pause"),
+        ("POST", "/api/v1/scans/{scan_id}/resume"),
+        ("POST", "/api/v1/scans/{scan_id}/cancel"),
         ("DELETE", "/api/v1/scans/{scan_id}"),
         ("POST", "/api/v1/scan/templates"),
         ("DELETE", "/api/v1/scan/templates/{template_id}"),
@@ -1116,6 +1131,105 @@ def _unlink_matching_artifacts(
         _close_artifact_descriptor(descriptor)
 
 
+class _DashboardProcessSupervisor:
+    """Linux process supervisor that never signals a PID by itself."""
+
+    @staticmethod
+    def _boot_id() -> str:
+        try:
+            return Path("/proc/sys/kernel/random/boot_id").read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            return ""
+
+    @staticmethod
+    def _start_token(pid: int) -> str:
+        try:
+            stat_line = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            # ``comm`` is parenthesized and may contain spaces/parentheses;
+            # splitting only after its final delimiter keeps field 22 stable.
+            fields = stat_line.rsplit(")", 1)[1].split()
+            return str(fields[19])
+        except (IndexError, OSError, ValueError):
+            return ""
+
+    @staticmethod
+    def _command_digest(pid: int) -> str:
+        try:
+            command = Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\x00")
+        except OSError:
+            return ""
+        return hashlib.sha256(command).hexdigest() if command else ""
+
+    @classmethod
+    def capture(
+        cls,
+        proc: subprocess.Popen[str],
+    ) -> ProcessIdentity | None:
+        """Capture an identity from a just-spawned process without storing argv."""
+
+        pid = getattr(proc, "pid", None)
+        if type(pid) is not int or pid <= 0:
+            return None
+        start_token = cls._start_token(pid)
+        boot_id = cls._boot_id()
+        command_digest = cls._command_digest(pid)
+        if not start_token or not boot_id or not command_digest:
+            return None
+        try:
+            return ProcessIdentity(
+                pid=pid,
+                start_token=start_token,
+                command_digest=command_digest,
+                boot_id=boot_id,
+            )
+        except ProcessIdentityError:
+            return None
+
+    @classmethod
+    def _matches(cls, identity: ProcessIdentity) -> bool:
+        if identity.boot_id and not hmac.compare_digest(
+            cls._boot_id(), identity.boot_id
+        ):
+            return False
+        start_token = cls._start_token(identity.pid)
+        digest = cls._command_digest(identity.pid)
+        return bool(
+            start_token
+            and digest
+            and hmac.compare_digest(start_token, identity.start_token)
+            and hmac.compare_digest(digest, identity.command_digest)
+        )
+
+    def is_alive(self, identity: ProcessIdentity) -> bool:
+        return self._matches(identity)
+
+    def _signal(self, identity: ProcessIdentity, sig: int) -> None:
+        # Recheck immediately before signaling.  When available, a pidfd
+        # pins that checked process so a PID reuse cannot receive the signal.
+        if not self._matches(identity):
+            raise ProcessIdentityError("process identity no longer matches")
+        pidfd_open = getattr(os, "pidfd_open", None)
+        pidfd_signal = getattr(signal, "pidfd_send_signal", None)
+        if callable(pidfd_open) and callable(pidfd_signal):
+            descriptor = pidfd_open(identity.pid)
+            try:
+                if not self._matches(identity):
+                    raise ProcessIdentityError("process identity no longer matches")
+                pidfd_signal(descriptor, sig)
+            finally:
+                os.close(descriptor)
+            return
+        os.kill(identity.pid, sig)
+
+    def terminate(self, identity: ProcessIdentity) -> None:
+        self._signal(identity, signal.SIGTERM)
+
+    def kill(self, identity: ProcessIdentity) -> None:
+        self._signal(identity, signal.SIGKILL)
+
+
 class DashboardServer:
     """War Room dashboard server.
 
@@ -1177,6 +1291,13 @@ class DashboardServer:
 
         # Active scan subprocess tracking
         self._active_scans: dict[str, dict[str, Any]] = {}  # scan_id → {proc, type, target, ...}
+        # Durable Task-103 authority.  The instance is opened lazily because
+        # tests and embedders may replace ``_scan_jobs_db_path`` after server
+        # construction; compatibility JSON/ORM stores remain projections only.
+        self._job_state_service: JobStateService | None = None
+        self._job_state_service_path: str | None = None
+        self._job_process_supervisor = _DashboardProcessSupervisor()
+        self._durable_agent_lease_tokens: dict[tuple[str, str], str] = {}
         self._last_results_dir: Path | None = None
         forge_root = Path(__file__).parent.parent.parent
         self._dashboard_state_root = _configured_dashboard_state_root()
@@ -1188,6 +1309,28 @@ class DashboardServer:
 
         # Subscribe to all events for WebSocket broadcast
         self.event_bus.subscribe(None, self._on_event)
+
+    def _durable_job_state(self) -> JobStateService:
+        """Return the tenant-qualified SQLite job authority for this dashboard."""
+        path = str(self._scan_jobs_db_path)
+        if self._job_state_service is None or self._job_state_service_path != path:
+            if self._job_state_service is not None:
+                try:
+                    self._job_state_service.close()
+                except Exception:
+                    pass
+            self._job_state_service = JobStateService(
+                path,
+                process_supervisor=self._job_process_supervisor,
+            )
+            self._job_state_service_path = path
+            # Reconciliation is part of startup authority establishment.  Do
+            # not turn a failed recovery into an apparently healthy dashboard.
+            self._job_state_service.reconcile(
+                tenant_id=self.tenant_id,
+                actor="dashboard-restart",
+            )
+        return self._job_state_service
 
     def _request_credential_bundle(
         self,
@@ -1263,6 +1406,26 @@ class DashboardServer:
                 return
 
             info["returncode"] = rc
+            durable_attempt_id = str(info.get("durable_attempt_id") or "")
+            durable_identity = info.get("durable_process_identity")
+            if durable_attempt_id and isinstance(durable_identity, Mapping):
+                try:
+                    self._durable_job_state().record_process_exit(
+                        self._base_scan_id(scan_key),
+                        durable_attempt_id,
+                        ProcessIdentity.from_value(durable_identity),
+                        tenant_id=self.tenant_id,
+                        identity_key=scan_key,
+                        reason="dashboard child process exited",
+                        actor="dashboard-monitor",
+                    )
+                except (KeyError, ProcessIdentityError, InvalidTransition) as exc:
+                    # A monitor observation is never completion authority; the
+                    # durable attempt will instead reconcile as uncertain.
+                    log.warning(
+                        "Could not record durable child exit reason=%s",
+                        type(exc).__name__,
+                    )
             if info.get("status") in {"aborted", "stopped"}:
                 event_type = EventType.SCAN_ABORTED
             else:
@@ -2652,6 +2815,20 @@ class DashboardServer:
             """Pause the current scan."""
             payload = _require_auth(request, Role.OPERATOR)
             server._scan_paused = True
+            for job in server._durable_job_state().list_jobs(
+                tenant_id=server.tenant_id,
+                states=(JobState.QUEUED, JobState.LEASED, JobState.RUNNING),
+                limit=1000,
+            ):
+                try:
+                    server._durable_job_state().pause_job(
+                        str(job["id"]),
+                        tenant_id=server.tenant_id,
+                        actor=payload.username,
+                        reason="operator pause",
+                    )
+                except (InvalidTransition, KeyError):
+                    pass
             server._write_all_control_files({"paused": True, "aborted": False})
             server.event_bus.emit_simple(
                 EventType.SCAN_PAUSED, source="dashboard",
@@ -2665,6 +2842,20 @@ class DashboardServer:
             payload = _require_auth(request, Role.OPERATOR)
             _require_not_killed()
             server._scan_paused = False
+            for job in server._durable_job_state().list_jobs(
+                tenant_id=server.tenant_id,
+                states=(JobState.PAUSED,),
+                limit=1000,
+            ):
+                try:
+                    server._durable_job_state().resume_job(
+                        str(job["id"]),
+                        tenant_id=server.tenant_id,
+                        actor=payload.username,
+                        reason="operator resume",
+                    )
+                except (InvalidTransition, KeyError):
+                    pass
             server._write_all_control_files({"paused": False, "aborted": False})
             server.event_bus.emit_simple(
                 EventType.SCAN_RESUMED, source="dashboard",
@@ -2677,6 +2868,20 @@ class DashboardServer:
             """Abort the current scan."""
             payload = _require_auth(request, Role.ADMIN)
             server._scan_aborted = True
+            for job in server._durable_job_state().list_jobs(
+                tenant_id=server.tenant_id,
+                states=(JobState.PLANNED, JobState.PENDING_APPROVAL, JobState.QUEUED, JobState.LEASED, JobState.RUNNING, JobState.PAUSED, JobState.CANCELING),
+                limit=1000,
+            ):
+                try:
+                    server._durable_job_state().cancel_job(
+                        str(job["id"]),
+                        tenant_id=server.tenant_id,
+                        actor=payload.username,
+                        reason="operator abort",
+                    )
+                except (InvalidTransition, KeyError, LeaseError):
+                    pass
             server._write_all_control_files({"paused": False, "aborted": True})
             killed = server._terminate_active_scans(status="aborted")
             server.event_bus.emit_simple(
@@ -3235,7 +3440,18 @@ class DashboardServer:
                 ))
 
             spawned: list[tuple[str, str, list[str], subprocess.Popen[str]]] = []
+            spawned_identities: dict[str, ProcessIdentity | None] = {}
             try:
+                # Establish the durable job/lease/attempt before the first
+                # subprocess side effect.  A crash in this window is then
+                # recoverable as an explicit attempt, never invisible work.
+                server._ensure_durable_scan_job(
+                    scan_id,
+                    target=target,
+                    frameworks=[item[1] for item in launch_specs],
+                    modules=[],
+                    authorization=web_authorization or net_authorization,
+                )
                 for key, framework_name, cmd, child_env in launch_specs:
                     if framework_name == "web" and web_credential_bundle is not None:
                         with web_credential_bundle.open_pipe() as handoff:
@@ -3259,6 +3475,10 @@ class DashboardServer:
                             text=True,
                         )
                     spawned.append((key, framework_name, cmd, proc))
+                    # Capture identity at the Popen boundary.  Registration is
+                    # completed before monitor threads are started below, even
+                    # if a very short-lived child exits in this window.
+                    spawned_identities[key] = server._job_process_supervisor.capture(proc)
             except Exception as exc:
                 for _, _, _, child in spawned:
                     try:
@@ -3266,6 +3486,10 @@ class DashboardServer:
                         child.wait(timeout=1)
                     except Exception:
                         pass
+                server._cancel_unstarted_durable_scan(
+                    scan_id,
+                    "dashboard subprocess launch failed",
+                )
                 log.error("Failed to launch scan reason=%s", type(exc).__name__)
                 raise HTTPException(
                     status_code=500,
@@ -3290,9 +3514,40 @@ class DashboardServer:
                     "control_file": str(control_file),
                     "command": server._sanitize_cmd(cmd),
                     "dashboard_url": dash_url,
+                    "pre_spawn_process_identity": spawned_identities.get(key),
                 }
-                server._track_scan_process(key, server._active_scans[key])
                 launched.append(framework_name)
+
+            try:
+                # Bind every child identity and recovered lease capability
+                # before monitor threads can observe an exit.
+                server._ensure_durable_scan_job(
+                    scan_id,
+                    target=target,
+                    frameworks=launched,
+                    modules=[],
+                    authorization=web_authorization or net_authorization,
+                )
+            except Exception as exc:
+                for key, _, _, child in spawned:
+                    try:
+                        child.terminate()
+                        child.wait(timeout=1)
+                    except Exception:
+                        pass
+                    server._active_scans.pop(key, None)
+                server._cancel_unstarted_durable_scan(
+                    scan_id,
+                    "durable dashboard process registration failed",
+                )
+                log.error("Could not register durable scan children reason=%s", type(exc).__name__)
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to establish durable scan ownership; execution denied",
+                )
+
+            for key, _, _, _ in spawned:
+                server._track_scan_process(key, server._active_scans[key])
 
             # Persist scan record to history DB
             server._write_scan_history(
@@ -3351,9 +3606,16 @@ class DashboardServer:
             _require_auth(request)
             running = []
             completed = []
+            durable_jobs = {
+                str(job.get("id")): job
+                for job in server._durable_jobs_for_read_projection(limit=1000)
+            }
+            seen_roots: set[str] = set()
             for key, info in list(server._active_scans.items()):
                 proc = info["proc"]
                 rc = info.get("returncode")
+                durable = durable_jobs.get(server._base_scan_id(key))
+                durable_status = str(durable.get("status")) if durable else None
                 entry = {
                     "scan_id": key,
                     "root_scan_id": server._base_scan_id(key),
@@ -3364,7 +3626,7 @@ class DashboardServer:
                     "started_at": info["started_at"],
                     "started_at_iso": info.get("started_dt"),
                     "returncode": rc,
-                    "status": info.get("status", "running" if rc is None else "completed"),
+                    "status": durable_status or info.get("status", "running" if rc is None else "completed"),
                     "control_file": info.get("control_file", ""),
                     "dashboard_url": info.get("dashboard_url", ""),
                     "requested_modules": info.get("requested_modules", []),
@@ -3373,16 +3635,67 @@ class DashboardServer:
                     "control": info.get("control", {}),
                     "log_path": str(server._scan_logs_dir / f"{key}.log"),
                 }
-                if rc is None:
-                    running.append(entry)
-                else:
+                seen_roots.add(server._base_scan_id(key))
+                if entry["status"] in {
+                    "completed",
+                    "failed",
+                    "canceled",
+                    "partial",
+                    "expired",
+                    "orphaned",
+                } or rc is not None:
                     completed.append(entry)
+                else:
+                    running.append(entry)
+            # A restarted dashboard may have no in-memory subprocess; durable
+            # jobs still remain visible and authoritative in status responses.
+            for scan_id, durable in durable_jobs.items():
+                if scan_id in seen_roots:
+                    continue
+                payload = durable.get("payload") or {}
+                entry = {
+                    "scan_id": scan_id,
+                    "root_scan_id": scan_id,
+                    "pid": None,
+                    "type": ",".join(payload.get("frameworks", [])) or "scan",
+                    "target": payload.get("target", ""),
+                    "engagement": (durable.get("metadata") or {}).get("engagement", ""),
+                    "started_at": durable.get("created_at"),
+                    "started_at_iso": durable.get("created_at"),
+                    "returncode": (durable.get("metadata") or {}).get("return_code"),
+                    "status": durable.get("status", "orphaned"),
+                    "control_file": "",
+                    "dashboard_url": "",
+                    "requested_modules": payload.get("modules", []),
+                    "actual_modules": payload.get("modules", []),
+                    "scan_options": {},
+                    "control": {},
+                    "log_path": "",
+                }
+                if entry["status"] in {"completed", "failed", "canceled", "partial", "expired", "orphaned"}:
+                    completed.append(entry)
+                else:
+                    running.append(entry)
             return {"running": running, "completed": completed}
 
         @app.post("/api/v1/scans/stop")
         async def api_scan_stop(request: Request):
             """Kill all running scan subprocesses."""
             payload = _require_auth(request, Role.OPERATOR)
+            for job in server._durable_job_state().list_jobs(
+                tenant_id=server.tenant_id,
+                states=(JobState.PLANNED, JobState.PENDING_APPROVAL, JobState.QUEUED, JobState.LEASED, JobState.RUNNING, JobState.PAUSED, JobState.CANCELING),
+                limit=1000,
+            ):
+                try:
+                    server._durable_job_state().cancel_job(
+                        str(job["id"]),
+                        tenant_id=server.tenant_id,
+                        actor=payload.username,
+                        reason="operator stop",
+                    )
+                except (InvalidTransition, KeyError, LeaseError):
+                    pass
             server._write_all_control_files({"paused": False, "aborted": True})
             killed = server._terminate_active_scans(status="stopped")
             server.event_bus.emit_simple(
@@ -3497,6 +3810,100 @@ class DashboardServer:
                 raise HTTPException(status_code=404, detail="Scan not found")
             log_entries = server._logs_for_scan(scan_id, max_lines=tail)
             return {"scan_id": scan_id, "logs": log_entries}
+
+        @app.post("/api/v1/scans/{scan_id}/pause")
+        async def api_scan_pause(request: Request, scan_id: str):
+            """Pause one scan without changing any other job in the tenant."""
+            payload = _require_auth(request, Role.OPERATOR)
+            try:
+                job = server._durable_job_state().pause_job(
+                    scan_id,
+                    tenant_id=server.tenant_id,
+                    actor=payload.username,
+                    reason="operator paused this scan",
+                )
+            except KeyError:
+                raise HTTPException(status_code=404, detail="Scan not found") from None
+            except (InvalidTransition, ValueError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "scan_pause_rejected"},
+                ) from exc
+            server._write_scan_control_files(scan_id, {"paused": True, "aborted": False})
+            server.event_bus.emit_simple(
+                EventType.SCAN_PAUSED,
+                source="dashboard",
+                scan_id=scan_id,
+            )
+            _audit(request, "scan.pause", object_id=scan_id, payload=payload)
+            return {"scan_id": scan_id, "status": job["status"]}
+
+        @app.post("/api/v1/scans/{scan_id}/resume")
+        async def api_scan_resume(request: Request, scan_id: str):
+            """Resume one paused scan without changing any other job in the tenant."""
+            payload = _require_auth(request, Role.OPERATOR)
+            _require_not_killed()
+            try:
+                job = server._durable_job_state().resume_job(
+                    scan_id,
+                    tenant_id=server.tenant_id,
+                    actor=payload.username,
+                    reason="operator resumed this scan",
+                )
+            except KeyError:
+                raise HTTPException(status_code=404, detail="Scan not found") from None
+            except (InvalidTransition, ValueError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "scan_resume_rejected"},
+                ) from exc
+            server._write_scan_control_files(scan_id, {"paused": False, "aborted": False})
+            server.event_bus.emit_simple(
+                EventType.SCAN_RESUMED,
+                source="dashboard",
+                scan_id=scan_id,
+            )
+            _audit(request, "scan.resume", object_id=scan_id, payload=payload)
+            return {"scan_id": scan_id, "status": job["status"]}
+
+        @app.post("/api/v1/scans/{scan_id}/cancel")
+        async def api_scan_cancel(request: Request, scan_id: str):
+            """Cancel one scan through the durable authority and worker projection."""
+            payload = _require_auth(request, Role.OPERATOR)
+            try:
+                job = server._durable_job_state().cancel_job(
+                    scan_id,
+                    tenant_id=server.tenant_id,
+                    actor=payload.username,
+                    reason="operator canceled this scan",
+                )
+            except KeyError:
+                raise HTTPException(status_code=404, detail="Scan not found") from None
+            except (InvalidTransition, LeaseError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "scan_cancel_rejected"},
+                ) from exc
+            server._write_scan_control_files(scan_id, {"paused": False, "aborted": True})
+            killed = server._terminate_active_scans(
+                status="canceled",
+                scan_id=scan_id,
+            )
+            server.event_bus.emit_simple(
+                EventType.SCAN_ABORTED,
+                source="dashboard",
+                scan_id=scan_id,
+                reason="operator_cancel",
+                killed=killed,
+            )
+            _audit(
+                request,
+                "scan.cancel",
+                object_id=scan_id,
+                detail={"killed": killed},
+                payload=payload,
+            )
+            return {"scan_id": scan_id, "status": job["status"], "killed": killed}
 
         @app.delete("/api/v1/scans/{scan_id}")
         async def api_scan_delete(
@@ -4257,10 +4664,10 @@ class DashboardServer:
                 "dashboard_url": dash_url,
                 "status_url": f"/api/v1/scans/{scan_id}",
                 "logs_url": f"/api/v1/scans/{scan_id}/logs",
-                "stop_url": "/api/v1/scans/stop",
-                "pause_url": "/api/v1/control/pause",
-                "resume_url": "/api/v1/control/resume",
-                "abort_url": "/api/v1/control/abort",
+                "stop_url": f"/api/v1/scans/{scan_id}/cancel",
+                "pause_url": f"/api/v1/scans/{scan_id}/pause",
+                "resume_url": f"/api/v1/scans/{scan_id}/resume",
+                "abort_url": f"/api/v1/scans/{scan_id}/cancel",
             }
 
             # Clean env for netforge — it doesn't read FORGE_* credential vars
@@ -4356,7 +4763,18 @@ class DashboardServer:
             spawned: list[
                 tuple[str, str, list[str], list[str], subprocess.Popen[str]]
             ] = []
+            spawned_identities: dict[str, ProcessIdentity | None] = {}
             try:
+                # Claim durable execution authority before any scanner child
+                # exists.  The subsequent binding pass records each concrete
+                # child identity before it is monitored.
+                server._ensure_durable_scan_job(
+                    scan_id,
+                    target=target,
+                    frameworks=[item[1] for item in launch_specs],
+                    modules=(web_modules + net_modules),
+                    authorization=web_authorization or net_authorization,
+                )
                 for key, framework_name, cmd, child_env, actual_modules in launch_specs:
                     if framework_name == "web" and web_credential_bundle is not None:
                         with web_credential_bundle.open_pipe() as handoff:
@@ -4380,6 +4798,7 @@ class DashboardServer:
                             text=True,
                         )
                     spawned.append((key, framework_name, cmd, actual_modules, proc))
+                    spawned_identities[key] = server._job_process_supervisor.capture(proc)
             except Exception as exc:
                 for _, _, _, _, child in spawned:
                     try:
@@ -4387,6 +4806,10 @@ class DashboardServer:
                         child.wait(timeout=1)
                     except Exception:
                         pass
+                server._cancel_unstarted_durable_scan(
+                    scan_id,
+                    "scan-builder subprocess launch failed",
+                )
                 raise HTTPException(
                     status_code=500,
                     detail="Failed to launch scan; execution denied",
@@ -4413,8 +4836,8 @@ class DashboardServer:
                     'actual_modules': actual_modules,
                     'scan_options': scan_options,
                     'control': control_metadata,
+                    'pre_spawn_process_identity': spawned_identities.get(key),
                 }
-                server._track_scan_process(key, server._active_scans[key])
                 launched.append(framework_name)
                 process_metadata.append({
                     'process_id': key,
@@ -4424,6 +4847,35 @@ class DashboardServer:
                     'control_file': str(control_file),
                     'log_path': str(server._scan_logs_dir / f"{key}.log"),
                 })
+
+            try:
+                server._ensure_durable_scan_job(
+                    scan_id,
+                    target=target,
+                    frameworks=launched,
+                    modules=(web_modules + net_modules),
+                    authorization=web_authorization or net_authorization,
+                )
+            except Exception as exc:
+                for key, _, _, _, child in spawned:
+                    try:
+                        child.terminate()
+                        child.wait(timeout=1)
+                    except Exception:
+                        pass
+                    server._active_scans.pop(key, None)
+                server._cancel_unstarted_durable_scan(
+                    scan_id,
+                    "durable scan-builder process registration failed",
+                )
+                log.error("Could not register durable scan-builder children reason=%s", type(exc).__name__)
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to establish durable scan ownership; execution denied",
+                )
+
+            for key, _, _, _, _ in spawned:
+                server._track_scan_process(key, server._active_scans[key])
 
             server._write_scan_history(
                 scan_id=scan_id, target=target, scan_type=scan_type,
@@ -5516,10 +5968,35 @@ class DashboardServer:
                 aborted=bool(state.get("aborted", False)),
             )
 
-    def _terminate_active_scans(self, status: str = "stopped") -> list[str]:
+    def _write_scan_control_files(self, scan_id: str, state: dict[str, bool]) -> None:
+        """Project one durable control decision to its worker signal files."""
+
+        scan_id = _artifact_identifier(scan_id)
+        seen: set[str] = set()
+        for key, info in self._active_scans.items():
+            if self._base_scan_id(key) != scan_id:
+                continue
+            path_str = info.get("control_file")
+            if not path_str or path_str in seen:
+                continue
+            seen.add(path_str)
+            self._write_control_file(
+                Path(path_str),
+                paused=bool(state.get("paused", False)),
+                aborted=bool(state.get("aborted", False)),
+            )
+
+    def _terminate_active_scans(
+        self,
+        status: str = "stopped",
+        *,
+        scan_id: str | None = None,
+    ) -> list[str]:
         """Terminate running child processes and mark them with a terminal status."""
         killed: list[str] = []
         for key, info in list(self._active_scans.items()):
+            if scan_id is not None and self._base_scan_id(key) != scan_id:
+                continue
             proc = info.get("proc")
             if not proc or proc.poll() is not None:
                 continue
@@ -5896,9 +6373,178 @@ class DashboardServer:
                 detail={"reason_code": "agent_state_persistence_failed"},
             ) from exc
 
+    @staticmethod
+    def _agent_job_projection_fields() -> frozenset[str]:
+        """Return fields rebuildable from the compatibility JSON projection.
+
+        Durable assignment and lifecycle facts are intentionally excluded.
+        These fields are presentation material (or the redacted result
+        projection retained for existing agent clients).
+        """
+
+        return frozenset(
+            {
+                "result",
+                "error",
+                "result_digest",
+                "accepted_lease_digest",
+                "lease_digest",
+                "lease_generation",
+                "lease_deadline_at",
+                "lease_expires_at",
+                "lease_agent_id",
+                "leased_at",
+                "completed_at",
+                "scope_decision",
+                "authorization_envelope",
+                "authorization_public",
+                "authorization_db",
+                "authorized",
+            }
+        )
+
+    def _durable_agent_job_projection(
+        self,
+        durable: Mapping[str, Any],
+        legacy: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Rebuild one agent job from durable state plus safe JSON metadata.
+
+        ``legacy`` is never allowed to override the durable assignment,
+        tenant, or lifecycle status. This lets a restarted dashboard recover
+        queued/running work even when the JSON projection was truncated or was
+        written by an older process.
+        """
+
+        raw_payload = durable.get("payload")
+        payload = dict(raw_payload) if isinstance(raw_payload, Mapping) else {}
+        job = dict(payload)
+        if isinstance(legacy, Mapping):
+            for field in self._agent_job_projection_fields():
+                if field in legacy:
+                    job[field] = legacy[field]
+
+        durable_id = str(durable.get("id") or payload.get("id") or "")
+        durable_tenant = str(durable.get("tenant_id") or self.tenant_id)
+        job["id"] = durable_id
+        job["tenant_id"] = durable_tenant
+        job["status"] = str(
+            durable.get("status") or durable.get("state") or "unknown"
+        )
+        # Keep the ISO timestamp emitted by the compatibility adapter when it
+        # exists; otherwise expose the durable numeric clock value.
+        if not job.get("updated_at"):
+            job["updated_at"] = durable.get("updated_at")
+        if durable.get("terminal_at") is not None and not job.get("completed_at"):
+            job["completed_at"] = durable.get("terminal_at")
+        if not isinstance(job.get("result"), (dict, list)):
+            job["result"] = None
+        if job.get("error") is not None and not isinstance(job.get("error"), str):
+            job["error"] = str(job["error"])
+        return job
+
+    def _durable_agent_jobs_for_mutation(
+        self,
+        state: Mapping[str, Any],
+        *,
+        states: Iterable[str | JobState] | None = None,
+        limit: int = 1000,
+    ) -> list[dict[str, Any]]:
+        """Enumerate agent jobs from Task-103 for mutation paths.
+
+        The JSON file is consulted only to recover presentation/result fields;
+        a queued JSON row without a corresponding durable row is never
+        eligible for execution.
+        """
+
+        legacy_jobs = {
+            str(item.get("id")): item
+            for item in state.get("jobs", [])
+            if isinstance(item, Mapping) and item.get("id")
+        }
+        durable_rows = self._durable_job_state().list_jobs(
+            tenant_id=self.tenant_id,
+            states=states,
+            limit=limit,
+        )
+        result: list[tuple[float, dict[str, Any]]] = []
+        for durable in durable_rows:
+            payload = durable.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            if not hmac.compare_digest(
+                str(payload.get("tenant_id") or durable.get("tenant_id") or ""),
+                self.tenant_id,
+            ):
+                continue
+            # Agent assignments always carry an authenticated agent_id in the
+            # durable payload. Do not infer it from mutable JSON.
+            if not str(payload.get("agent_id") or ""):
+                continue
+            try:
+                created_at = float(durable.get("created_at") or 0.0)
+            except (TypeError, ValueError):
+                created_at = 0.0
+            result.append(
+                (
+                    created_at,
+                    self._durable_agent_job_projection(
+                        durable,
+                        legacy_jobs.get(str(durable.get("id") or "")),
+                    ),
+                )
+            )
+        # ``list_jobs`` is newest-first; queue polling is FIFO by durable
+        # creation time, independent of JSON array order.
+        result.sort(key=lambda item: item[0])
+        return [item[1] for item in result]
+
     def _agent_state(self) -> dict[str, Any]:
         """Return JSON-friendly scan-agent inventory."""
         state = self._load_agents_state()
+        durable_rows = self._durable_jobs_for_read_projection(limit=1000)
+        durable_jobs = {
+            str(job.get("id")): job
+            for job in durable_rows
+            if isinstance(job, Mapping)
+        }
+        legacy_jobs = {
+            str(item.get("id")): item
+            for item in state.get("jobs", [])
+            if isinstance(item, Mapping) and item.get("id")
+        }
+        # Durable rows are the inventory. Merge only presentation fields from
+        # JSON so a stale status/assignment cannot resurrect executable work.
+        projected_jobs = [
+            self._durable_agent_job_projection(
+                durable,
+                legacy_jobs.get(job_id),
+            )
+            for job_id, durable in durable_jobs.items()
+            if isinstance(durable.get("payload"), Mapping)
+            and str(durable["payload"].get("agent_id") or "")
+            and hmac.compare_digest(
+                str(
+                    durable["payload"].get("tenant_id")
+                    or durable.get("tenant_id")
+                    or ""
+                ),
+                self.tenant_id,
+            )
+        ]
+        # Before Task-103 creates its database, preserve the old passive JSON
+        # inventory for compatibility. Once a durable DB exists, a JSON-only
+        # row is explicitly non-executable and is not counted as queued work.
+        if not durable_rows and not self._scan_jobs_db_path.exists():
+            projected_jobs.extend(
+                dict(item)
+                for item in state.get("jobs", [])
+                if isinstance(item, Mapping)
+                and hmac.compare_digest(
+                    str(item.get("tenant_id") or ""),
+                    self.tenant_id,
+                )
+            )
         agents = [
             self._sanitize_agent(agent)
             for agent in state.get("agents", {}).values()
@@ -5910,7 +6556,7 @@ class DashboardServer:
         ]
         jobs = [
             self._sanitize_agent_job(job)
-            for job in state.get("jobs", [])
+            for job in projected_jobs
             if isinstance(job, dict)
             and hmac.compare_digest(
                 str(job.get("tenant_id") or ""),
@@ -6338,6 +6984,134 @@ class DashboardServer:
             self._write_agents_state(state)
         return {"agent": self._sanitize_agent(agent), "credential": credential}
 
+    def _agent_job_idempotency_key(
+        self,
+        *,
+        agent_id: str,
+        client_job_id: str,
+    ) -> str:
+        """Derive one stable enqueue key for an agent/client correlation pair.
+
+        ``client_job_id`` is deliberately not used as the durable row id: it
+        is an untrusted caller correlation value and may collide across agents.
+        The tenant and authenticated agent are therefore part of the HMAC-like
+        digest used as the SQLite idempotency key.
+        """
+
+        material = (
+            f"{self.tenant_id}\x00{agent_id}\x00{client_job_id}"
+        ).encode("utf-8")
+        digest = hashlib.sha256(material).hexdigest()
+        return f"agent-job:{digest}"
+
+    @staticmethod
+    def _agent_job_request_identity(
+        *,
+        agent_id: str,
+        client_job_id: str,
+        engine: str,
+        target: str,
+        scope: Iterable[str],
+        excluded_scope: Iterable[str],
+        modules: Iterable[str],
+        policy_id: str,
+        dry_run: bool,
+        safety_mode: str,
+        confirmation: Any,
+    ) -> str:
+        """Hash material request fields for deterministic enqueue replays."""
+
+        material = {
+            "agent_id": agent_id,
+            "client_job_id": client_job_id,
+            "engine": engine,
+            "target": target,
+            "scope": list(scope),
+            "excluded_scope": list(excluded_scope),
+            "modules": list(modules),
+            "policy_id": policy_id,
+            "dry_run": bool(dry_run),
+            "safety_mode": safety_mode,
+            "confirmation": confirmation,
+        }
+        try:
+            encoded = json.dumps(
+                material,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+                default=str,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"reason_code": "agent_job_payload_invalid"},
+            ) from exc
+        if len(encoded) > 1_048_576:
+            raise HTTPException(
+                status_code=413,
+                detail={"reason_code": "agent_job_payload_too_large"},
+            )
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    def _find_durable_agent_job(
+        self,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        """Find an agent assignment by its stable durable enqueue key."""
+
+        rows = self._durable_job_state().list_jobs(
+            tenant_id=self.tenant_id,
+            limit=10_000,
+        )
+        return next(
+            (
+                row
+                for row in rows
+                if hmac.compare_digest(
+                    str(row.get("idempotency_key") or ""),
+                    idempotency_key,
+                )
+            ),
+            None,
+        )
+
+    def _replay_durable_agent_job(
+        self,
+        durable: Mapping[str, Any],
+        *,
+        request_identity: str,
+        state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Return an exact enqueue replay or reject a key/material conflict."""
+
+        metadata = durable.get("metadata")
+        metadata_map = metadata if isinstance(metadata, Mapping) else {}
+        stored_identity = str(metadata_map.get("request_identity") or "")
+        if not stored_identity or not hmac.compare_digest(
+            stored_identity,
+            request_identity,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail={"reason_code": "agent_job_idempotency_conflict"},
+            )
+        legacy = next(
+            (
+                item
+                for item in state.get("jobs", [])
+                if isinstance(item, Mapping)
+                and hmac.compare_digest(
+                    str(item.get("id") or ""),
+                    str(durable.get("id") or ""),
+                )
+            ),
+            None,
+        )
+        projected = self._durable_agent_job_projection(durable, legacy)
+        return self._sanitize_agent_job(projected)
+
     def _create_agent_job(
         self,
         body: dict[str, Any],
@@ -6455,6 +7229,54 @@ class DashboardServer:
         )
         if not submitted_decision.allowed:
             _deny(submitted_decision)
+        modules = self._string_list(body.get("modules") or [])
+        policy_id = str(body.get("policy_id", ""))[:120]
+        request_identity = self._agent_job_request_identity(
+            agent_id=agent_id,
+            client_job_id=client_job_id,
+            engine=engine,
+            target=target,
+            scope=effective_scope,
+            excluded_scope=effective_excluded,
+            modules=modules,
+            policy_id=policy_id,
+            dry_run=dry_run,
+            safety_mode=safety_mode,
+            confirmation=confirmation_value,
+        )
+        enqueue_idempotency_key = self._agent_job_idempotency_key(
+            agent_id=agent_id,
+            client_job_id=client_job_id,
+        )
+        # A retry of the same client request must not mint a second server
+        # assignment or authorization envelope.  Check the durable authority
+        # before any random run/attempt IDs or authorization side effects are
+        # generated; JSON is consulted only when rebuilding the response.
+        existing_durable = self._find_durable_agent_job(enqueue_idempotency_key)
+        if existing_durable is not None:
+            with self._agent_state_lock:
+                current_state = self._load_agents_state()
+                current_agent = current_state["agents"].get(agent_id)
+                if not isinstance(current_agent, dict):
+                    raise HTTPException(status_code=404, detail="Agent not found")
+                if not hmac.compare_digest(
+                    str(current_agent.get("tenant_id") or ""),
+                    self.tenant_id,
+                ):
+                    raise HTTPException(
+                        status_code=404,
+                        detail={"reason_code": "agent_not_found"},
+                    )
+                if current_agent.get("revoked"):
+                    raise HTTPException(
+                        status_code=401,
+                        detail={"reason_code": "agent_revoked"},
+                    )
+                return self._replay_durable_agent_job(
+                    existing_durable,
+                    request_identity=request_identity,
+                    state=current_state,
+                )
         if dry_run:
             confirmation_record = None
         else:
@@ -6485,7 +7307,6 @@ class DashboardServer:
             scope_decision = submitted_decision
 
         now = datetime.now(timezone.utc).isoformat()
-        modules = self._string_list(body.get("modules") or [])
         authorization_envelope: ActionAuthorizationEnvelope | None = None
         authorization_runtime: dict[str, str] = {}
         if not dry_run:
@@ -6540,7 +7361,7 @@ class DashboardServer:
             "scope": effective_scope,
             "excluded_scope": effective_excluded,
             "modules": modules,
-            "policy_id": str(body.get("policy_id", ""))[:120],
+            "policy_id": policy_id,
             "safety_mode": safety_mode,
             "dry_run": dry_run,
             "action": "scan",
@@ -6596,6 +7417,49 @@ class DashboardServer:
             current_decision = self._agent_job_decision(current_agent, job)
             if not current_decision.allowed:
                 self._raise_scope_denial(current_decision)
+            durable_service = self._durable_job_state()
+            try:
+                durable_service.create_job(
+                    job,
+                    tenant_id=self.tenant_id,
+                    job_id=job_id,
+                    idempotency_key=enqueue_idempotency_key,
+                    state=JobState.QUEUED,
+                    max_attempts=1,
+                    # An accepted agent result is one declared unit of work;
+                    # process/HTTP completion alone must not satisfy the
+                    # durable terminal invariant.
+                    required_work=1,
+                    actor=operator_id,
+                    reason="agent job queued",
+                    metadata={
+                        "agent_id": agent_id,
+                        "engine": engine,
+                        "request_identity": request_identity,
+                        "authorization_state": "allow" if authorization_envelope else "planned",
+                    },
+                )
+            except IdempotencyConflict:
+                # Another dashboard instance may have won the enqueue race.
+                # Return its exact durable assignment when the material
+                # matches; never append a second JSON-only job.
+                existing = self._find_durable_agent_job(enqueue_idempotency_key)
+                if existing is None:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={"reason_code": "agent_job_persistence_failed"},
+                    ) from None
+                return self._replay_durable_agent_job(
+                    existing,
+                    request_identity=request_identity,
+                    state=current_state,
+                )
+            except Exception as exc:
+                log.warning("Could not persist durable agent job reason=%s", type(exc).__name__)
+                raise HTTPException(
+                    status_code=503,
+                    detail={"reason_code": "agent_job_persistence_failed"},
+                ) from exc
             current_state["jobs"].append(job)
             self._write_agents_state(current_state)
         return self._sanitize_agent_job(job)
@@ -6681,7 +7545,16 @@ class DashboardServer:
             if leased is None:
                 self._write_agents_state(state)
                 return None
-            lease_token = secrets.token_urlsafe(32)
+            lease_key = (self.tenant_id, str(leased.get("id") or ""))
+            # A random adapter token cannot be validated by the durable HMAC
+            # authority. If the capability was not established in this
+            # process, fail closed instead of issuing an unusable lease.
+            lease_token = self._durable_agent_lease_tokens.get(lease_key, "")
+            if not lease_token:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "durable_lease_unavailable"},
+                )
             now_dt = self._agent_now()
             for job in state["jobs"]:
                 if (
@@ -6711,6 +7584,7 @@ class DashboardServer:
                     job["lease_expires_at"] = lease_expires.isoformat()
                     job["lease_agent_id"] = agent_id
                     self._write_agents_state(state)
+                    self._durable_agent_lease_tokens.pop(lease_key, None)
                     return {**self._sanitize_agent_job(job), "lease_token": lease_token}
             raise HTTPException(status_code=409, detail={"reason_code": "lease_state_conflict"})
 
@@ -6733,21 +7607,39 @@ class DashboardServer:
             raise HTTPException(status_code=404, detail="Agent not found")
         now = self._agent_now().isoformat()
         agent["last_seen"] = now
-        for job in state["jobs"]:
-            if (
-                job.get("agent_id") == agent_id
-                and job.get("status") == "queued"
-                and hmac.compare_digest(
-                    str(job.get("tenant_id") or ""),
-                    self.tenant_id,
-                )
-            ):
+        durable_service = self._durable_job_state()
+        # Queue eligibility comes from SQLite.  JSON jobs are merged only as a
+        # projection so a stale/missing array entry cannot hide or resurrect
+        # executable work after a restart.
+        queued_jobs = self._durable_agent_jobs_for_mutation(
+            state,
+            states=(JobState.QUEUED,),
+            limit=1000,
+        )
+        for job in queued_jobs:
+            if job.get("agent_id") != agent_id:
+                continue
+            projection_index = next(
+                (
+                    index
+                    for index, candidate in enumerate(state["jobs"])
+                    if isinstance(candidate, Mapping)
+                    and str(candidate.get("id") or "") == str(job.get("id") or "")
+                ),
+                None,
+            )
+            if projection_index is None:
+                state["jobs"].append(job)
+                projection_index = len(state["jobs"]) - 1
+            if projection_index is None:
+                continue
+            else:
+                state["jobs"][projection_index] = job
                 decision = self._agent_job_decision(agent, job)
                 if not decision.allowed:
-                    runtime = (
-                        job.get("runtime_context")
-                        if isinstance(job.get("runtime_context"), dict)
-                        else {}
+                    raw_runtime = job.get("runtime_context")
+                    runtime: Mapping[str, Any] = (
+                        raw_runtime if isinstance(raw_runtime, Mapping) else {}
                     )
                     self._audit_preflight_denial(
                         decision,
@@ -6782,6 +7674,17 @@ class DashboardServer:
                     job["updated_at"] = now
                     job["completed_at"] = now
                     agent["status"] = "idle"
+                    # A mutable agent boundary invalidates queued work in the
+                    # authority as well as in the compatibility projection.
+                    try:
+                        durable_service.cancel_job(
+                            str(job.get("id") or ""),
+                            tenant_id=self.tenant_id,
+                            actor=agent_id,
+                            reason=f"lease preflight denied: {decision.reason_code}",
+                        )
+                    except (InvalidTransition, KeyError, LeaseError):
+                        pass
                     self._write_agents_state(state)
                     self._raise_scope_denial(decision)
                 if not bool(job.get("dry_run", True)):
@@ -6892,6 +7795,43 @@ class DashboardServer:
                     job["authorization_envelope"] = child.envelope.to_dict()
                     job["authorization_public"] = child.envelope.to_event_payload()
                     job["authorization_db"] = str(self._scan_jobs_db_path)
+                try:
+                    attempts_before = durable_service.list_attempts(
+                        str(job["id"]),
+                        tenant_id=self.tenant_id,
+                    )
+                    durable_attempt = durable_service.acquire_lease(
+                        str(job["id"]),
+                        agent_id,
+                        tenant_id=self.tenant_id,
+                        lease_seconds=min(
+                            self._agent_lease_seconds(),
+                            self._agent_lease_max_seconds(),
+                        ),
+                        idempotency_key=(
+                            f"agent-lease:{job['id']}:{len(attempts_before) + 1}"
+                        ),
+                        actor=agent_id,
+                    )
+                    durable_token = durable_attempt.get("lease_token")
+                    if not durable_token:
+                        raise LeaseError("durable lease token unavailable")
+                    durable_started = durable_service.start_attempt(
+                        str(durable_attempt["id"]),
+                        str(durable_token),
+                        tenant_id=self.tenant_id,
+                        actor=agent_id,
+                        worker_id=agent_id,
+                    )
+                    job["attempt_id"] = str(durable_started["id"])
+                    # Hand the one-time token to the outer lease adapter through
+                    # a process-local map; it is never written to JSON.
+                    self._durable_agent_lease_tokens[(self.tenant_id, str(job["id"]))] = str(durable_token)
+                except (InvalidTransition, LeaseError, KeyError) as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"reason_code": "durable_lease_unavailable"},
+                    ) from exc
                 job["status"] = "running"
                 job["leased_at"] = now
                 job["updated_at"] = now
@@ -6931,9 +7871,77 @@ class DashboardServer:
             self.tenant_id,
         ):
             raise HTTPException(status_code=403, detail={"reason_code": "agent_tenant_mismatch"})
-        job = next((item for item in state["jobs"] if item.get("id") == job_id), None)
-        if not isinstance(job, dict):
+        legacy_job = next(
+            (
+                item
+                for item in state["jobs"]
+                if isinstance(item, Mapping) and item.get("id") == job_id
+            ),
+            None,
+        )
+        durable_service = self._durable_job_state()
+        durable_row = durable_service.get_job(
+            job_id,
+            tenant_id=self.tenant_id,
+        )
+        if durable_row is None:
             raise HTTPException(status_code=404, detail={"reason_code": "agent_job_not_found"})
+        raw_payload = durable_row.get("payload")
+        if not isinstance(raw_payload, Mapping) or not hmac.compare_digest(
+            str(raw_payload.get("agent_id") or ""),
+            agent_id,
+        ):
+            raise HTTPException(status_code=403, detail={"reason_code": "lease_assignment_mismatch"})
+        job = self._durable_agent_job_projection(durable_row, legacy_job)
+        # The attempt row, rather than the JSON seed attempt_id, identifies the
+        # capability currently owned by the worker.
+        attempts = durable_service.list_attempts(
+            job_id,
+            tenant_id=self.tenant_id,
+        )
+        latest_attempt = next(
+            (
+                item
+                for item in reversed(attempts)
+                if item.get("state") in {"leased", "running"}
+            ),
+            None,
+        )
+        if latest_attempt is None and allow_terminal_duplicate and attempts:
+            latest_attempt = attempts[-1]
+        if latest_attempt is not None:
+            job["attempt_id"] = str(latest_attempt.get("id") or "")
+            raw_expiry = latest_attempt.get("lease_expires_at")
+            try:
+                if raw_expiry is None:
+                    raise ValueError("missing durable lease expiry")
+                durable_expiry = datetime.fromtimestamp(
+                    float(str(raw_expiry)),
+                    tz=timezone.utc,
+                )
+            except (TypeError, ValueError, OverflowError, OSError):
+                durable_expiry = None
+            if durable_expiry is not None:
+                # A lost JSON projection has no lease timestamps. Recover a
+                # conservative deadline from the durable lease rather than
+                # treating a valid capability as already expired.
+                if self._agent_timestamp(job.get("lease_expires_at")) is None:
+                    job["lease_expires_at"] = durable_expiry.isoformat()
+                if self._agent_timestamp(job.get("lease_deadline_at")) is None:
+                    job["lease_deadline_at"] = durable_expiry.isoformat()
+        projection_index = next(
+            (
+                index
+                for index, candidate in enumerate(state["jobs"])
+                if isinstance(candidate, Mapping)
+                and str(candidate.get("id") or "") == job_id
+            ),
+            None,
+        )
+        if projection_index is None:
+            state["jobs"].append(job)
+        else:
+            state["jobs"][projection_index] = job
         if job.get("agent_id") != agent_id or job.get("tenant_id") != self.tenant_id:
             raise HTTPException(status_code=403, detail={"reason_code": "lease_assignment_mismatch"})
         lease_token = str(body.get("lease_token") or "")
@@ -6947,16 +7955,115 @@ class DashboardServer:
             and bool(accepted)
             and hmac.compare_digest(supplied, accepted)
         )
-        if not terminal_duplicate and (not supplied or not expected or not hmac.compare_digest(supplied, expected)):
+        # If the JSON projection was lost after a result was accepted, use the
+        # durable opaque result reference to recognize the exact redelivery.
+        # The submitted lease token remains part of the digest, so an arbitrary
+        # token or changed payload cannot turn this into a replay.
+        if (
+            allow_terminal_duplicate
+            and not terminal_duplicate
+            and str(durable_row.get("status") or durable_row.get("state") or "")
+            in {"completed", "partial", "failed", "canceled"}
+            and supplied
+            and job.get("attempt_id")
+        ):
+            try:
+                replay_material = json.dumps(
+                    {
+                        "outcome": body.get("outcome"),
+                        "result": body.get("result"),
+                        "error": body.get("error"),
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+                replay_digest = hmac.new(
+                    lease_token.encode("utf-8"),
+                    replay_material,
+                    hashlib.sha256,
+                ).hexdigest()
+                delivery = durable_service.latest_delivery(
+                    str(job["attempt_id"]),
+                    tenant_id=self.tenant_id,
+                )
+                terminal_duplicate = bool(
+                    delivery is not None
+                    and hmac.compare_digest(
+                        str(delivery.get("result_ref") or ""),
+                        f"agent:{replay_digest}",
+                    )
+                )
+                if terminal_duplicate:
+                    job["result_digest"] = replay_digest
+                    job["accepted_lease_digest"] = supplied
+            except (TypeError, ValueError, KeyError):
+                terminal_duplicate = False
+        durable_valid = False
+        if supplied and job.get("attempt_id"):
+            durable_valid = durable_service.validate_lease(
+                str(job["attempt_id"]),
+                lease_token,
+                tenant_id=self.tenant_id,
+                worker_id=agent_id,
+            )
+        if not terminal_duplicate and not durable_valid and (
+            not supplied or not expected or not hmac.compare_digest(supplied, expected)
+        ):
             raise HTTPException(status_code=409, detail={"reason_code": "lease_invalid"})
         if terminal_duplicate:
             return agent, job
+        if str(durable_row.get("status") or durable_row.get("state") or "") not in {
+            JobState.LEASED.value,
+            JobState.RUNNING.value,
+        }:
+            raise HTTPException(status_code=409, detail={"reason_code": "lease_not_active"})
         expires = self._agent_timestamp(job.get("lease_expires_at"))
         if expires is None:
             expires = datetime.min.replace(tzinfo=timezone.utc)
         if self._agent_now() >= expires:
             if job.get("status") == "running":
                 now = self._agent_now().isoformat()
+                try:
+                    durable_service = self._durable_job_state()
+                    durable = durable_service.get_job(
+                        job_id,
+                        tenant_id=self.tenant_id,
+                    )
+                    if durable is not None and durable.get("status") == JobState.RUNNING.value:
+                        attempt_id = str(job.get("attempt_id") or "")
+                        if not attempt_id:
+                            attempts = durable_service.list_attempts(
+                                job_id,
+                                tenant_id=self.tenant_id,
+                            )
+                            active = next(
+                                (
+                                    item
+                                    for item in reversed(attempts)
+                                    if item.get("state") in {"leased", "running"}
+                                ),
+                                None,
+                            )
+                            attempt_id = str(active.get("id") or "") if active else ""
+                        if attempt_id:
+                            durable_service.revoke_lease(
+                                attempt_id,
+                                tenant_id=self.tenant_id,
+                                actor="agent-lease",
+                                reason="agent lease expired",
+                            )
+                        else:
+                            durable_service.append_log(
+                                job_id,
+                                "legacy agent lease expired without a durable attempt",
+                                tenant_id=self.tenant_id,
+                                level="warning",
+                                actor="agent-lease",
+                            )
+                except (InvalidTransition, KeyError):
+                    pass
                 job["status"] = "orphaned"
                 job["lease_digest"] = None
                 job["lease_expires_at"] = now
@@ -6980,11 +8087,20 @@ class DashboardServer:
             agent, job = self._agent_lease_job(state, agent_id, job_id, body, identity)
             if job.get("status") != "running":
                 raise HTTPException(status_code=409, detail={"reason_code": "lease_not_active"})
-            token = secrets.token_urlsafe(32)
+            token = str(body.get("lease_token") or "")
             now = self._agent_now()
             deadline = self._agent_timestamp(job.get("lease_deadline_at")) or now
             if now >= deadline:
                 if job.get("status") == "running":
+                    try:
+                        self._durable_job_state().revoke_lease(
+                            str(job.get("attempt_id") or ""),
+                            tenant_id=self.tenant_id,
+                            actor=agent_id,
+                            reason="agent lease renewal deadline exhausted",
+                        )
+                    except (InvalidTransition, LeaseError, KeyError):
+                        pass
                     job["status"] = "orphaned"
                     job["lease_digest"] = None
                     job["lease_expires_at"] = now.isoformat()
@@ -6999,6 +8115,23 @@ class DashboardServer:
                 now + timedelta(seconds=self._agent_lease_seconds()),
                 deadline,
             )
+            try:
+                renewed = self._durable_job_state().renew_lease(
+                    str(job.get("attempt_id") or ""),
+                    token,
+                    tenant_id=self.tenant_id,
+                    lease_seconds=max(1.0, (next_expiry - now).total_seconds()),
+                    worker_id=agent_id,
+                    actor=agent_id,
+                )
+                token = str(renewed.get("lease_token") or renewed.get("token") or "")
+                if not token:
+                    raise LeaseError("durable renewal token unavailable")
+            except (LeaseError, InvalidTransition, KeyError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "durable_lease_renewal_failed"},
+                ) from exc
             job["lease_digest"] = self._agent_digest(token)
             job["lease_generation"] = int(job.get("lease_generation") or 0) + 1
             job["lease_expires_at"] = next_expiry.isoformat()
@@ -7038,6 +8171,15 @@ class DashboardServer:
                         self.tenant_id,
                     )
                 ):
+                    try:
+                        self._durable_job_state().cancel_job(
+                            str(job.get("id") or ""),
+                            tenant_id=self.tenant_id,
+                            actor=agent_id,
+                            reason="agent revoked",
+                        )
+                    except (InvalidTransition, LeaseError, KeyError):
+                        pass
                     job["status"] = "orphaned"
                     job["lease_digest"] = None
                     job["lease_expires_at"] = now
@@ -7138,6 +8280,33 @@ class DashboardServer:
                 raise HTTPException(status_code=409, detail={"reason_code": "result_conflict"})
             if job.get("status") != "running":
                 raise HTTPException(status_code=409, detail={"reason_code": "lease_not_active"})
+            try:
+                durable = self._durable_job_state()
+                if outcome == "canceled":
+                    durable.cancel_job(
+                        job_id,
+                        tenant_id=self.tenant_id,
+                        actor=agent_id,
+                        reason="agent canceled job",
+                    )
+                else:
+                    durable.finish_attempt(
+                        str(job.get("attempt_id") or ""),
+                        tenant_id=self.tenant_id,
+                        lease_token=str(body.get("lease_token") or ""),
+                        success=outcome == "success",
+                        result_ref=f"agent:{digest}",
+                        result_identity=f"sha256:{digest}",
+                        coverage_keys=("agent-result",) if outcome == "success" else (),
+                        error_reason=safe_error,
+                        terminal_reason=f"agent result: {outcome}",
+                        actor=agent_id,
+                    )
+            except (InvalidTransition, LeaseError, KeyError) as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "durable_result_rejected"},
+                ) from exc
             now = self._agent_now().isoformat()
             job["status"] = {"success": "completed", "failure": "failed", "canceled": "canceled"}[outcome]
             job["updated_at"] = now
@@ -7994,6 +9163,15 @@ class DashboardServer:
         authorization: ActionAuthorizationEnvelope | None = None,
     ) -> None:
         """Persist the dashboard scan job row used by status/log APIs."""
+        # Task 103 is the source of truth for lifecycle state.  Keep the
+        # legacy ScanJobModel write below as a rebuildable API projection.
+        self._ensure_durable_scan_job(
+            scan_id,
+            target=target,
+            frameworks=frameworks,
+            modules=modules or [],
+            authorization=authorization,
+        )
         logs = {
             key: str(self._scan_logs_dir / f"{key}.log")
             for key in self._active_scans
@@ -8052,6 +9230,319 @@ class DashboardServer:
                 type(exc).__name__,
             )
 
+    def _ensure_durable_scan_job(
+        self,
+        scan_id: str,
+        *,
+        target: str = "",
+        frameworks: list[str] | None = None,
+        modules: list[str] | None = None,
+        authorization: ActionAuthorizationEnvelope | None = None,
+    ) -> dict[str, Any] | None:
+        """Create one queued job/attempt in the durable authority if absent."""
+        service = self._durable_job_state()
+        existing = service.get_job(scan_id, tenant_id=self.tenant_id)
+        if existing is not None:
+            # A compatibility projection may be refreshed after its durable
+            # result is final.  Do not attempt to obtain a new execution
+            # capability for a terminal job merely to update dashboard data.
+            if str(existing.get("state")) in {
+                JobState.COMPLETED.value,
+                JobState.PARTIAL.value,
+                JobState.FAILED.value,
+                JobState.CANCELED.value,
+            }:
+                return existing
+            active_attempt = next(
+                (
+                    item
+                    for item in reversed(
+                        service.list_attempts(scan_id, tenant_id=self.tenant_id)
+                    )
+                    if item.get("state") in {"leased", "running"}
+                ),
+                None,
+            )
+            if active_attempt is not None:
+                # Lease tokens are deterministic, attempt-scoped capabilities
+                # backed by the durable store.  Replaying the original lease
+                # request lets the in-memory dashboard projection recover its
+                # capability without persisting a plaintext token.
+                replay = service.acquire_lease(
+                    scan_id,
+                    "dashboard",
+                    tenant_id=self.tenant_id,
+                    lease_seconds=24 * 60 * 60,
+                    idempotency_key=f"dashboard-attempt:{scan_id}",
+                    actor="dashboard",
+                )
+                token = replay.get("lease_token")
+                if not token or str(replay.get("id")) != str(active_attempt["id"]):
+                    raise LeaseError("durable dashboard lease capability unavailable")
+                if str(active_attempt.get("state")) == "leased":
+                    service.start_attempt(
+                        str(active_attempt["id"]),
+                        str(token),
+                        tenant_id=self.tenant_id,
+                        actor="dashboard",
+                        worker_id="dashboard",
+                    )
+                for key, info in self._active_scans.items():
+                    if self._base_scan_id(key) == scan_id:
+                        info["durable_attempt_id"] = str(active_attempt["id"])
+                        info["durable_lease_token"] = str(token)
+                self._register_durable_scan_processes(
+                    scan_id,
+                    str(active_attempt["id"]),
+                    service=service,
+                )
+            return existing
+        payload = {
+            "target": target,
+            "frameworks": list(frameworks or []),
+            "modules": list(modules or []),
+            "authorization_decision_id": (
+                authorization.decision_id if authorization is not None else None
+            ),
+        }
+        try:
+            service.create_job(
+                payload,
+                tenant_id=self.tenant_id,
+                job_id=scan_id,
+                idempotency_key=f"dashboard:{scan_id}",
+                state=JobState.QUEUED,
+                # A dashboard scan always has at least one declared work unit:
+                # its selected modules when available, otherwise its selected
+                # scanner frameworks.  This prevents process exit alone from
+                # manufacturing a zero-coverage completed job.
+                required_work=max(1, len(modules or frameworks or [])),
+                actor="dashboard",
+                reason="dashboard scan queued",
+                metadata={"source": "dashboard", "compatibility_projection": True},
+            )
+            attempt = service.acquire_lease(
+                scan_id,
+                "dashboard",
+                tenant_id=self.tenant_id,
+                lease_seconds=24 * 60 * 60,
+                idempotency_key=f"dashboard-attempt:{scan_id}",
+                actor="dashboard",
+            )
+            started = service.start_attempt(
+                str(attempt["id"]),
+                str(attempt["lease_token"]),
+                tenant_id=self.tenant_id,
+                actor="dashboard",
+                worker_id="dashboard",
+            )
+            # The token is retained only in the in-process compatibility
+            # projection so the monitor can durably finish its attempt.
+            for key, info in self._active_scans.items():
+                if self._base_scan_id(key) == scan_id:
+                    info["durable_attempt_id"] = str(started["id"])
+                    info["durable_lease_token"] = str(attempt["lease_token"])
+            self._register_durable_scan_processes(
+                scan_id,
+                str(started["id"]),
+                service=service,
+            )
+            return service.get_job(scan_id, tenant_id=self.tenant_id)
+        except Exception as exc:
+            log.error(
+                "Could not establish durable dashboard job %s reason=%s",
+                str(redact_authorization_value(scan_id))[:100],
+                type(exc).__name__,
+            )
+            raise
+
+    def _cancel_unstarted_durable_scan(self, scan_id: str, reason: str) -> None:
+        """Close a pre-spawn dashboard attempt when process launch cannot start.
+
+        The durable attempt is intentionally established before ``Popen``.  If
+        launch then fails, cancellation records that no worker was started
+        instead of leaving an apparently running lease for reconciliation.
+        """
+
+        try:
+            self._durable_job_state().cancel_job(
+                scan_id,
+                tenant_id=self.tenant_id,
+                actor="dashboard",
+                reason=reason,
+            )
+        except (InvalidTransition, KeyError, LeaseError):
+            log.warning(
+                "Could not close unstarted durable scan reason=%s",
+                type(reason).__name__,
+            )
+
+    def _register_durable_scan_processes(
+        self,
+        scan_id: str,
+        attempt_id: str,
+        *,
+        service: JobStateService | None = None,
+    ) -> None:
+        """Persist every safely identifiable dashboard child before monitoring it."""
+
+        service = service or self._durable_job_state()
+        for key, info in self._active_scans.items():
+            if self._base_scan_id(key) != scan_id:
+                continue
+            proc = info.get("proc")
+            if proc is None:
+                continue
+            identity = info.get("pre_spawn_process_identity")
+            if isinstance(identity, Mapping):
+                try:
+                    identity = ProcessIdentity.from_value(identity)
+                except ProcessIdentityError:
+                    identity = None
+            if not isinstance(identity, ProcessIdentity):
+                identity = self._job_process_supervisor.capture(proc)
+            if identity is None:
+                # Do not invent a PID-only record.  The durable attempt remains
+                # explicitly uncertain on restart rather than authorizing an
+                # unsafe signal to a potentially reused PID.
+                service.append_log(
+                    scan_id,
+                    "dashboard child process identity could not be captured",
+                    tenant_id=self.tenant_id,
+                    level="warning",
+                    attempt_id=attempt_id,
+                    data={"process_key": key},
+                    actor="dashboard",
+                )
+                continue
+            service.register_process(
+                scan_id,
+                attempt_id,
+                identity,
+                tenant_id=self.tenant_id,
+                identity_key=key,
+                actor="dashboard",
+            )
+            info["durable_process_identity"] = identity.to_dict()
+
+    def _durable_scan_status(self, scan_id: str) -> str | None:
+        row = self._durable_job_state().get_job(scan_id, tenant_id=self.tenant_id)
+        return str(row["status"]) if row is not None else None
+
+    def _finish_durable_scan(self, scan_id: str, status: str, reason: str = "") -> None:
+        service = self._durable_job_state()
+        row = service.get_job(scan_id, tenant_id=self.tenant_id)
+        if row is None:
+            active = next(
+                (
+                    info for key, info in self._active_scans.items()
+                    if self._base_scan_id(key) == scan_id
+                ),
+                None,
+            )
+            if active is not None:
+                self._ensure_durable_scan_job(
+                    scan_id,
+                    target=str(active.get("target", "")),
+                    frameworks=[str(active.get("type", "scan"))],
+                )
+                row = service.get_job(scan_id, tenant_id=self.tenant_id)
+            if row is None:
+                return
+        if status in {"stopped", "aborted", "canceled"}:
+            try:
+                service.cancel_job(
+                    scan_id,
+                    tenant_id=self.tenant_id,
+                    actor="dashboard",
+                    reason=reason or f"scan {status}",
+                )
+            except (InvalidTransition, KeyError, LeaseError):
+                pass
+            return
+        if status not in {"completed", "failed", "partial", "expired", "orphaned"}:
+            return
+        attempts = service.list_attempts(scan_id, tenant_id=self.tenant_id)
+        attempt = next(
+            (item for item in reversed(attempts) if item.get("state") in {"running", "leased"}),
+            None,
+        )
+        if attempt is not None:
+            # A child exit is only an observation.  Without an accepted
+            # worker delivery, revoke the capability into explicit orphaned
+            # work instead of allowing a zero-coverage/legacy job to become
+            # completed from a return code alone.
+            try:
+                accepted_result = service.has_accepted_result(
+                    str(attempt["id"]),
+                    tenant_id=self.tenant_id,
+                )
+            except (KeyError, InvalidTransition):
+                accepted_result = False
+            if not accepted_result:
+                try:
+                    service.revoke_lease(
+                        str(attempt["id"]),
+                        tenant_id=self.tenant_id,
+                        actor="dashboard",
+                        reason="process exit lacked accepted result delivery",
+                    )
+                except (InvalidTransition, KeyError, LeaseError):
+                    pass
+                return
+            token = None
+            for info in self._active_scans.values():
+                if self._base_scan_id(str(info.get("scan_id", ""))) == scan_id:
+                    token = info.get("durable_lease_token")
+                    break
+            # Process entries historically did not retain scan_id; inspect all
+            # active entries for the attempt token as a fallback.
+            if token is None:
+                for info in self._active_scans.values():
+                    if info.get("durable_attempt_id") == attempt.get("id"):
+                        token = info.get("durable_lease_token")
+                        break
+            if token:
+                try:
+                    service.finish_attempt(
+                        str(attempt["id"]),
+                        tenant_id=self.tenant_id,
+                        lease_token=str(token),
+                        success=status == "completed",
+                        error_reason=reason or ("scan failed" if status == "failed" else None),
+                        terminal_reason=reason or f"scan {status}",
+                        actor="dashboard",
+                    )
+                    return
+                except (InvalidTransition, LeaseError, KeyError):
+                    pass
+            # A process exit without the durable lease capability is not a
+            # trustworthy result.  Revoke it into explicit orphaned work
+            # instead of manufacturing a terminal state from an in-memory
+            # monitor observation.
+            try:
+                service.revoke_lease(
+                    str(attempt["id"]),
+                    tenant_id=self.tenant_id,
+                    actor="dashboard",
+                    reason="process exit lacked durable result capability",
+                )
+            except (InvalidTransition, KeyError, LeaseError):
+                pass
+            return
+        try:
+            service.reconcile(tenant_id=self.tenant_id, actor="dashboard-monitor")
+            service.append_log(
+                scan_id,
+                "compatibility process status was not accepted as a durable result",
+                tenant_id=self.tenant_id,
+                level="warning",
+                data={"status": status, "reason": reason},
+                actor="dashboard",
+            )
+        except (InvalidTransition, KeyError, LeaseError, ValueError):
+            pass
+
     def _sync_scan_job_from_active(self, scan_id: str, fallback: str = "running") -> None:
         """Update a durable job row from active subprocess state."""
         active_items = {
@@ -8092,6 +9583,11 @@ class DashboardServer:
         elif status in {"aborted", "stopped"}:
             error = f"Scan {status} by operator control."
 
+        # Update the durable state machine before refreshing the compatibility
+        # ORM row.  The latter is intentionally only a dashboard projection.
+        if terminal:
+            self._finish_durable_scan(scan_id, status, reason=error or "process exit")
+
         def _update(session: Any) -> None:
             update_scan_job(
                 session,
@@ -8114,6 +9610,34 @@ class DashboardServer:
 
     def _load_scan_job(self, scan_id: str) -> dict[str, Any] | None:
         """Load a durable scan job row as a JSON-friendly dict."""
+        durable_rows = self._durable_jobs_for_read_projection(
+            scan_id=scan_id,
+            limit=1,
+        )
+        durable = durable_rows[0] if durable_rows else None
+        if durable is not None:
+            payload = durable.get("payload") or {}
+            metadata = durable.get("metadata") or {}
+            return {
+                "scan_id": scan_id,
+                "status": durable.get("status"),
+                "state": durable.get("state"),
+                "target": payload.get("target", ""),
+                "frameworks": payload.get("frameworks", []),
+                "actual_modules": payload.get("modules", []),
+                "version": durable.get("version"),
+                "created_at": durable.get("created_at"),
+                "updated_at": durable.get("updated_at"),
+                "started_at": durable.get("started_at"),
+                "completed_at": durable.get("terminal_at"),
+                "error": durable.get("error_reason"),
+                "metadata": metadata,
+                "authorization_state": metadata.get(
+                    "authorization_state", "unknown_not_authorized"
+                ),
+                "authorization_decision_id": payload.get("authorization_decision_id"),
+            }
+
         def _load(session: Any) -> dict[str, Any] | None:
             job = get_scan_job(session, scan_id, tenant_id=self.tenant_id)
             if job is None:
@@ -8199,11 +9723,64 @@ class DashboardServer:
             },
         }
 
+    @staticmethod
+    def _durable_job_mapping(row: Mapping[str, Any]) -> dict[str, Any]:
+        """Decode a Task-103 row returned through the read-only SQLite path."""
+
+        result = dict(row)
+        for field in ("payload_json", "metadata_json", "process_identity_json"):
+            if field not in result:
+                continue
+            output_field = field.removesuffix("_json")
+            try:
+                value = result.pop(field)
+                result[output_field] = json.loads(str(value)) if value else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result[output_field] = {}
+        result["status"] = result.get("state", "unknown")
+        result.pop("lease_token_digest", None)
+        return result
+
+    def _durable_jobs_for_read_projection(
+        self,
+        *,
+        scan_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Read Task-103 state without creating or reconciling a database.
+
+        Viewer routes must never turn a missing dashboard database into a new
+        writable store.  Reuse the in-process authority only when it is
+        already open for the same path; otherwise take the descriptor-pinned
+        read-only SQLite path below.
+        """
+
+        if (
+            self._job_state_service is not None
+            and self._job_state_service_path == str(self._scan_jobs_db_path)
+        ):
+            if scan_id is None:
+                return self._job_state_service.list_jobs(
+                    tenant_id=self.tenant_id,
+                    limit=limit,
+                )
+            row = self._job_state_service.get_job(
+                scan_id,
+                tenant_id=self.tenant_id,
+            )
+            return [row] if row is not None else []
+        return self._load_scan_jobs_read_only(
+            scan_id=scan_id,
+            limit=limit,
+            durable=True,
+        )
+
     def _load_scan_jobs_read_only(
         self,
         *,
         scan_id: str | None = None,
         limit: int = 200,
+        durable: bool = False,
     ) -> list[dict[str, Any]]:
         """Read durable jobs without creating/migrating or writing the DB.
 
@@ -8282,19 +9859,33 @@ class DashboardServer:
             connection = sqlite3.connect(uri, uri=True, timeout=1.0)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only=ON").close()
-            if scan_id is None:
-                rows = connection.execute(
-                    "SELECT * FROM scan_jobs WHERE tenant_id=? "
-                    "ORDER BY created_at DESC LIMIT ?",
-                    (self.tenant_id, max(1, min(int(limit), 1000))),
-                ).fetchall()
+            if durable:
+                if scan_id is None:
+                    rows = connection.execute(
+                        "SELECT * FROM durable_job_state_jobs WHERE tenant_id=? "
+                        "ORDER BY created_at DESC LIMIT ?",
+                        (self.tenant_id, max(1, min(int(limit), 1000))),
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        "SELECT * FROM durable_job_state_jobs "
+                        "WHERE id=? AND tenant_id=? LIMIT 1",
+                        (scan_id, self.tenant_id),
+                    ).fetchall()
+                mapped_rows = [self._durable_job_mapping(row) for row in rows]
             else:
-                rows = connection.execute(
-                    "SELECT * FROM scan_jobs WHERE id=? AND tenant_id=? LIMIT 1",
-                    (scan_id, self.tenant_id),
-                ).fetchall()
-
-            mapped_rows = [self._scan_job_mapping(row) for row in rows]
+                if scan_id is None:
+                    rows = connection.execute(
+                        "SELECT * FROM scan_jobs WHERE tenant_id=? "
+                        "ORDER BY created_at DESC LIMIT ?",
+                        (self.tenant_id, max(1, min(int(limit), 1000))),
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        "SELECT * FROM scan_jobs WHERE id=? AND tenant_id=? LIMIT 1",
+                        (scan_id, self.tenant_id),
+                    ).fetchall()
+                mapped_rows = [self._scan_job_mapping(row) for row in rows]
             connection.close()
             connection = None
             comparison_parent_descriptor = _open_artifact_directory(
@@ -8361,7 +9952,12 @@ class DashboardServer:
                     current_parent_metadata.st_dev,
                     current_parent_metadata.st_ino,
                 )
-                or not sidecars_stable
+                # SQLite may update the WAL shared-memory header while a
+                # read-only connection opens it.  The durable reader still
+                # has a pinned main database identity and a transactional
+                # snapshot; retain the stricter sidecar replacement check for
+                # the legacy projection, whose file is itself the authority.
+                or (not durable and not sidecars_stable)
             ):
                 return []
             result = mapped_rows
@@ -8392,6 +9988,40 @@ class DashboardServer:
 
     def _load_scan_jobs(self, limit: int = 200) -> list[dict[str, Any]]:
         """Load durable scan job rows newest-first."""
+        durable_rows = self._durable_jobs_for_read_projection(limit=limit)
+        if durable_rows:
+            rows: list[dict[str, Any]] = []
+            for job in durable_rows:
+                payload = job.get("payload") or {}
+                metadata = job.get("metadata") or {}
+                rows.append({
+                    "scan_id": job.get("id", ""),
+                    "target": payload.get("target", ""),
+                    "scan_type": ",".join(payload.get("frameworks", [])) or "scan",
+                    "mode": metadata.get("mode", ""),
+                    "engagement": metadata.get("engagement", ""),
+                    "frameworks": payload.get("frameworks", []),
+                    "requested_modules": payload.get("modules", []),
+                    "actual_modules": payload.get("modules", []),
+                    "started_at": job.get("started_at") or job.get("created_at"),
+                    "updated_at": job.get("updated_at"),
+                    "completed_at": job.get("terminal_at"),
+                    "status": job.get("status"),
+                    "state": job.get("state"),
+                    "version": job.get("version"),
+                    "return_code": metadata.get("return_code"),
+                    "results_dir": metadata.get("results_dir"),
+                    "logs": metadata.get("logs", {}),
+                    "error": job.get("error_reason"),
+                    "authorization_state": metadata.get(
+                        "authorization_state", "unknown_not_authorized"
+                    ),
+                    "authorization_decision_id": payload.get("authorization_decision_id"),
+                    "authorization_action_id": metadata.get("authorization_action_id"),
+                    "findings_count": {"critical": 0, "high": 0, "medium": 0, "low": 0, "total": 0},
+                })
+            return rows
+
         def _load(session: Any) -> list[dict[str, Any]]:
             jobs = (
                 session.query(ScanJobModel)
@@ -8684,14 +10314,32 @@ class DashboardServer:
             "retest",
         )
 
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(forge_root),
-            env=child_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
+        try:
+            self._ensure_durable_scan_job(
+                scan_id,
+                target=target,
+                frameworks=[framework],
+                modules=[module],
+                authorization=authorization,
+            )
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(forge_root),
+                env=child_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except Exception as exc:
+            self._cancel_unstarted_durable_scan(
+                scan_id,
+                "retest subprocess launch failed",
+            )
+            log.error("Failed to launch durable retest reason=%s", type(exc).__name__)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to launch retest; execution denied",
+            ) from exc
         key = f"{scan_id}_{'net' if framework == 'netforge' else 'web'}"
         now_iso = datetime.now(timezone.utc).isoformat()
         self._active_scans[key] = {
@@ -8709,6 +10357,30 @@ class DashboardServer:
             "retest_id": retest_id,
             "finding_id": finding["id"],
         }
+        try:
+            self._ensure_durable_scan_job(
+                scan_id,
+                target=target,
+                frameworks=[framework],
+                modules=[module],
+                authorization=authorization,
+            )
+        except Exception as exc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1)
+            except Exception:
+                pass
+            self._active_scans.pop(key, None)
+            self._cancel_unstarted_durable_scan(
+                scan_id,
+                "durable retest process registration failed",
+            )
+            log.error("Could not register durable retest child reason=%s", type(exc).__name__)
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to establish durable retest ownership; execution denied",
+            ) from exc
         self._track_scan_process(key, self._active_scans[key])
         self._write_scan_job(
             scan_id=scan_id,
@@ -8968,7 +10640,7 @@ class DashboardServer:
 
         jobs = {
             job.get("scan_id", ""): job
-            for job in self._load_scan_jobs_read_only(limit=max(limit, 200))
+            for job in self._load_scan_jobs(limit=max(limit, 200))
         }
         seen_ids = {record.get("scan_id", "") for record in history}
         for record in history:
@@ -8995,8 +10667,18 @@ class DashboardServer:
 
         # Enrich the response projection only.  A viewer GET must never
         # reconcile jobs or persist orphan status.
+        durable_ids = {
+            str(job.get("id"))
+            for job in self._durable_jobs_for_read_projection(
+                limit=max(limit, 200),
+            )
+        }
         for record in history:
             sid = record.get("scan_id", "")
+            if sid in durable_ids:
+                # The state machine owns lifecycle status; active processes are
+                # only a best-effort process/log projection after restart.
+                continue
             if any(self._base_scan_id(key) == sid for key in self._active_scans):
                 record["status"] = self._aggregate_scan_status(
                     sid,
