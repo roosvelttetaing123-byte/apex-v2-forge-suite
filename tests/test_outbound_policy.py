@@ -62,6 +62,17 @@ TARGET = "https://127.0.0.1:8443/start"
 ALLOWED_SCOPE = ["127.0.0.1/32", "https://127.0.0.1:8443"]
 
 
+@pytest.fixture(autouse=True)
+def _default_trusted_test_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    test_now = datetime.now(timezone.utc).replace(microsecond=0)
+    monkeypatch.setitem(globals(), "NOW", test_now)
+    monkeypatch.setattr(
+        outbound_policy_module,
+        "_system_utc_now",
+        lambda: test_now,
+    )
+
+
 def test_test_harness_blocks_non_loopback_socket_attempts() -> None:
     import socket
 
@@ -940,59 +951,63 @@ def _policy(
         )
     )
     session = create_db(tmp_path / "outbound.db")
-    auth_context = _authorization_context(
-        requested_target=target,
-        resolved_target=target,
-        allowed_scope=allowed_scope or ALLOWED_SCOPE,
-        excluded_scope=excluded_scope or [],
-        **(context_overrides or {}),
-    )
-    envelope = _consumed_envelope(session, auth_context)
-    insecure_envelope = None
-    insecure_expected = None
-    if authorize_insecure_tls:
-        insecure_expected = replace(
-            auth_context,
-            action_kind="outbound.insecure_tls",
-            parent_decision_id=envelope.decision_id,
-            confirmation_method=ConfirmationMethod.INHERITED,
+    try:
+        auth_context = _authorization_context(
+            requested_target=target,
+            resolved_target=target,
+            allowed_scope=allowed_scope or ALLOWED_SCOPE,
+            excluded_scope=excluded_scope or [],
+            **(context_overrides or {}),
         )
-        derived = derive_authorization(
+        envelope = _consumed_envelope(session, auth_context)
+        insecure_envelope = None
+        insecure_expected = None
+        if authorize_insecure_tls:
+            insecure_expected = replace(
+                auth_context,
+                action_kind="outbound.insecure_tls",
+                parent_decision_id=envelope.decision_id,
+                confirmation_method=ConfirmationMethod.INHERITED,
+            )
+            derived = derive_authorization(
+                session=session,
+                parent_envelope=envelope,
+                context=insecure_expected,
+                parent_boundary="webforge.module",
+                now=validation_now,
+                ttl_seconds=insecure_tls_ttl_seconds,
+            )
+            assert derived.allowed
+            consumed_insecure = consume_authorization(
+                session=session,
+                envelope=derived.envelope,
+                expected=insecure_expected,
+                boundary="outbound.insecure_tls",
+                now=validation_now,
+            )
+            assert consumed_insecure.allowed
+            insecure_envelope = derived.envelope
+        route = outbound_overrides.pop("route", None)
+        if route is not None:
+            route = route.with_action_id(envelope.action_id)
+        outbound = OutboundContext.from_consumed_authorization(
             session=session,
-            parent_envelope=envelope,
-            context=insecure_expected,
-            parent_boundary="webforge.module",
-            now=validation_now,
-            ttl_seconds=insecure_tls_ttl_seconds,
+            envelope=envelope,
+            expected=auth_context,
+            boundary="webforge.module",
+            authorized_target=target,
+            allowed_scope=allowed_scope or ALLOWED_SCOPE,
+            excluded_scope=excluded_scope or [],
+            audit_sink=DatabaseOutboundAuditSink(session),
+            route=route,
+            insecure_tls_authorization=insecure_envelope,
+            insecure_tls_expected=insecure_expected,
+            **outbound_overrides,
         )
-        assert derived.allowed
-        consumed_insecure = consume_authorization(
-            session=session,
-            envelope=derived.envelope,
-            expected=insecure_expected,
-            boundary="outbound.insecure_tls",
-            now=validation_now,
-        )
-        assert consumed_insecure.allowed
-        insecure_envelope = derived.envelope
-    route = outbound_overrides.pop("route", None)
-    if route is not None:
-        route = route.with_action_id(envelope.action_id)
-    outbound = OutboundContext.from_consumed_authorization(
-        session=session,
-        envelope=envelope,
-        expected=auth_context,
-        boundary="webforge.module",
-        authorized_target=target,
-        allowed_scope=allowed_scope or ALLOWED_SCOPE,
-        excluded_scope=excluded_scope or [],
-        audit_sink=DatabaseOutboundAuditSink(session),
-        route=route,
-        insecure_tls_authorization=insecure_envelope,
-        insecure_tls_expected=insecure_expected,
-        **outbound_overrides,
-    )
-    return OutboundPolicy(outbound, runtime_id=runtime_id), session
+        return OutboundPolicy(outbound, runtime_id=runtime_id), session
+    except BaseException:
+        session.close()
+        raise
 
 
 def test_excluded_initial_target_is_denied_before_resolver_or_transport(tmp_path) -> None:
@@ -1905,12 +1920,13 @@ def test_imported_cookie_path_is_revalidated_on_same_origin_redirect(tmp_path) -
         port = int(server.sockets[0].getsockname()[1])
         origin = f"http://127.0.0.1:{port}"
         target = f"{origin}/admin/start"
-        policy, session = _policy(
-            tmp_path,
-            target=target,
-            allowed_scope=["127.0.0.1/32", origin],
-        )
+        session = None
         try:
+            policy, session = _policy(
+                tmp_path,
+                target=target,
+                allowed_scope=["127.0.0.1/32", origin],
+            )
             client = PolicyHttpClient(
                 policy,
                 cookies={"admin_session": "CANARY_ADMIN_COOKIE"},
@@ -1936,7 +1952,8 @@ def test_imported_cookie_path_is_revalidated_on_same_origin_redirect(tmp_path) -
             assert wire_requests[2].startswith("GET /public HTTP/1.1\r\n")
             assert "\r\nCookie:" not in wire_requests[2]
         finally:
-            session.close()
+            if session is not None:
+                session.close()
             server.close()
             await server.wait_closed()
 
@@ -3639,17 +3656,18 @@ def test_trusted_certificate_with_wrong_hostname_fails_closed(
         )
         port = int(server.sockets[0].getsockname()[1])
         target = f"https://allowed.test:{port}/"
-        policy, session = _policy(
-            tmp_path / "wrong-host",
-            target=target,
-            allowed_scope=["allowed.test", "127.0.0.1/32", target],
-        )
-        client_context = ssl.create_default_context(cafile=str(ca_path))
-        monkeypatch.setattr(
-            "common.outbound_policy.ssl.create_default_context",
-            lambda: client_context,
-        )
+        session = None
         try:
+            policy, session = _policy(
+                tmp_path / "wrong-host",
+                target=target,
+                allowed_scope=["allowed.test", "127.0.0.1/32", target],
+            )
+            client_context = ssl.create_default_context(cafile=str(ca_path))
+            monkeypatch.setattr(
+                "common.outbound_policy.ssl.create_default_context",
+                lambda: client_context,
+            )
             with pytest.raises(OutboundDenied) as denied:
                 await PolicyHttpClient(
                     policy,
@@ -3659,7 +3677,8 @@ def test_trusted_certificate_with_wrong_hostname_fails_closed(
                 ).get(target)
             assert denied.value.reason_code == OutboundReason.TLS_VERIFICATION_FAILED.value
         finally:
-            session.close()
+            if session is not None:
+                session.close()
             server.close()
             await server.wait_closed()
 
@@ -3691,18 +3710,20 @@ def test_delayed_response_chunks_cannot_bypass_body_limit(tmp_path) -> None:
         server = await asyncio.start_server(handler, "127.0.0.1", 0)
         port = int(server.sockets[0].getsockname()[1])
         target = f"http://127.0.0.1:{port}/slow"
-        policy, session = _policy(
-            tmp_path,
-            target=target,
-            allowed_scope=["127.0.0.1/32", target],
-            max_response_bytes=50,
-        )
+        session = None
         try:
+            policy, session = _policy(
+                tmp_path,
+                target=target,
+                allowed_scope=["127.0.0.1/32", target],
+                max_response_bytes=50,
+            )
             with pytest.raises(OutboundDenied) as denied:
                 await PolicyHttpClient(policy).get(target)
             assert denied.value.reason_code == OutboundReason.RESPONSE_TOO_LARGE.value
         finally:
-            session.close()
+            if session is not None:
+                session.close()
             server.close()
             await server.wait_closed()
 

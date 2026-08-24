@@ -350,6 +350,260 @@ class SupplyChainError(RuntimeError):
     """Raised when a security baseline or its independent receipt is invalid."""
 
 
+_GIT_CONTROL_FILE_LIMIT = 4096
+
+
+def _git_repository_environment() -> dict[str, str]:
+    """Return an environment without caller-controlled Git repository selectors."""
+
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+
+
+def _read_git_control_file(
+    path: Path,
+    label: str,
+) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
+    """Read one bounded Git control file without following links or accepting drift."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise SupplyChainError(f"{label} is missing, unreadable, or a symlink") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SupplyChainError(f"{label} must be a regular file")
+        if before.st_size > _GIT_CONTROL_FILE_LIMIT:
+            raise SupplyChainError(f"{label} exceeds the bounded control-file size")
+        content = os.read(descriptor, _GIT_CONTROL_FILE_LIMIT + 1)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity or len(content) != after.st_size:
+        raise SupplyChainError(f"{label} changed while it was being read")
+    return content, after_identity
+
+
+def _git_path_record(content: bytes, label: str, *, prefix: bytes = b"") -> str:
+    """Decode one canonical LF-terminated UTF-8 Git path record."""
+
+    if not content.endswith(b"\n") or content.count(b"\n") != 1 or b"\r" in content:
+        raise SupplyChainError(f"{label} must contain exactly one LF-terminated record")
+    record = content[:-1]
+    if prefix:
+        if not record.startswith(prefix):
+            raise SupplyChainError(f"{label} has invalid record syntax")
+        record = record[len(prefix) :]
+    if not record or any(byte < 0x20 or byte == 0x7F for byte in record):
+        raise SupplyChainError(f"{label} contains an empty or unsafe path")
+    try:
+        return record.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SupplyChainError(f"{label} path is not canonical UTF-8") from exc
+
+
+def _canonical_absolute_path(raw: str, label: str) -> Path:
+    """Resolve an absolute path while rejecting lexical aliases and symlink traversal."""
+
+    path = Path(raw)
+    if not path.is_absolute() or str(path) != raw:
+        raise SupplyChainError(f"{label} path is not canonical and absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise SupplyChainError(f"{label} path cannot be resolved") from exc
+    if resolved != path:
+        raise SupplyChainError(f"{label} path traverses a symlink or lexical alias")
+    return resolved
+
+
+def _real_directory_identity(
+    path: Path,
+    label: str,
+) -> tuple[int, int, int, int, int]:
+    """Capture a real canonical directory identity for later drift detection."""
+
+    try:
+        path_stat = path.lstat()
+    except OSError as exc:
+        raise SupplyChainError(f"{label} cannot be inspected") from exc
+    if not stat.S_ISDIR(path_stat.st_mode):
+        raise SupplyChainError(f"{label} must be a real directory")
+    try:
+        if path.resolve(strict=True) != path:
+            raise SupplyChainError(f"{label} must not traverse a symlink")
+    except OSError as exc:
+        raise SupplyChainError(f"{label} cannot be resolved") from exc
+    return (
+        path_stat.st_dev,
+        path_stat.st_ino,
+        path_stat.st_mode,
+        path_stat.st_mtime_ns,
+        path_stat.st_ctime_ns,
+    )
+
+
+def _assert_linked_worktree_unchanged(
+    control_files: tuple[
+        tuple[Path, str, tuple[bytes, tuple[int, int, int, int, int, int]]], ...
+    ],
+    directories: tuple[tuple[Path, str, tuple[int, int, int, int, int]], ...],
+) -> None:
+    """Fail when a linked-worktree marker or administrative path drifted."""
+
+    for path, label, expected in control_files:
+        if _read_git_control_file(path, label) != expected:
+            raise SupplyChainError(f"{label} changed during Git validation")
+    for directory_path, directory_label, directory_expected in directories:
+        if _real_directory_identity(directory_path, directory_label) != directory_expected:
+            raise SupplyChainError(f"{directory_label} changed during Git validation")
+
+
+def _validate_linked_worktree_gitfile(
+    root: Path,
+) -> tuple[
+    tuple[tuple[Path, str, tuple[bytes, tuple[int, int, int, int, int, int]]], ...],
+    tuple[tuple[Path, str, tuple[int, int, int, int, int]], ...],
+]:
+    """Validate a regular ``.git`` marker as this exact linked worktree."""
+
+    root = root.resolve(strict=True)
+    root_identity = _real_directory_identity(root, "candidate root")
+    marker = root / ".git"
+    marker_snapshot = _read_git_control_file(marker, "linked-worktree .git marker")
+    admin_raw = _git_path_record(
+        marker_snapshot[0],
+        "linked-worktree .git marker",
+        prefix=b"gitdir: ",
+    )
+    git_admin = _canonical_absolute_path(admin_raw, "linked-worktree Git admin")
+    admin_identity = _real_directory_identity(git_admin, "linked-worktree Git admin")
+
+    commondir_path = git_admin / "commondir"
+    commondir_snapshot = _read_git_control_file(
+        commondir_path,
+        "linked-worktree commondir",
+    )
+    common_raw = _git_path_record(commondir_snapshot[0], "linked-worktree commondir")
+    common_reference = Path(common_raw)
+    if str(common_reference) != common_raw:
+        raise SupplyChainError("linked-worktree commondir path is not canonical")
+    try:
+        common_dir = (
+            common_reference
+            if common_reference.is_absolute()
+            else git_admin / common_reference
+        ).resolve(strict=True)
+    except OSError as exc:
+        raise SupplyChainError("linked-worktree common directory cannot be resolved") from exc
+    if common_reference.is_absolute() and common_dir != common_reference:
+        raise SupplyChainError("linked-worktree commondir path traverses a symlink")
+    common_identity = _real_directory_identity(
+        common_dir,
+        "linked-worktree common directory",
+    )
+    worktrees_dir = common_dir / "worktrees"
+    worktrees_identity = _real_directory_identity(
+        worktrees_dir,
+        "linked-worktree administrative parent",
+    )
+    if git_admin.parent != worktrees_dir or not git_admin.name:
+        raise SupplyChainError("linked-worktree Git admin has invalid common-dir topology")
+
+    backlink_path = git_admin / "gitdir"
+    backlink_snapshot = _read_git_control_file(
+        backlink_path,
+        "linked-worktree gitdir backlink",
+    )
+    backlink_raw = _git_path_record(
+        backlink_snapshot[0],
+        "linked-worktree gitdir backlink",
+    )
+    backlink = _canonical_absolute_path(backlink_raw, "linked-worktree gitdir backlink")
+    if backlink != marker:
+        raise SupplyChainError("linked-worktree gitdir backlink does not name this marker")
+
+    control_files = (
+        (marker, "linked-worktree .git marker", marker_snapshot),
+        (commondir_path, "linked-worktree commondir", commondir_snapshot),
+        (backlink_path, "linked-worktree gitdir backlink", backlink_snapshot),
+    )
+    directories = (
+        (root, "candidate root", root_identity),
+        (git_admin, "linked-worktree Git admin", admin_identity),
+        (common_dir, "linked-worktree common directory", common_identity),
+        (worktrees_dir, "linked-worktree administrative parent", worktrees_identity),
+    )
+
+    try:
+        resolved = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+                "--git-dir",
+                "--git-common-dir",
+                "--is-inside-work-tree",
+                "--is-bare-repository",
+            ],
+            check=False,
+            capture_output=True,
+            timeout=30,
+            env=_git_repository_environment(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SupplyChainError("linked-worktree Git identity cannot be resolved") from exc
+    if resolved.returncode != 0:
+        raise SupplyChainError("linked-worktree Git identity cannot be resolved")
+    if (
+        not resolved.stdout.endswith(b"\n")
+        or b"\r" in resolved.stdout
+        or resolved.stdout.count(b"\n") != 5
+    ):
+        raise SupplyChainError("linked-worktree Git identity is not canonical output")
+    try:
+        resolved_records = resolved.stdout[:-1].decode("utf-8").split("\n")
+    except UnicodeDecodeError as exc:
+        raise SupplyChainError("linked-worktree Git identity is not canonical UTF-8") from exc
+    expected_paths = (root, git_admin, common_dir)
+    for raw, expected, label in zip(
+        resolved_records[:3],
+        expected_paths,
+        ("worktree root", "Git admin", "common directory"),
+        strict=True,
+    ):
+        if _canonical_absolute_path(raw, f"Git-resolved {label}") != expected:
+            raise SupplyChainError(f"Git-resolved {label} differs from linked-worktree metadata")
+    if resolved_records[3:] != ["true", "false"]:
+        raise SupplyChainError("Git identity is not a non-bare worktree")
+    _assert_linked_worktree_unchanged(control_files, directories)
+    return control_files, directories
+
+
 def _is_local_private_file(name: str) -> bool:
     """Classify private-looking filenames excluded when they are machine-local."""
 
@@ -388,12 +642,17 @@ def _tracked_local_private_paths(root: Path) -> tuple[str, ...]:
     ):
         raise SupplyChainError("Git worktree marker has an unsupported type")
 
+    linked_snapshot = None
+    if stat.S_ISREG(marker_stat.st_mode):
+        linked_snapshot = _validate_linked_worktree_gitfile(root)
+
     try:
         top_level = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
             check=False,
             capture_output=True,
             timeout=30,
+            env=_git_repository_environment(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise SupplyChainError("Git worktree identity cannot be resolved") from exc
@@ -405,6 +664,8 @@ def _tracked_local_private_paths(root: Path) -> tuple[str, ...]:
         raise SupplyChainError("Git worktree identity is not canonical UTF-8") from exc
     if resolved_top_level != root:
         raise SupplyChainError("Git worktree root differs from the candidate root")
+    if linked_snapshot is not None:
+        _assert_linked_worktree_unchanged(*linked_snapshot)
 
     try:
         tracked = subprocess.run(
@@ -412,11 +673,14 @@ def _tracked_local_private_paths(root: Path) -> tuple[str, ...]:
             check=False,
             capture_output=True,
             timeout=30,
+            env=_git_repository_environment(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise SupplyChainError("tracked source inventory cannot be enumerated") from exc
     if tracked.returncode != 0:
         raise SupplyChainError("tracked source inventory cannot be enumerated")
+    if linked_snapshot is not None:
+        _assert_linked_worktree_unchanged(*linked_snapshot)
 
     private_paths: list[str] = []
     for encoded in tracked.stdout.split(b"\0"):
@@ -444,6 +708,8 @@ def _tracked_local_private_paths(root: Path) -> tuple[str, ...]:
                 f"tracked private path must be a regular file: {relative}"
             )
         private_paths.append(relative)
+    if linked_snapshot is not None:
+        _assert_linked_worktree_unchanged(*linked_snapshot)
     return tuple(sorted(private_paths))
 
 
@@ -709,6 +975,9 @@ def _validate_top_level_classification(root: Path) -> None:
         if stat.S_ISLNK(entry_stat.st_mode):
             raise SupplyChainError(f"top-level candidate path must not be a symlink: {name}")
         if stat.S_ISREG(entry_stat.st_mode):
+            if name == ".git":
+                _validate_linked_worktree_gitfile(root)
+                continue
             if (
                 name not in candidate_files
                 and name not in _NONCANDIDATE_ROOT_FILES

@@ -2764,8 +2764,30 @@ def _persist_legacy_custody(
     return store, staged
 
 
-def save_finding_retest(session: Session, retest_dict: dict[str, Any]) -> None:
-    """Persist or replace a finding retest record."""
+def save_finding_retest(
+    session: Session,
+    retest_dict: dict[str, Any],
+    *,
+    allow_legacy_compat: bool = False,
+) -> None:
+    """Persist one legacy finding-retest row only for an explicit fixture.
+
+    Task 101 canonical retests require tenant, finding, and source-observation
+    lineage through ``CanonicalAdapter``.  This pre-Gate-1 table cannot express
+    that graph, so production callers fail before a row is written.
+    """
+    if not allow_legacy_compat:
+        from common.canonical import MissingCanonicalContextError
+
+        raise MissingCanonicalContextError(
+            "canonical retest adapters require tenant, finding, and source-observation context"
+        )
+    if "canonical_context" in retest_dict:
+        from common.canonical import MissingCanonicalContextError
+
+        raise MissingCanonicalContextError(
+            "legacy retest writer cannot persist canonical context; use CanonicalAdapter"
+        )
     if "id" not in retest_dict:
         raise ValueError("retest id is required")
     if "finding_id" not in retest_dict:
@@ -2807,8 +2829,20 @@ def save_finding_retest(session: Session, retest_dict: dict[str, Any]) -> None:
     session.commit()
 
 
-def update_finding_retest(session: Session, retest_id: str, **updates: Any) -> FindingRetestModel | None:
-    """Apply a partial update to a persisted finding retest."""
+def update_finding_retest(
+    session: Session,
+    retest_id: str,
+    *,
+    allow_legacy_compat: bool = False,
+    **updates: Any,
+) -> FindingRetestModel | None:
+    """Update one explicitly opted-in legacy finding-retest fixture."""
+    if not allow_legacy_compat:
+        from common.canonical import MissingCanonicalContextError
+
+        raise MissingCanonicalContextError(
+            "canonical retest adapters require tenant, finding, and source-observation context"
+        )
     model = session.get(FindingRetestModel, retest_id)
     if model is None:
         return None

@@ -643,6 +643,7 @@ def test_scan_job_migration_downgrades_unlinked_legacy_allow(tmp_path):
 
 
 def test_finding_retest_can_persist_and_update(tmp_path):
+    from common.canonical import MissingCanonicalContextError
     from common.db import (
         FindingRetestModel,
         create_db,
@@ -651,21 +652,27 @@ def test_finding_retest_can_persist_and_update(tmp_path):
     )
 
     session = create_db(tmp_path / "scan_jobs.db")
+    retest_payload = {
+        "id": "rt-1",
+        "finding_id": "finding-1",
+        "status": "pending",
+        "module": "sqli_scanner",
+        "target": "https://example.test",
+        "url": "https://example.test/login?id=1",
+        "param": "id",
+        "payload_class": "sqli_scanner",
+        "session_ref": "session.json",
+        "evidence": {"proof_summary": "time delay"},
+        "metadata_json": {"dry_run": True},
+    }
+    with pytest.raises(MissingCanonicalContextError):
+        save_finding_retest(session, retest_payload)
+    assert session.query(FindingRetestModel).count() == 0
+
     save_finding_retest(
         session,
-        {
-            "id": "rt-1",
-            "finding_id": "finding-1",
-            "status": "pending",
-            "module": "sqli_scanner",
-            "target": "https://example.test",
-            "url": "https://example.test/login?id=1",
-            "param": "id",
-            "payload_class": "sqli_scanner",
-            "session_ref": "session.json",
-            "evidence": {"proof_summary": "time delay"},
-            "metadata_json": {"dry_run": True},
-        },
+        retest_payload,
+        allow_legacy_compat=True,
     )
 
     retest = session.query(FindingRetestModel).filter_by(id="rt-1").one()
@@ -675,14 +682,23 @@ def test_finding_retest_can_persist_and_update(tmp_path):
     assert json.loads(retest.evidence)["proof_summary"] == "time delay"
     assert json.loads(retest.metadata_json)["dry_run"] is True
 
+    update_payload = {
+        "status": "completed",
+        "still_vulnerable": None,
+        "confidence": "UNVERIFIED",
+        "evidence": {"return_code": 0},
+        "retested_at": datetime.now(timezone.utc),
+    }
+    with pytest.raises(MissingCanonicalContextError):
+        update_finding_retest(session, "rt-1", **update_payload)
+    session.refresh(retest)
+    assert retest.status == "pending"
+
     updated = update_finding_retest(
         session,
         "rt-1",
-        status="completed",
-        still_vulnerable=None,
-        confidence="UNVERIFIED",
-        evidence={"return_code": 0},
-        retested_at=datetime.now(timezone.utc),
+        allow_legacy_compat=True,
+        **update_payload,
     )
 
     assert updated is not None
@@ -735,6 +751,7 @@ def test_finding_retest_redacts_every_ordinary_text_field_before_sqlite(
             "evidence": {"password": "RETEST_SAVE_EVIDENCE_CANARY_007"},
             "metadata_json": {"api_key": "RETEST_SAVE_METADATA_CANARY_007"},
         },
+        allow_legacy_compat=True,
     )
     saved = session.get(FindingRetestModel, "retest-redaction")
     assert saved is not None
@@ -761,6 +778,7 @@ def test_finding_retest_redacts_every_ordinary_text_field_before_sqlite(
     updated = update_finding_retest(
         session,
         "retest-redaction",
+        allow_legacy_compat=True,
         **update_canaries,
         evidence={"password": "RETEST_UPDATE_EVIDENCE_CANARY_007"},
         metadata_json={"api_key": "RETEST_UPDATE_METADATA_CANARY_007"},

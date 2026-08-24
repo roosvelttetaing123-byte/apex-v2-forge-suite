@@ -124,6 +124,27 @@ def clear_sensitive_values() -> None:
         _configured_values.clear()
 
 
+def is_sensitive_identifier(value: str) -> bool:
+    """Return whether an opaque structural ID contains credential material.
+
+    Structural IDs may legitimately contain long hexadecimal server digests,
+    so this predicate intentionally excludes the broad hash-material rule used
+    for free text. It covers runtime-registered secrets and recognizable token
+    or canary formats that must never be restored during serialization.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    with _configuration_lock:
+        if any(literal and literal in value for literal in _configured_values):
+            return True
+    return bool(
+        _KNOWN_TOKEN.search(value)
+        or _JWT.search(value)
+        or _CANARY.search(value)
+        or _AUTH_SCHEME.search(value)
+    )
+
+
 def _is_sensitive_field(key: str) -> bool:
     normalized = key.strip().lower()
     with _configuration_lock:
@@ -136,6 +157,7 @@ def _is_safe_reference(key: str, value: Any) -> bool:
         key.strip().lower() in _SAFE_REFERENCE_FIELDS
         and isinstance(value, str)
         and bool(_SAFE_REFERENCE.fullmatch(value))
+        and not is_sensitive_identifier(value)
         and redact_text(value) == value
     )
 
@@ -145,6 +167,7 @@ def _is_safe_identifier(key: str, value: Any) -> bool:
         key.strip().lower() in _SAFE_IDENTIFIER_FIELDS
         and isinstance(value, str)
         and bool(_SAFE_IDENTIFIER.fullmatch(value))
+        and not is_sensitive_identifier(value)
     )
 
 
@@ -152,14 +175,9 @@ def redact_text(value: str) -> str:
     """Redact secrets embedded in free-form, multiline text."""
     if not value:
         return value
-    if _SAFE_REFERENCE.fullmatch(value):
-        # An opaque-looking handle is safe only when it does not contain a
-        # registered runtime canary.  Check configured literals before the
-        # early return so ``cred:<canary>`` cannot bypass the redaction
-        # boundary merely by matching the reference grammar.
-        with _configuration_lock:
-            if not any(literal and literal in value for literal in _configured_values):
-                return value
+    if _SAFE_REFERENCE.fullmatch(value) and not is_sensitive_identifier(value):
+        # Reference syntax does not override token/canary recognition.
+        return value
 
     rendered = value
     with _configuration_lock:

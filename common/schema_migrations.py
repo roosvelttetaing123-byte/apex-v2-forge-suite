@@ -12,12 +12,12 @@ import json
 import hashlib
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from sqlalchemy import Connection, Engine, event
 
-from common.redaction import redact_value
+from common.redaction import is_sensitive_identifier, redact_value
 
 
 _LEGACY_CANARY = re.compile(r"(?i)\b[A-Z0-9_]*CANARY[A-Z0-9_:@./+\-]*\b")
@@ -38,7 +38,14 @@ _CANONICAL_TABLES = (
     "canonical_report_memberships", "canonical_exports", "canonical_events",
     "canonical_logs", "canonical_legacy_records",
 )
+_TASK102_METADATA_TABLES = (
+    "canonical_artifact_manifests",
+    "canonical_observation_artifacts",
+    "canonical_finding_observations",
+    "canonical_evidence_access_audit",
+)
 _LEGACY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,127}$")
+_SERVER_AUTHORIZATION_ID_RE = re.compile(r"^authz-[0-9a-f]{32}$")
 _SHA256_REF_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -202,7 +209,86 @@ class UnsupportedMigrationError(MigrationError):
     """A requested schema boundary is not supported."""
 
 
-def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
+def _insert_or_validate_legacy(
+    connection: Connection,
+    table: str,
+    values: Mapping[str, Any],
+    *,
+    identity_columns: tuple[str, ...],
+    ignore_columns: tuple[str, ...] = ("created_at", "migrated_at"),
+    label: str,
+) -> bool:
+    """Insert one deterministic legacy surrogate or validate the exact row.
+
+    ``INSERT OR IGNORE`` alone lets an attacker preoccupy a derived ID (or a
+    secondary unique key) and silently redirect migrated lineage.  All names
+    passed here are module-owned constants; values remain bound parameters.
+    Timestamps generated during migration are excluded so a byte-identical
+    replay remains idempotent.
+    """
+    identifier = re.compile(r"^[a-z_][a-z0-9_]*$")
+    if not identifier.fullmatch(table) or not values:
+        raise MigrationError("invalid legacy surrogate specification")
+    columns = tuple(values)
+    if any(not identifier.fullmatch(column) for column in columns):
+        raise MigrationError("invalid legacy surrogate column")
+    if not identity_columns or any(column not in values for column in identity_columns):
+        raise MigrationError("legacy surrogate identity is incomplete")
+
+    placeholders = ",".join("?" for _ in columns)
+    result = connection.exec_driver_sql(
+        f"INSERT OR IGNORE INTO {table}({','.join(columns)}) VALUES({placeholders})",
+        tuple(values[column] for column in columns),
+    )
+    if result.rowcount:
+        return True
+
+    compared = tuple(column for column in columns if column not in ignore_columns)
+    where = " AND ".join(f"{column}=?" for column in identity_columns)
+    row = connection.exec_driver_sql(
+        f"SELECT {','.join(compared)} FROM {table} WHERE {where}",
+        tuple(values[column] for column in identity_columns),
+    ).mappings().first()
+    if row is None:
+        raise MigrationError(
+            f"legacy {label} surrogate collides with an existing canonical row"
+        )
+
+    def semantic(value: Any, column: str) -> Any:
+        if column.endswith("_json"):
+            try:
+                parsed = json.loads(str(value))
+                return json.dumps(
+                    parsed,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError) as exc:
+                raise MigrationError(
+                    f"legacy {label} surrogate has malformed canonical JSON"
+                ) from exc
+        return value
+
+    mismatched = [
+        column
+        for column in compared
+        if semantic(row[column], column) != semantic(values[column], column)
+    ]
+    if mismatched:
+        raise MigrationError(
+            f"legacy {label} surrogate collides with semantically different "
+            f"canonical data"
+        )
+    return False
+
+
+def _normalize_legacy_records_in_transaction(
+    connection: Connection,
+    *,
+    evidence_boundary_available: bool | None = None,
+) -> int:
     """Normalize Gate-0 rows into canonical control-plane records.
 
     The archive is retained for byte-level diagnostic provenance, but it is
@@ -220,12 +306,26 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
             "SELECT name FROM sqlite_master WHERE type='table'"
         ).fetchall()
     }
+    if evidence_boundary_available is None:
+        evidence_boundary_available = bool(
+            JOURNAL_TABLE in tables
+            and connection.exec_driver_sql(
+                f"SELECT 1 FROM {JOURNAL_TABLE} "
+                "WHERE version=? AND state='applied' LIMIT 1",
+                (EVIDENCE_SCHEMA_VERSION,),
+            ).fetchone()
+        )
     known = {
         name: [str(row[1]) for row in connection.exec_driver_sql(
             f"PRAGMA table_info({name})"
         ).fetchall()]
         for name in (
-            "authorization_decisions", "audit_logs", "scan_jobs", "findings"
+            "authorization_decisions",
+            "authorization_consumptions",
+            "authorization_execution_claims",
+            "audit_logs",
+            "scan_jobs",
+            "findings",
         )
         if name in tables
     }
@@ -247,71 +347,189 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
     observation_ids: dict[tuple[str, str], str] = {}
     artifact_ids: dict[tuple[str, str], str] = {}
     scope_ids: dict[tuple[str, str], str] = {}
-    authorized_job_keys: set[str] = set()
+    authorized_jobs: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
-    def valid_legacy_allow_envelope(data: Mapping[str, Any]) -> bool:
-        """Require a self-consistent, complete envelope before preserving allow."""
-        raw_envelope = data.get("envelope_json")
-        try:
-            envelope = json.loads(raw_envelope) if isinstance(raw_envelope, str) else raw_envelope
-        except (TypeError, json.JSONDecodeError):
-            return False
-        if not isinstance(envelope, Mapping):
-            return False
-        required = (
-            "schema_version", "decision_id", "tenant_id", "engagement_id",
-            "run_id", "job_id", "action_id", "operator_id", "action_kind",
-            "engine", "requested_target", "resolved_target", "scope_snapshot",
-            "scope_policy_version", "scope_decision", "scope_reason_code",
-            "scope_reason", "safety_mode", "confirmation_method", "confirmed_by",
-            "confirmed_at", "issued_at", "expires_at", "decision_outcome",
-            "reason_code", "decision_reason", "single_use", "binding_digest",
+    def normalized_timestamp(value: Any) -> datetime | None:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def validated_legacy_authorization_envelope(
+        data: Mapping[str, Any],
+    ) -> Any | None:
+        """Return one exact Gate-0 envelope, or ``None`` on any mismatch."""
+        from common.action_authorization import (
+            ActionAuthorizationEnvelope,
+            MAX_FUTURE_SKEW_SECONDS,
         )
-        if any(key not in envelope for key in required):
-            return False
-        if envelope.get("decision_outcome") != "allow":
-            return False
-        if envelope.get("scope_decision") != "allowed":
-            return False
-        if envelope.get("single_use") is not True:
-            return False
-        if not envelope.get("confirmed_by") or not envelope.get("confirmed_at"):
-            return False
-        if not all(
-            _SHA256_REF_RE.fullmatch(str(envelope.get(field) or ""))
-            for field in ("requested_target", "resolved_target", "scope_snapshot", "binding_digest")
-        ):
-            return False
+        from common.confirm_gate import (
+            ActionConfirmation,
+            CONFIRMATION_SCHEMA_VERSION,
+            DEFAULT_CONFIRMATION_MAX_AGE_SECONDS,
+        )
+
+        raw_envelope = data.get("envelope_json")
+        if not isinstance(raw_envelope, str):
+            return None
         try:
-            issued = datetime.fromisoformat(str(envelope["issued_at"]).replace("Z", "+00:00"))
-            expires = datetime.fromisoformat(str(envelope["expires_at"]).replace("Z", "+00:00"))
-            if issued.tzinfo is None or expires.tzinfo is None or expires <= issued:
-                return False
-        except (TypeError, ValueError):
+            decoded = json.loads(raw_envelope)
+            envelope = ActionAuthorizationEnvelope.from_value(decoded)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+        string_fields = (
+            "schema_version",
+            "decision_id",
+            "parent_decision_id",
+            "tenant_id",
+            "engagement_id",
+            "run_id",
+            "job_id",
+            "action_id",
+            "operator_id",
+            "operator_role",
+            "action_kind",
+            "engine",
+            "module_id",
+            "requested_target",
+            "resolved_target",
+            "scope_snapshot",
+            "scope_policy_version",
+            "scope_decision",
+            "scope_reason_code",
+            "decision_outcome",
+            "reason_code",
+            "binding_digest",
+        )
+        for field in string_fields:
+            if str(data.get(field) or "") != str(getattr(envelope, field)):
+                return None
+        for field in ("issued_at", "expires_at"):
+            row_timestamp = normalized_timestamp(data.get(field))
+            envelope_timestamp = normalized_timestamp(getattr(envelope, field))
+            if row_timestamp is None or row_timestamp != envelope_timestamp:
+                return None
+
+        if envelope.decision_outcome == "allow":
+            confirmed_at = normalized_timestamp(envelope.confirmed_at)
+            issued_at = normalized_timestamp(envelope.issued_at)
+            expires_at = normalized_timestamp(envelope.expires_at)
+            if confirmed_at is None or issued_at is None or expires_at is None:
+                return None
+            confirmation_age = (issued_at - confirmed_at).total_seconds()
+            if (
+                confirmation_age > DEFAULT_CONFIRMATION_MAX_AGE_SECONDS
+                or confirmation_age < -MAX_FUTURE_SKEW_SECONDS
+                or expires_at
+                > confirmed_at
+                + timedelta(seconds=DEFAULT_CONFIRMATION_MAX_AGE_SECONDS)
+            ):
+                return None
+            try:
+                confirmation = ActionConfirmation.from_value(
+                    {
+                        "schema_version": CONFIRMATION_SCHEMA_VERSION,
+                        "confirmed": True,
+                        "job_id": envelope.job_id,
+                        "target": envelope.resolved_target,
+                        "engine": envelope.engine,
+                        "action": envelope.action_kind,
+                        "issued_at": envelope.confirmed_at,
+                        "binding_digest": str(data.get("confirmation_digest") or ""),
+                    }
+                )
+            except (TypeError, ValueError):
+                return None
+            if not confirmation.has_valid_binding():
+                return None
+        return envelope
+
+    def has_exact_execution_lineage(envelope: Any) -> bool:
+        """Require one matching consumption and one matching execution claim."""
+        if envelope.decision_outcome != "allow" or envelope.single_use is not True:
             return False
-        # The persisted envelope must agree with the normalized row for every
-        # field that can grant ownership or execution authority.
-        for field in (
-            "decision_id", "tenant_id", "engagement_id", "run_id", "job_id",
-            "action_id", "operator_id", "action_kind", "engine",
-            "requested_target", "resolved_target", "scope_snapshot",
-            "scope_policy_version", "scope_decision", "scope_reason_code",
-            "decision_outcome", "binding_digest",
+        consumptions = [
+            row
+            for row in rows.get("authorization_consumptions", [])
+            if str(row.get("decision_id") or "") == envelope.decision_id
+        ]
+        claims = [
+            row
+            for row in rows.get("authorization_execution_claims", [])
+            if str(row.get("decision_id") or "") == envelope.decision_id
+        ]
+        if len(consumptions) != 1 or len(claims) != 1:
+            return False
+        consumption = consumptions[0]
+        claim = claims[0]
+        boundary = str(consumption.get("boundary") or "")
+        if not boundary or str(claim.get("boundary") or "") != boundary:
+            return False
+        issued_at = normalized_timestamp(envelope.issued_at)
+        expires_at = normalized_timestamp(envelope.expires_at)
+        consumed_at = normalized_timestamp(consumption.get("consumed_at"))
+        claimed_at = normalized_timestamp(claim.get("claimed_at"))
+        if (
+            issued_at is None
+            or expires_at is None
+            or consumed_at is None
+            or claimed_at is None
+            or not issued_at <= consumed_at <= claimed_at <= expires_at
         ):
-            envelope_value = str(envelope.get(field) or "")
-            row_value = str(data.get(field) or "")
-            if field == "scope_decision":
-                row_value = {
-                    "allow": "allowed", "allowed": "allowed",
-                    "deny": "denied", "denied": "denied",
-                }.get(row_value.lower(), row_value)
-            if envelope_value != row_value:
-                return False
-        payload = {key: value for key, value in envelope.items() if key != "binding_digest"}
-        expected = "sha256:" + hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-        ).hexdigest()
-        return expected == str(envelope.get("binding_digest"))
+            return False
+        expected = {
+            "decision_id": envelope.decision_id,
+            "tenant_id": envelope.tenant_id,
+            "job_id": envelope.job_id,
+            "action_id": envelope.action_id,
+            "envelope_digest": envelope.binding_digest,
+        }
+        return bool(
+            all(str(consumption.get(field) or "") == value for field, value in expected.items())
+            and all(str(claim.get(field) or "") == value for field, value in expected.items())
+            and str(consumption.get("result_id") or "") == envelope.action_id
+        )
+
+    def exact_scan_job_binding(
+        data: Mapping[str, Any],
+        envelope: Any,
+    ) -> bool:
+        """Bind a legacy scan row to every execution-authoritative field."""
+        from common.action_authorization import (
+            _safe_target_for_binding,
+            module_set_binding,
+        )
+
+        raw_target = data.get("target")
+        if not isinstance(raw_target, str) or not raw_target.strip():
+            return False
+        target_binding = _safe_target_for_binding(raw_target)
+        modules = _legacy_json_list(data.get("modules"))
+        frameworks = _legacy_json_list(data.get("frameworks"))
+        expected_module = str(envelope.module_id or "")
+        module_matches = (
+            module_set_binding(modules) == expected_module
+            if expected_module.startswith("module-set-")
+            else modules == ([expected_module] if expected_module else [])
+        )
+        return bool(
+            str(data.get("authorization_state") or "").strip().lower() == "allow"
+            and str(data.get("authorization_decision_id") or "") == envelope.decision_id
+            and str(data.get("authorization_action_id") or "") == envelope.action_id
+            and target_binding == envelope.requested_target
+            and target_binding == envelope.resolved_target
+            and module_matches
+            and frameworks == [envelope.engine]
+        )
 
     def canonical_tenant(data: Mapping[str, Any]) -> tuple[str, bool]:
         source = data.get("tenant_id")
@@ -323,10 +541,18 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
         )
         value = _canonical_legacy_key(source or "default", kind="tenant", tenant_id="forge-legacy")
         tenant_ids.setdefault(value, value)
-        connection.exec_driver_sql(
-            "INSERT OR IGNORE INTO canonical_tenants"
-            "(id,schema_version,name,created_at,metadata_json) VALUES(?,?,?,?,?)",
-            (value, CANONICAL_SCHEMA_VERSION, _legacy_text(source or value, limit=300), _now(), "{}"),
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_tenants",
+            {
+                "id": value,
+                "schema_version": CANONICAL_SCHEMA_VERSION,
+                "name": _legacy_text(source or value, limit=300),
+                "created_at": _now(),
+                "metadata_json": '{"legacy":true}',
+            },
+            identity_columns=("id",),
+            label="tenant",
         )
         return value, complete
 
@@ -346,20 +572,21 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
             sort_keys=True,
             separators=(",", ":"),
         )
-        connection.exec_driver_sql(
-            "INSERT OR IGNORE INTO canonical_engagements"
-            "(id,tenant_id,project_id,schema_version,name,status,created_at,metadata_json)"
-            " VALUES(?,?,?,?,?,?,?,?)",
-            (
-                identifier,
-                tenant,
-                None,
-                CANONICAL_SCHEMA_VERSION,
-                _legacy_text(source or fallback, limit=300),
-                "unknown" if reduced else "planned",
-                _now(),
-                metadata,
-            ),
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_engagements",
+            {
+                "id": identifier,
+                "tenant_id": tenant,
+                "project_id": None,
+                "schema_version": CANONICAL_SCHEMA_VERSION,
+                "name": _legacy_text(source or fallback, limit=300),
+                "status": "unknown" if reduced else "planned",
+                "created_at": _now(),
+                "metadata_json": metadata,
+            },
+            identity_columns=("tenant_id", "id"),
+            label="engagement",
         )
         return identifier
 
@@ -372,19 +599,20 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
         identifier = _canonical_legacy_key(source or fallback, kind="operator", tenant_id=tenant)
         key = (tenant, identifier)
         operator_ids.setdefault(key, identifier)
-        connection.exec_driver_sql(
-            "INSERT OR IGNORE INTO canonical_operators"
-            "(id,tenant_id,schema_version,display_name,external_ref,created_at,metadata_json)"
-            " VALUES(?,?,?,?,?,?,?)",
-            (
-                identifier,
-                tenant,
-                CANONICAL_SCHEMA_VERSION,
-                _legacy_text(source or fallback, limit=200),
-                None,
-                _now(),
-                '{"legacy":true}',
-            ),
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_operators",
+            {
+                "id": identifier,
+                "tenant_id": tenant,
+                "schema_version": CANONICAL_SCHEMA_VERSION,
+                "display_name": _legacy_text(source or fallback, limit=200),
+                "external_ref": None,
+                "created_at": _now(),
+                "metadata_json": '{"legacy":true}',
+            },
+            identity_columns=("tenant_id", "id"),
+            label="operator",
         )
         return identifier
 
@@ -392,11 +620,19 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
         identifier = _canonical_legacy_key(source or "legacy-role", kind="role", tenant_id=tenant)
         key = (tenant, identifier)
         role_ids.setdefault(key, identifier)
-        connection.exec_driver_sql(
-            "INSERT OR IGNORE INTO canonical_roles"
-            "(id,tenant_id,schema_version,name,created_at,metadata_json)"
-            " VALUES(?,?,?,?,?,?)",
-            (identifier, tenant, CANONICAL_SCHEMA_VERSION, _legacy_text(source or "legacy-role", limit=100), _now(), '{"legacy":true}'),
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_roles",
+            {
+                "id": identifier,
+                "tenant_id": tenant,
+                "schema_version": CANONICAL_SCHEMA_VERSION,
+                "name": _legacy_text(source or "legacy-role", limit=100),
+                "created_at": _now(),
+                "metadata_json": '{"legacy":true}',
+            },
+            identity_columns=("tenant_id", "id"),
+            label="role",
         )
         return identifier
 
@@ -407,26 +643,26 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
         identifier = _canonical_legacy_key(identity, kind="module-version", tenant_id=tenant)
         key = (tenant, identifier)
         module_ids.setdefault(key, identifier)
-        connection.exec_driver_sql(
-            "INSERT OR IGNORE INTO canonical_module_versions"
-            "(id,tenant_id,schema_version,module_id,version,module_kind,manifest_digest,policy_version,"
-            "intelligence_snapshot_id,check_pack_snapshot_id,provenance_id,created_at,metadata_json)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                identifier,
-                tenant,
-                CANONICAL_SCHEMA_VERSION,
-                module_name,
-                version_name,
-                "legacy",
-                None,
-                "legacy",
-                None,
-                None,
-                None,
-                _now(),
-                '{"legacy":true}',
-            ),
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_module_versions",
+            {
+                "id": identifier,
+                "tenant_id": tenant,
+                "schema_version": CANONICAL_SCHEMA_VERSION,
+                "module_id": module_name,
+                "version": version_name,
+                "module_kind": "legacy",
+                "manifest_digest": None,
+                "policy_version": "legacy",
+                "intelligence_snapshot_id": None,
+                "check_pack_snapshot_id": None,
+                "provenance_id": None,
+                "created_at": _now(),
+                "metadata_json": '{"legacy":true}',
+            },
+            identity_columns=("tenant_id", "id"),
+            label="module version",
         )
         return identifier
 
@@ -438,21 +674,22 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
         identifier = _canonical_legacy_key(f"{kind}:{identity}", kind="asset", tenant_id=tenant)
         key = (tenant, f"{kind}:{identity}")
         asset_ids.setdefault(key, identifier)
-        connection.exec_driver_sql(
-            "INSERT OR IGNORE INTO canonical_assets"
-            "(id,tenant_id,schema_version,kind,identity_key,display_name,canonical_uri,created_at,metadata_json)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                identifier,
-                tenant,
-                CANONICAL_SCHEMA_VERSION,
-                kind,
-                identity,
-                raw[:2000],
-                raw if kind == "url" else None,
-                _now(),
-                '{"legacy":true}',
-            ),
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_assets",
+            {
+                "id": identifier,
+                "tenant_id": tenant,
+                "schema_version": CANONICAL_SCHEMA_VERSION,
+                "kind": kind,
+                "identity_key": identity,
+                "display_name": raw[:2000],
+                "canonical_uri": raw if kind == "url" else None,
+                "created_at": _now(),
+                "metadata_json": '{"legacy":true}',
+            },
+            identity_columns=("tenant_id", "id"),
+            label="asset",
         )
         return identifier
 
@@ -491,27 +728,30 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
                 "failed": "failed",
             }.get(str(status or "").lower(), "planned")
         )
-        connection.exec_driver_sql(
-            "INSERT OR IGNORE INTO canonical_jobs"
-            "(id,tenant_id,engagement_id,schema_version,job_kind,status,created_at,metadata_json)"
-            " VALUES(?,?,?,?,?,?,?,?)",
-            (
-                identifier,
-                tenant,
-                engagement_id,
-                CANONICAL_SCHEMA_VERSION,
-                _legacy_text(module or "legacy", default="legacy", limit=100),
-                mapped_status,
-                _now(),
-                json.dumps({"legacy": True, "claim_state": "reduced" if reduced else "complete"}, separators=(",", ":")),
-            ),
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_jobs",
+            {
+                "id": identifier,
+                "tenant_id": tenant,
+                "engagement_id": engagement_id,
+                "schema_version": CANONICAL_SCHEMA_VERSION,
+                "job_kind": _legacy_text(
+                    module or "legacy", default="legacy", limit=100
+                ),
+                "status": mapped_status,
+                "created_at": _now(),
+                "metadata_json": json.dumps(
+                    {
+                        "legacy": True,
+                        "claim_state": "reduced" if reduced else "complete",
+                    },
+                    separators=(",", ":"),
+                ),
+            },
+            identity_columns=("tenant_id", "id"),
+            label="job",
         )
-        existing = connection.exec_driver_sql(
-            "SELECT engagement_id FROM canonical_jobs WHERE tenant_id=? AND id=?",
-            (tenant, identifier),
-        ).fetchone()
-        if existing is not None:
-            engagement_id = str(existing[0])
         return identifier, engagement_id, module_id, asset_id, mapped_status
 
     def observation(
@@ -528,33 +768,106 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
         identifier = _canonical_legacy_key(source_id or f"{job_id}:observation", kind="observation", tenant_id=tenant)
         key = (tenant, identifier)
         observation_ids.setdefault(key, identifier)
-        connection.exec_driver_sql(
-            "INSERT OR IGNORE INTO canonical_observations"
-            "(id,tenant_id,engagement_id,job_id,module_version_id,module_execution_id,asset_id,action_id,"
-            "intelligence_snapshot_id,provenance_id,schema_version,status,observed_at,created_at,metadata_json)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                identifier,
-                tenant,
-                engagement_id,
-                job_id,
-                module_id,
-                None,
-                asset_id,
-                None,
-                None,
-                None,
-                CANONICAL_SCHEMA_VERSION,
-                "not_authorized" if reduced else status,
-                _now(),
-                _now(),
-                json.dumps({"legacy": True, "claim_state": "reduced" if reduced else "complete"}, separators=(",", ":")),
+        observation_values: dict[str, Any] = {
+            "id": identifier,
+            "tenant_id": tenant,
+            "engagement_id": engagement_id,
+            "job_id": job_id,
+            "module_version_id": module_id,
+            "module_execution_id": None,
+            "asset_id": asset_id,
+            "action_id": None,
+            "intelligence_snapshot_id": None,
+            "provenance_id": None,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "status": "not_authorized" if reduced else status,
+            "observed_at": _now(),
+            "created_at": _now(),
+            "metadata_json": json.dumps(
+                {
+                    "legacy": True,
+                    "claim_state": "reduced" if reduced else "complete",
+                },
+                separators=(",", ":"),
             ),
+        }
+        observation_columns = {
+            str(row[1])
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(canonical_observations)"
+            ).fetchall()
+        }
+        observation_values.update(
+            {
+                name: value
+                for name, value in {
+                    "proof_type": "unknown",
+                    "collection_status": "unknown",
+                    "check_id": None,
+                    "route": None,
+                    "parameter": None,
+                    "location": None,
+                    "identity_ref": None,
+                }.items()
+                if name in observation_columns
+            }
+        )
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_observations",
+            observation_values,
+            identity_columns=("tenant_id", "id"),
+            ignore_columns=("created_at", "observed_at"),
+            label="observation",
         )
         return identifier
 
-    # Authorization decisions are normalized first so their engagement,
-    # operator, role, and decision truth can be reused by jobs/actions.
+    def write_action(
+        *,
+        tenant: str,
+        raw_action: Any,
+        engagement_id: str,
+        job_id: str,
+        decision_id: str,
+        action_kind: Any,
+        complete: bool,
+    ) -> str:
+        action_id = _canonical_legacy_key(
+            raw_action, kind="action", tenant_id=tenant
+        )
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_actions",
+            {
+                "id": action_id,
+                "tenant_id": tenant,
+                "engagement_id": engagement_id,
+                "job_id": job_id,
+                "schema_version": CANONICAL_SCHEMA_VERSION,
+                "action_kind": _legacy_text(
+                    action_kind or "legacy-action",
+                    default="legacy-action",
+                    limit=100,
+                ),
+                "authorization_decision_id": decision_id if complete else None,
+                "created_at": _now(),
+                "metadata_json": json.dumps(
+                    {
+                        "legacy": True,
+                        "claim_state": "complete" if complete else "unknown",
+                    },
+                    separators=(",", ":"),
+                ),
+            },
+            identity_columns=("tenant_id", "id"),
+            label="action",
+        )
+        return action_id
+
+    pending_authorizations: list[dict[str, Any]] = []
+
+    # Authorization decisions are normalized first so their exact envelope,
+    # consumption, and execution truth can be reused by matching jobs/actions.
     for data in rows.get("authorization_decisions", []):
         tenant, tenant_complete = canonical_tenant(data)
         raw_decision = data.get("decision_id") or data.get("id") or data.get("sequence")
@@ -582,6 +895,7 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
             if decision_value is not None and scope_value == decision_value
             else "unknown"
         )
+        envelope = validated_legacy_authorization_envelope(data)
         complete = bool(
             tenant_complete
             and isinstance(raw_decision, str)
@@ -595,100 +909,146 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
                 # ``redact_value`` intentionally treats authz handles as
                 # protected references; a server-generated authz identifier
                 # is nevertheless a safe structural key, not a credential.
-                or str(raw_decision).strip().startswith("authz-")
+                or (
+                    _SERVER_AUTHORIZATION_ID_RE.fullmatch(raw_decision.strip())
+                    and not is_sensitive_identifier(raw_decision.strip())
+                )
             )
             and _redact_legacy(raw_engagement) == raw_engagement
             and _redact_legacy(raw_operator) == raw_operator
             and data.get("scope_policy_version")
             and outcome in {"allow", "deny"}
+            and envelope is not None
         )
-        if outcome == "allow" and not valid_legacy_allow_envelope(data):
-            complete = False
-        if not complete and outcome == "allow":
+        if not complete:
             outcome = "unknown"
-        if complete and outcome == "allow" and data.get("job_id"):
-            authorized_job_keys.add(
-                f"{tenant}\x00{str(data.get('job_id')).strip()}"
+        execution_complete = bool(
+            complete
+            and outcome == "allow"
+            and envelope is not None
+            and has_exact_execution_lineage(envelope)
+        )
+        if execution_complete and data.get("job_id"):
+            authorized_jobs.setdefault(
+                (tenant, str(data.get("job_id")).strip()), []
+            ).append(
+                {
+                    "envelope": envelope,
+                    "decision_id": decision_id,
+                    "engagement_id": engagement_id,
+                    "raw_action": data.get("action_id"),
+                    "action_kind": data.get("action_kind"),
+                }
             )
         scope_ids[(tenant, str(raw_decision or decision_id))] = decision_id
-        connection.exec_driver_sql(
-            "INSERT OR IGNORE INTO canonical_scope_decisions"
-            "(id,tenant_id,engagement_id,operator_id,role_id,schema_version,outcome,policy_version,"
-            "decision_reason,decided_at,created_at,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                decision_id,
-                tenant,
-                engagement_id,
-                operator_id,
-                role_id,
-                CANONICAL_SCHEMA_VERSION,
-                outcome,
-                _legacy_text(data.get("scope_policy_version") or "legacy-unknown", default="legacy-unknown", limit=100),
-                _legacy_text(data.get("scope_reason_code") or data.get("reason_code") or "legacy-reduced", default="legacy-reduced", limit=2000),
-                _legacy_timestamp(data.get("issued_at") or data.get("timestamp")),
-                _legacy_timestamp(data.get("recorded_at") or data.get("issued_at")),
-                json.dumps({"legacy": True, "claim_state": "complete" if complete else "unknown"}, separators=(",", ":")),
-            ),
-        )
-        raw_action = data.get("action_id")
-        if raw_action:
-            action_id = _canonical_legacy_key(raw_action, kind="action", tenant_id=tenant)
-            job_source = data.get("job_id") or data.get("run_id") or f"{decision_id}-job"
-            job_id, job_engagement, module_id, asset_id, _ = job(
-                tenant,
-                job_source,
-                engagement_source=raw_engagement or engagement_id,
-                target=data.get("resolved_target") or data.get("requested_target") or decision_id,
-                module=data.get("module_id") or data.get("engine") or "legacy-module",
-                status="planned",
-                reduced=not complete,
-            )
-            action_engagement = job_engagement
-            connection.exec_driver_sql(
-                "INSERT OR IGNORE INTO canonical_actions"
-                "(id,tenant_id,engagement_id,job_id,schema_version,action_kind,authorization_decision_id,created_at,metadata_json)"
-                " VALUES(?,?,?,?,?,?,?,?,?)",
-                (
-                    action_id,
-                    tenant,
-                    action_engagement,
-                    job_id,
-                    CANONICAL_SCHEMA_VERSION,
-                    _legacy_text(data.get("action_kind") or "legacy-action", default="legacy-action", limit=100),
-                    decision_id if action_engagement == engagement_id else None,
-                    _now(),
-                    json.dumps({"legacy": True, "claim_state": "complete" if complete else "unknown"}, separators=(",", ":")),
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_scope_decisions",
+            {
+                "id": decision_id,
+                "tenant_id": tenant,
+                "engagement_id": engagement_id,
+                "operator_id": operator_id,
+                "role_id": role_id,
+                "schema_version": CANONICAL_SCHEMA_VERSION,
+                "outcome": outcome,
+                "policy_version": _legacy_text(
+                    data.get("scope_policy_version") or "legacy-unknown",
+                    default="legacy-unknown",
+                    limit=100,
                 ),
+                "decision_reason": _legacy_text(
+                    data.get("scope_reason_code")
+                    or data.get("reason_code")
+                    or "legacy-reduced",
+                    default="legacy-reduced",
+                    limit=2000,
+                ),
+                "decided_at": _legacy_timestamp(
+                    data.get("issued_at") or data.get("timestamp")
+                ),
+                "created_at": _legacy_timestamp(
+                    data.get("recorded_at") or data.get("issued_at")
+                ),
+                "metadata_json": json.dumps(
+                    {
+                        "legacy": True,
+                        "claim_state": "complete" if complete else "unknown",
+                    },
+                    separators=(",", ":"),
+                ),
+            },
+            identity_columns=("tenant_id", "id"),
+            ignore_columns=("created_at", "decided_at"),
+            label="scope decision",
+        )
+        if data.get("job_id"):
+            pending_authorizations.append(
+                {
+                    "tenant": tenant,
+                    "raw_job_id": str(data.get("job_id")).strip(),
+                    "raw_action": data.get("action_id"),
+                    "action_kind": data.get("action_kind"),
+                    "module": data.get("module_id")
+                    or data.get("engine")
+                    or "legacy-module",
+                    "target": data.get("resolved_target")
+                    or data.get("requested_target")
+                    or decision_id,
+                    "decision_id": decision_id,
+                }
             )
 
     # Jobs are normalized even when no authorization row exists.  Such rows
     # receive ``unknown_not_authorized`` and a reduced observation, never an
     # implicit allow.
+    processed_job_keys: set[tuple[str, str]] = set()
     for data in rows.get("scan_jobs", []):
         tenant, tenant_complete = canonical_tenant(data)
         modules = _legacy_json_list(data.get("modules"))
-        module = modules[0] if modules else data.get("framework") or "legacy-module"
-        raw_auth_state = str(data.get("authorization_state") or "").lower()
-        # A client-controlled ``authorization_state=allow`` is not itself
-        # evidence of a Gate-0 decision.  Only a normalized, complete allow
-        # decision from the same tenant/job can lift a legacy job out of the
-        # fail-closed reduced state.
-        reduced = (
-            not tenant_complete
-            or (
-                f"{tenant}\x00{str(data.get('id') or data.get('job_id') or '').strip()}"
-                not in authorized_job_keys
-            )
+        frameworks = _legacy_json_list(data.get("frameworks"))
+        module = modules[0] if modules else (
+            frameworks[0] if frameworks else "legacy-module"
         )
+        raw_job_id = str(data.get("id") or data.get("job_id") or "").strip()
+        processed_job_keys.add((tenant, raw_job_id))
+        bindings = authorized_jobs.get((tenant, raw_job_id), [])
+        exact_bindings = [
+            binding
+            for binding in bindings
+            if exact_scan_job_binding(data, binding["envelope"])
+        ]
+        # More than one match is ambiguous even if all rows look individually
+        # valid.  A single exact envelope/consumption/claim chain is required.
+        binding = exact_bindings[0] if len(exact_bindings) == 1 else None
+        reduced = not tenant_complete or binding is None
+        if binding is not None:
+            envelope = binding["envelope"]
+            engagement_source = envelope.engagement_id
+            module = envelope.module_id or envelope.engine
+        else:
+            engagement_source = data.get("engagement") or data.get(
+                "engagement_id"
+            )
         job_id, engagement_id, module_id, asset_id, mapped_status = job(
             tenant,
-            data.get("id") or data.get("job_id"),
-            engagement_source=data.get("engagement") or data.get("engagement_id"),
+            raw_job_id,
+            engagement_source=engagement_source,
             target=data.get("target") or "legacy-target",
             module=module,
             status=data.get("status"),
             reduced=reduced,
         )
+        if binding is not None and binding["raw_action"]:
+            write_action(
+                tenant=tenant,
+                raw_action=binding["raw_action"],
+                engagement_id=engagement_id,
+                job_id=job_id,
+                decision_id=binding["decision_id"],
+                action_kind=binding["action_kind"],
+                complete=True,
+            )
         observation(
             tenant,
             f"{job_id}:observation",
@@ -700,13 +1060,46 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
             status="observed" if mapped_status == "completed" else "not_tested",
         )
 
-    # Findings get a complete source observation and opaque artifact reference
-    # whenever their legacy row contains a usable target/module.  Missing
-    # lineage is retained as ``unknown`` metadata and never as verified truth.
-    for data in rows.get("findings", []):
+    # Preserve authorization-only legacy rows as explicitly unbound/reduced.
+    # Without an exact scan row there is no trustworthy target/module/job
+    # state to promote, even when the decision envelope itself was valid.
+    for pending in pending_authorizations:
+        key = (pending["tenant"], pending["raw_job_id"])
+        if key in processed_job_keys:
+            continue
+        job_id, engagement_id, _module_id, _asset_id, _ = job(
+            pending["tenant"],
+            pending["raw_job_id"],
+            engagement_source=None,
+            target=pending["target"],
+            module=pending["module"],
+            status="planned",
+            reduced=True,
+        )
+        if pending["raw_action"]:
+            write_action(
+                tenant=pending["tenant"],
+                raw_action=pending["raw_action"],
+                engagement_id=engagement_id,
+                job_id=job_id,
+                decision_id=pending["decision_id"],
+                action_kind=pending["action_kind"],
+                complete=False,
+            )
+
+    # Task 101 has no durable evidence boundary and therefore archives legacy
+    # findings without manufacturing canonical observation/artifact lineage.
+    # Once the Task 102 evidence tables are being applied, preserve the live
+    # v2 behavior: materialize only reduced/unknown custody references and
+    # never invent artifact bytes, digests, integrity, or authorization.
+    for data in rows.get("findings", []) if evidence_boundary_available else ():
         tenant, tenant_complete = canonical_tenant(data)
         raw_finding = data.get("id") or data.get("finding_id") or data.get("dedup_key")
         finding_id = _canonical_legacy_key(raw_finding or "legacy", kind="finding", tenant_id=tenant)
+        legacy_finding_key = _legacy_text(
+            data.get("dedup_key") or "", default="", limit=300
+        ) or None
+        legacy_identity_key = "finding-v1:legacy"
         module = data.get("module") or "legacy-module"
         target = data.get("target") or data.get("url") or "legacy-target"
         source_job = data.get("last_seen_run") or data.get("engagement") or f"{finding_id}-job"
@@ -758,68 +1151,111 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
             "legacy": True,
             "claim_state": "complete" if complete else "reduced",
             "integrity_state": "unknown",
-            "protection_state": "unknown",
+            "protection_state": "legacy_unknown",
         }
-        artifact_values: tuple[Any, ...] = (
-            artifact_id,
-            tenant,
-            obs_id,
-            CANONICAL_SCHEMA_VERSION,
-            f"artifact:{artifact_id}",
-            digest,
-            "application/json",
-            0,
-            "unknown",
-            "unknown",
-            _legacy_timestamp(data.get("discovered_at")),
-            _legacy_timestamp(data.get("discovered_at")),
+        artifact_values: dict[str, Any] = {
+            "id": artifact_id,
+            "tenant_id": tenant,
+            "observation_id": obs_id,
+            "schema_version": CANONICAL_SCHEMA_VERSION,
+            "reference": f"artifact:{artifact_id}",
+            "digest": digest,
+            "media_type": "application/json",
+            "size": 0,
+            "redaction_state": "unknown",
+            "encryption_state": "unknown",
+            "collected_at": _legacy_timestamp(data.get("discovered_at")),
+            "created_at": _legacy_timestamp(data.get("discovered_at")),
+            "metadata_json": json.dumps(artifact_metadata, separators=(",", ":")),
+        }
+        task102_artifact_defaults: dict[str, Any] = {
+            "collector_id": "unknown",
+            "collector_version": "unknown",
+            "source_target": "unknown",
+            "source_asset_id": None,
+            "redaction_version": "unknown",
+            "protection_state": "legacy_unknown",
+            "signer_state": "unsigned",
+            "integrity_state": "unknown",
+            "retention_class": "default",
+            "retention_expires_at": None,
+            "protected_original_authorization_ref": None,
+            "derivative_reference": None,
+        }
+        # A v2 replay must validate every migration-owned custody default,
+        # while a v2-first apply can only bind columns already present before
+        # the post-migration repair step.
+        artifact_values.update(
+            {
+                name: value
+                for name, value in task102_artifact_defaults.items()
+                if name in artifact_columns
+            }
         )
-        if {"integrity_state", "protection_state"}.issubset(artifact_columns):
-            connection.exec_driver_sql(
-                "INSERT OR IGNORE INTO canonical_artifact_refs"
-                "(id,tenant_id,observation_id,schema_version,reference,digest,media_type,size,redaction_state,encryption_state,collected_at,created_at,integrity_state,protection_state,metadata_json)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                artifact_values
-                + (
-                    "unknown",
-                    "unknown",
-                    json.dumps(artifact_metadata, separators=(",", ":")),
-                ),
-            )
-        else:
-            # v1 has no custody-state columns.  Keep the unknown claim in
-            # bounded metadata until the evidence migration adds the typed
-            # columns; never fabricate a digest or promote the legacy row.
-            connection.exec_driver_sql(
-                "INSERT OR IGNORE INTO canonical_artifact_refs"
-                "(id,tenant_id,observation_id,schema_version,reference,digest,media_type,size,redaction_state,encryption_state,collected_at,created_at,metadata_json)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                artifact_values + (json.dumps(artifact_metadata, separators=(",", ":")),),
-            )
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_artifact_refs",
+            artifact_values,
+            identity_columns=("tenant_id", "id"),
+            ignore_columns=("created_at", "collected_at"),
+            label="artifact reference",
+        )
         severity = str(data.get("severity") or "informational").lower()
         if severity not in {"critical", "high", "medium", "low", "informational"}:
             severity = "informational"
         status = str(data.get("status") or "unknown").lower()
         if status not in {"open", "verified", "false_positive", "remediated", "unknown"} or not complete:
             status = "unknown"
-        connection.exec_driver_sql(
-            "INSERT OR IGNORE INTO canonical_findings"
-            "(id,tenant_id,observation_id,artifact_id,schema_version,title,severity,description,status,finding_key,created_at,metadata_json)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                finding_id,
-                tenant,
-                obs_id,
-                artifact_id,
-                CANONICAL_SCHEMA_VERSION,
-                _legacy_text(data.get("title") or "legacy finding", default="legacy finding", limit=500),
-                severity,
-                _legacy_text(data.get("description") or "Legacy finding with reduced context", default="Legacy finding with reduced context", limit=8000),
-                status,
-                _legacy_text(data.get("dedup_key") or "", default="", limit=300) or None,
-                _legacy_timestamp(data.get("discovered_at")),
-                json.dumps({"legacy": True, "claim_state": "complete" if complete else "reduced"}, separators=(",", ":")),
+        finding_values: dict[str, Any] = {
+                "id": finding_id,
+                "tenant_id": tenant,
+                "observation_id": obs_id,
+                "artifact_id": artifact_id,
+                "schema_version": CANONICAL_SCHEMA_VERSION,
+                "title": _legacy_text(
+                    data.get("title") or "legacy finding",
+                    default="legacy finding",
+                    limit=500,
+                ),
+                "severity": severity,
+                "description": _legacy_text(
+                    data.get("description") or "Legacy finding with reduced context",
+                    default="Legacy finding with reduced context",
+                    limit=8000,
+                ),
+                "status": status,
+                "finding_key": legacy_finding_key,
+                "created_at": _legacy_timestamp(data.get("discovered_at")),
+                "metadata_json": json.dumps(
+                    {
+                        "legacy": True,
+                        "claim_state": "complete" if complete else "reduced",
+                    },
+                    separators=(",", ":"),
+                ),
+        }
+        finding_columns = {
+            str(row[1])
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(canonical_findings)"
+            ).fetchall()
+        }
+        if "dedup_key" in finding_columns:
+            finding_values["dedup_key"] = None
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_findings",
+            finding_values,
+            identity_columns=("tenant_id", "id"),
+            ignore_columns=(
+                "created_at",
+                "title",
+                "severity",
+                "description",
+                "status",
+                "metadata_json",
             ),
+            label="finding",
         )
         # The source-link table belongs to the Task 102 migration.  Task 101
         # can be replayed from an older database before that table exists, so
@@ -829,18 +1265,60 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
         if connection.exec_driver_sql(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='canonical_finding_observations'"
         ).fetchone() is not None:
-            connection.exec_driver_sql(
-                "INSERT OR IGNORE INTO canonical_finding_observations"
-                "(tenant_id,finding_id,observation_id,artifact_id,created_at,metadata_json) VALUES(?,?,?,?,?,?)",
-                (
-                    tenant,
-                    finding_id,
-                    obs_id,
-                    artifact_id,
-                    _legacy_timestamp(data.get("discovered_at")),
-                    json.dumps({"legacy": True, "integrity_state": "unknown"}, separators=(",", ":")),
-                ),
+            link_columns = {
+                str(row[1])
+                for row in connection.exec_driver_sql(
+                    "PRAGMA table_info(canonical_finding_observations)"
+                ).fetchall()
+            }
+            persisted_finding = connection.exec_driver_sql(
+                "SELECT created_at, dedup_key FROM canonical_findings "
+                "WHERE tenant_id=? AND id=?",
+                (tenant, finding_id),
+            ).fetchone()
+            if persisted_finding is None:
+                raise MigrationError("legacy finding source row is missing")
+            link_created_at = str(persisted_finding[0])
+            link_identity_key = str(persisted_finding[1] or legacy_identity_key)
+            link_metadata = json.dumps(
+                {"legacy": True, "integrity_state": "unknown"},
+                separators=(",", ":"),
             )
+            if {"identity_key", "first_seen_at", "last_seen_at"} <= link_columns:
+                _insert_or_validate_legacy(
+                    connection,
+                    "canonical_finding_observations",
+                    {
+                        "tenant_id": tenant,
+                        "finding_id": finding_id,
+                        "observation_id": obs_id,
+                        "artifact_id": artifact_id,
+                        "identity_key": link_identity_key,
+                        "first_seen_at": link_created_at,
+                        "last_seen_at": link_created_at,
+                        "created_at": link_created_at,
+                        "metadata_json": link_metadata,
+                    },
+                    identity_columns=("tenant_id", "finding_id", "observation_id"),
+                    ignore_columns=("created_at",),
+                    label="finding observation",
+                )
+            else:
+                _insert_or_validate_legacy(
+                    connection,
+                    "canonical_finding_observations",
+                    {
+                        "tenant_id": tenant,
+                        "finding_id": finding_id,
+                        "observation_id": obs_id,
+                        "artifact_id": artifact_id,
+                        "created_at": link_created_at,
+                        "metadata_json": link_metadata,
+                    },
+                    identity_columns=("tenant_id", "finding_id", "observation_id"),
+                    ignore_columns=("created_at",),
+                    label="finding observation",
+                )
 
     # Audit rows become canonical events.  If an audit event has no usable job
     # relationship, a reduced synthetic job is created so the event remains
@@ -862,21 +1340,35 @@ def _normalize_legacy_records_in_transaction(connection: Connection) -> int:
         if level not in {"debug", "info", "warning", "error", "critical"}:
             level = "info"
         event_id = _canonical_legacy_key(data.get("id") or event_source, kind="event", tenant_id=tenant)
-        connection.exec_driver_sql(
-            "INSERT OR IGNORE INTO canonical_events"
-            "(id,tenant_id,job_id,actor_id,schema_version,event_type,level,created_at,metadata_json)"
-            " VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                event_id,
-                tenant,
-                job_id,
-                actor_id,
-                CANONICAL_SCHEMA_VERSION,
-                _legacy_text(data.get("action") or "legacy.audit", default="legacy.audit", limit=160),
-                level,
-                _legacy_timestamp(data.get("timestamp")),
-                json.dumps({"legacy": True, "claim_state": "complete" if tenant_complete else "reduced"}, separators=(",", ":")),
-            ),
+        _insert_or_validate_legacy(
+            connection,
+            "canonical_events",
+            {
+                "id": event_id,
+                "tenant_id": tenant,
+                "job_id": job_id,
+                "actor_id": actor_id,
+                "schema_version": CANONICAL_SCHEMA_VERSION,
+                "event_type": _legacy_text(
+                    data.get("action") or "legacy.audit",
+                    default="legacy.audit",
+                    limit=160,
+                ),
+                "level": level,
+                "created_at": _legacy_timestamp(data.get("timestamp")),
+                "metadata_json": json.dumps(
+                    {
+                        "legacy": True,
+                        "claim_state": (
+                            "complete" if tenant_complete else "reduced"
+                        ),
+                    },
+                    separators=(",", ":"),
+                ),
+            },
+            identity_columns=("tenant_id", "id"),
+            ignore_columns=("created_at",),
+            label="event",
         )
 
     return inserted
@@ -891,6 +1383,10 @@ def archive_legacy_records(bind: Engine | Connection) -> int:
     never become an implicit allow or verified finding.  The operation is
     idempotent on ``(tenant_id, record_kind, legacy_id)``.
     """
+    if isinstance(bind, Connection) and bind.in_transaction():
+        raise MigrationError(
+            "archive_legacy_records cannot mutate a borrowed active transaction"
+        )
     connection, owned = _as_connection(bind)
     count = 0
     try:
@@ -907,6 +1403,11 @@ def archive_legacy_records(bind: Engine | Connection) -> int:
             connection.commit()
         known = (
             ("authorization_decisions", "authorization"),
+            ("authorization_consumptions", "authorization_consumption"),
+            (
+                "authorization_execution_claims",
+                "authorization_execution_claim",
+            ),
             ("audit_logs", "audit"),
             ("scan_jobs", "job"),
             ("findings", "finding"),
@@ -925,6 +1426,8 @@ def archive_legacy_records(bind: Engine | Connection) -> int:
                     tenant = _canonical_legacy_key(data.get("tenant_id") or "default", kind="tenant", tenant_id="forge-legacy")
                     legacy_id = _legacy_identifier(
                         data.get("id")
+                        or data.get("consumption_id")
+                        or data.get("claim_id")
                         or data.get("decision_id")
                         or data.get("job_id")
                         or data.get("finding_id")
@@ -937,15 +1440,37 @@ def archive_legacy_records(bind: Engine | Connection) -> int:
                     claim_state = "not_authorized" if outcome in {"deny", "denied", "not_authorized"} else ("unknown" if record_kind == "authorization" else "reduced")
                     payload = _redact_legacy(data)
                     rendered = _legacy_payload_json(payload if isinstance(payload, Mapping) else {})
-                    connection.exec_driver_sql(
-                        "INSERT OR IGNORE INTO canonical_tenants(id,schema_version,name,created_at,metadata_json) VALUES(?,?,?,?,?)",
-                        (tenant, CANONICAL_SCHEMA_VERSION, tenant, _now(), "{}"),
+                    _insert_or_validate_legacy(
+                        connection,
+                        "canonical_tenants",
+                        {
+                            "id": tenant,
+                            "schema_version": CANONICAL_SCHEMA_VERSION,
+                            "name": _legacy_text(
+                                data.get("tenant_id") or tenant, limit=300
+                            ),
+                            "created_at": _now(),
+                            "metadata_json": '{"legacy":true}',
+                        },
+                        identity_columns=("id",),
+                        label="tenant",
                     )
-                    result = connection.exec_driver_sql(
-                        "INSERT OR IGNORE INTO canonical_legacy_records(tenant_id,record_kind,legacy_id,claim_state,schema_version,payload_json,migrated_at) VALUES(?,?,?,?,?,?,?)",
-                        (tenant, record_kind, legacy_id, claim_state, CANONICAL_SCHEMA_VERSION, rendered, _now()),
+                    was_inserted = _insert_or_validate_legacy(
+                        connection,
+                        "canonical_legacy_records",
+                        {
+                            "tenant_id": tenant,
+                            "record_kind": record_kind,
+                            "legacy_id": legacy_id,
+                            "claim_state": claim_state,
+                            "schema_version": CANONICAL_SCHEMA_VERSION,
+                            "payload_json": rendered,
+                            "migrated_at": _now(),
+                        },
+                        identity_columns=("tenant_id", "record_kind", "legacy_id"),
+                        label="archive record",
                     )
-                    count += int(result.rowcount or 0)
+                    count += int(was_inserted)
         return count
     finally:
         if owned:
@@ -1022,6 +1547,437 @@ def _immutable_update_guard(
         """
 
 
+_METADATA_RELATIONSHIP_KEYS = (
+    "id",
+    "tenant_id",
+    "client_id",
+    "project_id",
+    "engagement_id",
+    "operator_id",
+    "role_id",
+    "scope_decision_id",
+    "authorization_decision_id",
+    "run_id",
+    "execution_id",
+    "attempt_id",
+    "job_id",
+    "action_id",
+    "module_version_id",
+    "module_execution_id",
+    "intelligence_snapshot_id",
+    "feed_snapshot_id",
+    "check_pack_snapshot_id",
+    "asset_id",
+    "source_asset_id",
+    "observation_id",
+    "source_observation_id",
+    "artifact_id",
+    "finding_id",
+    "retest_id",
+    "report_id",
+    "export_id",
+    "source_id",
+    "provenance_id",
+    "manifest_id",
+    "actor_id",
+    "created_by",
+    "parent_id",
+)
+
+
+def _metadata_relationship_exists(value: str) -> str:
+    """Return recursive SQLite metadata-key and relationship rejection."""
+    key = "CAST(j.key AS TEXT)"
+    normalized = f"lower(trim({key}))"
+    for separator in ("-", " ", ".", "/", ":", "\\"):
+        normalized = f"replace({normalized}, '{separator}', '_')"
+    collapsed = f"replace({normalized}, '_', '')"
+    names = ",".join(f"'{name}'" for name in _METADATA_RELATIONSHIP_KEYS)
+    collapsed_names = ",".join(
+        f"'{name.replace('_', '')}'" for name in _METADATA_RELATIONSHIP_KEYS
+    )
+    return (
+        f"EXISTS(SELECT 1 FROM json_tree({value}) AS j "
+        "WHERE j.key IS NOT NULL AND ("
+        f"length({key})=0 OR length({key})>64 "
+        f"OR {key} GLOB '*[^A-Za-z0-9_]*' "
+        f"OR {normalized} IN ({names}) "
+        f"OR {collapsed} IN ({collapsed_names}) "
+        f"OR {normalized} GLOB '*_id' OR {normalized} GLOB '*_ids' "
+        f"OR {key} GLOB '*[a-z0-9]Id' OR {key} GLOB '*[a-z0-9]Ids' "
+        f"OR {key} GLOB '*[a-z0-9]ID' OR {key} GLOB '*[a-z0-9]IDs'"
+        "))"
+    )
+
+
+def _metadata_invalid(value: str) -> str:
+    """Return the metadata rejection predicate for a row or trigger value."""
+    return (
+        f"length(CAST({value} AS BLOB)) > 16384 "
+        f"OR json_valid({value})=0 "
+        f"OR CASE WHEN json_valid({value})=1 "
+        f"THEN json_type({value})<>'object' ELSE 0 END "
+        f"OR CASE WHEN json_valid({value})=1 THEN "
+        f"{_metadata_relationship_exists(value)} ELSE 0 END"
+    )
+
+
+def _metadata_integrity_guard_sql(
+    tables: tuple[str, ...] = _CANONICAL_TABLES,
+) -> tuple[str, ...]:
+    """Enforce metadata object shape, byte bound, and relationship isolation."""
+    statements: list[str] = []
+    for table in tables:
+        if table == "canonical_legacy_records":
+            continue
+        invalid = _metadata_invalid("NEW.metadata_json")
+        statements.extend(
+            (
+                f"""
+                CREATE TRIGGER IF NOT EXISTS canonical_metadata_integrity_guard_insert_{table}
+                BEFORE INSERT ON {table}
+                WHEN {invalid}
+                BEGIN SELECT RAISE(ABORT, 'canonical metadata is invalid'); END
+                """,
+                f"""
+                CREATE TRIGGER IF NOT EXISTS canonical_metadata_integrity_guard_update_{table}
+                BEFORE UPDATE OF metadata_json ON {table}
+                WHEN {invalid}
+                BEGIN SELECT RAISE(ABORT, 'canonical metadata is invalid'); END
+                """,
+            )
+        )
+    return tuple(statements)
+
+
+def _audit_existing_canonical_rows(connection: Connection) -> None:
+    """Reject invalid rows before accepting or repairing a v1 schema.
+
+    Triggers protect future writes but cannot retroactively validate rows that
+    predate a guard.  Keep this audit read-only and fail closed without
+    rewriting evidence or guessing a repair.
+    """
+    tables = {
+        str(row[0])
+        for row in connection.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+
+    for table in _CANONICAL_TABLES + _TASK102_METADATA_TABLES:
+        if table not in tables:
+            continue
+        if connection.exec_driver_sql(
+            f"PRAGMA foreign_key_check({table})"
+        ).fetchone() is not None:
+            raise MigrationError(
+                f"existing canonical rows violate foreign keys in {table}"
+            )
+        if table != "canonical_legacy_records" and connection.exec_driver_sql(
+            f"SELECT 1 FROM {table} AS c "
+            f"WHERE {_metadata_invalid('c.metadata_json')} LIMIT 1"
+        ).fetchone() is not None:
+            raise MigrationError(
+                f"existing canonical metadata is invalid in {table}"
+            )
+
+    relationship_checks = (
+        (
+            {"canonical_engagements", "canonical_tenants"},
+            """
+            SELECT 1 FROM canonical_engagements e
+            WHERE NOT EXISTS(
+              SELECT 1 FROM canonical_tenants t WHERE t.id=e.tenant_id
+            ) LIMIT 1
+            """,
+            "existing canonical engagement tenant is missing",
+        ),
+        (
+            {"canonical_reports", "canonical_tenants"},
+            """
+            SELECT 1 FROM canonical_reports r
+            WHERE NOT EXISTS(
+              SELECT 1 FROM canonical_tenants t WHERE t.id=r.tenant_id
+            ) LIMIT 1
+            """,
+            "existing canonical report tenant is missing",
+        ),
+        (
+            {
+                "canonical_provenance",
+                "canonical_intelligence_sources",
+                "canonical_feed_snapshots",
+                "canonical_check_pack_snapshots",
+            },
+            """
+            SELECT 1 FROM canonical_provenance p
+            WHERE p.source_type NOT IN (
+                'intelligence_source','feed_snapshot','check_pack_snapshot'
+              )
+              OR (p.source_type='intelligence_source' AND NOT EXISTS(
+                SELECT 1 FROM canonical_intelligence_sources s
+                WHERE s.tenant_id=p.tenant_id AND s.id=p.source_id
+              ))
+              OR (p.source_type='feed_snapshot' AND NOT EXISTS(
+                SELECT 1 FROM canonical_feed_snapshots f
+                WHERE f.tenant_id=p.tenant_id AND f.id=p.source_id
+                  AND f.digest=p.digest
+              ))
+              OR (p.source_type='check_pack_snapshot' AND NOT EXISTS(
+                SELECT 1 FROM canonical_check_pack_snapshots c
+                WHERE c.tenant_id=p.tenant_id AND c.id=p.source_id
+                  AND c.digest=p.digest
+              ))
+            LIMIT 1
+            """,
+            "existing canonical provenance source is mismatched",
+        ),
+        (
+            {
+                "canonical_module_versions",
+                "canonical_provenance",
+                "canonical_feed_snapshots",
+                "canonical_check_pack_snapshots",
+            },
+            """
+            SELECT 1 FROM canonical_module_versions mv
+            WHERE mv.provenance_id IS NOT NULL AND NOT EXISTS(
+              SELECT 1 FROM canonical_provenance p
+              WHERE p.tenant_id=mv.tenant_id AND p.id=mv.provenance_id
+                AND (
+                  (p.source_type='intelligence_source'
+                    AND mv.intelligence_snapshot_id IS NULL
+                    AND mv.check_pack_snapshot_id IS NULL)
+                  OR (p.source_type='feed_snapshot'
+                    AND mv.intelligence_snapshot_id=p.source_id
+                    AND EXISTS(
+                      SELECT 1 FROM canonical_feed_snapshots f
+                      WHERE f.tenant_id=mv.tenant_id AND f.id=p.source_id
+                        AND f.digest=p.digest))
+                  OR (p.source_type='check_pack_snapshot'
+                    AND mv.check_pack_snapshot_id=p.source_id
+                    AND EXISTS(
+                      SELECT 1 FROM canonical_check_pack_snapshots c
+                      WHERE c.tenant_id=mv.tenant_id AND c.id=p.source_id
+                        AND c.digest=p.digest))
+                )
+            ) LIMIT 1
+            """,
+            "existing canonical module provenance is mismatched",
+        ),
+        (
+            {"canonical_module_executions", "canonical_module_versions"},
+            """
+            SELECT 1 FROM canonical_module_executions me
+            WHERE NOT EXISTS(
+              SELECT 1 FROM canonical_module_versions mv
+              WHERE mv.tenant_id=me.tenant_id AND mv.id=me.module_version_id
+                AND COALESCE(me.intelligence_snapshot_id, '') =
+                    COALESCE(mv.intelligence_snapshot_id, '')
+                AND COALESCE(me.check_pack_snapshot_id, '') =
+                    COALESCE(mv.check_pack_snapshot_id, '')
+                AND COALESCE(me.provenance_id, '') =
+                    COALESCE(mv.provenance_id, '')
+            ) LIMIT 1
+            """,
+            "existing canonical module execution snapshot is mismatched",
+        ),
+        (
+            {"canonical_observations", "canonical_module_versions"},
+            """
+            SELECT 1 FROM canonical_observations o
+            WHERE (o.intelligence_snapshot_id IS NOT NULL
+                   OR o.provenance_id IS NOT NULL)
+              AND NOT EXISTS(
+                SELECT 1 FROM canonical_module_versions mv
+                WHERE mv.tenant_id=o.tenant_id AND mv.id=o.module_version_id
+                  AND COALESCE(o.intelligence_snapshot_id, '') =
+                      COALESCE(mv.intelligence_snapshot_id, '')
+                  AND COALESCE(o.provenance_id, '') =
+                      COALESCE(mv.provenance_id, '')
+              ) LIMIT 1
+            """,
+            "existing canonical observation snapshot is mismatched",
+        ),
+        (
+            {
+                "canonical_finding_observations",
+                "canonical_findings",
+                "canonical_observations",
+                "canonical_artifact_refs",
+            },
+            """
+            SELECT 1 FROM canonical_finding_observations link
+            WHERE NOT EXISTS(
+                SELECT 1 FROM canonical_findings f
+                WHERE f.tenant_id=link.tenant_id AND f.id=link.finding_id
+              )
+              OR NOT EXISTS(
+                SELECT 1 FROM canonical_observations o
+                WHERE o.tenant_id=link.tenant_id AND o.id=link.observation_id
+              )
+              OR (link.artifact_id IS NOT NULL AND NOT EXISTS(
+                SELECT 1 FROM canonical_artifact_refs a
+                WHERE a.tenant_id=link.tenant_id AND a.id=link.artifact_id
+                  AND a.observation_id=link.observation_id
+              ))
+            LIMIT 1
+            """,
+            "existing canonical finding-observation custody is mismatched",
+        ),
+        (
+            {
+                "canonical_observation_artifacts",
+                "canonical_observations",
+                "canonical_artifact_refs",
+            },
+            """
+            SELECT 1 FROM canonical_observation_artifacts link
+            WHERE NOT EXISTS(
+                SELECT 1 FROM canonical_observations o
+                WHERE o.tenant_id=link.tenant_id AND o.id=link.observation_id
+              )
+              OR NOT EXISTS(
+                SELECT 1 FROM canonical_artifact_refs a
+                WHERE a.tenant_id=link.tenant_id AND a.id=link.artifact_id
+                  AND a.observation_id=link.observation_id
+              )
+            LIMIT 1
+            """,
+            "existing canonical observation-artifact custody is mismatched",
+        ),
+        (
+            {
+                "canonical_artifact_manifests",
+                "canonical_artifact_refs",
+                "canonical_observations",
+                "canonical_assets",
+            },
+            f"""
+            SELECT 1 FROM canonical_artifact_manifests m
+            WHERE m.id<>m.artifact_id
+              OR NOT ({_sha256_guard('m.sha256')})
+              OR NOT ({_sha256_guard('m.derivative_sha256')})
+              OR NOT ({_sha256_guard('m.manifest_digest')})
+              OR NOT EXISTS(
+                SELECT 1 FROM canonical_artifact_refs a
+                WHERE a.tenant_id=m.tenant_id AND a.id=m.artifact_id
+                  AND a.observation_id=m.observation_id
+              )
+              OR NOT EXISTS(
+                SELECT 1 FROM canonical_observations o
+                WHERE o.tenant_id=m.tenant_id AND o.id=m.observation_id
+              )
+              OR (m.source_asset_id IS NOT NULL AND NOT EXISTS(
+                SELECT 1 FROM canonical_assets a
+                WHERE a.tenant_id=m.tenant_id AND a.id=m.source_asset_id
+              ))
+            LIMIT 1
+            """,
+            "existing canonical artifact manifest custody is mismatched",
+        ),
+        (
+            {"canonical_evidence_access_audit", "canonical_artifact_refs"},
+            """
+            SELECT 1 FROM canonical_evidence_access_audit access
+            WHERE NOT EXISTS(
+                SELECT 1 FROM canonical_artifact_refs a
+                WHERE a.tenant_id=access.tenant_id AND a.id=access.artifact_id
+                  AND a.observation_id=access.observation_id
+              )
+              OR (access.access_kind='protected_original'
+                  AND access.authorization_ref IS NULL)
+            LIMIT 1
+            """,
+            "existing canonical evidence-access custody is mismatched",
+        ),
+    )
+    for required, sql, message in relationship_checks:
+        if required <= tables and connection.exec_driver_sql(
+            sql
+        ).fetchone() is not None:
+            raise MigrationError(message)
+
+    if "canonical_artifact_refs" in tables and connection.exec_driver_sql(
+        "SELECT 1 FROM canonical_artifact_refs a "
+        "WHERE NOT (" + _opaque_reference_guard("a.reference") + ") "
+        "OR (a.digest IS NOT NULL AND NOT (" + _sha256_guard("a.digest") + ")) "
+        "LIMIT 1"
+    ).fetchone() is not None:
+        raise MigrationError("existing canonical artifact custody is malformed")
+
+    if "canonical_findings" in tables:
+        finding_columns = {
+            str(row[1])
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(canonical_findings)"
+            ).fetchall()
+        }
+        if "dedup_key" in finding_columns and connection.exec_driver_sql(
+            "SELECT 1 FROM canonical_findings WHERE dedup_key IS NOT NULL "
+            "GROUP BY tenant_id,dedup_key HAVING COUNT(*)>1 LIMIT 1"
+        ).fetchone() is not None:
+            raise MigrationError("existing canonical finding dedup identity collides")
+
+
+def _snapshot_lineage_runtime_guard_sql() -> tuple[str, ...]:
+    """Reinstall exact snapshot-lineage triggers on every reconciliation."""
+    return (
+        "DROP TRIGGER IF EXISTS canonical_module_execution_snapshot_guard_insert",
+        """
+        CREATE TRIGGER canonical_module_execution_snapshot_guard_insert
+        BEFORE INSERT ON canonical_module_executions
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_module_versions mv
+          WHERE mv.tenant_id=NEW.tenant_id AND mv.id=NEW.module_version_id
+            AND COALESCE(NEW.intelligence_snapshot_id, '') = COALESCE(mv.intelligence_snapshot_id, '')
+            AND COALESCE(NEW.check_pack_snapshot_id, '') = COALESCE(mv.check_pack_snapshot_id, '')
+            AND COALESCE(NEW.provenance_id, '') = COALESCE(mv.provenance_id, '')
+        )
+        BEGIN SELECT RAISE(ABORT, 'module execution snapshot lineage mismatch'); END
+        """,
+        "DROP TRIGGER IF EXISTS canonical_module_execution_snapshot_guard_update",
+        """
+        CREATE TRIGGER canonical_module_execution_snapshot_guard_update
+        BEFORE UPDATE OF tenant_id, module_version_id, intelligence_snapshot_id, check_pack_snapshot_id, provenance_id ON canonical_module_executions
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_module_versions mv
+          WHERE mv.tenant_id=NEW.tenant_id AND mv.id=NEW.module_version_id
+            AND COALESCE(NEW.intelligence_snapshot_id, '') = COALESCE(mv.intelligence_snapshot_id, '')
+            AND COALESCE(NEW.check_pack_snapshot_id, '') = COALESCE(mv.check_pack_snapshot_id, '')
+            AND COALESCE(NEW.provenance_id, '') = COALESCE(mv.provenance_id, '')
+        )
+        BEGIN SELECT RAISE(ABORT, 'module execution snapshot lineage mismatch'); END
+        """,
+        "DROP TRIGGER IF EXISTS canonical_observation_snapshot_guard_insert",
+        """
+        CREATE TRIGGER canonical_observation_snapshot_guard_insert
+        BEFORE INSERT ON canonical_observations
+        WHEN (NEW.intelligence_snapshot_id IS NOT NULL OR NEW.provenance_id IS NOT NULL)
+          AND NOT EXISTS(
+          SELECT 1 FROM canonical_module_versions mv
+          WHERE mv.tenant_id=NEW.tenant_id AND mv.id=NEW.module_version_id
+            AND COALESCE(NEW.intelligence_snapshot_id, '') = COALESCE(mv.intelligence_snapshot_id, '')
+            AND COALESCE(NEW.provenance_id, '') = COALESCE(mv.provenance_id, '')
+        )
+        BEGIN SELECT RAISE(ABORT, 'observation snapshot lineage mismatch'); END
+        """,
+        "DROP TRIGGER IF EXISTS canonical_observation_snapshot_guard_update",
+        """
+        CREATE TRIGGER canonical_observation_snapshot_guard_update
+        BEFORE UPDATE OF tenant_id, module_version_id, intelligence_snapshot_id, provenance_id ON canonical_observations
+        WHEN (NEW.intelligence_snapshot_id IS NOT NULL OR NEW.provenance_id IS NOT NULL)
+          AND NOT EXISTS(
+          SELECT 1 FROM canonical_module_versions mv
+          WHERE mv.tenant_id=NEW.tenant_id AND mv.id=NEW.module_version_id
+            AND COALESCE(NEW.intelligence_snapshot_id, '') = COALESCE(mv.intelligence_snapshot_id, '')
+            AND COALESCE(NEW.provenance_id, '') = COALESCE(mv.provenance_id, '')
+        )
+        BEGIN SELECT RAISE(ABORT, 'observation snapshot lineage mismatch'); END
+        """,
+    )
+
+
 def _runtime_guard_sql() -> tuple[str, ...]:
     """Return safety guards that must also repair already-applied schemas."""
     digest_tables = (
@@ -1033,6 +1989,122 @@ def _runtime_guard_sql() -> tuple[str, ...]:
 
     statements: list[str] = [
         _MODULE_VERSION_IMMUTABILITY_GUARD,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_engagement_tenant_guard_insert
+        BEFORE INSERT ON canonical_engagements
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_tenants WHERE id=NEW.tenant_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'engagement tenant is missing'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_engagement_tenant_guard_update
+        BEFORE UPDATE OF tenant_id ON canonical_engagements
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_tenants WHERE id=NEW.tenant_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'engagement tenant is missing'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_tenant_guard_insert
+        BEFORE INSERT ON canonical_reports
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_tenants WHERE id=NEW.tenant_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'report tenant is missing'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_tenant_guard_update
+        BEFORE UPDATE OF tenant_id ON canonical_reports
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_tenants WHERE id=NEW.tenant_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'report tenant is missing'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_module_version_provenance_guard_insert
+        BEFORE INSERT ON canonical_module_versions
+        WHEN NEW.provenance_id IS NOT NULL AND NOT EXISTS(
+          SELECT 1 FROM canonical_provenance p
+          WHERE p.tenant_id=NEW.tenant_id AND p.id=NEW.provenance_id
+            AND (
+              (p.source_type='intelligence_source'
+                AND NEW.intelligence_snapshot_id IS NULL
+                AND NEW.check_pack_snapshot_id IS NULL)
+              OR (p.source_type='feed_snapshot'
+                AND NEW.intelligence_snapshot_id=p.source_id
+                AND EXISTS(
+                  SELECT 1 FROM canonical_feed_snapshots f
+                  WHERE f.tenant_id=NEW.tenant_id AND f.id=p.source_id
+                    AND f.digest=p.digest))
+              OR (p.source_type='check_pack_snapshot'
+                AND NEW.check_pack_snapshot_id=p.source_id
+                AND EXISTS(
+                  SELECT 1 FROM canonical_check_pack_snapshots c
+                  WHERE c.tenant_id=NEW.tenant_id AND c.id=p.source_id
+                    AND c.digest=p.digest))
+            )
+        )
+        BEGIN SELECT RAISE(ABORT, 'module version provenance snapshot mismatch'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_module_version_provenance_guard_update
+        BEFORE UPDATE OF tenant_id, intelligence_snapshot_id, check_pack_snapshot_id, provenance_id
+        ON canonical_module_versions
+        WHEN NEW.provenance_id IS NOT NULL AND NOT EXISTS(
+          SELECT 1 FROM canonical_provenance p
+          WHERE p.tenant_id=NEW.tenant_id AND p.id=NEW.provenance_id
+            AND (
+              (p.source_type='intelligence_source'
+                AND NEW.intelligence_snapshot_id IS NULL
+                AND NEW.check_pack_snapshot_id IS NULL)
+              OR (p.source_type='feed_snapshot'
+                AND NEW.intelligence_snapshot_id=p.source_id
+                AND EXISTS(
+                  SELECT 1 FROM canonical_feed_snapshots f
+                  WHERE f.tenant_id=NEW.tenant_id AND f.id=p.source_id
+                    AND f.digest=p.digest))
+              OR (p.source_type='check_pack_snapshot'
+                AND NEW.check_pack_snapshot_id=p.source_id
+                AND EXISTS(
+                  SELECT 1 FROM canonical_check_pack_snapshots c
+                  WHERE c.tenant_id=NEW.tenant_id AND c.id=p.source_id
+                    AND c.digest=p.digest))
+            )
+        )
+        BEGIN SELECT RAISE(ABORT, 'module version provenance snapshot mismatch'); END
+        """,
+        "DROP TRIGGER IF EXISTS canonical_provenance_source_guard",
+        """
+        CREATE TRIGGER canonical_provenance_source_guard
+        BEFORE INSERT ON canonical_provenance
+        BEGIN
+          SELECT CASE
+            WHEN NEW.source_type='intelligence_source' AND NOT EXISTS(
+              SELECT 1 FROM canonical_intelligence_sources
+              WHERE tenant_id=NEW.tenant_id AND id=NEW.source_id)
+            THEN RAISE(ABORT, 'canonical provenance source is missing')
+            WHEN NEW.source_type='feed_snapshot' AND NOT EXISTS(
+              SELECT 1 FROM canonical_feed_snapshots
+              WHERE tenant_id=NEW.tenant_id AND id=NEW.source_id
+                AND digest=NEW.digest)
+            THEN RAISE(ABORT, 'canonical provenance feed is missing or mismatched')
+            WHEN NEW.source_type='check_pack_snapshot' AND NOT EXISTS(
+              SELECT 1 FROM canonical_check_pack_snapshots
+              WHERE tenant_id=NEW.tenant_id AND id=NEW.source_id
+                AND digest=NEW.digest)
+            THEN RAISE(ABORT, 'canonical provenance check pack is missing or mismatched')
+          END;
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_provenance_normalized_source_guard_insert
+        BEFORE INSERT ON canonical_provenance
+        WHEN NEW.source_type NOT IN (
+          'intelligence_source', 'feed_snapshot', 'check_pack_snapshot'
+        )
+        BEGIN SELECT RAISE(ABORT, 'canonical provenance source type is unsupported'); END
+        """,
         _immutable_update_guard(
             "canonical_provenance",
             "canonical provenance",
@@ -1126,6 +2198,8 @@ def _runtime_guard_sql() -> tuple[str, ...]:
             """,
         )
     )
+    statements.extend(_snapshot_lineage_runtime_guard_sql())
+    statements.extend(_metadata_integrity_guard_sql())
     return tuple(statements)
 
 
@@ -1164,6 +2238,27 @@ def _task102_schema_repair(connection: Connection) -> None:
         for name, declaration in table_columns:
             if name not in known:
                 connection.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+    # Some combined pre-acceptance candidates added Task 102 columns to v1
+    # rows using optimistic defaults.  A legacy artifact with no digest has
+    # neither verified integrity nor retained protected bytes.  Correct only
+    # that narrowly identifiable legacy/default combination before restoring
+    # append-only guards; do not rewrite ordinary evidence rows.
+    connection.exec_driver_sql(
+        "DROP TRIGGER IF EXISTS canonical_artifact_refs_append_only_update"
+    )
+    connection.exec_driver_sql(
+        "DROP TRIGGER IF EXISTS canonical_artifact_refs_custody_immutable_update"
+    )
+    artifact_columns = columns("canonical_artifact_refs")
+    if {"integrity_state", "protection_state"} <= artifact_columns:
+        connection.exec_driver_sql(
+            "UPDATE canonical_artifact_refs "
+            "SET integrity_state='unknown', protection_state='legacy_unknown' "
+            "WHERE digest IS NULL AND json_valid(metadata_json)=1 "
+            "AND json_extract(metadata_json, '$.legacy')=1 "
+            "AND integrity_state IN ('sha256_verified','unknown') "
+            "AND protection_state IN ('reference_only','unknown')"
+        )
     connection.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS canonical_finding_observations (
             tenant_id TEXT NOT NULL, finding_id TEXT NOT NULL, observation_id TEXT NOT NULL,
@@ -1189,21 +2284,93 @@ def _task102_schema_repair(connection: Connection) -> None:
             connection.exec_driver_sql(
                 f"ALTER TABLE canonical_finding_observations ADD COLUMN {name} {declaration}"
             )
+    connection.exec_driver_sql(
+        "DROP TRIGGER IF EXISTS canonical_finding_observations_append_only_update"
+    )
+    connection.exec_driver_sql(
+        "DROP TRIGGER IF EXISTS canonical_finding_observations_no_update"
+    )
+    # Enrich only the exact defaults introduced by the historical six-column
+    # table repair.  Existing metadata and artifact ownership remain intact.
+    connection.exec_driver_sql(
+        "UPDATE canonical_finding_observations AS link "
+        "SET identity_key=COALESCE((SELECT NULLIF(f.dedup_key,'') FROM canonical_findings f "
+        "WHERE f.tenant_id=link.tenant_id AND f.id=link.finding_id), "
+        "'finding-v1:legacy'), first_seen_at=link.created_at, "
+        "last_seen_at=link.created_at "
+        "WHERE link.identity_key='' "
+        "AND link.first_seen_at='1970-01-01T00:00:00Z' "
+        "AND link.last_seen_at='1970-01-01T00:00:00Z' "
+        "AND EXISTS(SELECT 1 FROM canonical_findings f "
+        "WHERE f.tenant_id=link.tenant_id AND f.id=link.finding_id)"
+    )
     # Preserve links for canonical rows that pre-date the additive table.  A
     # missing digest or legacy artifact is represented by its existing opaque
     # reference; no new evidence bytes or fabricated integrity is created.
-    connection.exec_driver_sql(
+    backfill_rows = connection.exec_driver_sql(
         """
-        INSERT OR IGNORE INTO canonical_finding_observations
-          (tenant_id, finding_id, observation_id, artifact_id, identity_key,
-           first_seen_at, last_seen_at, created_at, metadata_json)
-        SELECT f.tenant_id, f.id, f.observation_id, f.artifact_id,
-               COALESCE(f.dedup_key, 'finding-v1:legacy'),
-               f.created_at, f.created_at, f.created_at,
-               '{"legacy":true,"integrity_state":"unknown"}'
-        FROM canonical_findings f
+        SELECT f.tenant_id, f.id AS finding_id, f.observation_id, f.artifact_id,
+               COALESCE(NULLIF(f.dedup_key, ''), 'finding-v1:legacy') AS identity_key,
+               f.created_at, f.dedup_key AS finding_dedup_key
+        FROM canonical_findings AS f
         """
-    )
+    ).mappings().all()
+    for row in backfill_rows:
+        values = {
+            "tenant_id": row["tenant_id"],
+            "finding_id": row["finding_id"],
+            "observation_id": row["observation_id"],
+            "artifact_id": row["artifact_id"],
+            "identity_key": row["identity_key"],
+            "first_seen_at": row["created_at"],
+            "last_seen_at": row["created_at"],
+            "created_at": row["created_at"],
+            "metadata_json": '{"legacy":true,"integrity_state":"unknown"}',
+        }
+        existing = connection.exec_driver_sql(
+            "SELECT artifact_id,identity_key,first_seen_at,last_seen_at,"
+            "created_at,metadata_json FROM canonical_finding_observations "
+            "WHERE tenant_id=? AND finding_id=? AND observation_id=?",
+            (row["tenant_id"], row["finding_id"], row["observation_id"]),
+        ).mappings().one_or_none()
+        if existing is None:
+            _insert_or_validate_legacy(
+                connection,
+                "canonical_finding_observations",
+                values,
+                identity_columns=("tenant_id", "finding_id", "observation_id"),
+                label="finding observation backfill",
+            )
+            continue
+        try:
+            existing_metadata = json.loads(str(existing["metadata_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise MigrationError("canonical finding source metadata is invalid") from exc
+        # The link marker is append-only custody data; finding metadata is a
+        # mutable workflow field and must not weaken strict legacy-link replay.
+        # Any attempted legacy marker, including a type-confused value such as
+        # integer 1, remains on the strict comparison path and is rejected.
+        if row["finding_dedup_key"] is None or (
+            isinstance(existing_metadata, Mapping) and "legacy" in existing_metadata
+        ):
+            _insert_or_validate_legacy(
+                connection,
+                "canonical_finding_observations",
+                values,
+                identity_columns=("tenant_id", "finding_id", "observation_id"),
+                label="legacy finding observation backfill",
+            )
+        elif (
+            existing["artifact_id"] != row["artifact_id"]
+            or existing["identity_key"] != row["identity_key"]
+            or not isinstance(existing["identity_key"], str)
+            or not existing["identity_key"]
+            or not all(
+                isinstance(existing[field], str) and existing[field]
+                for field in ("first_seen_at", "last_seen_at", "created_at")
+            )
+        ):
+            raise MigrationError("existing canonical finding source link is mismatched")
     connection.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS canonical_evidence_access_audit (
             id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, artifact_id TEXT NOT NULL, observation_id TEXT NOT NULL,
@@ -1333,6 +2500,18 @@ def _task102_schema_repair(connection: Connection) -> None:
             )
         )
 
+    repaired_tables = {
+        str(row[0])
+        for row in connection.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    guarded_task102_tables = tuple(
+        table for table in _TASK102_METADATA_TABLES if table in repaired_tables
+    )
+    for statement in _metadata_integrity_guard_sql(guarded_task102_tables):
+        connection.exec_driver_sql(statement)
+
 
 def _table_sql() -> tuple[str, ...]:
     # Every owned child carries tenant_id and references (tenant_id, id) on
@@ -1387,6 +2566,7 @@ def _table_sql() -> tuple[str, ...]:
             metadata_json TEXT NOT NULL DEFAULT '{}',
             UNIQUE(tenant_id, id),
             UNIQUE(tenant_id, project_id, id),
+            FOREIGN KEY(tenant_id) REFERENCES canonical_tenants(id) ON DELETE RESTRICT,
             FOREIGN KEY(tenant_id, project_id) REFERENCES canonical_projects(tenant_id, id) ON DELETE RESTRICT
         )
         """,
@@ -1487,9 +2667,9 @@ def _table_sql() -> tuple[str, ...]:
         CREATE TABLE IF NOT EXISTS canonical_provenance (
             id TEXT PRIMARY KEY,
             tenant_id TEXT NOT NULL,
-            source_type TEXT NOT NULL CHECK(source_type IN ('intelligence_source','feed_snapshot','check_pack_snapshot','legacy')),
+            source_type TEXT NOT NULL CHECK(source_type IN ('intelligence_source','feed_snapshot','check_pack_snapshot')),
             source_id TEXT NOT NULL,
-            digest TEXT NOT NULL CHECK(source_type='legacy' OR digest GLOB 'sha256:*'),
+            digest TEXT NOT NULL CHECK(digest GLOB 'sha256:*'),
             schema_version TEXT NOT NULL,
             created_at TEXT NOT NULL,
             metadata_json TEXT NOT NULL DEFAULT '{}',
@@ -1692,6 +2872,7 @@ def _table_sql() -> tuple[str, ...]:
             created_at TEXT NOT NULL,
             metadata_json TEXT NOT NULL DEFAULT '{}',
             UNIQUE(tenant_id, id),
+            FOREIGN KEY(tenant_id) REFERENCES canonical_tenants(id) ON DELETE RESTRICT,
             FOREIGN KEY(tenant_id, created_by) REFERENCES canonical_operators(tenant_id, id) ON DELETE RESTRICT
         )
         """,
@@ -1871,11 +3052,15 @@ def _table_sql() -> tuple[str, ...]:
               SELECT 1 FROM canonical_intelligence_sources WHERE tenant_id=NEW.tenant_id AND id=NEW.source_id)
             THEN RAISE(ABORT, 'canonical provenance source is missing')
             WHEN NEW.source_type='feed_snapshot' AND NOT EXISTS(
-              SELECT 1 FROM canonical_feed_snapshots WHERE tenant_id=NEW.tenant_id AND id=NEW.source_id)
-            THEN RAISE(ABORT, 'canonical provenance feed is missing')
+              SELECT 1 FROM canonical_feed_snapshots
+              WHERE tenant_id=NEW.tenant_id AND id=NEW.source_id
+                AND digest=NEW.digest)
+            THEN RAISE(ABORT, 'canonical provenance feed is missing or mismatched')
             WHEN NEW.source_type='check_pack_snapshot' AND NOT EXISTS(
-              SELECT 1 FROM canonical_check_pack_snapshots WHERE tenant_id=NEW.tenant_id AND id=NEW.source_id)
-            THEN RAISE(ABORT, 'canonical provenance check pack is missing')
+              SELECT 1 FROM canonical_check_pack_snapshots
+              WHERE tenant_id=NEW.tenant_id AND id=NEW.source_id
+                AND digest=NEW.digest)
+            THEN RAISE(ABORT, 'canonical provenance check pack is missing or mismatched')
           END;
         END
         """,
@@ -2417,24 +3602,38 @@ class MigrationManager:
     def _connection(self) -> tuple[Connection, bool]:
         return _as_connection(self.bind)
 
+    def _reject_borrowed_transaction(self, operation: str) -> None:
+        if isinstance(self.bind, Connection) and self.bind.in_transaction():
+            raise MigrationError(
+                f"{operation} cannot mutate a borrowed active transaction"
+            )
+
     def current_version(self) -> str | None:
         connection, owned = self._connection()
+        had_transaction = connection.in_transaction()
         try:
             _ensure_journal(connection)
-            if connection.in_transaction():
-                connection.commit()
             row = connection.exec_driver_sql(
                 f"SELECT version FROM {JOURNAL_TABLE} WHERE state='applied' ORDER BY rowid DESC LIMIT 1"
             ).fetchone()
+            version: str | None
             if not row:
-                return None
+                version = None
             # ``CURRENT_SCHEMA_VERSION`` is the canonical contract wire
             # version retained for existing callers.  Evidence custody is an
             # additive migration and must not make v1 contract serializers
             # claim a new payload version merely because its tables exist.
-            if str(row[0]) == EVIDENCE_SCHEMA_VERSION:
-                return CANONICAL_SCHEMA_VERSION
-            return str(row[0])
+            elif str(row[0]) == EVIDENCE_SCHEMA_VERSION:
+                version = CANONICAL_SCHEMA_VERSION
+            else:
+                version = str(row[0])
+            if not had_transaction and connection.in_transaction():
+                connection.commit()
+            return version
+        except Exception:
+            if not had_transaction and connection.in_transaction():
+                connection.rollback()
+            raise
         finally:
             if owned:
                 connection.close()
@@ -2445,29 +3644,69 @@ class MigrationManager:
 
     def journal(self) -> list[dict[str, Any]]:
         connection, owned = self._connection()
+        had_transaction = connection.in_transaction()
         try:
             _ensure_journal(connection)
-            if connection.in_transaction():
+            rows = [
+                dict(row._mapping)
+                for row in connection.exec_driver_sql(
+                    f"SELECT * FROM {JOURNAL_TABLE} ORDER BY rowid"
+                ).fetchall()
+            ]
+            if not had_transaction and connection.in_transaction():
                 connection.commit()
-            return [dict(row._mapping) for row in connection.exec_driver_sql(f"SELECT * FROM {JOURNAL_TABLE} ORDER BY rowid").fetchall()]
+            return rows
+        except Exception:
+            if not had_transaction and connection.in_transaction():
+                connection.rollback()
+            raise
         finally:
             if owned:
                 connection.close()
 
     def recover(self) -> str | None:
         """Replay any applying/failed step and return the resulting version."""
+        self._reject_borrowed_transaction("recover")
         connection, owned = self._connection()
         try:
             _ensure_journal(connection)
             if connection.in_transaction():
                 connection.commit()
+            applied = {
+                str(row[0])
+                for row in connection.exec_driver_sql(
+                    f"SELECT version FROM {JOURNAL_TABLE} WHERE state='applied'"
+                ).fetchall()
+            }
+            if connection.in_transaction():
+                connection.commit()
+            if CANONICAL_SCHEMA_VERSION in applied:
+                with connection.begin():
+                    _audit_existing_canonical_rows(connection)
+                    for statement in _runtime_guard_sql():
+                        connection.exec_driver_sql(statement)
             pending = connection.exec_driver_sql(
                 f"SELECT version FROM {JOURNAL_TABLE} WHERE state IN ('applying','failed') ORDER BY rowid LIMIT 1"
             ).fetchone()
             if connection.in_transaction():
                 connection.commit()
             if pending:
-                return self._apply_one(connection, _migration_by_version(str(pending[0])))
+                self._apply_one(connection, _migration_by_version(str(pending[0])))
+            applied = {
+                str(row[0])
+                for row in connection.exec_driver_sql(
+                    f"SELECT version FROM {JOURNAL_TABLE} WHERE state='applied'"
+                ).fetchall()
+            }
+            if connection.in_transaction():
+                connection.commit()
+            if CANONICAL_SCHEMA_VERSION in applied:
+                with connection.begin():
+                    _audit_existing_canonical_rows(connection)
+                    if EVIDENCE_SCHEMA_VERSION in applied:
+                        _task102_schema_repair(connection)
+                    for statement in _runtime_guard_sql():
+                        connection.exec_driver_sql(statement)
             return self.current_version()
         finally:
             if owned:
@@ -2477,15 +3716,43 @@ class MigrationManager:
         target = target or (self.versions[-1] if self.versions else None)
         if target is None or target not in self.versions:
             raise UnsupportedMigrationError(f"unsupported upgrade target {target}")
+        self._reject_borrowed_transaction("upgrade")
         connection, owned = self._connection()
         try:
             _ensure_journal(connection)
             if connection.in_transaction():
                 connection.commit()
-            self._recover_on_connection(connection)
+            # An already-applied canonical v1 must pass the read-only audit
+            # before recovery is allowed to replay a later migration.  This
+            # prevents v2 DDL, repair, or legacy normalization from changing
+            # a database whose accepted v1 rows already violate the contract.
+            applied_before_recovery = {
+                str(row[0])
+                for row in connection.exec_driver_sql(
+                    f"SELECT version FROM {JOURNAL_TABLE} WHERE state='applied'"
+                ).fetchall()
+            }
+            if connection.in_transaction():
+                connection.commit()
+            if CANONICAL_SCHEMA_VERSION in applied_before_recovery:
+                with connection.begin():
+                    _audit_existing_canonical_rows(connection)
+                    for statement in _runtime_guard_sql():
+                        connection.exec_driver_sql(statement)
+            self._recover_on_connection(connection, target=target)
             applied = {str(row[0]) for row in connection.exec_driver_sql(f"SELECT version FROM {JOURNAL_TABLE} WHERE state='applied'").fetchall()}
             if connection.in_transaction():
                 connection.commit()
+            # Recovery may have completed v1 itself.  Audit and install its
+            # current runtime guards before considering any later migration.
+            if (
+                CANONICAL_SCHEMA_VERSION in applied
+                and CANONICAL_SCHEMA_VERSION not in applied_before_recovery
+            ):
+                with connection.begin():
+                    _audit_existing_canonical_rows(connection)
+                    for statement in _runtime_guard_sql():
+                        connection.exec_driver_sql(statement)
             # SQLAlchemy's SQLite connection autobegins for the read above.
             # Close that read transaction before ``_apply_one`` opens its
             # explicit journal/work transactions; otherwise a fresh
@@ -2493,12 +3760,18 @@ class MigrationManager:
             # initialization fails before the canonical tables are created.
             if connection.in_transaction():
                 connection.commit()
-            for index, migration in enumerate(sorted(MIGRATIONS, key=lambda item: item.order)):
+            failure_target_available = fail_after is not None
+            for migration in sorted(MIGRATIONS, key=lambda item: item.order):
                 if migration.version in applied:
                     if migration.version == target:
                         break
                     continue
-                self._apply_one(connection, migration, fail_after=fail_after if index == 0 else None)
+                self._apply_one(
+                    connection,
+                    migration,
+                    fail_after=fail_after if failure_target_available else None,
+                )
+                failure_target_available = False
                 if migration.version == target:
                     break
             # Task 102 custody repair is a later migration boundary.  Do not
@@ -2516,6 +3789,7 @@ class MigrationManager:
             if connection.in_transaction():
                 connection.commit()
             with connection.begin():
+                _audit_existing_canonical_rows(connection)
                 if target == EVIDENCE_SCHEMA_VERSION or evidence_applied:
                     _task102_schema_repair(connection)
                 for statement in _runtime_guard_sql():
@@ -2529,6 +3803,7 @@ class MigrationManager:
         """Reverse to ``None`` (empty) or the requested supported version."""
         if target is not None and target not in self.versions:
             raise UnsupportedMigrationError(f"unsupported downgrade target {target}")
+        self._reject_borrowed_transaction("downgrade")
         connection, owned = self._connection()
         try:
             _ensure_journal(connection)
@@ -2554,14 +3829,22 @@ class MigrationManager:
             if owned:
                 connection.close()
 
-    def _recover_on_connection(self, connection: Connection) -> None:
+    def _recover_on_connection(
+        self,
+        connection: Connection,
+        *,
+        target: str | None = None,
+    ) -> None:
         row = connection.exec_driver_sql(
             f"SELECT version FROM {JOURNAL_TABLE} WHERE state IN ('applying','failed') ORDER BY rowid LIMIT 1"
         ).fetchone()
         if connection.in_transaction():
             connection.commit()
         if row:
-            self._apply_one(connection, _migration_by_version(str(row[0])))
+            pending = _migration_by_version(str(row[0]))
+            if target is not None and pending.order > _migration_by_version(target).order:
+                return
+            self._apply_one(connection, pending)
 
     def _apply_one(self, connection: Connection, migration: Migration, *, fail_after: int | None = None) -> str:
         # Journal state is deliberately committed before the work.  If the
@@ -2590,7 +3873,18 @@ class MigrationManager:
                                 "SELECT name FROM sqlite_master WHERE type='table'"
                             ).fetchall()
                         }
-                        referenced = {name for name in ("findings", "scan_jobs", "audit_logs", "authorization_decisions") if name in lowered}
+                        referenced = {
+                            name
+                            for name in (
+                                "findings",
+                                "scan_jobs",
+                                "audit_logs",
+                                "authorization_decisions",
+                                "authorization_consumptions",
+                                "authorization_execution_claims",
+                            )
+                            if name in lowered
+                        }
                         if referenced - legacy_tables:
                             continue
                     # SQLite has no ``ADD COLUMN IF NOT EXISTS``.  The
@@ -2613,8 +3907,14 @@ class MigrationManager:
                 # diagnostic archive.  The archive is not the canonical
                 # relationship model; it preserves reduced/unknown truth and
                 # redacted source payloads for auditability.
-                _normalize_legacy_records_in_transaction(connection)
+                _normalize_legacy_records_in_transaction(
+                    connection,
+                    evidence_boundary_available=(
+                        migration.version == EVIDENCE_SCHEMA_VERSION
+                    ),
+                )
                 self._archive_legacy_records_in_transaction(connection)
+                _audit_existing_canonical_rows(connection)
                 connection.exec_driver_sql(
                     f"UPDATE {JOURNAL_TABLE} SET state='applied', completed_at=?, detail=? WHERE version=?",
                     (_now(), json.dumps({"description": migration.description}, sort_keys=True), migration.version),
@@ -2641,6 +3941,11 @@ class MigrationManager:
         count = 0
         for table, record_kind in (
             ("authorization_decisions", "authorization"),
+            ("authorization_consumptions", "authorization_consumption"),
+            (
+                "authorization_execution_claims",
+                "authorization_execution_claim",
+            ),
             ("audit_logs", "audit"),
             ("scan_jobs", "job"),
             ("findings", "finding"),
@@ -2653,6 +3958,8 @@ class MigrationManager:
                 tenant = _canonical_legacy_key(data.get("tenant_id") or "default", kind="tenant", tenant_id="forge-legacy")
                 legacy_id = _legacy_identifier(
                     data.get("id")
+                    or data.get("consumption_id")
+                    or data.get("claim_id")
                     or data.get("decision_id")
                     or data.get("job_id")
                     or data.get("finding_id")
@@ -2664,15 +3971,37 @@ class MigrationManager:
                 outcome = str(data.get("decision_outcome") or data.get("outcome") or "").lower()
                 claim_state = "not_authorized" if outcome in {"deny", "denied", "not_authorized"} else ("unknown" if record_kind == "authorization" else "reduced")
                 rendered = _legacy_payload_json(data)
-                connection.exec_driver_sql(
-                    "INSERT OR IGNORE INTO canonical_tenants(id,schema_version,name,created_at,metadata_json) VALUES(?,?,?,?,?)",
-                    (tenant, CANONICAL_SCHEMA_VERSION, tenant, _now(), "{}"),
+                _insert_or_validate_legacy(
+                    connection,
+                    "canonical_tenants",
+                    {
+                        "id": tenant,
+                        "schema_version": CANONICAL_SCHEMA_VERSION,
+                        "name": _legacy_text(
+                            data.get("tenant_id") or tenant, limit=300
+                        ),
+                        "created_at": _now(),
+                        "metadata_json": '{"legacy":true}',
+                    },
+                    identity_columns=("id",),
+                    label="tenant",
                 )
-                result = connection.exec_driver_sql(
-                    "INSERT OR IGNORE INTO canonical_legacy_records(tenant_id,record_kind,legacy_id,claim_state,schema_version,payload_json,migrated_at) VALUES(?,?,?,?,?,?,?)",
-                    (tenant, record_kind, legacy_id, claim_state, CANONICAL_SCHEMA_VERSION, rendered, _now()),
+                was_inserted = _insert_or_validate_legacy(
+                    connection,
+                    "canonical_legacy_records",
+                    {
+                        "tenant_id": tenant,
+                        "record_kind": record_kind,
+                        "legacy_id": legacy_id,
+                        "claim_state": claim_state,
+                        "schema_version": CANONICAL_SCHEMA_VERSION,
+                        "payload_json": rendered,
+                        "migrated_at": _now(),
+                    },
+                    identity_columns=("tenant_id", "record_kind", "legacy_id"),
+                    label="archive record",
                 )
-                count += int(result.rowcount or 0)
+                count += int(was_inserted)
         return count
 
 

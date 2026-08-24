@@ -16,8 +16,10 @@ from common.canonical import (
     Asset,
     AssetKind,
     CanonicalAdapter,
+    CanonicalContractError,
     CanonicalContext,
     CanonicalLineageError,
+    CanonicalSerializationError,
     MissingCanonicalContextError,
     CanonicalStore,
     CanonicalTenantMismatchError,
@@ -152,10 +154,32 @@ def test_optional_intelligence_retest_report_export_links_share_finding(tmp_path
         report = Report(tenant_id=graph["tenant"].id, name="fixture report")
         membership = ReportMembership(tenant_id=graph["tenant"].id, report_id=report.id, finding_id=graph["finding"].id, observation_id=graph["observation"].id)
         export = Export(tenant_id=graph["tenant"].id, finding_id=graph["finding"].id, source_observation_id=graph["observation"].id, format="json", report_id=report.id, provenance_id=provenance.id)
+        lineage_context = {
+            "tenant": graph["tenant"], "client": graph["client"], "project": graph["project"],
+            "engagement": graph["engagement"], "job": graph["job"], "intelligence_source": source,
+            "feed_snapshot": feed, "check_pack_snapshot": checkpack, "module_version": graph["module"],
+            "asset": graph["asset"], "observation": graph["observation"], "artifact": graph["artifact"],
+            "finding": graph["finding"],
+        }
+        mismatched_provenance = (
+            Provenance(id=provenance.id, tenant_id=graph["tenant"].id, source_type=ProvenanceSourceType.CHECK_PACK_SNAPSHOT, source_id=feed.id, digest=feed.digest),
+            Provenance(id=provenance.id, tenant_id=graph["tenant"].id, source_type=ProvenanceSourceType.FEED_SNAPSHOT, source_id=checkpack.id, digest=feed.digest),
+            Provenance(id=provenance.id, tenant_id=graph["tenant"].id, source_type=ProvenanceSourceType.FEED_SNAPSHOT, source_id=feed.id, digest="sha256:" + "d" * 64),
+        )
+        for mismatch in mismatched_provenance:
+            with pytest.raises(CanonicalLineageError, match="provenance"):
+                store.create_lineage(**lineage_context, provenance=mismatch)
+        cross_tenant_provenance = Provenance(
+            id=provenance.id,
+            tenant_id="other-tenant",
+            source_type=ProvenanceSourceType.FEED_SNAPSHOT,
+            source_id=feed.id,
+            digest=feed.digest,
+        )
+        with pytest.raises(CanonicalTenantMismatchError):
+            store.create_lineage(**lineage_context, provenance=cross_tenant_provenance)
         result = store.create_lineage(
-            tenant=graph["tenant"], client=graph["client"], project=graph["project"], engagement=graph["engagement"], job=graph["job"],
-            intelligence_source=source, feed_snapshot=feed, check_pack_snapshot=checkpack, provenance=provenance,
-            module_version=graph["module"], asset=graph["asset"], observation=graph["observation"], artifact=graph["artifact"], finding=graph["finding"],
+            **lineage_context, provenance=provenance,
             retest=retest, report=report, report_membership=membership, export=export,
         )
         assert result["retest"].finding_id == graph["finding"].id
@@ -271,12 +295,49 @@ def test_asset_identity_deduplicates_exact_key_but_not_display_labels(tmp_path: 
 def test_relationship_ids_cannot_hide_in_metadata_and_secrets_are_redacted(tmp_path: Path) -> None:
     register_sensitive_values(["TASK101_CANARY_SECRET"])
     try:
+        relationship_keys = (
+            "finding_id",
+            "run_id",
+            "execution_id",
+            "attempt_id",
+            "authorization_decision_id",
+            "intelligence_snapshot_id",
+            "check_pack_snapshot_id",
+            "source_observation_id",
+            "source_asset_id",
+            "manifest_id",
+            "futureRelationshipId",
+            "tenant.id",
+            "tenant/id",
+            "tenant id",
+            "tenant_id[]",
+            "finding@id",
+            "𝐟𝐢𝐧𝐝𝐢𝐧𝐠_𝐢𝐝",
+            "finding_ids",
+            "asset-ids",
+            "ｆｉｎｄｉｎｇ＿ｉｄ",
+            "id",
+        )
+        for relationship_key in relationship_keys:
+            with pytest.raises(ValueError, match="relationship"):
+                Tenant(name="x", metadata={relationship_key: "forged"})
         with pytest.raises(ValueError, match="relationship"):
-            Tenant(name="x", metadata={"finding_id": "forged"})
+            Tenant(
+                name="x",
+                metadata={"nested": [{"sourceObservationId": "forged"}]},
+            )
+        assert Tenant(
+            name="x",
+            metadata={"display_label": "Unicode values remain valid: 項目"},
+        ).metadata == {"display_label": "Unicode values remain valid: 項目"}
         tenant = Tenant(name="x", metadata={"password": "TASK101_CANARY_SECRET", "credential_ref": "cred:fixture-12345678"})
         rendered = serialize_contract(tenant)
         assert "TASK101_CANARY_SECRET" not in rendered
         assert "cred:fixture-12345678" in rendered
+        tenant.metadata["finding_ids"] = ["forged"]  # type: ignore[index]
+        tenant.metadata["tenant.id"] = "forged"  # type: ignore[index]
+        with pytest.raises(ValueError, match="relationship"):
+            serialize_contract(tenant)
     finally:
         clear_sensitive_values()
 
@@ -335,6 +396,63 @@ def test_lineage_constraint_failure_rolls_back_every_insert(tmp_path: Path) -> N
         session.rollback()
         after = {table: store.count(table, tenant_id=graph["tenant"].id) for table in before}
         assert after == before
+
+        session.commit()
+        session.close()
+        session = create_db(tmp_path / "canonical.db")
+        store = CanonicalStore(session)
+        context = CanonicalContext(
+            graph["tenant"].id,
+            graph["engagement"].id,
+            graph["job"].id,
+            graph["module"].id,
+            graph["asset"].id,
+        )
+        adapter = CanonicalAdapter(store, context)
+        persisted = adapter.persist_finding(
+            title="Adapter durable finding",
+            severity=FindingSeverity.LOW,
+            description="Persisted through a reopened canonical context.",
+            artifact_reference="artifact:adapter-durable",
+            artifact_digest="sha256:" + "e" * 64,
+        )
+        session.commit()
+        persisted_finding_id = persisted["finding"].id
+
+        session.close()
+        session = create_db(tmp_path / "canonical.db")
+        store = CanonicalStore(session)
+        reopened_lineage = store.resolve_finding_lineage(persisted_finding_id, graph["tenant"].id)
+        assert reopened_lineage is not None
+        assert reopened_lineage["engagement_id"] == graph["engagement"].id
+        assert reopened_lineage["job_id"] == graph["job"].id
+
+        session.execute(text(
+            "CREATE TRIGGER reject_seeded_adapter_finding "
+            "BEFORE INSERT ON canonical_findings "
+            "WHEN NEW.title='Seeded adapter failure' "
+            "BEGIN SELECT RAISE(ABORT, 'seeded adapter failure'); END"
+        ))
+        session.commit()
+        adapter = CanonicalAdapter(store, context)
+        before_seeded_failure = {
+            table: store.count(table, tenant_id=graph["tenant"].id)
+            for table in ("canonical_observations", "canonical_artifact_refs", "canonical_findings")
+        }
+        with pytest.raises(IntegrityError):
+            adapter.persist_finding(
+                title="Seeded adapter failure",
+                severity=FindingSeverity.LOW,
+                description="The transaction must leave no partial lineage.",
+                artifact_reference="artifact:adapter-seeded-failure",
+                artifact_digest="sha256:" + "f" * 64,
+            )
+        session.rollback()
+        after_seeded_failure = {
+            table: store.count(table, tenant_id=graph["tenant"].id)
+            for table in before_seeded_failure
+        }
+        assert after_seeded_failure == before_seeded_failure
     finally:
         session.close()
 
@@ -352,6 +470,29 @@ def test_contract_round_trip_preserves_enum_timestamp_ids_relationships(tmp_path
     assert round_tripped.severity is FindingSeverity.HIGH
     assert round_tripped.created_at.tzinfo == timezone.utc
     assert round_tripped.observation_id == finding.observation_id
+    assert finding.status.value == "open"  # Normal constructors retain server defaults.
+
+    legacy_operator_id = "legacy-operator-" + "a" * 64
+    report = Report(
+        tenant_id=finding.tenant_id,
+        name="Legacy report",
+        created_by=legacy_operator_id,
+    )
+    assert deserialize_contract(serialize_contract(report), Report).created_by == legacy_operator_id
+
+    wire = json.loads(serialize_contract(offset_finding))
+    missing_field = dict(wire)
+    missing_field.pop("status")
+    with pytest.raises(CanonicalSerializationError, match="missing"):
+        deserialize_contract(missing_field, Finding)
+    with pytest.raises(CanonicalSerializationError, match="unexpected"):
+        deserialize_contract({**wire, "future_field": "unsupported"}, Finding)
+
+    tenant_wire = json.loads(serialize_contract(Tenant(name="wire validation")))
+    for field_name in ("created_at", "metadata"):
+        invalid_wire = {**tenant_wire, field_name: None}
+        with pytest.raises(CanonicalContractError, match=field_name):
+            deserialize_contract(invalid_wire, Tenant)
 
 
 def test_optional_relationship_none_and_registered_reference_canary_round_trip(tmp_path: Path) -> None:
@@ -372,10 +513,22 @@ def test_optional_relationship_none_and_registered_reference_canary_round_trip(t
             metadata={
                 "credential_ref": "cred:TASK101_CANARY_SECRET",
                 "artifact_ref": "artifact:TASK101_CANARY_SECRET",
+                "secret_ref": "cred:ghp_" + "A" * 24,
             },
         )
+        assert "TASK101_CANARY_SECRET" not in repr(tenant.metadata)
+        assert "ghp_" not in repr(tenant.metadata)
         safe = serialize_contract(tenant)
         assert "TASK101_CANARY_SECRET" not in safe
+        with pytest.raises(ValueError):
+            ArtifactReference(
+                tenant_id="tenant-a",
+                observation_id="observation-a",
+                reference="artifact:CANARY_UNREGISTERED_VALUE",
+                digest="sha256:" + "a" * 64,
+                media_type="application/json",
+                size=0,
+            )
     finally:
         clear_sensitive_values()
 
@@ -396,6 +549,14 @@ def test_missing_context_adapter_rejects_before_persistence(tmp_path: Path) -> N
 
 
 def test_database_guards_immutable_provenance_authorization_and_schema_version(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        Provenance(
+            tenant_id="tenant-a",
+            source_type="legacy",  # type: ignore[arg-type]
+            source_id="archive-row",
+            digest="sha256:" + "a" * 64,
+        )
+
     session, store, graph = _graph(tmp_path)
     try:
         source = IntelligenceSource(tenant_id=graph["tenant"].id, name="source", source_kind="feed")
@@ -413,6 +574,22 @@ def test_database_guards_immutable_provenance_authorization_and_schema_version(t
         store.insert(provenance)
         session.commit()
         with pytest.raises(IntegrityError):
+            session.execute(
+                text(
+                    "INSERT INTO canonical_provenance "
+                    "(id,tenant_id,source_type,source_id,digest,schema_version,created_at,metadata_json) "
+                    "VALUES ('mismatched-provenance',:tenant,'feed_snapshot',:source,:digest,"
+                    "'forge-canonical-v1','2026-01-01T00:00:00Z','{}')"
+                ),
+                {
+                    "tenant": graph["tenant"].id,
+                    "source": feed.id,
+                    "digest": "sha256:" + "f" * 64,
+                },
+            )
+            session.commit()
+        session.rollback()
+        with pytest.raises(IntegrityError):
             session.execute(text("UPDATE canonical_provenance SET tenant_id='other' WHERE id=:id"), {"id": provenance.id})
             session.commit()
         session.rollback()
@@ -424,6 +601,40 @@ def test_database_guards_immutable_provenance_authorization_and_schema_version(t
             session.execute(text("INSERT INTO canonical_artifact_refs(id,tenant_id,observation_id,schema_version,reference,digest,media_type,size,redaction_state,encryption_state,collected_at,created_at,metadata_json) VALUES ('bad',:tenant,'missing','forge-canonical-v1','/tmp/plaintext','sha256:" + "a" * 64 + "','text/plain',0,'redacted','reference_only','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}')"), {"tenant": graph["tenant"].id})
             session.commit()
         session.rollback()
+
+        session.execute(
+            text("DROP TRIGGER canonical_provenance_normalized_source_guard_insert")
+        )
+        session.commit()
+        from common.schema_migrations import MigrationManager
+
+        MigrationManager(session.get_bind()).upgrade()
+        assert session.execute(
+            text(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+                "AND name='canonical_provenance_normalized_source_guard_insert'"
+            )
+        ).scalar_one() == 1
+        session.execute(text("PRAGMA ignore_check_constraints=ON"))
+        try:
+            with pytest.raises(IntegrityError):
+                session.execute(
+                    text(
+                        "INSERT INTO canonical_provenance "
+                        "(id,tenant_id,source_type,source_id,digest,schema_version,created_at,metadata_json) "
+                        "VALUES ('p',:tenant,'legacy','archive-row',:digest,'forge-canonical-v1',"
+                        "'2026-01-01T00:00:00Z','{}')"
+                    ),
+                    {
+                        "tenant": graph["tenant"].id,
+                        "digest": "sha256:" + "a" * 64,
+                    },
+                )
+                session.commit()
+            session.rollback()
+        finally:
+            session.execute(text("PRAGMA ignore_check_constraints=OFF"))
+            session.commit()
     finally:
         session.rollback()
         session.close()
@@ -445,6 +656,12 @@ def test_module_version_snapshot_identity_and_db_shapes_are_immutable(tmp_path: 
             version="v2",
             digest="sha256:" + "b" * 64,
         )
+        check_pack = CheckPackSnapshot(
+            tenant_id=graph["tenant"].id,
+            source_id=source.id,
+            version="pack-v1",
+            digest="sha256:" + "c" * 64,
+        )
         provenance = Provenance(
             tenant_id=graph["tenant"].id,
             source_type=ProvenanceSourceType.FEED_SNAPSHOT,
@@ -457,6 +674,7 @@ def test_module_version_snapshot_identity_and_db_shapes_are_immutable(tmp_path: 
             module_id="fixture.module",
             version="1.0.0",
             intelligence_snapshot_id=feed_one.id,
+            check_pack_snapshot_id=check_pack.id,
             provenance_id=provenance.id,
         )
         execution = ModuleExecution(
@@ -464,6 +682,7 @@ def test_module_version_snapshot_identity_and_db_shapes_are_immutable(tmp_path: 
             job_id=graph["job"].id,
             module_version_id=module.id,
             intelligence_snapshot_id=feed_one.id,
+            check_pack_snapshot_id=check_pack.id,
             provenance_id=provenance.id,
         )
         observation = Observation(
@@ -491,6 +710,47 @@ def test_module_version_snapshot_identity_and_db_shapes_are_immutable(tmp_path: 
             severity=FindingSeverity.LOW,
             description="fixture",
         )
+        incomplete_execution = ModuleExecution(
+            id=execution.id,
+            tenant_id=graph["tenant"].id,
+            job_id=graph["job"].id,
+            module_version_id=module.id,
+        )
+        zero_write_tables = (
+            "canonical_tenants",
+            "canonical_module_versions",
+            "canonical_module_executions",
+            "canonical_observations",
+            "canonical_artifact_refs",
+            "canonical_findings",
+        )
+        before = {
+            table: session.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+            for table in zero_write_tables
+        }
+        with pytest.raises(CanonicalLineageError, match="snapshot lineage"):
+            store.create_lineage(
+                tenant=graph["tenant"],
+                client=graph["client"],
+                project=graph["project"],
+                engagement=graph["engagement"],
+                job=graph["job"],
+                module_version=module,
+                asset=graph["asset"],
+                observation=observation,
+                artifact=artifact,
+                finding=finding,
+                module_execution=incomplete_execution,
+                intelligence_source=source,
+                feed_snapshot=feed_one,
+                check_pack_snapshot=check_pack,
+                provenance=provenance,
+            )
+        after = {
+            table: session.execute(text(f"SELECT COUNT(*) FROM {table}")).scalar_one()
+            for table in zero_write_tables
+        }
+        assert after == before == {table: 0 for table in zero_write_tables}
         store.create_lineage(
             tenant=graph["tenant"],
             client=graph["client"],
@@ -505,8 +765,78 @@ def test_module_version_snapshot_identity_and_db_shapes_are_immutable(tmp_path: 
             module_execution=execution,
             intelligence_source=source,
             feed_snapshot=feed_one,
+            check_pack_snapshot=check_pack,
             provenance=provenance,
         )
+        session.commit()
+        with pytest.raises(IntegrityError, match="snapshot"):
+            session.execute(
+                text(
+                    "INSERT INTO canonical_module_executions "
+                    "(id,tenant_id,job_id,module_version_id,schema_version,status,"
+                    "intelligence_snapshot_id,check_pack_snapshot_id,provenance_id,"
+                    "created_at,metadata_json) VALUES ('raw-incomplete-execution',"
+                    ":tenant,:job,:module,'forge-canonical-v1','planned',"
+                    "NULL,NULL,NULL,'2026-01-01T00:00:00Z','{}')"
+                ),
+                {
+                    "tenant": graph["tenant"].id,
+                    "job": graph["job"].id,
+                    "module": module.id,
+                },
+            )
+            session.commit()
+        session.rollback()
+        assert session.execute(
+            text(
+                "SELECT COUNT(*) FROM canonical_module_executions "
+                "WHERE id='raw-incomplete-execution'"
+            )
+        ).scalar_one() == 0
+        with pytest.raises(IntegrityError, match="metadata"):
+            session.execute(
+                text(
+                    "INSERT INTO canonical_evidence_access_audit "
+                    "(id,tenant_id,artifact_id,observation_id,access_kind,"
+                    "authorization_ref,accessed_at,metadata_json) VALUES "
+                    "('invalid-task102-metadata',:tenant,:artifact,:observation,"
+                    "'redacted_derivative',NULL,'2026-01-01T00:00:00Z',:metadata)"
+                ),
+                {
+                    "tenant": graph["tenant"].id,
+                    "artifact": artifact.id,
+                    "observation": observation.id,
+                    "metadata": json.dumps(
+                        {"nested": {"sourceObservationId": observation.id}}
+                    ),
+                },
+            )
+            session.commit()
+        session.rollback()
+        session.close()
+        session = create_db(tmp_path / "canonical.db")
+        store = CanonicalStore(session)
+        adapter = CanonicalAdapter(
+            store,
+            CanonicalContext(
+                graph["tenant"].id,
+                graph["engagement"].id,
+                graph["job"].id,
+                module.id,
+                graph["asset"].id,
+            ),
+        )
+        adapted = adapter.persist_finding(
+            title="snapshot-bound adapter finding",
+            severity=FindingSeverity.LOW,
+            description="inert snapshot-bound adapter regression",
+            artifact_reference="artifact:snapshot-bound-adapter",
+            artifact_digest="sha256:" + "d" * 64,
+        )
+        assert adapted["feed_snapshot"].id == feed_one.id
+        assert adapted["check_pack_snapshot"].id == check_pack.id
+        assert adapted["provenance"].id == provenance.id
+
         store.insert(feed_two)
         with pytest.raises(IntegrityError):
             session.execute(
@@ -594,6 +924,26 @@ def test_module_version_snapshot_identity_and_db_shapes_are_immutable(tmp_path: 
 def test_server_ids_reject_secret_like_caller_values(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="secret-like"):
         Tenant(id="TASK101_CANARY_SECRET", name="fixture")
+
+    tenant = Tenant(id="opaque-later-value", name="x")
+    session = create_db(tmp_path / "late-secret.db")
+    register_sensitive_values(["opaque-runtime-secret", "opaque-later-value"])
+    try:
+        with pytest.raises(ValueError, match="secret-like"):
+            Tenant(id="opaque-runtime-secret", name="x")
+        with pytest.raises(ValueError, match="secret-like"):
+            Client(tenant_id="ghp_" + "a" * 24, name="x")
+        with pytest.raises(ValueError, match="secret-like"):
+            serialize_contract(tenant)
+        with pytest.raises(ValueError, match="secret-like"):
+            CanonicalStore(session).insert(tenant)
+        assert session.execute(
+            text("SELECT COUNT(*) FROM canonical_tenants")
+        ).scalar_one() == 0
+    finally:
+        session.rollback()
+        session.close()
+        clear_sensitive_values()
 
 
 def test_database_rejects_cross_engagement_authorization_decision(tmp_path: Path) -> None:

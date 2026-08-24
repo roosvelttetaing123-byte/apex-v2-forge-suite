@@ -51,6 +51,51 @@ def _seed_secret_inventory_context(root: Path) -> None:
         (root / relative).mkdir(parents=True, exist_ok=True)
 
 
+def _create_linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    common = tmp_path / "common-repository"
+    linked = tmp_path / "linked-candidate"
+    subprocess.run(["git", "init", "-q", str(common)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(common),
+            "-c",
+            "user.name=Forge Fixture",
+            "-c",
+            "user.email=forge-fixture@example.invalid",
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "linked-worktree fixture",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(common),
+            "worktree",
+            "add",
+            "--detach",
+            "-q",
+            str(linked),
+            "HEAD",
+        ],
+        check=True,
+    )
+    return common, linked
+
+
+def _linked_admin_path(root: Path) -> Path:
+    marker = (root / ".git").read_text(encoding="utf-8")
+    assert marker.startswith("gitdir: ") and marker.endswith("\n")
+    return Path(marker.removeprefix("gitdir: ").removesuffix("\n"))
+
+
 def test_supply_inventory_includes_gitignored_docker_shipped_text(tmp_path: Path) -> None:
     _seed_supply_inventory_context(tmp_path)
     ignored_runtime_asset = tmp_path / "common/dashboard/web/static/js/credentials.js"
@@ -118,7 +163,10 @@ def test_supply_inventory_rejects_unreviewed_binary_in_shipped_source(tmp_path: 
         verify_supply_chain.docker_shipped_text_paths(tmp_path)
 
 
-def test_supply_inventory_rejects_unclassified_top_level_paths(tmp_path: Path) -> None:
+def test_supply_inventory_rejects_unclassified_top_level_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     (tmp_path / "unreviewed-secret.txt").write_text("fixture\n", encoding="utf-8")
 
     with pytest.raises(
@@ -126,6 +174,158 @@ def test_supply_inventory_rejects_unclassified_top_level_paths(tmp_path: Path) -
         match="unclassified top-level candidate paths",
     ):
         verify_supply_chain._validate_top_level_classification(tmp_path)
+
+    malformed_root = tmp_path / "malformed"
+    malformed_root.mkdir()
+    (malformed_root / ".git").write_text("not a git marker\n", encoding="utf-8")
+    with pytest.raises(verify_supply_chain.SupplyChainError, match="record syntax"):
+        verify_supply_chain._validate_top_level_classification(malformed_root)
+    (malformed_root / ".git").write_bytes(b"gitdir: /tmp/unsafe\tpath\n")
+    with pytest.raises(verify_supply_chain.SupplyChainError, match="unsafe path"):
+        verify_supply_chain._validate_top_level_classification(malformed_root)
+
+    symlink_root = tmp_path / "symlink-marker"
+    symlink_root.mkdir()
+    (symlink_root / "marker-target").write_text("fixture\n", encoding="utf-8")
+    (symlink_root / ".git").symlink_to(symlink_root / "marker-target")
+    with pytest.raises(verify_supply_chain.SupplyChainError, match="must not be a symlink"):
+        verify_supply_chain._validate_top_level_classification(symlink_root)
+
+    common, linked = _create_linked_worktree(tmp_path / "valid")
+    verify_supply_chain._validate_top_level_classification(common)
+    verify_supply_chain._validate_top_level_classification(linked)
+    admin = _linked_admin_path(linked)
+
+    forged_root = tmp_path / "forged-root"
+    forged_root.mkdir()
+    (forged_root / ".git").write_bytes((linked / ".git").read_bytes())
+    with pytest.raises(verify_supply_chain.SupplyChainError, match="backlink"):
+        verify_supply_chain._validate_top_level_classification(forged_root)
+
+    topology_root = tmp_path / "forged-topology"
+    topology_root.mkdir()
+    fake_admin = common / ".git" / "forged-admin"
+    fake_admin.mkdir()
+    (fake_admin / "commondir").write_text("..\n", encoding="utf-8")
+    (fake_admin / "gitdir").write_text(
+        f"{topology_root / '.git'}\n",
+        encoding="utf-8",
+    )
+    (topology_root / ".git").write_text(f"gitdir: {fake_admin}\n", encoding="utf-8")
+    with pytest.raises(verify_supply_chain.SupplyChainError, match="topology"):
+        verify_supply_chain._validate_top_level_classification(topology_root)
+
+    backlink = admin / "gitdir"
+    backlink_content = backlink.read_bytes()
+    backlink.write_text(f"{common / '.git'}\n", encoding="utf-8")
+    with pytest.raises(verify_supply_chain.SupplyChainError, match="backlink"):
+        verify_supply_chain._validate_top_level_classification(linked)
+    backlink.write_bytes(backlink_content)
+
+    commondir = admin / "commondir"
+    commondir_content = commondir.read_bytes()
+    commondir.write_text("..\n", encoding="utf-8")
+    with pytest.raises(verify_supply_chain.SupplyChainError, match="administrative parent"):
+        verify_supply_chain._validate_top_level_classification(linked)
+    commondir.write_bytes(commondir_content)
+
+    hostile = tmp_path / "hostile-git-selection"
+    hostile.mkdir()
+    monkeypatch.setenv("GIT_DIR", str(common / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(hostile))
+    monkeypatch.setenv("GIT_COMMON_DIR", str(hostile))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(hostile / "index"))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.bare")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    captured_environments: list[dict[str, str]] = []
+    captured_commands: list[tuple[str, ...]] = []
+    real_run = subprocess.run
+
+    def inspecting_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        captured_environments.append(kwargs["env"])
+        captured_commands.append(tuple(args[0]))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(verify_supply_chain.subprocess, "run", inspecting_run)
+    verify_supply_chain._validate_top_level_classification(linked)
+    assert verify_supply_chain._tracked_local_private_paths(common) == ()
+    assert verify_supply_chain._tracked_local_private_paths(linked) == ()
+    assert captured_environments
+    assert all(
+        not any(key.upper().startswith("GIT_") for key in environment)
+        for environment in captured_environments
+    )
+    assert any(
+        "--is-inside-work-tree" in command and "--is-bare-repository" in command
+        for command in captured_commands
+    )
+    assert any("ls-files" in command for command in captured_commands)
+
+    marker = linked / ".git"
+
+    def drifting_run(*args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        completed = real_run(*args, **kwargs)
+        replacement = marker.with_name(".git.replacement")
+        replacement.write_bytes(marker.read_bytes())
+        os.replace(replacement, marker)
+        return completed
+
+    monkeypatch.setattr(verify_supply_chain.subprocess, "run", drifting_run)
+    with pytest.raises(verify_supply_chain.SupplyChainError, match="changed during Git validation"):
+        verify_supply_chain._validate_top_level_classification(linked)
+
+    def inventory_drifting_run(
+        *args: Any,
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[bytes]:
+        completed = real_run(*args, **kwargs)
+        if "ls-files" in args[0]:
+            replacement = marker.with_name(".git.replacement")
+            replacement.write_bytes(marker.read_bytes())
+            os.replace(replacement, marker)
+        return completed
+
+    monkeypatch.setattr(verify_supply_chain.subprocess, "run", inventory_drifting_run)
+    with pytest.raises(verify_supply_chain.SupplyChainError, match="changed during Git validation"):
+        verify_supply_chain._tracked_local_private_paths(linked)
+
+    replacement_root = linked.with_name("linked-candidate-prelinked-replacement")
+    replacement_root.mkdir()
+    os.link(linked / ".git", replacement_root / ".git")
+    (replacement_root / "unreviewed-secret.txt").write_text("fixture\n", encoding="utf-8")
+    original_root = linked.with_name("linked-candidate-original")
+    rejected_root = linked.with_name("linked-candidate-rejected-replacement")
+    marker_identity = (linked / ".git").stat().st_dev, (linked / ".git").stat().st_ino
+    replacement_marker_identity = (
+        (replacement_root / ".git").stat().st_dev,
+        (replacement_root / ".git").stat().st_ino,
+    )
+    assert marker_identity == replacement_marker_identity
+
+    def replacing_root_run(
+        *args: Any,
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[bytes]:
+        completed = real_run(*args, **kwargs)
+        if "--is-inside-work-tree" in args[0]:
+            linked.rename(original_root)
+            replacement_root.rename(linked)
+        return completed
+
+    monkeypatch.setattr(verify_supply_chain.subprocess, "run", replacing_root_run)
+    try:
+        with pytest.raises(
+            verify_supply_chain.SupplyChainError,
+            match="candidate root changed during Git validation",
+        ):
+            verify_supply_chain._validate_top_level_classification(linked)
+        assert (linked / "unreviewed-secret.txt").is_file()
+    finally:
+        if linked.exists() and original_root.exists():
+            linked.rename(rejected_root)
+            original_root.rename(linked)
 
 
 def test_supply_inventory_classifies_runtime_database_sidecars(tmp_path: Path) -> None:
@@ -187,34 +387,35 @@ def test_supply_inventory_scans_force_tracked_private_paths(
     relative: str,
     tmp_path: Path,
 ) -> None:
-    _seed_secret_inventory_context(tmp_path)
-    private_path = tmp_path / relative
-    private_path.parent.mkdir(parents=True, exist_ok=True)
-    fixture_value = "AKIA" + "IOSFODNN7EXAMPLE"
-    field_name = "aws_" + "access_key_id"
-    private_path.write_text(
-        f'{field_name} = "{fixture_value}"\n',
-        encoding="utf-8",
-    )
-    untracked = tmp_path / "common/untracked.key"
-    untracked_label = "se" + "cret"
-    untracked.write_text(
-        f'{untracked_label} = "machine-local"\n',
-        encoding="utf-8",
-    )
+    normal, linked = _create_linked_worktree(tmp_path)
+    for candidate_root in (normal, linked):
+        _seed_secret_inventory_context(candidate_root)
+        private_path = candidate_root / relative
+        private_path.parent.mkdir(parents=True, exist_ok=True)
+        fixture_value = "AKIA" + "IOSFODNN7EXAMPLE"
+        field_name = "aws_" + "access_key_id"
+        private_path.write_text(
+            f'{field_name} = "{fixture_value}"\n',
+            encoding="utf-8",
+        )
+        untracked = candidate_root / "common/untracked.key"
+        untracked_label = "se" + "cret"
+        untracked.write_text(
+            f'{untracked_label} = "machine-local"\n',
+            encoding="utf-8",
+        )
 
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    subprocess.run(
-        ["git", "-C", str(tmp_path), "add", "-f", "--", relative],
-        check=True,
-    )
+        subprocess.run(
+            ["git", "-C", str(candidate_root), "add", "-f", "--", relative],
+            check=True,
+        )
 
-    candidate = verify_supply_chain.secret_scan_paths(tmp_path)
+        candidate = verify_supply_chain.secret_scan_paths(candidate_root)
 
-    assert relative in candidate
-    assert "common/untracked.key" not in candidate
-    report = verify_supply_chain.scan_secrets(tmp_path, (relative,))
-    assert report["results"][relative]
+        assert relative in candidate
+        assert "common/untracked.key" not in candidate
+        report = verify_supply_chain.scan_secrets(candidate_root, (relative,))
+        assert report["results"][relative]
 
 
 @pytest.mark.asyncio

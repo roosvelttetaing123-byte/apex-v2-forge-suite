@@ -1,6 +1,6 @@
 {
   "backend_source": "common/dashboard/server.py",
-  "backend_source_sha256": "d11dbc0ed5b2abf4808700b0e962b931509fe93a5a4647f5ce38926b0aa1fc2a",
+  "backend_source_sha256": "a4e83e7368a6edd480157b905092efb43d60a2c198effe893f8efb362c610e52",
   "endpoints": {
     "actionConfirmations": {
       "method": "POST",

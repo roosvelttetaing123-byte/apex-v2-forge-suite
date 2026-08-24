@@ -7,12 +7,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 
 import httpx
 
-from common.action_authorization import (
-    AUTHORIZATION_ENVELOPES_ENV,
-    load_authorization_envelopes,
-    module_set_binding,
-)
-from common.confirm_gate import ActionConfirmation, LAUNCH_CONFIRMATIONS_ENV
+from common.confirm_gate import ActionConfirmation
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -148,7 +143,7 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                     return_value=scan_jobs_db,
                 ),
                 patch.object(DashboardServer, "_track_scan_process"),
-                patch("subprocess.Popen", return_value=mock_proc),
+                patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
             ):
                 async with _make_async_client(app) as client:
                     resp = await client.post(
@@ -168,14 +163,14 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
             )
             self.assertFalse(history_path.exists())
             self.assertFalse(any(logs_dir.iterdir()))
-            mock_proc.assert_not_called()
+            mock_popen.assert_not_called()
             session = create_db(scan_jobs_db)
             try:
                 self.assertEqual(session.query(ScanJobModel).count(), 0)
             finally:
                 session.close()
 
-    async def test_retest_finding_persists_plan_without_spawning_dry_run_job(self):
+    async def test_retest_finding_without_canonical_lineage_fails_before_dry_run_persistence(self):
         from common.dashboard.event_bus import Event, EventType
         from common.dashboard.server import DashboardServer
         from common.db import FindingRetestModel, create_db
@@ -236,28 +231,16 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                         },
                     )
 
-            self.assertEqual(resp.status_code, 200, resp.text)
-            body = resp.json()
-            self.assertEqual(body["status"], "planned")
-            self.assertTrue(body["dry_run"])
-            self.assertEqual(body["module"], "sqli_scanner")
-            self.assertEqual(body["client_job_id"], "retest-dry-plan")
-            self.assertTrue(body["job_id"].startswith("job-"))
+            self.assertEqual(resp.status_code, 500, resp.text)
+            self.assertEqual(
+                resp.json()["detail"],
+                "Canonical retest context is required; persistence denied",
+            )
             mock_popen.assert_not_called()
 
             session = create_db(scan_jobs_db)
             try:
-                retest = session.query(FindingRetestModel).filter_by(id=body["retest_id"]).one()
-                self.assertEqual(retest.finding_id, "finding-123")
-                self.assertEqual(retest.module, "sqli_scanner")
-                self.assertEqual(retest.target, "http://127.0.0.1:8080")
-                self.assertEqual(retest.status, "planned")
-                self.assertEqual(retest.job_id, body["job_id"])
-                self.assertEqual(retest.param, "id")
-                self.assertEqual(retest.payload_class, "time-based-sqli")
-                evidence = json.loads(retest.evidence)
-                self.assertTrue(evidence["dry_run"])
-                self.assertFalse(evidence["authorized"])
+                self.assertEqual(session.query(FindingRetestModel).count(), 0)
             finally:
                 session.close()
 
@@ -325,7 +308,7 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
         )
         popen.assert_not_called()
 
-    def test_retest_completion_updates_persisted_record(self):
+    def test_retest_completion_without_canonical_lineage_leaves_legacy_record_unchanged(self):
         from common.dashboard.server import DashboardServer
         from common.db import FindingRetestModel, create_db, save_finding_retest
 
@@ -358,6 +341,7 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                             "module": "sqli_scanner",
                             "target": "http://example.com",
                         },
+                        allow_legacy_compat=True,
                     )
                 finally:
                     session.close()
@@ -372,12 +356,11 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                 session = create_db(scan_jobs_db)
                 try:
                     retest = session.query(FindingRetestModel).filter_by(id="rt-1").one()
-                    self.assertEqual(retest.status, "completed")
+                    self.assertEqual(retest.status, "running")
                     self.assertIsNone(retest.still_vulnerable)
-                    self.assertEqual(retest.confidence, "UNVERIFIED")
+                    self.assertIsNone(retest.confidence)
                     evidence = json.loads(retest.evidence)
-                    self.assertEqual(evidence["return_code"], 0)
-                    self.assertIn("dry run complete", evidence["log_tail"])
-                    self.assertIsNotNone(retest.retested_at)
+                    self.assertEqual(evidence, {})
+                    self.assertIsNone(retest.retested_at)
                 finally:
                     session.close()

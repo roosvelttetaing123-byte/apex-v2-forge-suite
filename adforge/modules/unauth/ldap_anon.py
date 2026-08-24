@@ -18,6 +18,7 @@ import time
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
@@ -48,6 +49,36 @@ _SENSITIVE_ROOTDSE_ATTRS = {
     "forestFunctionality",
     "domainControllerFunctionality",
 }
+
+
+def _close_ldap_connection(connection: Any | None, logger: Any) -> None:
+    """Idempotently close ldap3 state, including sockets retained after failed open."""
+
+    if connection is None:
+        return
+    raw_socket = None
+    try:
+        raw_socket = getattr(connection, "socket", None)
+    except Exception as exc:
+        try:
+            logger.debug("LDAP cleanup could not inspect the retained socket: %s", exc)
+        except Exception:
+            pass
+    try:
+        connection.unbind()
+    except Exception as exc:
+        try:
+            logger.debug("LDAP unbind cleanup failed: %s", exc)
+        except Exception:
+            pass
+    if raw_socket is not None:
+        try:
+            raw_socket.close()
+        except Exception as exc:
+            try:
+                logger.debug("LDAP raw-socket cleanup failed: %s", exc)
+            except Exception:
+                pass
 
 
 class LdapAnon(BaseModule):
@@ -107,6 +138,7 @@ class LdapAnon(BaseModule):
 
     def _try_anonymous_bind(self, host: str, port: int = 389) -> bool:
         """Attempt an anonymous LDAP bind; return True if rootDSE is readable."""
+        conn: Any | None = None
         try:
             import ldap3
             server = ldap3.Server(host, port=port, get_info=ldap3.NONE, connect_timeout=5)
@@ -126,15 +158,17 @@ class LdapAnon(BaseModule):
                 attributes=["namingContexts"],
             )
             readable = bool(conn.entries or conn.result.get("description") == "success")
-            conn.unbind()
             return readable
         except Exception as exc:
             self.log.debug("Anonymous bind probe failed: %s", exc)
             return False
+        finally:
+            _close_ldap_connection(conn, self.log)
 
     def _enum_rootdse(self, host: str, port: int = 389) -> dict[str, Any]:
         """Extract key rootDSE attributes from an anonymously bound connection."""
         result: dict[str, Any] = {}
+        conn: Any | None = None
         try:
             import ldap3
             attrs = list(_SENSITIVE_ROOTDSE_ATTRS) + [
@@ -177,9 +211,10 @@ class LdapAnon(BaseModule):
                             result[k] = val
                     except Exception:
                         pass
-            conn.unbind()
         except Exception as exc:
             self.log.debug("rootDSE enumeration failed: %s", exc)
+        finally:
+            _close_ldap_connection(conn, self.log)
         return result
 
     def _enum_domain_info(
@@ -187,6 +222,7 @@ class LdapAnon(BaseModule):
     ) -> list[dict]:
         """Enumerate users, groups, and computers via anonymous bind if permitted."""
         found: list[dict] = []
+        conn: Any | None = None
         try:
             import ldap3
             server = ldap3.Server(host, port=port, get_info=ldap3.NONE, connect_timeout=5)
@@ -230,14 +266,15 @@ class LdapAnon(BaseModule):
                         found.append(obj)
                 except Exception as exc:
                     self.log.debug("Anonymous enum (%s) failed: %s", obj_type, exc)
-
-            conn.unbind()
         except Exception as exc:
             self.log.debug("Domain info enumeration error: %s", exc)
+        finally:
+            _close_ldap_connection(conn, self.log)
         return found
 
     def _detect_null_base(self, host: str, port: int = 389) -> bool:
         """Check whether a null/empty base-DN search returns data (misconfiguration)."""
+        conn: Any | None = None
         try:
             import ldap3
             server = ldap3.Server(host, port=port, get_info=ldap3.NONE, connect_timeout=5)
@@ -256,11 +293,12 @@ class LdapAnon(BaseModule):
                 size_limit=5,
             )
             result = len(conn.entries) > 0
-            conn.unbind()
             return result
         except Exception as exc:
             self.log.debug("Null-base probe failed: %s", exc)
             return False
+        finally:
+            _close_ldap_connection(conn, self.log)
 
     # ------------------------------------------------------------------
     # Findings emitter
@@ -417,6 +455,13 @@ class LdapAnon(BaseModule):
 
 class TestLdapAnon(unittest.TestCase):
 
+    @staticmethod
+    def _connection_probe(*, bind_result: bool = False) -> mock.MagicMock:
+        connection = mock.MagicMock()
+        connection.bind.return_value = bind_result
+        connection.socket = mock.MagicMock()
+        return connection
+
     def test_phase(self):
         assert LdapAnon.PHASE == 1
 
@@ -452,12 +497,25 @@ class TestLdapAnon(unittest.TestCase):
         mod = LdapAnon.__new__(LdapAnon)
         mod.log = type("L", (), {"debug": lambda *a, **k: None})()
         assert mod._try_anonymous_bind("127.0.0.1", 19999) is False
+        connection = self._connection_probe(bind_result=False)
+        with mock.patch("ldap3.Connection", return_value=connection):
+            assert mod._try_anonymous_bind("127.0.0.1", 19999) is False
+        connection.unbind.assert_called_once_with()
+        connection.socket.close.assert_called_once_with()
 
     def test_detect_null_base_no_server(self):
         """Returns False when the host is unreachable."""
         mod = LdapAnon.__new__(LdapAnon)
         mod.log = type("L", (), {"debug": lambda *a, **k: None})()
         assert mod._detect_null_base("127.0.0.1", 19999) is False
+        connection = self._connection_probe()
+        connection.bind.side_effect = RuntimeError("fixture bind failure")
+        connection.unbind.side_effect = RuntimeError("fixture unbind failure")
+        connection.socket.close.side_effect = RuntimeError("fixture close failure")
+        with mock.patch("ldap3.Connection", return_value=connection):
+            assert mod._detect_null_base("127.0.0.1", 19999) is False
+        connection.unbind.assert_called_once_with()
+        connection.socket.close.assert_called_once_with()
 
     def test_enum_domain_info_no_server(self):
         """Returns empty list when the host is unreachable."""
@@ -466,6 +524,12 @@ class TestLdapAnon(unittest.TestCase):
         result = mod._enum_domain_info("127.0.0.1", "DC=test,DC=local", port=19999)
         assert isinstance(result, list)
         assert len(result) == 0
+        connection = self._connection_probe(bind_result=False)
+        with mock.patch("ldap3.Connection", return_value=connection):
+            result = mod._enum_domain_info("127.0.0.1", "DC=test,DC=local", port=19999)
+        assert result == []
+        connection.unbind.assert_called_once_with()
+        connection.socket.close.assert_called_once_with()
 
     def test_enum_rootdse_no_server(self):
         """Returns empty dict when the host is unreachable."""
@@ -473,6 +537,13 @@ class TestLdapAnon(unittest.TestCase):
         mod.log = type("L", (), {"debug": lambda *a, **k: None})()
         result = mod._enum_rootdse("127.0.0.1", port=19999)
         assert isinstance(result, dict)
+        connection = self._connection_probe(bind_result=True)
+        connection.search.side_effect = RuntimeError("fixture search failure")
+        with mock.patch("ldap3.Connection", return_value=connection):
+            result = mod._enum_rootdse("127.0.0.1", port=19999)
+        assert result == {}
+        connection.unbind.assert_called_once_with()
+        connection.socket.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

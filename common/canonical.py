@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import hashlib
 import re
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
@@ -24,7 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from common.evidence_custody import ArtifactManifest
-from common.redaction import redact_text, redact_value
+from common.redaction import is_sensitive_identifier, redact_text, redact_value
 
 
 CANONICAL_SCHEMA_VERSION = "forge-canonical-v1"
@@ -78,16 +79,19 @@ _RELATIONSHIP_KEYS = {
     "created_by",
     "parent_id",
 }
+_METADATA_KEY_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 
 
 def _is_relationship_metadata_key(key: str) -> bool:
     """Recognize relationship-shaped metadata keys across casing styles."""
-    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key).replace("-", "_").lower()
-    # Any ``*_id`` value is structurally relationship-shaped.  Keeping a
-    # short explicit set is useful for non-suffixed historical names, but the
-    # suffix guard prevents new contracts (attempt_id, execution_id,
-    # manifest_id, check_id, etc.) from silently becoming JSON-only links.
-    return normalized in _RELATIONSHIP_KEYS or normalized.endswith("_id")
+    normalized = unicodedata.normalize("NFKC", key)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", normalized)
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", normalized).strip("_").lower()
+    return (
+        normalized == "id"
+        or normalized in _RELATIONSHIP_KEYS
+        or normalized.endswith(("_id", "_ids"))
+    )
 _SECRET_KEYS = re.compile(
     r"(?:password|passwd|pwd|secret|token|cookie|credential|private[_-]?key|"
     r"api[_-]?key|access[_-]?key|passphrase|hash(?:es)?|authorization)",
@@ -252,14 +256,13 @@ class ProvenanceSourceType(str, Enum):
 
     Keeping this as an enum prevents a free-form ``source_type`` plus ID from
     becoming an unchecked polymorphic relationship at the contract boundary.
-    The ``legacy`` value is intentionally limited to the reduced Gate 0
-    archive and is not treated as executable evidence.
+    Reduced Gate 0 rows live only in ``canonical_legacy_records``; they are
+    not a polymorphic provenance source and cannot be linked to execution.
     """
 
     INTELLIGENCE_SOURCE = "intelligence_source"
     FEED_SNAPSHOT = "feed_snapshot"
     CHECK_PACK_SNAPSHOT = "check_pack_snapshot"
-    LEGACY = "legacy"
 
 
 class _Contract:
@@ -271,34 +274,39 @@ class _Contract:
         identifier = getattr(self, "id", None)
         if not isinstance(identifier, str) or not _ID_RE.fullmatch(identifier):
             raise CanonicalContractError("id must be a bounded server identifier")
-        if _SECRET_KEYS.search(identifier) or re.search(r"(?i)canary", identifier):
+        if (
+            _SECRET_KEYS.search(identifier)
+            or re.search(r"(?i)canary", identifier)
+            or is_sensitive_identifier(identifier)
+        ):
             raise CanonicalContractError("id may not contain secret-like material")
         version = getattr(self, "schema_version", None)
         if version != CANONICAL_SCHEMA_VERSION:
             raise CanonicalContractError("unsupported canonical schema version")
-        created = getattr(self, "created_at", None)
-        if isinstance(created, datetime):
-            # Store one canonical representation at the contract boundary;
-            # callers may supply an aware offset, but persisted/serialized
-            # values are always UTC and never a naive local timestamp.
-            object.__setattr__(self, "created_at", ensure_utc(created))
         for name in ("observed_at", "collected_at", "decided_at", "created_at"):
-            value = getattr(self, name, None)
-            if value is None:
+            if not hasattr(self, name):
                 continue
+            value = getattr(self, name)
             if not isinstance(value, datetime):
                 raise CanonicalContractError(f"{name} must be a timezone-aware datetime")
             object.__setattr__(self, name, ensure_utc(value))
         metadata = getattr(self, "metadata", None)
-        if metadata is not None:
-            object.__setattr__(self, "metadata", bounded_metadata(metadata))
+        if not isinstance(metadata, Mapping):
+            raise CanonicalContractError("metadata must be an object")
+        object.__setattr__(self, "metadata", bounded_metadata(metadata))
 
     def to_dict(self) -> dict[str, Any]:
         if not is_dataclass(self):
             raise CanonicalSerializationError("contract is not a dataclass")
+        _validate_structural_identifiers(self)
         result = _serialize_value(asdict(self))
         if not isinstance(result, dict):
             raise CanonicalSerializationError("contract did not serialize to an object")
+        if "metadata" in result:
+            # Recheck mutable mappings at the serialization boundary.
+            result["metadata"] = _serialize_value(
+                bounded_metadata(getattr(self, "metadata", {}))
+            )
         # Structural identities are not content and must not be redacted by a
         # broad hash/canary rule in ordinary metadata.
         for name in _structural_keys(result):
@@ -307,6 +315,8 @@ class _Contract:
                 original = original.value
             if isinstance(original, datetime):
                 original = isoformat_utc(original)
+            if isinstance(original, str):
+                _identifier(original, name)
             # Optional relationship IDs are structural too: preserve an
             # explicit ``None`` instead of allowing the generic redactor to
             # turn a sensitive-looking field name into ``<redacted>``.
@@ -344,9 +354,22 @@ class _Contract:
         if not isinstance(value, Mapping):
             raise CanonicalSerializationError("contract payload must be an object")
         payload = dict(value)
-        for item in fields(cls):  # type: ignore[arg-type]
-            if item.name not in payload:
-                continue
+        contract_fields = fields(cls)  # type: ignore[arg-type]
+        expected_fields = {item.name for item in contract_fields}
+        provided_fields = set(payload)
+        missing_fields = expected_fields - provided_fields
+        if missing_fields:
+            raise CanonicalSerializationError(
+                "contract payload is missing fields: "
+                + ", ".join(sorted(missing_fields))
+            )
+        unexpected_fields = provided_fields - expected_fields
+        if unexpected_fields:
+            raise CanonicalSerializationError(
+                "contract payload has unexpected fields: "
+                + ", ".join(sorted(str(name) for name in unexpected_fields))
+            )
+        for item in contract_fields:
             raw = payload[item.name]
             if item.name.endswith("_at") and isinstance(raw, str):
                 payload[item.name] = parse_utc(raw)
@@ -425,7 +448,11 @@ def _identifier(value: Any, field_name: str) -> str:
     # caller-controlled credential material.  Legacy migration code derives
     # tenant-bound opaque IDs before constructing contracts, while a direct
     # contract boundary rejects obvious canaries/secret-bearing labels.
-    if _SECRET_KEYS.search(rendered) or re.search(r"(?i)canary", rendered):
+    if (
+        _SECRET_KEYS.search(rendered)
+        or re.search(r"(?i)canary", rendered)
+        or is_sensitive_identifier(rendered)
+    ):
         raise CanonicalContractError(f"{field_name} may not contain secret-like material")
     return rendered
 
@@ -513,8 +540,21 @@ def _structural_keys(value: Mapping[str, Any]) -> set[str]:
     return {
         key
         for key in value
-        if key == "id" or key.endswith("_id") or key in {"schema_version", "tenant_id"}
+        if key == "id"
+        or key.endswith("_id")
+        or key in {"schema_version", "tenant_id", "created_by"}
     }
+
+
+def _validate_structural_identifiers(record: Any) -> None:
+    """Revalidate IDs at each serialization and persistence boundary."""
+    if not is_dataclass(record):
+        raise CanonicalSerializationError("contract is not a dataclass")
+    for item in fields(record):
+        if item.name == "id" or item.name.endswith("_id") or item.name == "created_by":
+            value = getattr(record, item.name, None)
+            if value is not None:
+                _identifier(value, item.name)
 
 
 def _restore_opaque_references(original: Any, redacted: Any) -> Any:
@@ -572,6 +612,10 @@ def _bounded(value: Any, depth: int = 0) -> Any:
             if _is_relationship_metadata_key(key):
                 raise CanonicalContractError(
                     f"metadata cannot carry normalized relationship {key}"
+                )
+            if _METADATA_KEY_RE.fullmatch(key) is None:
+                raise CanonicalContractError(
+                    "metadata key must use 1-64 ASCII letters, digits, or underscores"
                 )
             if _SECRET_KEYS.search(key):
                 if key.lower().endswith("_ref") and isinstance(item, str) and (
@@ -1374,6 +1418,7 @@ class CanonicalStore:
         ``insert()`` remains strict for callers that explicitly request one
         row insertion.
         """
+        _validate_structural_identifiers(record)
         table = _TABLE_TYPES.get(type(record))
         if table is None:
             raise CanonicalContractError(f"unsupported canonical record {type(record).__name__}")
@@ -1403,6 +1448,7 @@ class CanonicalStore:
                 )
 
     def _record_params(self, record: _Contract) -> dict[str, Any]:
+        _validate_structural_identifiers(record)
         base = {
             "id": cast(str, getattr(record, "id")),
             "schema_version": cast(str, getattr(record, "schema_version")),
@@ -1566,6 +1612,18 @@ class CanonicalStore:
                 raise CanonicalLineageError("observation module execution link is inconsistent")
             if module_execution.job_id != job.id or module_execution.module_version_id != module_version.id:
                 raise CanonicalLineageError("module execution lineage is inconsistent")
+            execution_snapshot_ids = (
+                module_execution.intelligence_snapshot_id,
+                module_execution.check_pack_snapshot_id,
+                module_execution.provenance_id,
+            )
+            version_snapshot_ids = (
+                module_version.intelligence_snapshot_id,
+                module_version.check_pack_snapshot_id,
+                module_version.provenance_id,
+            )
+            if execution_snapshot_ids != version_snapshot_ids:
+                raise CanonicalLineageError("module execution snapshot lineage is inconsistent")
         elif observation.module_execution_id is not None:
             raise CanonicalLineageError("observation references an unprovided module execution")
         if action is not None:
@@ -1615,6 +1673,25 @@ class CanonicalStore:
                 provenance is None or module_execution.provenance_id != provenance.id
             ):
                 raise CanonicalLineageError("module execution provenance link is inconsistent")
+        if provenance is not None and (feed_snapshot is not None or check_pack_snapshot is not None):
+            matches_feed = (
+                feed_snapshot is not None
+                and provenance.tenant_id == feed_snapshot.tenant_id
+                and provenance.source_type == ProvenanceSourceType.FEED_SNAPSHOT
+                and provenance.source_id == feed_snapshot.id
+                and provenance.digest == feed_snapshot.digest
+            )
+            matches_check_pack = (
+                check_pack_snapshot is not None
+                and provenance.tenant_id == check_pack_snapshot.tenant_id
+                and provenance.source_type == ProvenanceSourceType.CHECK_PACK_SNAPSHOT
+                and provenance.source_id == check_pack_snapshot.id
+                and provenance.digest == check_pack_snapshot.digest
+            )
+            if not (matches_feed or matches_check_pack):
+                raise CanonicalLineageError(
+                    "provenance does not match a selected feed/check-pack snapshot"
+                )
         with self._atomic():
             # Context rows may already exist when an adapter emits an
             # observation.  Reuse them only after checking tenant and
@@ -2226,10 +2303,45 @@ class CanonicalAdapter:
             raise MissingCanonicalContextError("canonical action context is not persisted")
         if not all((engagement, job, module_version, asset)):
             raise MissingCanonicalContextError("canonical context references must already exist")
+        module_version = cast(ModuleVersion, module_version)
+        feed_snapshot = (
+            self._existing(FeedSnapshot, module_version.intelligence_snapshot_id, tenant_id)
+            if module_version.intelligence_snapshot_id
+            else None
+        )
+        check_pack_snapshot = (
+            self._existing(CheckPackSnapshot, module_version.check_pack_snapshot_id, tenant_id)
+            if module_version.check_pack_snapshot_id
+            else None
+        )
+        provenance = (
+            self._existing(Provenance, module_version.provenance_id, tenant_id)
+            if module_version.provenance_id
+            else None
+        )
+        if (
+            (module_version.intelligence_snapshot_id and feed_snapshot is None)
+            or (module_version.check_pack_snapshot_id and check_pack_snapshot is None)
+            or (module_version.provenance_id and provenance is None)
+        ):
+            raise MissingCanonicalContextError("canonical module lineage context is not persisted")
         observation = Observation(tenant_id=tenant_id, engagement_id=engagement_id, job_id=job_id, module_version_id=module_version_id, asset_id=asset_id, action_id=action_id, metadata=metadata or {})
         artifact = ArtifactReference(tenant_id=tenant_id, observation_id=observation.id, reference=artifact_reference, digest=artifact_digest, media_type="application/json", size=0)
         finding = Finding(tenant_id=tenant_id, observation_id=observation.id, artifact_id=artifact.id, title=title, severity=FindingSeverity(severity), description=description, metadata=metadata or {})
-        return self.store.create_lineage(tenant=tenant, engagement=cast(Engagement, engagement), job=cast(Job, job), module_version=cast(ModuleVersion, module_version), asset=cast(Asset, asset), observation=observation, artifact=artifact, finding=finding, action=cast(Action | None, action))
+        return self.store.create_lineage(
+            tenant=tenant,
+            engagement=cast(Engagement, engagement),
+            job=cast(Job, job),
+            module_version=module_version,
+            asset=cast(Asset, asset),
+            observation=observation,
+            artifact=artifact,
+            finding=finding,
+            action=cast(Action | None, action),
+            feed_snapshot=feed_snapshot,
+            check_pack_snapshot=check_pack_snapshot,
+            provenance=provenance,
+        )
 
     def _existing(self, cls: type[TContract], identifier: str, tenant_id: str) -> TContract | None:
         table = _TABLE_TYPES[cls]
@@ -2323,6 +2435,14 @@ def _asset_from_row(row: Mapping[str, Any]) -> Asset:
 
 
 def _contract_from_row(cls: type[_Contract], row: Mapping[str, Any]) -> _Contract:
+    if cls is Tenant:
+        return Tenant(
+            id=str(row["id"]),
+            name=str(row["name"]),
+            schema_version=str(row["schema_version"]),
+            created_at=parse_utc(str(row["created_at"])),
+            metadata=_row_metadata(row),
+        )
     common: dict[str, Any] = {
         "id": str(row["id"]),
         "tenant_id": str(row["tenant_id"]),
@@ -2332,14 +2452,6 @@ def _contract_from_row(cls: type[_Contract], row: Mapping[str, Any]) -> _Contrac
     }
     if cls is Asset:
         return _asset_from_row(cast(Mapping[str, Any], row))
-    if cls is Tenant:
-        return Tenant(
-            id=str(row["id"]),
-            name=str(row["name"]),
-            schema_version=str(row["schema_version"]),
-            created_at=parse_utc(str(row["created_at"])),
-            metadata=_row_metadata(row),
-        )
     if cls is Client:
         return Client(name=str(row["name"]), **common)
     if cls is Project:

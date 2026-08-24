@@ -3736,11 +3736,19 @@ class DashboardServer:
                 )[0]
 
             retest_id = str(uuid.uuid4())[:8]
-            retest = server._create_finding_retest(
-                retest_id=retest_id,
-                finding=finding,
-                dry_run=dry_run,
-            )
+            from common.canonical import MissingCanonicalContextError
+
+            try:
+                retest = server._create_finding_retest(
+                    retest_id=retest_id,
+                    finding=finding,
+                    dry_run=dry_run,
+                )
+            except MissingCanonicalContextError:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Canonical retest context is required; persistence denied",
+                ) from None
             job = server._launch_finding_retest_job(
                 retest_id,
                 finding,
