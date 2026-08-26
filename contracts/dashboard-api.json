@@ -1,6 +1,6 @@
 {
   "backend_source": "common/dashboard/server.py",
-  "backend_source_sha256": "a4e83e7368a6edd480157b905092efb43d60a2c198effe893f8efb362c610e52",
+  "backend_source_sha256": "4b84339289b7c26c36ac03ad5063247e0eebd3f274012734de975b87135acc6d",
   "endpoints": {
     "actionConfirmations": {
       "method": "POST",
@@ -215,6 +215,10 @@
     {
       "method": "GET",
       "path": "/api/v1/findings"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/findings/export"
     },
     {
       "method": "GET",

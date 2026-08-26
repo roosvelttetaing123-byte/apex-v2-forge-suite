@@ -850,12 +850,22 @@ def test_bruteforce_logs_and_raw_findings_use_only_protected_references(
     for module in (spray, hydra):
         assert len(module.findings) == 1
         raw_finding = repr(module.findings[0])
-        serialized = _render(module.findings[0].to_dict())
+        serialized_payload = module.findings[0].to_dict()
+        serialized = _render(serialized_payload)
         for rendered in (raw_finding, serialized):
             assert secret not in rendered
             assert secret[:8] not in rendered
             assert secret[-4:] not in rendered
-            assert "credential_reference" in rendered
+        # The in-memory finding retains the opaque protected reference, while
+        # ordinary evidence serialization intentionally carries only capture
+        # shape/state and never mutable credential metadata or raw inputs.
+        assert "credential_reference" in raw_finding
+        assert "cred:sha256:" in raw_finding
+        evidence_payload = serialized_payload["evidence"]
+        assert "credential_reference" not in evidence_payload
+        assert "request_raw" not in evidence_payload
+        assert "response_raw" not in evidence_payload
+        assert "Credential reference:" in serialized
 
 
 def test_bruteforce_metadata_cannot_disclose_a_password_fragment(

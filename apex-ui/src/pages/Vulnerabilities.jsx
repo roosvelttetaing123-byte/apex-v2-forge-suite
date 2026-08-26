@@ -67,6 +67,50 @@ const confidenceColor = {
   LOW:    'var(--color-high)',
 };
 
+const renderPersistedEvidence = (evidence) => {
+  if (!evidence || evidence.state !== 'persisted' || !Array.isArray(evidence.observations)) {
+    return '';
+  }
+  return evidence.observations.flatMap(observation => (
+    observation && typeof observation === 'object' && !Array.isArray(observation)
+      && Array.isArray(observation.artifacts) ? observation.artifacts : []
+  )).filter(artifact => (
+    artifact && typeof artifact === 'object' && !Array.isArray(artifact)
+  )).map(artifact => {
+    const kind = String(artifact.capture_kind || 'evidence');
+    const derivative = String(artifact.derivative || '');
+    return `[${kind}] ${derivative}`;
+  }).filter(Boolean).join('\n\n');
+};
+
+const persistedFinding = (finding, index) => {
+  if (!finding || typeof finding !== 'object' || Array.isArray(finding)) return null;
+  return {
+    ...normalizeFindingTruth(finding),
+    status: displayStatus(finding.status),
+    id: finding.id || finding.finding_id || `f-${index}`,
+    cve: finding.cve || '',
+    finding: finding.title || finding.finding || '',
+    target: finding.target || '',
+    cvss: finding.cvss || 0,
+    vpr: finding.vpr_score || finding.vpr || 0,
+    severity: (finding.severity || 'info').toLowerCase(),
+    module: finding.module || '',
+    description: finding.description || '',
+    repro: finding.reproduction_steps || finding.repro || '',
+    evidence: renderPersistedEvidence(finding.evidence),
+    remediation: finding.remediation || '',
+    owner: finding.owner || 'Unassigned',
+    businessImpact: finding.business_impact || finding.businessImpact
+      || (finding.severity === 'critical' ? 'Critical Service' : 'Unknown'),
+    dueDate: finding.due_date || finding.dueDate
+      || addDays(SLA_DAYS[(finding.severity || 'info').toLowerCase()] || 90),
+    ticketState: finding.ticket_state || finding.ticketState || 'Not Filed',
+    ticketId: finding.ticket_id || finding.ticketId || '',
+    queueNote: finding.queue_note || finding.queueNote || '',
+  };
+};
+
 const loadWorkflowMeta = () => {
   try {
     return JSON.parse(window.localStorage.getItem(WORKFLOW_STORAGE_KEY)) || {};
@@ -108,6 +152,7 @@ const Vulnerabilities = ({ authToken }) => {
 
   // Status update state
   const [statusUpdating, setStatusUpdating] = useState(null);
+  const findingsRefreshSequence = useRef(0);
 
   useEffect(() => {
     saveWorkflowMeta(workflowMeta);
@@ -120,38 +165,24 @@ const Vulnerabilities = ({ authToken }) => {
 
   const selected = hydratedVulns.find(v => v.id === selectedId) || null;
 
-  // Fetch findings from backend on mount
-  useEffect(() => {
-    apiFetch('/api/v1/findings?limit=200')
-      .then(r => r.ok ? r.json() : null)
-      .then(d => {
-        if (d?.findings?.length) {
-          setVulns(d.findings.map((f, i) => ({
-            ...normalizeFindingTruth(f),
-            status: displayStatus(f.status),
-            id: f.id || f.finding_id || `f-${i}`,
-            cve: f.cve || '',
-            finding: f.title || f.finding || '',
-            target: f.target || '',
-            cvss: f.cvss || 0,
-            vpr: f.vpr_score || f.vpr || 0,
-            severity: (f.severity || 'info').toLowerCase(),
-            module: f.module || '',
-            description: f.description || '',
-            repro: f.reproduction_steps || f.repro || '',
-            evidence: f.evidence || '',
-            remediation: f.remediation || '',
-            owner: f.owner || 'Unassigned',
-            businessImpact: f.business_impact || f.businessImpact || (f.severity === 'critical' ? 'Critical Service' : 'Unknown'),
-            dueDate: f.due_date || f.dueDate || addDays(SLA_DAYS[(f.severity || 'info').toLowerCase()] || 90),
-            ticketState: f.ticket_state || f.ticketState || 'Not Filed',
-            ticketId: f.ticket_id || f.ticketId || '',
-            queueNote: f.queue_note || f.queueNote || '',
-          })));
-        }
-      })
-      .catch(() => {}); // backend offline — keep seed data
+  const refreshPersistedFindings = useCallback(async () => {
+    const sequence = ++findingsRefreshSequence.current;
+    try {
+      const response = await apiFetch('/api/v1/findings?limit=200');
+      if (!response.ok) return;
+      const payload = await response.json();
+      if (sequence !== findingsRefreshSequence.current) return;
+      if (Array.isArray(payload?.findings)) {
+        setVulns(payload.findings.map(persistedFinding).filter(Boolean));
+      }
+    } catch {}
   }, []);
+
+  // Fetch canonical persisted findings from the backend on mount.
+  useEffect(() => {
+    void refreshPersistedFindings();
+    return () => { findingsRefreshSequence.current += 1; };
+  }, [refreshPersistedFindings]);
 
   // Live finding updates from WebSocket
   useEffect(() => {
@@ -159,31 +190,15 @@ const Vulnerabilities = ({ authToken }) => {
     const { type, event_type, data } = lastMessage;
     if (type !== 'event') return;
     if (event_type === 'finding_new') {
-      const truth = normalizeFindingTruth(data);
-      setVulns(prev => [{
-        ...truth,
-        status: displayStatus(truth.status),
-        id: data.id || data.finding_id || `f-live-${Date.now()}`,
-        cve: data.cve || '',
-        finding: data.title || '',
-        target: data.target || '',
-        cvss: data.cvss || 0,
-        vpr: data.vpr || 0,
-        severity: (data.severity || 'info').toLowerCase(),
-        module: data.module || '',
-        description: data.description || '',
-        repro: data.repro || '',
-        evidence: data.evidence || '',
-        remediation: data.remediation || '',
-        owner: 'Unassigned',
-        businessImpact: (data.severity || '').toLowerCase() === 'critical' ? 'Critical Service' : 'Unknown',
-        dueDate: addDays(SLA_DAYS[(data.severity || 'info').toLowerCase()] || 90),
-        ticketState: 'Not Filed',
-        ticketId: '',
-        queueNote: '',
-      }, ...prev]);
+      // The event is only an invalidation signal. Retrieve the tenant-bound,
+      // persisted canonical projection instead of trusting transient payload.
+      void refreshPersistedFindings();
     }
-    if (event_type === 'finding_updated' && (data.finding_id || data.id)) {
+    if (
+      event_type === 'finding_updated'
+      && data && typeof data === 'object' && !Array.isArray(data)
+      && (data.finding_id || data.id)
+    ) {
       const truth = normalizeFindingTruth(data);
       const findingId = data.finding_id || data.id;
       const truthPatch = Object.fromEntries(
@@ -199,7 +214,7 @@ const Vulnerabilities = ({ authToken }) => {
         } : v
       ));
     }
-  }, [lastMessage]);
+  }, [lastMessage, refreshPersistedFindings]);
 
   // Escape key closes panel
   useEffect(() => {
@@ -365,18 +380,26 @@ const Vulnerabilities = ({ authToken }) => {
   }, [checked]);
 
   // Bulk export
-  const bulkExport = useCallback(() => {
+  const bulkExport = useCallback(async () => {
     const ids = [...checked];
-    const exportData = hydratedVulns.filter(v => ids.includes(v.id));
-    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `forge_findings_${new Date().toISOString().slice(0,10)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    setChecked(new Set());
-  }, [checked, hydratedVulns]);
+    if (!ids.length) return;
+    try {
+      const response = await apiFetch('/api/v1/findings/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ finding_ids: ids }),
+      });
+      if (!response.ok) return;
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `forge_findings_${new Date().toISOString().slice(0,10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setChecked(new Set());
+    } catch {}
+  }, [checked]);
 
   const bulkAssign = useCallback((owner) => {
     const ids = [...checked];

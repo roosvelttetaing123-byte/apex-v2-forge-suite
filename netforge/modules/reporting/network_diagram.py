@@ -19,7 +19,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
-from common.finding import Finding, Severity
+from common.evidence import ordinary_finding_projection
 
 
 # ── Severity colors for nodes ────────────────────────────────────────────────
@@ -76,6 +76,7 @@ def generate_svg(
     height: int = 800,
 ) -> str:
     """Generate an SVG network topology diagram."""
+    findings = [ordinary_finding_projection(finding) for finding in findings]
 
     # Group findings by host
     host_findings: dict[str, list[dict]] = defaultdict(list)
@@ -222,27 +223,21 @@ class NetworkDiagram(BaseModule):
         start = time.monotonic()
         findings_raw: list = self.config.extra.get("findings", self.findings)
 
-        # Normalize findings to dicts
-        finding_dicts = []
-        for f in findings_raw:
-            if isinstance(f, dict):
-                finding_dicts.append(f)
-            elif hasattr(f, "to_dict"):
-                finding_dicts.append(f.to_dict())
-
         out_path = self.results_dir / "network_diagram.svg"
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         svg = generate_svg(
-            findings=finding_dicts,
+            findings=findings_raw,
             live_hosts=self.config.extra.get("live_hosts"),
             open_ports=self.config.extra.get("open_ports"),
             target=self.config.target,
         )
         out_path.write_text(svg, encoding="utf-8")
-        self.log.info("Network diagram written: %s (%d hosts)", out_path, len(set(
-            f.get("target", "") for f in finding_dicts
-        )))
+        self.log.info(
+            "Network diagram written: %s (%d findings)",
+            out_path,
+            len(findings_raw),
+        )
 
         # Also generate an HTML wrapper for easy viewing
         html_path = self.results_dir / "network_diagram.html"

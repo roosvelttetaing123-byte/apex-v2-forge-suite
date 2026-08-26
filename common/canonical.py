@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, ClassVar, Iterable, Mapping, TypeVar, cast
+from typing import Any, ClassVar, Iterable, Mapping, Sequence, TypeVar, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import text
@@ -211,9 +211,11 @@ class FindingSeverity(str, Enum):
 
 class FindingStatus(str, Enum):
     OPEN = "open"
+    IN_PROGRESS = "in_progress"
     VERIFIED = "verified"
     FALSE_POSITIVE = "false_positive"
     REMEDIATED = "remediated"
+    ACCEPTED_RISK = "accepted_risk"
     UNKNOWN = "unknown"
 
 
@@ -1319,6 +1321,47 @@ def _iso(value: datetime) -> str:
     return isoformat_utc(value)
 
 
+def _artifact_reference_matches_manifest(
+    artifact: ArtifactReference,
+    manifest: ArtifactManifest,
+) -> bool:
+    """Return whether a canonical reference exactly describes custody bytes."""
+    expected_integrity = (
+        ArtifactIntegrityState.VERIFIED.value
+        if manifest.integrity_state == "verified"
+        else manifest.integrity_state
+    )
+    retention_expires_at = (
+        _iso(artifact.retention_expires_at)
+        if artifact.retention_expires_at is not None
+        else None
+    )
+    return (
+        artifact.id == manifest.artifact_id
+        and artifact.tenant_id == manifest.tenant_id
+        and artifact.observation_id == manifest.source_observation_id
+        and artifact.digest == manifest.sha256
+        and artifact.size == manifest.byte_size
+        and artifact.media_type == manifest.media_type
+        and artifact.collected_at == parse_utc(manifest.collected_at)
+        and artifact.redaction_state.value == manifest.redaction_state
+        and artifact.encryption_state == manifest.encryption_state
+        and artifact.collector_id == manifest.collector_id
+        and artifact.source_target == (manifest.source_target or "unknown")
+        and artifact.source_asset_id == manifest.source_asset_id
+        and artifact.redaction_version == manifest.redaction_version
+        and artifact.protection_state == manifest.protection_state
+        and artifact.signer_state == manifest.signer_state
+        and artifact.integrity_state.value == expected_integrity
+        and artifact.retention_class == manifest.retention_class
+        and retention_expires_at == manifest.retention_expires_at
+        and artifact.protected_original_authorization_ref
+        == manifest.protected_original_authorization_ref
+        and artifact.derivative_reference == manifest.derivative_artifact_id
+        and artifact.manifest_digest in (None, manifest.manifest_digest)
+    )
+
+
 def finding_identity_key(
     *,
     tenant_id: str,
@@ -1558,6 +1601,9 @@ class CanonicalStore:
         observation: Observation,
         artifact: ArtifactReference,
         finding: Finding,
+        operator: Operator | None = None,
+        role: Role | None = None,
+        scope_decision: ScopeDecision | None = None,
         module_execution: ModuleExecution | None = None,
         action: Action | None = None,
         intelligence_source: IntelligenceSource | None = None,
@@ -1570,7 +1616,7 @@ class CanonicalStore:
         export: Export | None = None,
     ) -> dict[str, _Contract]:
         records: list[_Contract] = [tenant, engagement, job, module_version, asset, observation, artifact, finding]
-        records.extend(record for record in (client, project) if record is not None)
+        records.extend(record for record in (client, project, operator, role, scope_decision) if record is not None)
         records.extend(record for record in (module_execution, action, intelligence_source, provenance, feed_snapshot, check_pack_snapshot, retest, report, report_membership, export) if record is not None)
         tenant_id = self._assert_same_tenant(records)
         if project is not None and client is not None and project.client_id != client.id:
@@ -1591,6 +1637,20 @@ class CanonicalStore:
         for label, (actual, expected) in expected_links.items():
             if actual != expected:
                 raise CanonicalLineageError(f"{label} link is inconsistent")
+        if scope_decision is not None:
+            if operator is None:
+                raise CanonicalLineageError("scope decision requires its operator context")
+            if scope_decision.engagement_id != engagement.id:
+                raise CanonicalLineageError("scope decision engagement link is inconsistent")
+            if scope_decision.operator_id != operator.id:
+                raise CanonicalLineageError("scope decision operator link is inconsistent")
+            if scope_decision.role_id is not None:
+                if role is None or scope_decision.role_id != role.id:
+                    raise CanonicalLineageError("scope decision role link is inconsistent")
+        elif operator is not None or role is not None:
+            raise CanonicalLineageError(
+                "operator and role context require a scope decision"
+            )
         # The workflow summary identity intentionally excludes this run's
         # observation/job IDs.  Populate it once at the canonical boundary so
         # every downstream reader has the same explainable grouping key.
@@ -1631,6 +1691,15 @@ class CanonicalStore:
                 raise CanonicalLineageError("observation action link is inconsistent")
             if action.engagement_id != engagement.id or action.job_id != job.id:
                 raise CanonicalLineageError("action lineage is inconsistent")
+            if action.authorization_decision_id is not None:
+                if (
+                    scope_decision is None
+                    or action.authorization_decision_id != scope_decision.id
+                    or scope_decision.outcome is not ScopeOutcome.ALLOW
+                ):
+                    raise CanonicalLineageError(
+                        "action authorization decision is inconsistent"
+                    )
         elif observation.action_id is not None:
             raise CanonicalLineageError("observation references an unprovided action")
         if retest is not None and (retest.finding_id != finding.id or retest.source_observation_id != observation.id):
@@ -1698,8 +1767,8 @@ class CanonicalStore:
             # relationship identity; new observation/artifact/finding and
             # downstream records remain strict inserts so seeded constraint
             # failures roll back the complete write.
-            for record in (tenant, client, project, engagement, job,
-                           action, intelligence_source, feed_snapshot,
+            for record in (tenant, client, project, engagement, operator, role,
+                           scope_decision, job, action, intelligence_source, feed_snapshot,
                            check_pack_snapshot, provenance, module_version,
                            module_execution, asset, report):
                 if record is not None:
@@ -1782,7 +1851,7 @@ class CanonicalStore:
             result["client"] = client
         if project is not None:
             result["project"] = project
-        optional_records: tuple[tuple[str, _Contract | None], ...] = (("action", action), ("module_execution", module_execution), ("intelligence_source", intelligence_source), ("provenance", provenance), ("feed_snapshot", feed_snapshot), ("check_pack_snapshot", check_pack_snapshot), ("retest", retest), ("report", report), ("report_membership", report_membership), ("export", export))
+        optional_records: tuple[tuple[str, _Contract | None], ...] = (("operator", operator), ("role", role), ("scope_decision", scope_decision), ("action", action), ("module_execution", module_execution), ("intelligence_source", intelligence_source), ("provenance", provenance), ("feed_snapshot", feed_snapshot), ("check_pack_snapshot", check_pack_snapshot), ("retest", retest), ("report", report), ("report_membership", report_membership), ("export", export))
         for name, optional_record in optional_records:
             if optional_record is not None:
                 result[name] = optional_record
@@ -1880,8 +1949,13 @@ class CanonicalStore:
         tenant_id = _identifier(typed_manifest.tenant_id, "tenant_id")
         artifact_id = _identifier(typed_manifest.artifact_id, "artifact_id")
         observation_id = _identifier(typed_manifest.source_observation_id, "source_observation_id")
-        if artifact is not None and (artifact.id != artifact_id or artifact.observation_id != observation_id or artifact.tenant_id != tenant_id):
-            raise CanonicalLineageError("artifact manifest lineage is inconsistent")
+        if artifact is not None and not _artifact_reference_matches_manifest(
+            artifact,
+            typed_manifest,
+        ):
+            raise CanonicalLineageError(
+                "artifact manifest custody binding is inconsistent"
+            )
         if observation is not None and (observation.id != observation_id or observation.tenant_id != tenant_id):
             raise CanonicalLineageError("artifact manifest observation is inconsistent")
         if typed_manifest.protection_state == "protected_original" and typed_manifest.protected_original_authorization_ref is None:
@@ -1900,8 +1974,12 @@ class CanonicalStore:
         # merely because both identifiers happen to be well formed.
         artifact_row = self.session.execute(
             text(
-                "SELECT observation_id, digest, media_type, size, source_target, "
-                "source_asset_id, manifest_digest FROM canonical_artifact_refs "
+                "SELECT observation_id, digest, media_type, size, redaction_state, "
+                "encryption_state, collected_at, collector_id, source_target, "
+                "source_asset_id, redaction_version, protection_state, signer_state, "
+                "integrity_state, retention_class, retention_expires_at, "
+                "protected_original_authorization_ref, derivative_reference, "
+                "manifest_digest FROM canonical_artifact_refs "
                 "WHERE tenant_id=:tenant_id AND id=:artifact_id"
             ),
             {"tenant_id": tenant_id, "artifact_id": artifact_id},
@@ -1933,6 +2011,36 @@ class CanonicalStore:
             raise CanonicalLineageError("artifact manifest source asset does not match artifact reference")
         if typed_manifest.source_asset_id is not None and str(observation_row["asset_id"]) != typed_manifest.source_asset_id:
             raise CanonicalLineageError("artifact manifest source asset is inconsistent with observation")
+        expected_integrity = (
+            ArtifactIntegrityState.VERIFIED.value
+            if typed_manifest.integrity_state == "verified"
+            else typed_manifest.integrity_state
+        )
+        custody_values = {
+            "redaction_state": typed_manifest.redaction_state,
+            "encryption_state": typed_manifest.encryption_state,
+            "collected_at": typed_manifest.collected_at,
+            "collector_id": typed_manifest.collector_id,
+            "source_target": typed_manifest.source_target or "unknown",
+            "source_asset_id": typed_manifest.source_asset_id,
+            "redaction_version": typed_manifest.redaction_version,
+            "protection_state": typed_manifest.protection_state,
+            "signer_state": typed_manifest.signer_state,
+            "integrity_state": expected_integrity,
+            "retention_class": typed_manifest.retention_class,
+            "retention_expires_at": typed_manifest.retention_expires_at,
+            "protected_original_authorization_ref": (
+                typed_manifest.protected_original_authorization_ref
+            ),
+            "derivative_reference": typed_manifest.derivative_artifact_id,
+        }
+        if any(
+            artifact_row[field] != expected
+            for field, expected in custody_values.items()
+        ):
+            raise CanonicalLineageError(
+                "artifact manifest custody attributes do not match artifact reference"
+            )
         if artifact_row["manifest_digest"] is not None and artifact_row["manifest_digest"] != typed_manifest.manifest_digest:
             raise CanonicalLineageError("artifact manifest digest conflicts with artifact reference")
         with self._atomic():
@@ -2094,6 +2202,171 @@ class CanonicalStore:
                     ) from rollback_exc
             raise
         return typed_manifest
+
+    def persist_custodied_lineage(
+        self,
+        *,
+        custody_store: Any,
+        manifests: Sequence[ArtifactManifest],
+        tenant: Tenant,
+        engagement: Engagement,
+        job: Job,
+        module_version: ModuleVersion,
+        asset: Asset,
+        observation: Observation,
+        primary_artifact: ArtifactReference,
+        finding: Finding,
+        supporting_artifacts: Sequence[ArtifactReference] = (),
+        client: Client | None = None,
+        project: Project | None = None,
+        operator: Operator | None = None,
+        role: Role | None = None,
+        scope_decision: ScopeDecision | None = None,
+        module_execution: ModuleExecution | None = None,
+        action: Action | None = None,
+    ) -> dict[str, Any]:
+        """Commit a newly staged custody set and its full graph as one unit.
+
+        The filesystem writes necessarily happen first.  This method therefore
+        owns the outermost database transaction and compensates every exact
+        staged artifact if validation, any SQL statement, or the actual commit
+        fails.  It refuses a caller-owned transaction because an outer rollback
+        would otherwise be invisible to the compensation boundary.
+        """
+        typed_manifests = tuple(manifests)
+        rollback_manifests = tuple(
+            item for item in typed_manifests if isinstance(item, ArtifactManifest)
+        )
+        artifacts = (primary_artifact, *tuple(supporting_artifacts))
+        rollback_errors: list[Exception] = []
+        try:
+            if self.session.in_transaction():
+                raise CanonicalContractError(
+                    "custodied lineage requires an idle database session"
+                )
+            if not typed_manifests or len(typed_manifests) != len(artifacts):
+                raise CanonicalLineageError(
+                    "custodied lineage requires one manifest per artifact"
+                )
+            if any(not isinstance(item, ArtifactManifest) for item in typed_manifests):
+                raise CanonicalContractError(
+                    "custodied lineage requires typed artifact manifests"
+                )
+            manifest_by_id = {item.artifact_id: item for item in typed_manifests}
+            artifact_by_id = {item.id: item for item in artifacts}
+            if (
+                len(manifest_by_id) != len(typed_manifests)
+                or len(artifact_by_id) != len(artifacts)
+                or set(manifest_by_id) != set(artifact_by_id)
+            ):
+                raise CanonicalLineageError(
+                    "custodied lineage artifact identities are not one-to-one"
+                )
+            verifier = getattr(custody_store, "verify", None)
+            if not callable(verifier):
+                raise CanonicalContractError(
+                    "custody store does not expose verification"
+                )
+            for canonical_artifact in artifacts:
+                manifest = manifest_by_id[canonical_artifact.id]
+                manifest.verify()
+                verified = verifier(manifest.artifact_id)
+                if (
+                    not isinstance(verified, ArtifactManifest)
+                    or verified.to_dict() != manifest.to_dict()
+                ):
+                    raise CanonicalContractError(
+                        "custody manifest does not match stored artifact"
+                    )
+                if (
+                    manifest.tenant_id != tenant.id
+                    or manifest.source_observation_id != observation.id
+                    or not _artifact_reference_matches_manifest(
+                        canonical_artifact,
+                        manifest,
+                    )
+                ):
+                    raise CanonicalLineageError(
+                        "custody manifest does not match canonical artifact lineage"
+                    )
+
+            # SQLite defers its physical BEGIN until a write.  If the first
+            # write happens inside a SAVEPOINT, releasing that savepoint can
+            # durably commit even though SQLAlchemy still presents a logical
+            # outer transaction.  BEGIN IMMEDIATE establishes the real outer
+            # transaction before any nested repository operation.
+            self.session.execute(text("BEGIN IMMEDIATE"))
+            result: dict[str, Any] = self.create_lineage(
+                tenant=tenant,
+                client=client,
+                project=project,
+                engagement=engagement,
+                operator=operator,
+                role=role,
+                scope_decision=scope_decision,
+                job=job,
+                action=action,
+                module_version=module_version,
+                module_execution=module_execution,
+                asset=asset,
+                observation=observation,
+                artifact=primary_artifact,
+                finding=finding,
+            )
+            link_time = _iso(utc_now())
+            for sequence, supporting in enumerate(supporting_artifacts, start=1):
+                self._insert(supporting)
+                self.session.execute(
+                    text(
+                        "INSERT INTO canonical_observation_artifacts "
+                        "(tenant_id,observation_id,artifact_id,role,sequence,created_at,metadata_json) "
+                        "VALUES (:tenant_id,:observation_id,:artifact_id,'supporting',:sequence,:created_at,:metadata_json)"
+                    ),
+                    {
+                        "tenant_id": tenant.id,
+                        "observation_id": observation.id,
+                        "artifact_id": supporting.id,
+                        "sequence": sequence,
+                        "created_at": link_time,
+                        "metadata_json": _metadata_json(
+                            {"source": "canonical_custodied_lineage"}
+                        ),
+                    },
+                )
+            for sequence, canonical_artifact in enumerate(artifacts):
+                self.persist_artifact_manifest(
+                    manifest_by_id[canonical_artifact.id],
+                    custody_store=custody_store,
+                    artifact=canonical_artifact,
+                    observation=observation,
+                    role="primary" if sequence == 0 else "supporting",
+                    sequence=sequence,
+                )
+            self.session.commit()
+            result["artifacts"] = list(artifacts)
+            result["manifests"] = list(typed_manifests)
+            return result
+        except Exception as exc:
+            if self.session.in_transaction():
+                self.session.rollback()
+            rollback = getattr(custody_store, "rollback_artifact", None)
+            if not callable(rollback):
+                raise CanonicalContractError(
+                    "custodied lineage failed and custody rollback is unavailable"
+                ) from exc
+            for manifest in reversed(rollback_manifests):
+                try:
+                    rollback(
+                        manifest.artifact_id,
+                        expected_manifest_digest=manifest.manifest_digest,
+                    )
+                except Exception as rollback_exc:
+                    rollback_errors.append(rollback_exc)
+            if rollback_errors:
+                raise CanonicalContractError(
+                    "custodied lineage failed and custody rollback did not complete"
+                ) from rollback_errors[0]
+            raise
 
     def record_evidence_access(
         self,

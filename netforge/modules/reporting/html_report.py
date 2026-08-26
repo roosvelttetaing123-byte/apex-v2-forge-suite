@@ -1,8 +1,7 @@
 """NetForge HTML Report — self-contained HTML from accumulated findings.
 
 Network pentest oriented: shows host/port/service tables, attack chain
-summary, credentialed check results, and full evidence with
-request/response captures.
+summary, credentialed check results, and verified evidence derivatives.
 
 Mirrors WebForge's HTML reporter architecture but adapted for network
 infrastructure findings (CVE matches, service misconfigs, lateral
@@ -10,17 +9,22 @@ movement paths, credential harvesting results).
 """
 from __future__ import annotations
 
-import base64
 import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
+from common.evidence import (
+    EvidenceCaptureError,
+    ordinary_evidence_artifacts,
+    ordinary_finding_projection,
+)
 from common.finding import Finding, Severity
 from common.version import VERSION
 
@@ -68,7 +72,7 @@ def _confidence_badge(conf: str) -> str:
     bg = colors.get(conf.upper(), "#95a5a6")
     return (
         f'<span style="background:{bg};color:#fff;padding:2px 8px;'
-        f'border-radius:3px;font-size:0.8em;">{conf}</span>'
+        f'border-radius:3px;font-size:0.8em;">{_escape(conf)}</span>'
     )
 
 
@@ -80,16 +84,62 @@ def _escape(text: str) -> str:
             .replace('"', "&quot;"))
 
 
-def _count_by_severity(findings: list[Finding]) -> dict[str, int]:
+def _ordinary_html_finding(value: Any) -> SimpleNamespace:
+    projected = ordinary_finding_projection(value)
+    try:
+        severity = Severity(str(projected.get("severity") or "Informational"))
+        discovered_at = datetime.fromisoformat(
+            str(
+                projected.get("discovered_at")
+                or projected.get("timestamp")
+                or ""
+            ).replace("Z", "+00:00")
+        )
+    except (TypeError, ValueError) as exc:
+        raise EvidenceCaptureError(
+            "ordinary report finding metadata is invalid"
+        ) from exc
+    defaults: dict[str, Any] = {
+        "confidence": "UNVERIFIED",
+        "cvss_v31_score": None,
+        "cvss_v31_vector": None,
+        "cvss_v40_score": None,
+        "cvss_v40_vector": None,
+        "description": "",
+        "id": "",
+        "mitre_attack": [],
+        "module": "",
+        "port": None,
+        "references": [],
+        "remediation": "",
+        "reproduction_steps": [],
+        "service": None,
+        "tags": [],
+        "target": "",
+        "title": "",
+        "vpr": None,
+        "vpr_priority": None,
+        "vpr_score": None,
+    }
+    defaults.update(projected)
+    defaults["severity"] = severity
+    defaults["discovered_at"] = discovered_at
+    defaults["evidence_artifacts"] = ordinary_evidence_artifacts(
+        projected["evidence"]
+    )
+    return SimpleNamespace(**defaults)
+
+
+def _count_by_severity(findings: list[Any]) -> dict[str, int]:
     counts: dict[str, int] = {s.value: 0 for s in SEVERITY_ORDER}
     for f in findings:
         counts[f.severity.value] = counts.get(f.severity.value, 0) + 1
     return counts
 
 
-def _group_by_host(findings: list[Finding]) -> dict[str, list[Finding]]:
+def _group_by_host(findings: list[Any]) -> dict[str, list[Any]]:
     """Group findings by target host for the host summary table."""
-    groups: dict[str, list[Finding]] = defaultdict(list)
+    groups: dict[str, list[Any]] = defaultdict(list)
     for f in findings:
         host = f.target or "unknown"
         groups[host].append(f)
@@ -112,9 +162,10 @@ def generate_html(
     attack_chain_stats: dict[str, Any] | None = None,
 ) -> str:
     """Generate self-contained HTML report for NetForge network assessment."""
+    ordinary_findings = [_ordinary_html_finding(finding) for finding in findings]
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    counts = _count_by_severity(findings)
-    total = len(findings)
+    counts = _count_by_severity(ordinary_findings)
+    total = len(ordinary_findings)
 
     # ── Executive Summary: severity table ─────────────────────────────────
     exec_rows = "".join(
@@ -132,7 +183,7 @@ def generate_html(
     )
 
     # ── Host summary table ────────────────────────────────────────────────
-    host_groups = _group_by_host(findings)
+    host_groups = _group_by_host(ordinary_findings)
     host_rows = ""
     for host, host_findings in sorted(host_groups.items()):
         h_counts = {s.value: 0 for s in SEVERITY_ORDER}
@@ -176,20 +227,20 @@ def generate_html(
     <div style="background:#1a1a2e;color:#e0e0e0;padding:18px;border-radius:8px;font-family:monospace">
       <table style="border:none;color:#e0e0e0;width:auto">
         <tr><td style="border:none;padding:4px 16px 4px 0;color:#e74c3c"><b>Hosts Compromised</b></td>
-            <td style="border:none;font-size:1.2em">{attack_chain_stats.get('compromised_hosts', 0)}</td></tr>
+            <td style="border:none;font-size:1.2em">{_escape(str(attack_chain_stats.get('compromised_hosts', 0)))}</td></tr>
         <tr><td style="border:none;padding:4px 16px 4px 0;color:#f39c12"><b>Credentials Harvested</b></td>
-            <td style="border:none;font-size:1.2em">{attack_chain_stats.get('valid_creds', credentials_found)}</td></tr>
+            <td style="border:none;font-size:1.2em">{_escape(str(attack_chain_stats.get('valid_creds', credentials_found)))}</td></tr>
         <tr><td style="border:none;padding:4px 16px 4px 0;color:#3498db"><b>Lateral Paths</b></td>
-            <td style="border:none;font-size:1.2em">{attack_chain_stats.get('lateral_moves', 0)}</td></tr>
+            <td style="border:none;font-size:1.2em">{_escape(str(attack_chain_stats.get('lateral_moves', 0)))}</td></tr>
         <tr><td style="border:none;padding:4px 16px 4px 0;color:#2ecc71"><b>Persistence Installed</b></td>
-            <td style="border:none;font-size:1.2em">{attack_chain_stats.get('persistence_count', 0)}</td></tr>
+            <td style="border:none;font-size:1.2em">{_escape(str(attack_chain_stats.get('persistence_count', 0)))}</td></tr>
       </table>
     </div>
     """
 
     # ── Sort findings by severity, then by CVSS score (descending) ────────
     sorted_findings = sorted(
-        findings,
+        ordinary_findings,
         key=lambda f: (
             SEVERITY_ORDER.index(f.severity) if f.severity in SEVERITY_ORDER else 99,
             -(f.cvss_v31_score or 0),
@@ -204,24 +255,28 @@ def generate_html(
             f"<li><code>{_escape(step)}</code></li>" for step in (f.reproduction_steps or [])
         )
         refs_html = "".join(
-            f'<li><a href="{r}" style="color:#1a73e8">{_escape(r)}</a></li>'
-            if r.startswith("http") else f"<li>{_escape(r)}</li>"
+            f'<li><a href="{_escape(r)}" style="color:#1a73e8">{_escape(r)}</a></li>'
+            if r.startswith(("http://", "https://")) else f"<li>{_escape(r)}</li>"
             for r in (f.references or [])
         )
-        mitre_html = ", ".join(f.mitre_attack) if f.mitre_attack else "N/A"
+        mitre_html = (
+            ", ".join(_escape(item) for item in f.mitre_attack)
+            if f.mitre_attack
+            else "N/A"
+        )
         tags_html = " ".join(
             f'<span style="background:#e8eaf6;color:#3949ab;padding:1px 6px;'
-            f'border-radius:3px;font-size:0.75em;margin-right:4px">{t}</span>'
+            f'border-radius:3px;font-size:0.75em;margin-right:4px">{_escape(t)}</span>'
             for t in (f.tags or [])
         )
 
         # CVSS display
         cvss31_str = (
-            f"{f.cvss_v31_vector} (<b>{f.cvss_v31_score}</b>)"
+            f"{_escape(f.cvss_v31_vector)} (<b>{_escape(str(f.cvss_v31_score))}</b>)"
             if f.cvss_v31_vector else "N/A"
         )
         cvss40_str = (
-            f"{f.cvss_v40_vector} (<b>{f.cvss_v40_score}</b>)"
+            f"{_escape(f.cvss_v40_vector)} (<b>{_escape(str(f.cvss_v40_score))}</b>)"
             if f.cvss_v40_vector else "N/A"
         )
 
@@ -230,54 +285,22 @@ def generate_html(
         if f.vpr_score is not None:
             vpr_str = (
                 f'<tr><td style="color:#555;padding:4px 0"><b>VPR Score</b></td>'
-                f'<td>{f.vpr_score} ({f.vpr_priority or f.vpr or ""})</td></tr>'
+                f'<td>{_escape(str(f.vpr_score))} '
+                f'({_escape(str(f.vpr_priority or f.vpr or ""))})</td></tr>'
             )
 
-        # Evidence: screenshots
-        screenshot = ""
-        if f.evidence and f.evidence.screenshot_path:
-            sp = Path(f.evidence.screenshot_path)
-            if sp.exists():
-                data = base64.b64encode(sp.read_bytes()).decode()
-                screenshot = (
-                    f'<p><b>Screenshot (POC):</b><br>'
-                    f'<img src="data:image/png;base64,{data}" '
-                    f'style="max-width:100%;border:2px solid #e74c3c;border-radius:4px" /></p>'
-                )
-            else:
-                screenshot = (
-                    f'<p><b>Screenshot:</b><br>'
-                    f'<img src="{f.evidence.screenshot_path}" '
-                    f'style="max-width:100%;border:1px solid #ddd;" /></p>'
-                )
-
-        # Evidence: request/response
-        request_html = ""
-        if f.evidence and f.evidence.request_raw:
-            request_html = (
-                f'<p><b>Request:</b></p>'
-                f'<pre style="background:#1e1e1e;color:#d4d4d4;padding:10px;'
-                f'border-radius:4px;overflow-x:auto;font-size:0.85em;max-height:300px">'
-                f'{_escape(f.evidence.request_raw)}</pre>'
+        evidence_html = "".join(
+            (
+                "<h4>Evidence Derivative — "
+                + _escape(str(artifact["capture_kind"]).replace("_", " ").title())
+                + "</h4><pre style=\"background:#1e1e1e;color:#d4d4d4;"
+                "padding:10px;border-radius:4px;overflow-x:auto;"
+                "font-size:0.85em;max-height:300px\">"
+                + _escape(str(artifact["derivative"]))
+                + "</pre>"
             )
-        response_html = ""
-        if f.evidence and f.evidence.response_raw:
-            resp_text = f.evidence.response_raw[:3000]
-            response_html = (
-                f'<p><b>Response:</b></p>'
-                f'<pre style="background:#1e1e1e;color:#d4d4d4;padding:10px;'
-                f'border-radius:4px;overflow-x:auto;font-size:0.85em;max-height:300px">'
-                f'{_escape(resp_text)}</pre>'
-            )
-
-        # Evidence: extra metadata
-        evidence_extra = ""
-        if f.evidence and f.evidence.extra:
-            items = "".join(
-                f"<li><b>{_escape(str(k))}:</b> {_escape(str(v))}</li>"
-                for k, v in f.evidence.extra.items()
-            )
-            evidence_extra = f"<h4>Evidence Details</h4><ul>{items}</ul>"
+            for artifact in f.evidence_artifacts
+        )
 
         # Port/service line
         port_service = ""
@@ -299,7 +322,7 @@ def generate_html(
               &nbsp;{_confidence_badge(f.confidence)}</h3>
           {tags_html}
           <table style="width:100%;font-size:0.9em;border-collapse:collapse;margin-top:10px">
-            <tr><td style="width:150px;color:#555;padding:4px 0"><b>Finding ID</b></td><td style="font-family:monospace;font-size:0.85em">{f.id}</td></tr>
+            <tr><td style="width:150px;color:#555;padding:4px 0"><b>Finding ID</b></td><td style="font-family:monospace;font-size:0.85em">{_escape(f.id)}</td></tr>
             <tr><td style="color:#555;padding:4px 0"><b>Target</b></td><td>{_escape(f.target)}</td></tr>
             {port_service}
             <tr><td style="color:#555;padding:4px 0"><b>Module</b></td><td>{_escape(f.module)}</td></tr>
@@ -317,10 +340,7 @@ def generate_html(
           <p style="margin:0;background:#e8f5e9;padding:12px;border-radius:4px;border-left:3px solid #4caf50">{_escape(f.remediation)}</p>
           <h4 style="margin:14px 0 4px 0">References</h4>
           <ul>{refs_html}</ul>
-          {screenshot}
-          {request_html}
-          {response_html}
-          {evidence_extra}
+          {evidence_html}
         </div>""")
 
     details_html = "\n".join(detail_blocks)
@@ -379,7 +399,7 @@ def generate_html(
     Assessor: <b>{_escape(assessor)}</b> &nbsp;|&nbsp;
     Generated: <b>{now}</b>
     {mode_badge}{live_hosts_str}
-    <br>Scan Start: {scan_start or "N/A"} &nbsp;|&nbsp; Scan End: {scan_end or "N/A"}
+    <br>Scan Start: {_escape(str(scan_start or "N/A"))} &nbsp;|&nbsp; Scan End: {_escape(str(scan_end or "N/A"))}
   </div>
 
   <h2>Executive Summary</h2>

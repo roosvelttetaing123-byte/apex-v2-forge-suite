@@ -4,12 +4,14 @@ import csv, io, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
+from common.evidence import ordinary_finding_projection
 
 COLUMNS = ["id", "title", "severity", "cvss_v31_score", "cvss_v31_vector",
            "cvss_v40_vector", "target", "module", "description",
            "remediation", "mitre_attack", "references", "discovered_at"]
 
 def findings_to_csv(findings: list[dict]) -> str:
+    findings = [ordinary_finding_projection(finding) for finding in findings]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=COLUMNS, extrasaction="ignore")
     writer.writeheader()

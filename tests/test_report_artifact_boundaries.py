@@ -1,6 +1,8 @@
 """Filesystem-boundary regressions for ordinary report artifacts."""
 from __future__ import annotations
 
+import json
+
 import asyncio
 import hashlib
 import logging
@@ -684,6 +686,44 @@ def test_evidence_previews_and_copy_reject_aliased_source_files(
     assert victim.read_bytes() == b"OUTSIDE_EVIDENCE_CANARY_007"
 
 
+def test_evidence_previews_and_copy_withhold_verified_precustody_sources(
+    tmp_path: Path,
+) -> None:
+    screenshot = tmp_path / "verified-shot.png"
+    console = tmp_path / "verified-console.html"
+    pcap = tmp_path / "verified-capture.pcap"
+    screenshot.write_bytes(b"TASK102_VERIFIED_SCREENSHOT_CANARY")
+    console.write_text(
+        "<pre>TASK102_VERIFIED_CONSOLE_CANARY</pre>",
+        encoding="utf-8",
+    )
+    pcap.write_bytes(b"TASK102_VERIFIED_PCAP_CANARY")
+    for source in (screenshot, console, pcap):
+        source.chmod(0o600)
+
+    evidence = evidence_module.Evidence(
+        request_raw="TASK102_VERIFIED_REQUEST_CANARY",
+        response_raw="TASK102_VERIFIED_RESPONSE_CANARY",
+        screenshot_path=str(screenshot),
+        console_capture_path=str(console),
+        pcap_path=str(pcap),
+    )
+    assert evidence.screenshot_as_base64() is None
+    assert evidence.console_capture_as_html() is None
+    assert evidence.has_screenshot() is True
+
+    destination = tmp_path / "ordinary-copy"
+    copied = evidence.copy_to(destination)
+    assert copied.to_dict() == {
+        "artifact_count": 0,
+        "capture_kinds": [],
+        "state": "empty",
+    }
+    assert list(destination.iterdir()) == []
+    assert screenshot.read_bytes() == b"TASK102_VERIFIED_SCREENSHOT_CANARY"
+    assert pcap.read_bytes() == b"TASK102_VERIFIED_PCAP_CANARY"
+
+
 def test_evidence_read_rejects_intermediate_directory_symlink(
     tmp_path: Path,
 ) -> None:
@@ -1170,3 +1210,355 @@ def test_report_engine_never_embeds_caller_supplied_binary_logo(
     assert canary.decode("ascii") not in html
     assert "T1BBUVVFX1JFUE9SVF9MT0dPX1NFQ1JFVF8wMDdfWDlwUQ==" not in html
     assert victim.read_bytes() == canary
+
+
+def _narrator_persisted_finding(derivative: str) -> dict[str, Any]:
+    """Build the strict ordinary projection shape consumed by the narrator."""
+    return {
+        "id": "finding:narrator-fixture",
+        "title": "Narrator fixture",
+        "severity": "High",
+        "target": "https://fixture.invalid/item",
+        "module": "fixture.check",
+        "description": "Canonical persisted finding.",
+        "remediation": "Apply the fixture remediation.",
+        "references": ["CWE-000"],
+        "evidence": {
+            "finding_id": "finding:narrator-fixture",
+            "state": "persisted",
+            "observations": [
+                {
+                    "observation_id": "observation:narrator-fixture",
+                    "artifacts": [
+                        {
+                            "artifact_id": "artifact:narrator-fixture",
+                            "capture_kind": "request",
+                            "derivative": derivative,
+                            "derivative_sha256": "sha256:" + "1" * 64,
+                            "derivative_size": len(derivative.encode("utf-8")),
+                            "integrity_state": "verified",
+                            "manifest_digest": "sha256:" + "2" * 64,
+                            "media_type": "text/plain",
+                            "primary_sha256": "sha256:" + "3" * 64,
+                            "primary_size": 64,
+                            "redaction_state": "redacted",
+                            "role": "primary",
+                            "sequence": 0,
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+
+def test_report_narrator_uses_verified_derivative_and_withholds_inline_raw() -> None:
+    from common.brain.narrator import ReportNarrator
+
+    raw_request = "opaque-inline-request-body-q7w9x3"
+    derivative = "GET /item?value=<redacted> HTTP/1.1"
+    narrator = ReportNarrator(SimpleNamespace(available=False))
+
+    persisted = asyncio.run(
+        narrator.finding_description(_narrator_persisted_finding(derivative))
+    )
+    unavailable = asyncio.run(
+        narrator.finding_description(
+            {
+                "id": "finding:inline-fixture",
+                "title": "Inline fixture",
+                "severity": "High",
+                "description": "Mutable inline capture must be unavailable.",
+                "evidence": {
+                    "request_raw": raw_request,
+                    "response_raw": raw_request,
+                },
+            }
+        )
+    )
+
+    assert derivative in persisted
+    assert raw_request not in persisted
+    assert raw_request not in unavailable
+    assert "Evidence available in the raw scan results" not in unavailable
+
+
+def test_report_narrator_attack_chain_withholds_inline_result_from_template_and_prompt() -> None:
+    from common.brain.narrator import ReportNarrator
+
+    raw_result = "opaque-inline-chain-result-r4t8m2"
+    chain = [
+        {
+            "action": "Local fixture observation",
+            "target": "https://fixture.invalid/item?credential=value",
+            "result": raw_result,
+            "response": raw_result,
+            "payload": raw_result,
+            "evidence": {"body": raw_result},
+            "path": f"/protected/{raw_result}",
+            "verification_state": "candidate",
+        }
+    ]
+    template = asyncio.run(
+        ReportNarrator(SimpleNamespace(available=False)).attack_narrative(chain)
+    )
+    assert raw_result not in template
+    assert "Observation detail withheld" in template
+
+    class PromptBrain:
+        available = True
+        _model = "fixture-model"
+        _fast_model = "fixture-fast-model"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+            self.memory = SimpleNamespace(
+                size=1,
+                get_context=lambda last_n: [
+                    {
+                        "timestamp": "2026-08-25T00:00:00Z",
+                        "event_type": "finding",
+                        "framework": "fixture",
+                        "data": {"result": raw_result},
+                    }
+                ][:last_n],
+            )
+
+        async def _call(self, prompt: str, **_kwargs: Any) -> str:
+            self.prompts.append(prompt)
+            return "fixture narrative"
+
+    brain = PromptBrain()
+    generated = asyncio.run(ReportNarrator(brain).attack_narrative(chain))
+    assert generated == "fixture narrative"
+    assert brain.prompts
+    assert raw_result not in brain.prompts[0]
+    assert "Observation detail withheld" in brain.prompts[0]
+
+
+def test_forge_brain_external_prompts_project_findings_and_chain_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from common.brain.brain import ForgeBrain
+
+    raw_value = "opaque-external-prompt-evidence-k6n2p9"
+    offline_brain = ForgeBrain(api_key="")
+    original_rule_based = offline_brain._rule_based_analyze
+    offline_inputs: list[dict[str, Any]] = []
+
+    def capture_rule_based(finding: dict[str, Any]) -> Any:
+        offline_inputs.append(finding)
+        return original_rule_based(finding)
+
+    monkeypatch.setattr(
+        offline_brain,
+        "_rule_based_analyze",
+        capture_rule_based,
+    )
+    asyncio.run(
+        offline_brain.analyze_finding(
+            {
+                "id": "finding:offline-brain-fixture",
+                "title": "Offline brain fixture",
+                "severity": "High",
+                "evidence": {"request_raw": raw_value},
+            }
+        )
+    )
+    assert offline_inputs[0]["evidence"] == {
+        "observations": [],
+        "state": "unavailable",
+    }
+    assert raw_value not in json.dumps(offline_inputs[0])
+
+    brain = ForgeBrain(api_key="")
+    brain._client = object()
+    brain.memory.add("finding", "fixture", {"evidence": raw_value})
+    prompts: list[str] = []
+
+    async def analyze_call(prompt: str, **_kwargs: Any) -> str:
+        prompts.append(prompt)
+        return (
+            '{"verdict":"NEEDS_VERIFICATION","confidence":"LOW",'
+            '"reasoning":"fixture","action":"review",'
+            '"severity_adjustment":"unchanged","fn_risk":"unknown"}'
+        )
+
+    monkeypatch.setattr(brain, "_call", analyze_call)
+    result = asyncio.run(
+        brain.analyze_finding(
+            {
+                "id": "finding:brain-fixture",
+                "title": "Brain fixture",
+                "severity": "High",
+                "description": "Local fixture.",
+                "evidence": {
+                    "request_raw": raw_value,
+                    "response_raw": raw_value,
+                },
+            }
+        )
+    )
+    assert result.finding_id == "finding:brain-fixture"
+    assert prompts and raw_value not in prompts[-1]
+    assert '"state": "unavailable"' in prompts[-1]
+
+    async def narrative_call(prompt: str, **_kwargs: Any) -> str:
+        prompts.append(prompt)
+        return "fixture narrative"
+
+    monkeypatch.setattr(brain, "_call", narrative_call)
+    narrative = asyncio.run(
+        brain.write_attack_narrative(
+            [
+                {
+                    "action": "Fixture action",
+                    "target": "local fixture",
+                    "result": raw_value,
+                    "payload": raw_value,
+                }
+            ]
+        )
+    )
+    assert narrative == "fixture narrative"
+    assert raw_value not in prompts[-1]
+    assert "Observation detail withheld" in prompts[-1]
+
+
+def test_forge_brain_exception_fallback_receives_ordinary_finding_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from common.brain.brain import ForgeBrain
+
+    raw_canary = "opaque-brain-fallback-raw-canary-h4j8m2"
+    brain = ForgeBrain(api_key="")
+    brain._client = object()
+    fallback_inputs: list[dict[str, Any]] = []
+    original_rule_based = brain._rule_based_analyze
+
+    def capture_rule_based(finding: dict[str, Any]) -> Any:
+        fallback_inputs.append(finding)
+        return original_rule_based(finding)
+
+    async def failing_call(_prompt: str, **_kwargs: Any) -> str:
+        raise RuntimeError("local fixture failure")
+
+    monkeypatch.setattr(brain, "_rule_based_analyze", capture_rule_based)
+    monkeypatch.setattr(brain, "_call", failing_call)
+
+    result = asyncio.run(
+        brain.analyze_finding(
+            {
+                "id": "finding:brain-fallback-fixture",
+                "title": "Brain fallback fixture",
+                "severity": "High",
+                "description": "Local fixture.",
+                "evidence": {
+                    "request_raw": raw_canary,
+                    "response_raw": raw_canary,
+                    "screenshot_path": f"/evidence/{raw_canary}",
+                },
+            }
+        )
+    )
+
+    assert result.finding_id == "finding:brain-fallback-fixture"
+    assert len(fallback_inputs) == 1
+    fallback_finding = fallback_inputs[0]
+    assert fallback_finding["id"] == "finding:brain-fallback-fixture"
+    assert fallback_finding["evidence"] == {
+        "observations": [],
+        "state": "unavailable",
+    }
+    rendered_fallback = json.dumps(fallback_finding)
+    assert raw_canary not in rendered_fallback
+    for forbidden_field in ("request_raw", "response_raw", "screenshot_path"):
+        assert forbidden_field not in rendered_fallback
+
+
+def _malformed_persisted_report_finding(raw_value: str) -> dict[str, Any]:
+    return {
+        "id": "finding:aiforge-report-fixture",
+        "title": "AIForge report fixture",
+        "severity": "High",
+        "module": "fixture.check",
+        "description": "Ordinary finding description.",
+        "remediation": "Apply the fixture remediation.",
+        "references": [],
+        "evidence": {
+            "finding_id": "finding:aiforge-report-fixture",
+            "state": "persisted",
+            "observations": [
+                {
+                    "observation_id": "observation:aiforge-report-fixture",
+                    "request_raw": raw_value,
+                    "artifacts": [],
+                }
+            ],
+        },
+    }
+
+
+def test_aiforge_html_report_rejects_raw_bearing_persisted_projection() -> None:
+    from copy import deepcopy
+
+    from aiforge.modules.reporting.html_report import HtmlReport
+    from common.evidence import EvidenceCaptureError
+
+    raw_value = "opaque-aiforge-html-original-z8m4q2"
+    finding = _malformed_persisted_report_finding(raw_value)
+    before = deepcopy(finding)
+
+    with pytest.raises(EvidenceCaptureError, match="raw or path data"):
+        HtmlReport.__new__(HtmlReport)._render_findings([finding])
+
+    assert finding == before
+
+
+def test_aiforge_pdf_fallback_rejects_raw_bearing_persisted_projection(
+    tmp_path: Path,
+) -> None:
+    from copy import deepcopy
+
+    from aiforge.modules.reporting.pdf_report import PdfReport
+    from common.evidence import EvidenceCaptureError
+
+    raw_value = "opaque-aiforge-pdf-original-p6v3n7"
+    finding = _malformed_persisted_report_finding(raw_value)
+    before = deepcopy(finding)
+    output = tmp_path / "aiforge-report.pdf"
+    reporter = PdfReport.__new__(PdfReport)
+    reporter.config = SimpleNamespace(target="local-fixture")
+
+    with pytest.raises(EvidenceCaptureError, match="raw or path data"):
+        reporter._generate_text_fallback([finding], output)
+
+    assert finding == before
+    assert not output.with_suffix(".txt").exists()
+
+
+def test_netforge_html_escapes_all_ordinary_finding_markup() -> None:
+    from netforge.modules.reporting.html_report import generate_html
+
+    markup = '<font color="not-a-color">MARKUP_CANARY'
+    finding = {
+        "id": "finding:markup-fixture",
+        "title": markup,
+        "severity": "High",
+        "target": markup,
+        "module": markup,
+        "description": markup,
+        "reproduction_steps": [markup],
+        "remediation": markup,
+        "references": [markup],
+        "mitre_attack": [markup],
+        "tags": [markup],
+        "cvss_v31_vector": markup,
+        "discovered_at": "2026-08-25T00:00:00+00:00",
+        "evidence": {"observations": [], "state": "unavailable"},
+    }
+
+    rendered = generate_html([finding], target=markup, scan_start=markup)
+
+    assert markup not in rendered
+    assert "&lt;font color=&quot;not-a-color&quot;&gt;MARKUP_CANARY" in rendered

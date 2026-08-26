@@ -94,17 +94,10 @@
       {% if f.mitre_attack %}
       <strong>MITRE ATT&amp;CK:</strong> {{ f.mitre_attack | join(', ') | e }}<br>
       {% endif %}
-      {% set ev = f.evidence | default({}) %}
-      {% if ev.screenshot_b64 %}
-      <br><strong>Screenshot (POC):</strong><br>
-      <img src="{{ ev.screenshot_b64 }}" alt="POC screenshot">
-      {% endif %}
-      {% if ev.request_raw %}
-      <br><strong>Request:</strong><pre>{{ ev.request_raw | e }}</pre>
-      {% endif %}
-      {% if ev.response_raw %}
-      <br><strong>Response:</strong><pre>{{ ev.response_raw[:2000] | e }}</pre>
-      {% endif %}
+      {% for artifact in f.evidence_artifacts | default([]) %}
+      <br><strong>Evidence derivative ({{ artifact.capture_kind | e }}):</strong>
+      <pre>{{ artifact.derivative | e }}</pre>
+      {% endfor %}
     </td>
   </tr>
   {% endfor %}

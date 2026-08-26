@@ -25,6 +25,13 @@ from common.brain.brain import (
     ForgeBrain,
     Confidence,
     EngagementMemory,
+    _ordinary_chain_log,
+    _ordinary_label,
+    _ordinary_memory_metadata,
+)
+from common.evidence import (
+    ordinary_evidence_artifacts,
+    ordinary_finding_projection,
 )
 
 log = logging.getLogger("forge.brain.narrator")
@@ -151,6 +158,34 @@ def _sort_by_severity(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(findings, key=lambda f: _SEV_ORDER.get(f.get("severity", "Informational"), 99))
 
 
+def _ordinary_findings(value: Any) -> list[dict[str, Any]]:
+    """Project every narrative finding through the ordinary-consumer boundary."""
+    if not isinstance(value, list) or len(value) > 10_000:
+        raise ValueError("report narrative findings are invalid")
+    return [ordinary_finding_projection(item) for item in value]
+
+
+def _ordinary_finding_context(value: Any) -> dict[str, str]:
+    """Allowlist non-evidence metadata accepted by finding narration."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("finding narrative context is invalid")
+    fields = (
+        "application",
+        "framework",
+        "language",
+        "platform",
+        "technology",
+        "version",
+    )
+    return {
+        field: _ordinary_label(value.get(field), limit=500)
+        for field in fields
+        if value.get(field) is not None
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════
 # REPORT NARRATOR
 # ══════════════════════════════════════════════════════════════════════
@@ -223,6 +258,10 @@ class ReportNarrator:
         Returns:
             Executive summary as formatted markdown string.
         """
+        findings = _ordinary_findings(findings)
+        target = _ordinary_label(target, limit=2_000)
+        engagement = _ordinary_label(engagement, limit=500)
+        scope = _ordinary_label(scope, limit=2_000)
         if self._brain.available:
             try:
                 return await self._ai_executive_summary(
@@ -253,15 +292,7 @@ class ReportNarrator:
         Returns:
             Attack narrative as formatted markdown string.
         """
-        truthful_chain_log = [
-            {
-                **step,
-                "verification_state": step.get("verification_state") or "unknown",
-                "proof_type": step.get("proof_type") or "unknown",
-                "maturity": step.get("maturity") or "experimental",
-            }
-            for step in chain_log
-        ]
+        truthful_chain_log = _ordinary_chain_log(chain_log)
         if self._brain.available:
             try:
                 return await self._ai_attack_narrative(truthful_chain_log, memory)
@@ -285,6 +316,7 @@ class ReportNarrator:
         Returns:
             Remediation roadmap as formatted markdown string.
         """
+        findings = _ordinary_findings(findings)
         if self._brain.available:
             try:
                 return await self._ai_remediation_roadmap(findings)
@@ -317,6 +349,8 @@ class ReportNarrator:
         Returns:
             Enhanced description as a string.
         """
+        finding = ordinary_finding_projection(finding)
+        context = _ordinary_finding_context(context)
         if self._brain.available:
             try:
                 return await self._ai_finding_description(finding, context)
@@ -343,6 +377,7 @@ class ReportNarrator:
         Returns:
             Risk scenario narrative as formatted markdown string.
         """
+        findings = _ordinary_findings(findings)
         if self._brain.available:
             try:
                 return await self._ai_risk_scenario(findings)
@@ -363,6 +398,7 @@ class ReportNarrator:
         scope: str,
     ) -> str:
         """AI-generated executive summary via ForgeBrain."""
+        findings = _ordinary_findings(findings)
         sev_counts = Counter(f.get("severity", "Informational") for f in findings)
         sorted_findings = _sort_by_severity(findings)
 
@@ -414,11 +450,14 @@ class ReportNarrator:
         memory: EngagementMemory | None = None,
     ) -> str:
         """AI-generated attack narrative via ForgeBrain."""
+        chain_log = _ordinary_chain_log(chain_log)
         memory_ctx = []
         if memory:
-            memory_ctx = memory.get_context(last_n=30)
+            memory_ctx = _ordinary_memory_metadata(memory.get_context(last_n=30))
         elif self._brain.memory.size > 0:
-            memory_ctx = self._brain.memory.get_context(last_n=30)
+            memory_ctx = _ordinary_memory_metadata(
+                self._brain.memory.get_context(last_n=30)
+            )
 
         prompt = json.dumps({
             "task": "attack_narrative",
@@ -431,7 +470,9 @@ class ReportNarrator:
                 "2. Treat result text as an observation, not proof; only a step whose "
                 "verification_state is verified may be described as a successful outcome\n"
                 "3. Show the chain of discovery — how one finding led to the next\n"
-                "4. Include technical details (payloads, responses) inline\n"
+                "4. Never reproduce payloads, raw responses, original evidence, "
+                "caller-controlled paths, or secrets; refer to verified canonical "
+                "evidence derivatives\n"
                 "5. Map steps to MITRE ATT&CK where relevant\n"
                 "6. Label candidate, simulation, and unknown states explicitly and do not "
                 "infer outcome truth from confidence, log wording, or process exit\n"
@@ -459,6 +500,7 @@ class ReportNarrator:
         findings: list[dict[str, Any]],
     ) -> str:
         """AI-generated remediation roadmap via ForgeBrain."""
+        findings = _ordinary_findings(findings)
         sorted_findings = _sort_by_severity(findings)
 
         prompt = json.dumps({
@@ -504,6 +546,8 @@ class ReportNarrator:
         context: dict[str, Any] | None = None,
     ) -> str:
         """AI-generated finding description via ForgeBrain."""
+        finding = ordinary_finding_projection(finding)
+        context = _ordinary_finding_context(context)
         prompt = json.dumps({
             "task": "finding_description",
             "finding": {
@@ -553,6 +597,7 @@ class ReportNarrator:
         findings: list[dict[str, Any]],
     ) -> str:
         """AI-generated risk scenario via ForgeBrain."""
+        findings = _ordinary_findings(findings)
         sorted_findings = _sort_by_severity(findings)
 
         prompt = json.dumps({
@@ -603,6 +648,7 @@ class ReportNarrator:
         scope: str,
     ) -> str:
         """Template-based executive summary when brain is unavailable."""
+        findings = _ordinary_findings(findings)
         sev = Counter(f.get("severity", "Informational") for f in findings)
         crit = sev.get("Critical", 0)
         high = sev.get("High", 0)
@@ -699,6 +745,7 @@ class ReportNarrator:
         chain_log: list[dict[str, Any]],
     ) -> str:
         """Template-based attack narrative when brain is unavailable."""
+        chain_log = _ordinary_chain_log(chain_log)
         if not chain_log:
             return (
                 "# Attack Narrative\n\n"
@@ -776,6 +823,7 @@ class ReportNarrator:
         findings: list[dict[str, Any]],
     ) -> str:
         """Template-based remediation roadmap when brain is unavailable."""
+        findings = _ordinary_findings(findings)
         if not findings:
             return (
                 "# Remediation Roadmap\n\n"
@@ -863,6 +911,7 @@ class ReportNarrator:
         kev_status: bool = False,
     ) -> str:
         """Template-based finding description when brain is unavailable."""
+        finding = ordinary_finding_projection(finding)
         title       = finding.get("title", "Unknown Finding")
         severity    = finding.get("severity", "Informational")
         target      = finding.get("target", "")
@@ -881,15 +930,24 @@ class ReportNarrator:
         kev_str      = "Yes — CISA Known Exploited Vulnerability (immediate remediation required)" if kev else "No"
         cvss_display = cvss_str if cvss_str else "Not scored"
 
-        # Build evidence section
-        evidence_text = ""
-        if evidence:
-            req = evidence.get("request_raw", "")
-            resp = evidence.get("response_raw", "")
-            if req:
-                evidence_text += f"\n**Request:**\n```\n{req[:500]}\n```\n"
-            if resp:
-                evidence_text += f"\n**Response (excerpt):**\n```\n{resp[:500]}\n```\n"
+        # Only verified, redacted derivatives may enter ordinary narrative text.
+        evidence_items: list[str] = []
+        for artifact in ordinary_evidence_artifacts(evidence):
+            derivative = str(artifact.get("derivative") or "")[:500]
+            derivative = derivative.replace("```", "` ` `")
+            kind = str(artifact.get("capture_kind") or "evidence").replace(
+                "_", " "
+            ).title()
+            if derivative:
+                evidence_items.append(
+                    f"**{kind} derivative:**\n```\n{derivative}\n```"
+                )
+            else:
+                evidence_items.append(
+                    f"**{kind} derivative:** content-free verified receipt "
+                    f"(`{artifact.get('derivative_sha256')}`)."
+                )
+        evidence_text = "\n\n".join(evidence_items)
 
         # Build references section
         ref_text = ""
@@ -913,7 +971,7 @@ class ReportNarrator:
             {description or "This vulnerability was detected during automated scanning."}
 
             ### Evidence
-            {evidence_text or "Evidence available in the raw scan results."}
+            {evidence_text or "No verified evidence derivative is available for ordinary presentation."}
 
             ### Business Impact
 
@@ -930,6 +988,7 @@ class ReportNarrator:
         findings: list[dict[str, Any]],
     ) -> str:
         """Template-based risk scenario when brain is unavailable."""
+        findings = _ordinary_findings(findings)
         sorted_f = _sort_by_severity(findings)
         crits = [f for f in sorted_f if f.get("severity") == "Critical"]
         highs = [f for f in sorted_f if f.get("severity") == "High"]

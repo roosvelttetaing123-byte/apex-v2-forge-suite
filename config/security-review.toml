@@ -3,19 +3,19 @@ receipt_type = "LOCAL_UNSIGNED"
 task_id = "008"
 task_sha256 = "ba38ababe417c56ebb1296b8e54a1877d27ace0da10e81b280a726ae900e5e15"
 decision = "ACCEPT"
-implementer_identity = "codex:/root/task008_contract_binding_implementer"
-reviewer_identity = "codex:/root/task008_supply_reviewer_contract_final"
-implemented_on = "2026-08-24"
-reviewed_on = "2026-08-24"
-expires_on = "2026-11-22"
-reviewed_contract_sha256 = "3e4999d0af62cfc10a526ae85f729d401ccbd7e220d7af21fa454e55b7fe9201"
-proposal_manifest_sha256 = "eb7626d9a47ec8037568cdf3517adb1ea4b4364c3fa21df7c40f4772e052e9bd"
-review_evidence_id = "task008-supply-review-frontend-contract-final-20260824T194455Z/independent-supply-review.md"
-review_evidence_sha256 = "bf3de536fde664ca21c2e49aa2df51ed337b2dc3789f5892e5c1b76d6db6295d"
+implementer_identity = "codex:/root"
+reviewer_identity = "codex:/root/task008_supply_review_collection"
+implemented_on = "2026-08-25"
+reviewed_on = "2026-08-25"
+expires_on = "2026-11-23"
+reviewed_contract_sha256 = "b1fd8f98054e5b0dcfd1ce13557c0e6beb200c14c12c8298f509887ea5bf00c8"
+proposal_manifest_sha256 = "27388ce6de821785383407366bd98a36c9f1420110b84be5caf182110e9c3228"
+review_evidence_id = "task008-supply-review-task102-collection-final-accepted-20260825T202500Z/independent-supply-review.md"
+review_evidence_sha256 = "1f038c0988a79a75c3f6e334097cbd052a6addcb2b1e26eccf52b89313fb1002"
 
 [scanner_contract]
 path = "scripts/verify_supply_chain.py"
-sha256 = "62ed0b7f0eb1d7d59dab0542968e0634e7654bd62b4b01d783b9a1e03edd7908"
+sha256 = "16c2197537d4cc518a76e06ac14842cee2a750e2de195d0762a05e5f4384fb2e"
 python_version = "3.13.9"
 development_lock = "requirements-dev.lock"
 development_lock_sha256 = "b7cc0f9a39b5f632dbde52458bc179bccbcafa78167b9aaa7a41964b109da7c7"
@@ -26,7 +26,7 @@ dockerignore = ".dockerignore"
 dockerignore_sha256 = "ddc6a9d3a1f86298f19f44583c95f755af1fedd14e2927b578bc381f474c520e"
 
 [baseline_set]
-sha256 = "a8d0521df6c35535125da0e63fd274415f4f26ce9443c6683581293eff120779"
+sha256 = "89f99220a3ce8d0edea953b210a23174958e7ef869eae2463527a9227a18cfb2"
 
 [bandit]
 baseline = "config/bandit-baseline.json"
@@ -34,19 +34,19 @@ baseline_sha256 = "43da870783557e67c8c50a9914a6abe3512b86162f6bea23c66731ceb8d3f
 finding_count = 96
 scope = ["common", "webforge", "netforge", "adforge", "aiforge", "forge_c2", "forge_collab", "forge_payload", "cloud", "leak_intel"]
 config = "pyproject.toml"
-config_sha256 = "d93584060e620146afe1f215ce3f20d0f0e285045fe809c3729efa5b54f8b2ab"
+config_sha256 = "c2294cc865c28bfabc379a1cc4d2f420641161630b9d746376ac8ab590906edc"
 scanner_version = "1.8.6"
 severity = "medium"
 confidence = "medium"
 
 [detect_secrets]
 baseline = ".secrets.baseline"
-baseline_sha256 = "c6530cf33f8beba8ab84d85406c49fd1c7f8053a5540d0f651b1d96c8f047b9e"
-finding_count = 256
-path_count = 798
-paths_sha256 = "2ff5b491acb34a317c7873ed3cc62dfd94c3d5e1758d59172a2cbdad8736731a"
-docker_path_count = 690
-docker_paths_sha256 = "80c99afe144767a92def212679b78c5c2fec15b2396d083096e0995c48731885"
+baseline_sha256 = "456f64dbd55445072e6e90e69875230f2f930342c956cdd609ab51ddd505ee75"
+finding_count = 257
+path_count = 801
+paths_sha256 = "6e103838ed005cff29ae4ac1a8255599871daab3941d679b5806292509e70bae"
+docker_path_count = 691
+docker_paths_sha256 = "496865da459535f46d528fcffed6a3d7d90883f4057ee635e72e989109ebc832"
 plugin_count = 27
 plugins_sha256 = "ba415e50000530b6b2cfae1ac8087d2224696444e140bbd82d5d7b3b917ae11f"
 scanner_version = "1.5.0"

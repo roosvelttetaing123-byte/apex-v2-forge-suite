@@ -1,6 +1,7 @@
 """PDF report generator using reportlab."""
 from __future__ import annotations
 
+from html import escape
 import sys
 import time
 from pathlib import Path
@@ -8,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
+from common.evidence import ordinary_finding_projection
 
 _SEVERITY_ORDER = ["Critical", "High", "Medium", "Low", "Informational"]
 _SEVERITY_RGB = {
@@ -20,6 +22,7 @@ _SEVERITY_RGB = {
 
 
 def generate_pdf(findings: list[dict], target: str, output_path: Path) -> None:
+    findings = [ordinary_finding_projection(finding) for finding in findings]
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -42,7 +45,10 @@ def generate_pdf(findings: list[dict], target: str, output_path: Path) -> None:
     body_style  = styles["BodyText"]
 
     story.append(Paragraph("WebForge Security Assessment Report", title_style))
-    story.append(Paragraph(f"Target: {target} &nbsp;|&nbsp; Date: {scan_date}", body_style))
+    story.append(Paragraph(
+        f"Target: {escape(str(target))} &nbsp;|&nbsp; Date: {scan_date}",
+        body_style,
+    ))
     story.append(Spacer(1, 8*mm))
 
     counts = {s: sum(1 for f in findings if f.get("severity") == s) for s in _SEVERITY_ORDER}
@@ -65,17 +71,29 @@ def generate_pdf(findings: list[dict], target: str, output_path: Path) -> None:
         sev   = f.get("severity", "Informational")
         r, g, b = _SEVERITY_RGB.get(sev, (0.42, 0.45, 0.50))
         sev_color = colors.Color(r, g, b)
-        story.append(Paragraph(f'<font color="#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}">[{sev}]</font> {f.get("title","")}', h3_style))
-        story.append(Paragraph(f'<b>Target:</b> {f.get("target","")} | <b>CVSS:</b> {f.get("cvss_v31_score","")} | <b>Module:</b> {f.get("module","")}', body_style))
-        story.append(Paragraph(f.get("description", ""), body_style))
+        story.append(Paragraph(
+            f'<font color="#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}">'
+            f'[{escape(str(sev))}]</font> {escape(str(f.get("title", "")))}',
+            h3_style,
+        ))
+        story.append(Paragraph(
+            f'<b>Target:</b> {escape(str(f.get("target", "")))} | '
+            f'<b>CVSS:</b> {escape(str(f.get("cvss_v31_score", "")))} | '
+            f'<b>Module:</b> {escape(str(f.get("module", "")))}',
+            body_style,
+        ))
+        story.append(Paragraph(escape(str(f.get("description", ""))), body_style))
 
         steps = f.get("reproduction_steps", [])
         if steps:
             story.append(Paragraph("<b>Reproduction Steps:</b>", body_style))
             for i, s in enumerate(steps, 1):
-                story.append(Paragraph(f"{i}. {s}", body_style))
+                story.append(Paragraph(f"{i}. {escape(str(s))}", body_style))
 
-        story.append(Paragraph(f'<b>Remediation:</b> {f.get("remediation","")}', body_style))
+        story.append(Paragraph(
+            f'<b>Remediation:</b> {escape(str(f.get("remediation", "")))}',
+            body_style,
+        ))
         story.append(Spacer(1, 4*mm))
 
     doc.build(story)

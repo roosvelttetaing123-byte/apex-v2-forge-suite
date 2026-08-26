@@ -30,6 +30,51 @@ def _make_finding(**kwargs):
     return Finding(**defaults)
 
 
+def _persisted_evidence_projection() -> dict:
+    """Return a complete ordinary-consumer projection with synthetic digests."""
+    derivative_digest = "sha256:" + "1" * 64
+    manifest_digest = "sha256:" + "2" * 64
+    primary_digest = "sha256:" + "3" * 64
+    return {
+        "finding_id": "finding-task102-core",
+        "observations": [
+            {
+                "observation_id": "observation-task102-core",
+                "asset_id": "asset-task102-core",
+                "check_id": "check.task102.core",
+                "collection_status": "collected",
+                "engagement_id": "engagement-task102-core",
+                "identity_ref": "identity-task102-core",
+                "job_id": "job-task102-core",
+                "location": "query",
+                "module_execution_id": "execution-task102-core",
+                "observed_at": "2026-08-25T00:00:00Z",
+                "parameter": "q",
+                "proof_type": "response",
+                "route": "/task102",
+                "artifacts": [
+                    {
+                        "artifact_id": "artifact-task102-core",
+                        "capture_kind": "response",
+                        "derivative": "PERSISTED_DERIVATIVE_CANARY",
+                        "derivative_sha256": derivative_digest,
+                        "derivative_size": 29,
+                        "integrity_state": "sha256_verified",
+                        "manifest_digest": manifest_digest,
+                        "media_type": "text/plain",
+                        "primary_sha256": primary_digest,
+                        "primary_size": 29,
+                        "redaction_state": "redacted",
+                        "role": "primary",
+                        "sequence": 0,
+                    }
+                ],
+            }
+        ],
+        "state": "persisted",
+    }
+
+
 class TestFindingSchema:
     def test_new_fields_have_defaults(self):
         f = _make_finding()
@@ -83,12 +128,186 @@ class TestFindingSchema:
         assert d["proof_type"] == "unknown"
         assert d["maturity"] == "experimental"
 
-    def test_to_dict_evidence_preserved(self):
+    def test_to_dict_exposes_only_content_free_capture_state(self):
         from common.evidence import Evidence
         ev = Evidence(request_raw="GET / HTTP/1.1", response_raw="200 OK")
         f = _make_finding(evidence=ev)
         d = f.to_dict()
-        assert d["evidence"]["request_raw"] == "GET / HTTP/1.1"
+        assert d["evidence"] == {
+            "artifact_count": 2,
+            "capture_kinds": ["request", "response"],
+            "state": "pending_custody",
+        }
+        assert "GET / HTTP/1.1" not in str(d)
+
+    def test_ordinary_projection_makes_inline_legacy_evidence_unavailable(self):
+        from common.evidence import ordinary_evidence_projection
+
+        projected = ordinary_evidence_projection(
+            {
+                "request_raw": "INLINE_RAW_CANARY",
+                "response_raw": "INLINE_RESPONSE_CANARY",
+            }
+        )
+        assert projected == {"observations": [], "state": "unavailable"}
+        assert "INLINE_RAW_CANARY" not in str(projected)
+        assert "INLINE_RESPONSE_CANARY" not in str(projected)
+
+    def test_ordinary_finding_projection_accepts_finding_and_normalizes_severity(self):
+        from common.evidence import Evidence, ordinary_finding_projection
+        from common.finding import Severity
+
+        projected = ordinary_finding_projection(
+            _make_finding(
+                severity=Severity.HIGH,
+                evidence=Evidence(request_raw="INLINE_FINDING_CANARY"),
+            )
+        )
+
+        assert projected["severity"] == "High"
+        assert projected["evidence"] == {
+            "observations": [],
+            "state": "unavailable",
+        }
+        assert "INLINE_FINDING_CANARY" not in str(projected)
+
+    def test_ordinary_projection_preserves_safe_persisted_metadata_and_digests(self):
+        from common.evidence import ordinary_evidence_projection
+
+        source = _persisted_evidence_projection()
+        projected = ordinary_evidence_projection(source)
+        artifact = projected["observations"][0]["artifacts"][0]
+        assert projected["finding_id"] == "finding-task102-core"
+        assert projected["observations"][0]["observation_id"] == "observation-task102-core"
+        assert artifact["artifact_id"] == "artifact-task102-core"
+        assert artifact["derivative"] == "PERSISTED_DERIVATIVE_CANARY"
+        assert artifact["derivative_sha256"] == "sha256:" + "1" * 64
+        assert artifact["manifest_digest"] == "sha256:" + "2" * 64
+        assert artifact["primary_sha256"] == "sha256:" + "3" * 64
+
+    def test_ordinary_projection_preserves_an_empty_verified_derivative(self):
+        from common.evidence import ordinary_evidence_projection
+
+        source = _persisted_evidence_projection()
+        artifact = source["observations"][0]["artifacts"][0]
+        artifact["derivative"] = ""
+        artifact["derivative_sha256"] = (
+            "sha256:e3b0c44298fc1c149afbf4c8996fb924"
+            "27ae41e4649b934ca495991b7852b855"
+        )
+        artifact["derivative_size"] = 0
+
+        projected = ordinary_evidence_projection(source)
+
+        assert projected["observations"][0]["artifacts"][0]["derivative"] == ""
+
+    @pytest.mark.parametrize(
+        "forbidden_key",
+        [
+            "request_raw",
+            "response_raw",
+            "screenshot_path",
+            "console_capture_path",
+            "pcap_path",
+            "original_relative_path",
+            "derivative_relative_path",
+        ],
+    )
+    def test_ordinary_projection_rejects_nested_raw_and_path_keys(self, forbidden_key):
+        from common.evidence import EvidenceCaptureError, ordinary_evidence_projection
+
+        source = _persisted_evidence_projection()
+        source["observations"][0]["artifacts"][0]["nested"] = {
+            "deeper": {forbidden_key: "SYNTHETIC_RAW_OR_PATH_CANARY"}
+        }
+        with pytest.raises(EvidenceCaptureError, match="raw or path"):
+            ordinary_evidence_projection(source)
+
+    def test_ordinary_finding_projection_preserves_dedup_and_rejects_nested_values(self):
+        from common.evidence import EvidenceCaptureError, ordinary_finding_projection
+
+        dedup_key = "finding-v1:" + "a" * 64
+        projected = ordinary_finding_projection(
+            {
+                "dedup_key": dedup_key,
+                "id": "finding-task102-core",
+                "severity": "High",
+                "tags": ["verified"],
+                "evidence": _persisted_evidence_projection(),
+            }
+        )
+        assert projected["dedup_key"] == dedup_key
+        assert projected["evidence"]["finding_id"] == projected["id"]
+
+        with pytest.raises(EvidenceCaptureError, match="tags"):
+            ordinary_finding_projection(
+                {
+                    "severity": "High",
+                    "tags": [{"request_raw": "UNCLASSIFIED_RAW_CANARY"}],
+                }
+            )
+
+        mismatched = _persisted_evidence_projection()
+        mismatched["finding_id"] = "finding-other"
+        with pytest.raises(EvidenceCaptureError, match="another finding"):
+            ordinary_finding_projection(
+                {
+                    "id": "finding-task102-core",
+                    "severity": "High",
+                    "evidence": mismatched,
+                }
+            )
+
+    @pytest.mark.parametrize(
+        ("path", "replacement"),
+        [
+            (("observations",), {}),
+            (("observations",), []),
+            (("observations", 0), "malformed-observation"),
+            (("observations", 0, "artifacts"), []),
+            (("observations", 0, "artifacts", 0), "malformed-artifact"),
+            (("observations", 0, "artifacts", 0, "derivative_sha256"), "sha256:not-a-digest"),
+            (("observations", 0, "artifacts", 0, "manifest_digest"), "sha256:BAD"),
+            (("observations", 0, "artifacts", 0, "primary_sha256"), "sha256:bad"),
+            (("observations", 0, "artifacts", 0, "derivative_size"), True),
+        ],
+    )
+    def test_ordinary_projection_rejects_malformed_persisted_values(self, path, replacement):
+        from common.evidence import EvidenceCaptureError, ordinary_evidence_projection
+
+        source = _persisted_evidence_projection()
+        current = source
+        for component in path[:-1]:
+            current = current[component]
+        current[path[-1]] = replacement
+        with pytest.raises(EvidenceCaptureError):
+            ordinary_evidence_projection(source)
+
+    def test_finding_binds_defensive_persisted_projection_and_keeps_digest_references(self):
+        from common.evidence import Evidence, EvidenceCaptureError
+
+        source = _persisted_evidence_projection()
+        finding = _make_finding(
+            evidence=Evidence(request_raw="BOUND_RAW_CANARY", response_raw="BOUND_RESPONSE_CANARY")
+        )
+        with pytest.raises(ValueError, match="another finding"):
+            finding.bind_canonical_evidence(source)
+        finding.id = source["finding_id"]
+        finding.bind_canonical_evidence(source)
+        source["observations"][0]["artifacts"][0]["derivative"] = "CALLER_MUTATION_CANARY"
+        source["observations"].append({"observation_id": "caller-mutation"})
+
+        bound = finding.canonical_evidence
+        rendered = finding.to_dict()
+        assert bound["observations"][0]["artifacts"][0]["derivative"] == "PERSISTED_DERIVATIVE_CANARY"
+        assert rendered["evidence"] == bound
+        assert rendered["evidence"]["observations"][0]["artifacts"][0]["derivative_sha256"] == "sha256:" + "1" * 64
+        assert "BOUND_RAW_CANARY" not in str(rendered)
+        assert "BOUND_RESPONSE_CANARY" not in str(rendered)
+        with pytest.raises(EvidenceCaptureError):
+            finding.bind_canonical_evidence(
+                {"state": "persisted", "observations": [{"artifacts": []}]}
+            )
 
     def test_cvss_auto_computed(self):
         from common.finding import cvss31_score
@@ -422,7 +641,7 @@ class TestReportEngine:
             assert "HIGH" in html
             assert "unknown" in html
 
-    def test_generate_html_shows_verification_block(self):
+    def test_generate_html_omits_inline_verification_evidence(self):
         from common.reporting.report_engine import ReportEngine, ReportConfig
         with tempfile.TemporaryDirectory() as tmpdir:
             config = ReportConfig(output_dir=tmpdir, formats=["html"])
@@ -430,7 +649,8 @@ class TestReportEngine:
             paths = asyncio.run(engine.generate())
             html = Path(paths["html"]).read_text()
             assert "FP Verification" in html
-            assert "time-delay" in html
+            assert "HIGH" in html
+            assert "time-delay" not in html
 
     def test_suppressed_note_in_html(self):
         from common.reporting.report_engine import ReportEngine, ReportConfig

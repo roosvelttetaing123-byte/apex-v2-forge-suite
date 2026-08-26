@@ -31,15 +31,89 @@ import json
 import logging
 import os
 import time
+from collections.abc import Mapping
 from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from common.evidence import ordinary_finding_projection
+from common.redaction import redact_text
 from common.version import PRODUCT_LABEL
 
 log = logging.getLogger("forge.brain")
+
+_NARRATIVE_DETAIL_WITHHELD = (
+    "Observation detail withheld; use verified canonical evidence derivatives."
+)
+_NARRATIVE_LABEL_FIELDS = (
+    "action",
+    "target",
+    "framework",
+    "timestamp",
+    "mitre",
+    "module",
+    "phase",
+)
+
+
+def _ordinary_label(value: Any, *, limit: int = 512) -> str:
+    """Return one bounded, redacted narrative label without object traversal."""
+    if value is None:
+        return ""
+    if not isinstance(value, (str, int, float, bool)):
+        return "<withheld>"
+    return " ".join(redact_text(str(value)).split())[:limit]
+
+
+def _ordinary_chain_log(value: Any) -> list[dict[str, str]]:
+    """Allowlist attack-chain metadata and withhold mutable inline results."""
+    if not isinstance(value, list) or len(value) > 10_000:
+        raise ValueError("attack narrative chain log is invalid")
+    rendered: list[dict[str, str]] = []
+    for raw_step in value:
+        if not isinstance(raw_step, Mapping):
+            raise ValueError("attack narrative chain step is invalid")
+        step = {
+            field: _ordinary_label(raw_step.get(field))
+            for field in _NARRATIVE_LABEL_FIELDS
+            if raw_step.get(field) is not None
+        }
+        step["verification_state"] = _ordinary_label(
+            raw_step.get("verification_state") or "unknown",
+            limit=100,
+        )
+        step["proof_type"] = _ordinary_label(
+            raw_step.get("proof_type") or "unknown",
+            limit=100,
+        )
+        step["maturity"] = _ordinary_label(
+            raw_step.get("maturity") or "experimental",
+            limit=100,
+        )
+        raw_result = raw_step.get("result")
+        if raw_result is not None and raw_result != "":
+            step["result"] = _NARRATIVE_DETAIL_WITHHELD
+        rendered.append(step)
+    return rendered
+
+
+def _ordinary_memory_metadata(value: Any) -> list[dict[str, str]]:
+    """Keep only content-free memory metadata in an external-model prompt."""
+    if not isinstance(value, list):
+        return []
+    rendered: list[dict[str, str]] = []
+    for raw_entry in value[:100]:
+        if not isinstance(raw_entry, Mapping):
+            continue
+        rendered.append(
+            {
+                field: _ordinary_label(raw_entry.get(field), limit=200)
+                for field in ("timestamp", "event_type", "framework")
+            }
+        )
+    return rendered
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -497,15 +571,18 @@ class ForgeBrain:
         Returns:
             AnalysisResult with verdict, confidence, reasoning, action.
         """
-        finding_id = finding.get("id", "unknown")
+        ordinary_finding = ordinary_finding_projection(finding)
+        finding_id = str(ordinary_finding.get("id") or "unknown")
 
         if not self.available:
-            return self._rule_based_analyze(finding)
+            return self._rule_based_analyze(ordinary_finding)
 
-        context = self.memory.get_context(last_n=15)
+        context = _ordinary_memory_metadata(
+            self.memory.get_context(last_n=15)
+        )
         prompt = json.dumps({
             "task": "analyze_finding",
-            "finding": finding,
+            "finding": ordinary_finding,
             "engagement_context": context,
             "instructions": (
                 "Analyze this security finding. Determine if it's a TRUE_POSITIVE, "
@@ -531,7 +608,7 @@ class ForgeBrain:
             )
         except Exception as exc:
             log.warning("Brain analyze_finding failed, using rule-based: %s", exc)
-            return self._rule_based_analyze(finding)
+            return self._rule_based_analyze(ordinary_finding)
 
     async def detect_false_negatives(
         self,
@@ -769,6 +846,9 @@ class ForgeBrain:
         Returns:
             Executive summary as a formatted string.
         """
+        findings = [ordinary_finding_projection(item) for item in findings]
+        target = _ordinary_label(target, limit=2_000)
+        engagement_name = _ordinary_label(engagement_name, limit=500)
         if not self.available:
             return self._rule_based_exec_summary(findings, target, engagement_name)
 
@@ -821,6 +901,7 @@ class ForgeBrain:
         Returns:
             Attack narrative as a formatted string.
         """
+        chain_log = _ordinary_chain_log(chain_log)
         if not self.available:
             return self._rule_based_narrative(chain_log)
 
@@ -831,7 +912,9 @@ class ForgeBrain:
                 "Write a compelling attack narrative from this chain log. "
                 "Describe what an attacker did step by step, what was discovered, "
                 "and what the impact was. Write as a story — 'First we... then we found... "
-                "which led us to...' Format as markdown prose, not JSON."
+                "which led us to...' Never infer or reproduce payloads, raw responses, "
+                "original evidence, caller-controlled paths, or secret values; refer to "
+                "verified canonical evidence derivatives. Format as markdown prose, not JSON."
             ),
         }, indent=2, default=str)
 

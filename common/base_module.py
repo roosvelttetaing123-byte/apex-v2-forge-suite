@@ -37,6 +37,7 @@ from common.action_authorization import (
     validate_consumed_authorization,
 )
 from common.canonical import MissingCanonicalContextError
+from common.canonical_evidence import CanonicalEvidenceService
 from common.outbound_policy import (
     ApprovedEgressRoute,
     AuthorizationDatabaseOutboundAuditSink,
@@ -807,6 +808,7 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         self.authorization_envelope: ActionAuthorizationEnvelope | None = None
         self.authorization_context: AuthorizationContext | None = None
         self.authorization_boundary = ""
+        self._canonical_evidence_service: CanonicalEvidenceService | None = None
         self.outbound_policy: OutboundPolicy | None = None
         self._authorized_outbound_policy: OutboundPolicy | None = None
         self._authorized_outbound_context: OutboundContext | None = None
@@ -1093,11 +1095,10 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
     def add_finding(self, finding: Finding) -> None:
         """Record a finding, persist to DB, emit to dashboard, and log it.
 
-        Duplicate suppression: if this module has already emitted a finding with
-        the same title and observation identity, the second call is dropped and
-        a warning is logged.  The identity includes route/query, parameter,
-        location, and principal dimensions so per-payload / per-probe-variant
-        inflation is suppressed without merging distinct observations.
+        Canonical persistence always creates a new immutable observation.
+        Finding identity only groups mutable workflow summaries; it never
+        suppresses evidence.  Explicit Gate-0 compatibility fixtures retain
+        the historical in-memory duplicate suppression.
         """
         _url = finding.url or finding.target or ""
         # Preserve all observation dimensions before canonical persistence.
@@ -1106,19 +1107,8 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         # and principals independently observable.
         _dedup_identity = _finding_observation_identity(finding)
         _dedup_key = f"{self.NAME}\x00{finding.title}\x00{_dedup_identity}"
-        if _dedup_key in self._seen_finding_keys:
-            self._seen_finding_keys[_dedup_key] += 1
-            self.log.warning(
-                "[DEDUP] Suppressed duplicate finding (occurrence %d): '%s' at '%s'",
-                self._seen_finding_keys[_dedup_key],
-                finding.title,
-                _dedup_log_target(_url),
-            )
-            return
-        self._seen_finding_keys[_dedup_key] = 1
-
-        # Cross-module dedup — normalize title to catch overlapping modules
-        # e.g. "Security Header Missing: Content-Security-Policy" ≈ "Content-Security-Policy Header Missing"
+        # Cross-module identity remains useful for grouping and diagnostics,
+        # but never as a pre-persistence drop gate on the canonical path.
         _norm_title = self._normalize_for_global_dedup(finding.title)
         _tenant_id = (
             self.authorization_envelope.tenant_id
@@ -1128,84 +1118,110 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         _global_key = (
             f"{_tenant_id}\x00{self.run_id}\x00{_norm_title}\x00{_dedup_identity}"
         )
-        if _global_key in BaseModule._global_finding_keys:
-            self.log.warning(
-                "[GLOBAL-DEDUP] Suppressed cross-module duplicate: '%s' (module=%s)",
-                finding.title, self.NAME,
-            )
-            return
-        BaseModule._global_finding_keys.add(_global_key)
-        self.findings.append(finding)
-        # Task 101 adapters are strict by default: a module finding may not
-        # silently fall back to the legacy ORM writer and create an orphan
-        # record.  Gate-0 fixtures that genuinely need the compatibility
-        # writer must opt in explicitly; a missing/falsey flag is never
-        # treated as authorization to persist without canonical lineage.
-        canonical_required = not (
+        legacy_allowed = (
             self.config.extra.get("allow_legacy_compat") is True
             and self.config.extra.get("canonical_context") is None
         )
-        # A caller that supplies a context marker is always on the canonical
-        # path.  The legacy writer cannot persist that graph, even when a
-        # stale compatibility flag is present in a reused config object.
-        if self.config.extra.get("canonical_context") is not None:
-            canonical_required = True
-        persisted = True
+        canonical_path = self.authorization_envelope is not None
+
+        if not canonical_path and legacy_allowed:
+            if _dedup_key in self._seen_finding_keys:
+                self._seen_finding_keys[_dedup_key] += 1
+                self.log.warning(
+                    "[DEDUP] Suppressed compatibility finding (occurrence %d): '%s' at '%s'",
+                    self._seen_finding_keys[_dedup_key],
+                    finding.title,
+                    _dedup_log_target(_url),
+                )
+                return
+            if _global_key in BaseModule._global_finding_keys:
+                self.log.warning(
+                    "[GLOBAL-DEDUP] Suppressed compatibility finding: '%s' (module=%s)",
+                    finding.title,
+                    self.NAME,
+                )
+                return
+
         try:
-            save_finding(
-                self.db,
-                finding.to_dict(),
-                run_id=self.run_id,
-                allow_legacy_compat=not canonical_required,
-                evidence_store=self.results_dir / "evidence-custody",
-            )
-        except MissingCanonicalContextError:
-            if canonical_required:
-                self.findings.pop()
-                self._seen_finding_keys.pop(_dedup_key, None)
-                BaseModule._global_finding_keys.discard(_global_key)
-                raise
-            # Explicit Gate-0 fixture compatibility: retain the finding in
-            # memory for existing reporters, but do not emit a success event
-            # or claim that a canonical row was persisted.
-            persisted = False
-            self.log.warning(
-                "Finding retained in memory only; canonical context is unavailable"
-            )
+            if canonical_path:
+                if self._canonical_evidence_service is None:
+                    assert self.authorization_envelope is not None
+                    self._canonical_evidence_service = (
+                        CanonicalEvidenceService.from_authorization(
+                            self.db,
+                            self.results_dir / "evidence-custody",
+                            self.authorization_envelope,
+                        )
+                    )
+                self._canonical_evidence_service.persist_finding(finding)
+            elif legacy_allowed:
+                legacy_payload = finding.to_dict()
+                legacy_payload["evidence"] = finding.evidence._legacy_custody_payload()
+                save_finding(
+                    self.db,
+                    legacy_payload,
+                    run_id=self.run_id,
+                    allow_legacy_compat=True,
+                    evidence_store=self.results_dir / "evidence-custody",
+                )
+            else:
+                raise MissingCanonicalContextError(
+                    "module finding requires a consumed authorization envelope or typed canonical evidence context"
+                )
         except Exception as exc:
-            self.log.error("Failed to save finding to DB: %s", exc)
-        if not persisted:
-            return
+            self.log.error(
+                "Finding persistence failed closed (%s)", type(exc).__name__
+            )
+            raise
+
+        prior_local_count = self._seen_finding_keys.get(_dedup_key, 0)
+        self._seen_finding_keys[_dedup_key] = prior_local_count + 1
+        if canonical_path and prior_local_count:
+            self.log.info(
+                "[DEDUP] Grouped additional immutable observation (occurrence %d): '%s'",
+                prior_local_count + 1,
+                finding.title,
+            )
+        prior_global = _global_key in BaseModule._global_finding_keys
+        BaseModule._global_finding_keys.add(_global_key)
+        if canonical_path and prior_global:
+            self.log.info(
+                "[GLOBAL-DEDUP] Grouped additional immutable observation: '%s' (module=%s)",
+                finding.title,
+                self.NAME,
+            )
+        self.findings.append(finding)
+        safe_finding = finding.to_dict()
         self.log.info(
             "[FINDING] %s | %s | %s",
-            finding.severity.value,
-            finding.title,
-            finding.target,
-            extra={"forge_module": self.NAME, "target": finding.target},
+            safe_finding["severity"],
+            safe_finding["title"],
+            safe_finding["target"],
+            extra={"forge_module": self.NAME, "target": safe_finding["target"]},
         )
         # Emit to dashboard event bus
         self._emit_event(
             "finding_new",
-            id=finding.id,
-            title=finding.title,
-            severity=finding.severity.value,
+            id=safe_finding["id"],
+            title=safe_finding["title"],
+            severity=safe_finding["severity"],
             module=self.NAME,
-            target=finding.target,
-            cvss_score=finding.cvss_v31_score,
-            url=finding.url or "",
-            port=finding.port,
-            service=finding.service,
-            description=finding.description,
-            mitre_attack=finding.mitre_attack,
-            confidence=finding.confidence,
-            status=finding.status,
-            vpr_score=finding.vpr_score,
-            vpr_priority=finding.vpr_priority or finding.vpr,
-            verification_state=finding.verification_state,
-            proof_type=finding.proof_type,
-            maturity=finding.maturity,
-            verification=finding.verification or {},
-            evidence=finding.evidence.to_dict(),
+            target=safe_finding["target"],
+            cvss_score=safe_finding["cvss_v31_score"],
+            url=safe_finding["url"] or "",
+            port=safe_finding["port"],
+            service=safe_finding["service"],
+            description=safe_finding["description"],
+            mitre_attack=safe_finding["mitre_attack"],
+            confidence=safe_finding["confidence"],
+            status=safe_finding["status"],
+            vpr_score=safe_finding["vpr_score"],
+            vpr_priority=safe_finding["vpr_priority"],
+            verification_state=safe_finding["verification_state"],
+            proof_type=safe_finding["proof_type"],
+            maturity=safe_finding["maturity"],
+            verification=safe_finding["verification"] or {},
+            evidence=safe_finding["evidence"],
         )
 
         # External model analysis is an independent outbound action.  It stays

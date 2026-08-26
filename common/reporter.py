@@ -17,7 +17,12 @@ from common.artifact_io import (
     read_verified_regular_file,
 )
 from common.confidence_policy import normalise_finding
-from common.redaction import redact_text, redact_value, redacted_json_dumps
+from common.evidence import (
+    ordinary_evidence_artifacts,
+    ordinary_evidence_projection,
+    ordinary_finding_projection,
+)
+from common.redaction import redact_text, redacted_json_dumps
 
 try:
     from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -52,6 +57,13 @@ def _write_private_text(path: Path, content: str) -> None:
     _write_private_bytes(path, content.encode("utf-8"))
 
 
+def _ordinary_report_finding(value: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one finding without carrying unstructured proof fields."""
+    row = normalise_finding(ordinary_finding_projection(value))
+    row["verification"] = {"confidence": row["confidence"]}
+    return row
+
+
 class BaseReporter:
     """Base reporter that serializes findings to multiple output formats."""
 
@@ -68,7 +80,7 @@ class BaseReporter:
         compliance_authority: Any = None,
     ) -> None:
         self.findings     = sorted(
-            [normalise_finding(redact_value(f)) for f in findings],
+            [_ordinary_report_finding(f) for f in findings],
             key=lambda f: (
                 -(float(f.get("vpr_score") or f.get("cvss_v31_score") or 0.0)),
                 SEVERITY_ORDER.get(f.get("severity", ""), 99),
@@ -151,7 +163,10 @@ class BaseReporter:
             "findings":     self.findings,
         }
         path = self.results_dir / "findings.json"
-        _write_private_text(path, redacted_json_dumps(out, indent=2, default=str))
+        _write_private_text(
+            path,
+            json.dumps(out, indent=2, default=str, ensure_ascii=True),
+        )
         return str(path)
 
     def generate_docx(self) -> str | None:
@@ -272,16 +287,16 @@ class BaseReporter:
         )
         template = env.get_template("report.html.j2")
 
-        # Ordinary reports do not embed protected-original screenshots.  Work
-        # Package 102 owns authorized evidence-custody and redacted derivatives.
+        # Ordinary reports render only verified redacted derivatives produced
+        # by canonical custody. Protected originals and source paths never
+        # enter this context.
         enriched: list[dict[str, Any]] = []
         for f in self.findings:
             row = dict(f)
-            ev = dict(f.get("evidence") or {})
-            ev["screenshot_path"] = None
-            ev["console_capture_path"] = None
-            ev["pcap_path"] = None
-            row["evidence"] = ev
+            row["evidence"] = ordinary_evidence_projection(f.get("evidence"))
+            row["evidence_artifacts"] = ordinary_evidence_artifacts(
+                row["evidence"]
+            )
             enriched.append(row)
 
         return template.render(
@@ -324,20 +339,15 @@ class BaseReporter:
             sev = f.get("severity", "Informational")
             color = self._severity_color(sev)
             text_color = "#FFFFFF" if sev in ("Critical", "High") else "#000000"
-            ev = f.get("evidence", {})
-            screenshot_html = ""
-            request_html = ""
-            if ev.get("request_raw"):
-                request_html = (
-                    f'<br><strong>Request:</strong><pre style="background:#1e1e1e;color:#d4d4d4;'
-                    f'padding:8px;overflow:auto">{self._escape(ev["request_raw"])}</pre>'
+            evidence_html = "".join(
+                (
+                    '<br><strong>Evidence derivative '
+                    f'({self._escape(artifact["capture_kind"])}):</strong>'
+                    '<pre style="background:#1e1e1e;color:#d4d4d4;'
+                    f'padding:8px;overflow:auto">{self._escape(artifact["derivative"])}</pre>'
                 )
-            response_html = ""
-            if ev.get("response_raw"):
-                response_html = (
-                    f'<br><strong>Response:</strong><pre style="background:#1e1e1e;color:#d4d4d4;'
-                    f'padding:8px;overflow:auto">{self._escape(str(ev["response_raw"])[:2000])}</pre>'
-                )
+                for artifact in ordinary_evidence_artifacts(f.get("evidence"))
+            )
             steps = "".join(
                 f"<li>{self._escape(s)}</li>"
                 for s in f.get("reproduction_steps", [])
@@ -366,7 +376,7 @@ class BaseReporter:
               <strong>Remediation:</strong> {self._escape(f.get('remediation',''))}<br>
               <strong>References:</strong> {self._escape(refs)}<br>
               <strong>MITRE ATT&CK:</strong> {self._escape(mitre)}
-              {screenshot_html}{request_html}{response_html}
+              {evidence_html}
             </td></tr>"""
 
         summary_bars = ""

@@ -1247,7 +1247,12 @@ def _unique_results_dir(base: Path, dirname: str) -> Path:
                 pass
 
 
-def setup_results(engagement: str, target: str, resume: str | None) -> Path:
+def setup_results(
+    engagement: str,
+    target: str,
+    resume: str | None,
+    output_dir: str | None = None,
+) -> Path:
     if resume:
         path = absolute_lexical_path(Path(resume).expanduser())
         _prepare_owner_only_directory(path)
@@ -1255,8 +1260,13 @@ def setup_results(engagement: str, target: str, resume: str | None) -> Path:
         safe_target = _safe_result_component(safe_target_display(target), "target")
         safe_engagement = _safe_result_component(engagement, "engagement")
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        base = (
+            absolute_lexical_path(Path(output_dir).expanduser())
+            if output_dir
+            else Path(__file__).parent / "results"
+        )
         path = _unique_results_dir(
-            Path(__file__).parent / "results",
+            base,
             f"{safe_engagement}_{safe_target}_{ts}",
         )
     _prepare_owner_only_directory(path / "pcaps")
@@ -2004,7 +2014,12 @@ async def run_for_target(
     if args.dry_run:
         results_dir = Path(args.output).expanduser() if args.output else Path.cwd()
     else:
-        results_dir = setup_results(args.engagement, args.target, args.resume)
+        results_dir = setup_results(
+            args.engagement,
+            args.target,
+            args.resume,
+            args.output,
+        )
 
     return await run_scan(cfg, args, results_dir, event_bus, scan_control)
 
@@ -2067,7 +2082,12 @@ async def main() -> int:
     if args.dry_run:
         results_dir = Path(args.output).expanduser() if args.output else Path.cwd()
     else:
-        results_dir = setup_results(args.engagement, args.target, args.resume)
+        results_dir = setup_results(
+            args.engagement,
+            args.target,
+            args.resume,
+            args.output,
+        )
 
     if not args.dry_run:
         ask_internet_permission("CVE database updates, nuclei templates")

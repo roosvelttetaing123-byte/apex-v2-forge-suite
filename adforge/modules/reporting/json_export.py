@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
+from common.evidence import ordinary_finding_projection
 
 
 class JsonExport(BaseModule):
@@ -22,19 +23,8 @@ class JsonExport(BaseModule):
     async def run(self) -> ModuleResult:
         start = time.monotonic()
 
-        def _serialize(obj):
-            if hasattr(obj, "value"):
-                return obj.value
-            return str(obj)
-
         out_path = self.results_dir / "adforge_report.json"
-        findings = []
-        for f in self.findings:
-            try:
-                from dataclasses import asdict
-                findings.append(asdict(f))
-            except Exception:
-                findings.append({"title": str(getattr(f, "title", ""))})
+        findings = [ordinary_finding_projection(finding) for finding in self.findings]
 
         out_path.write_text(
             json.dumps(
@@ -48,7 +38,6 @@ class JsonExport(BaseModule):
                     "generated":  time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 },
                 indent=2,
-                default=_serialize,
             ),
             encoding="utf-8",
         )

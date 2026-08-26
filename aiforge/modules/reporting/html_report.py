@@ -12,7 +12,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
-from common.evidence import Evidence
+from common.evidence import Evidence, ordinary_finding_projection
 from common.finding import Finding, Severity
 from common.version import VERSION
 
@@ -38,7 +38,10 @@ class HtmlReport(BaseModule):
     async def run(self) -> ModuleResult:
         start = time.monotonic()
 
-        all_findings: list[dict[str, Any]] = self.config.extra.get("all_findings", [])
+        all_findings = [
+            ordinary_finding_projection(finding)
+            for finding in self.config.extra.get("all_findings", [])
+        ]
         if not all_findings:
             self.log.info("No findings to report")
             return self._make_result(start, skipped=True, skip_reason="no findings")
@@ -148,12 +151,17 @@ class HtmlReport(BaseModule):
         return self._make_result(start)
 
     def _render_findings(self, findings: list[dict[str, Any]]) -> str:
+        ordinary_findings = [
+            ordinary_finding_projection(finding) for finding in findings
+        ]
         parts: list[str] = []
         # Sort by severity
         order = {s: i for i, s in enumerate(SEVERITY_ORDER)}
-        findings.sort(key=lambda f: order.get(f.get("severity", "Informational"), 99))
+        ordinary_findings.sort(
+            key=lambda f: order.get(f.get("severity", "Informational"), 99)
+        )
 
-        for f in findings:
+        for f in ordinary_findings:
             sev = f.get("severity", "Informational")
             title = html.escape(f.get("title", "Untitled"))
             module = html.escape(f.get("module", ""))

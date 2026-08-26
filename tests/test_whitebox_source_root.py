@@ -52,6 +52,8 @@ def _isolated_module_authorization_db(tmp_path: Path, monkeypatch) -> None:
 def _authorized_module_config(
     source_root: object | None,
     module_id: str,
+    *,
+    attach_envelope: bool = True,
 ) -> tuple[BaseForgeConfig, str]:
     cfg = BaseForgeConfig(target="https://example.test", mode="whitebox")
     cfg.extra["allowed_scope"] = ["example.test"]
@@ -99,7 +101,8 @@ def _authorized_module_config(
         assert consumed.allowed is True
     finally:
         session.close()
-    cfg.extra["authorized_module_envelopes"] = {module_id: issued.envelope}
+    if attach_envelope:
+        cfg.extra["authorized_module_envelopes"] = {module_id: issued.envelope}
     # These source-root tests exercise traversal and redaction in isolation;
     # they do not construct the canonical module-version / asset graph.  Keep
     # persistence compatibility explicit so production adapters stay strict.
@@ -107,8 +110,17 @@ def _authorized_module_config(
     return cfg, run_id
 
 
-def _secret_scan(tmp_path: Path, source_root: object | None) -> SecretScan:
-    cfg, run_id = _authorized_module_config(source_root, "secret_scan")
+def _secret_scan(
+    tmp_path: Path,
+    source_root: object | None,
+    *,
+    attach_envelope: bool = True,
+) -> SecretScan:
+    cfg, run_id = _authorized_module_config(
+        source_root,
+        "secret_scan",
+        attach_envelope=attach_envelope,
+    )
     return SecretScan(
         cfg,
         Scope(["example.test"]),
@@ -338,7 +350,7 @@ def test_approved_in_root_file_is_scanned_without_secret_echo(tmp_path: Path) ->
     root.mkdir()
     secret = "CANARY_EXACT_PASSWORD_42"
     (root / "settings.py").write_text(f'password="{secret}"', encoding="utf-8")
-    scanner = _secret_scan(tmp_path, str(root))
+    scanner = _secret_scan(tmp_path, str(root), attach_envelope=False)
     approved_root = scanner.config.extra["source_root"]
 
     findings = asyncio.run(

@@ -302,6 +302,75 @@ def test_engagement_bus_canonicalises_nested_verification_confidence() -> None:
     bus.close()
 
 
+def test_engagement_bus_projects_untrusted_evidence_without_mutating_input() -> None:
+    bus = EngagementBus(db_path=":memory:")
+    received: list[dict[str, Any]] = []
+    bus.subscribe(lambda _framework, finding: received.append(dict(finding)))
+    raw_canary = "TASK102_ENGAGEMENT_BUS_RAW_CANARY"
+    finding = _finding_dict("engagement-raw-boundary")
+    finding["evidence"] = {
+        "request_raw": raw_canary,
+        "response_raw": raw_canary,
+        "screenshot_path": f"/untrusted/{raw_canary}.png",
+    }
+    original = json.loads(json.dumps(finding))
+
+    asyncio.run(bus.publish("webforge", finding))
+
+    stored = bus.get_all_findings()[0]
+    assert finding == original
+    assert received[0]["evidence"] == {
+        "observations": [],
+        "state": "unavailable",
+    }
+    assert stored["evidence"] == received[0]["evidence"]
+    assert raw_canary not in json.dumps(received[0])
+    assert raw_canary not in json.dumps(stored)
+    bus.close()
+
+
+def test_engagement_bus_preserves_verified_persisted_derivative() -> None:
+    bus = EngagementBus(db_path=":memory:")
+    finding = _finding_dict("engagement-persisted-boundary")
+    digest = "sha256:" + "a" * 64
+    derivative = "redacted persisted derivative"
+    finding["evidence"] = {
+        "finding_id": "engagement-persisted-boundary",
+        "observations": [
+            {
+                "artifacts": [
+                    {
+                        "artifact_id": "artifact-persisted-boundary",
+                        "capture_kind": "request",
+                        "derivative": derivative,
+                        "derivative_sha256": digest,
+                        "derivative_size": len(derivative.encode("utf-8")),
+                        "integrity_state": "verified",
+                        "manifest_digest": digest,
+                        "media_type": "text/plain",
+                        "primary_sha256": digest,
+                        "primary_size": 128,
+                        "redaction_state": "redacted",
+                        "role": "primary",
+                        "sequence": 0,
+                    }
+                ],
+                "observation_id": "observation-persisted-boundary",
+            }
+        ],
+        "state": "persisted",
+    }
+
+    asyncio.run(bus.publish("webforge", finding))
+
+    stored = bus.get_all_findings()[0]
+    assert stored["evidence"]["state"] == "persisted"
+    assert stored["evidence"]["observations"][0]["artifacts"][0][
+        "derivative"
+    ] == derivative
+    bus.close()
+
+
 def test_base_reporter_json_csv_and_fallback_html_are_unverified(tmp_path: Path) -> None:
     legacy_finding = _finding_dict()
     legacy_finding["verification"] = {"confidence": "UNKNOWN"}

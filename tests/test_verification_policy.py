@@ -683,7 +683,9 @@ def test_attack_narrative_uses_verification_state_not_result_wording() -> None:
     )
 
     assert "**1** action(s) produced verified outcomes" in narrative
-    assert "Observation: successfully exploited according to process log" in narrative
+    assert "successfully exploited according to process log" not in narrative
+    assert "documented proof policy satisfied" not in narrative
+    assert narrative.count("Observation detail withheld") == 2
     assert "verification_state=candidate" in narrative
     assert "proof_type=active" in narrative
 

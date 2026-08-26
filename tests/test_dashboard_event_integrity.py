@@ -173,14 +173,18 @@ def _issued_registry(tmp_path: Path):
     clock = [NOW]
     job_status = ["running"]
     authorization = _authorization(tmp_path)
+    session = create_db(tmp_path / "event-authorization.db")
+    try:
+        row = get_authorization_decision(session, authorization.decision_id)
+        assert row is not None
+        persisted_authorization = json.loads(str(row.envelope_json))
+    finally:
+        session.close()
 
     def resolve_authorization(decision_id: str):
-        session = create_db(tmp_path / "event-authorization.db")
-        try:
-            row = get_authorization_decision(session, decision_id)
-            return json.loads(str(row.envelope_json)) if row is not None else None
-        finally:
-            session.close()
+        if decision_id != authorization.decision_id:
+            return None
+        return persisted_authorization
 
     registry = EventCredentialRegistry(
         clock=lambda: clock[0],
@@ -2118,7 +2122,7 @@ async def test_websocket_authenticates_tenant_before_redacted_snapshot() -> None
     assert server._websocket_reservation_count() == 0
 
 
-def test_public_state_snapshot_omits_evidence_verification_and_secrets() -> None:
+def test_public_state_snapshot_ignores_transient_findings_and_omits_secrets() -> None:
     from common.dashboard.server import DashboardServer
 
     server = DashboardServer(auth=True)
@@ -2143,8 +2147,8 @@ def test_public_state_snapshot_omits_evidence_verification_and_secrets() -> None
     operator = server._public_state_snapshot(Role.OPERATOR)
     rendered = json.dumps({"viewer": viewer, "operator": operator})
     assert canary not in rendered
-    assert "evidence" not in viewer["findings"][0]
-    assert "verification" not in viewer["findings"][0]
+    assert viewer["findings"] == []
+    assert operator["findings"] == []
     assert viewer["credentials"] == []
     assert "secret" not in operator["credentials"][0]
 

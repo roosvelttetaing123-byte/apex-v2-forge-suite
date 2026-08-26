@@ -13,6 +13,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Mapping
 
 from sqlalchemy import Connection, Engine, event
@@ -47,6 +48,32 @@ _TASK102_METADATA_TABLES = (
 _LEGACY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,127}$")
 _SERVER_AUTHORIZATION_ID_RE = re.compile(r"^authz-[0-9a-f]{32}$")
 _SHA256_REF_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_TASK102_FINDING_STATUSES = (
+    "open",
+    "in_progress",
+    "verified",
+    "false_positive",
+    "remediated",
+    "accepted_risk",
+    "unknown",
+)
+_CANONICAL_FINDING_TRIGGER_NAMES = frozenset(
+    {
+        "canonical_export_source_guard",
+        "canonical_export_source_update_guard",
+        "canonical_finding_observation_tenant_guard",
+        "canonical_findings_identity_guard_update",
+        "canonical_findings_lineage_guard_delete",
+        "canonical_metadata_bound_guard_canonical_findings",
+        "canonical_metadata_bound_update_guard_canonical_findings",
+        "canonical_metadata_integrity_guard_insert_canonical_findings",
+        "canonical_metadata_integrity_guard_update_canonical_findings",
+        "canonical_retest_source_guard",
+        "canonical_retest_source_update_guard",
+        "canonical_schema_version_guard_canonical_findings",
+        "canonical_schema_version_update_guard_canonical_findings",
+    }
+)
 
 
 def _redact_legacy(value: Any) -> Any:
@@ -2203,6 +2230,157 @@ def _runtime_guard_sql() -> tuple[str, ...]:
     return tuple(statements)
 
 
+def _expand_task102_finding_status_constraint(connection: Connection) -> None:
+    """Atomically extend the v1 finding workflow constraint for Task 102.
+
+    SQLite cannot alter a CHECK constraint in place.  The evidence migration
+    therefore rebuilds only this table, with foreign-key enforcement disabled
+    for the duration of one transaction, and refuses to commit unless the
+    complete database passes ``foreign_key_check``.  Task 102 repair then
+    recreates the finding indexes and runtime guards.
+    """
+    table_sql_row = connection.exec_driver_sql(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type='table' AND name='canonical_findings'"
+    ).fetchone()
+    if table_sql_row is None:
+        if connection.in_transaction():
+            connection.commit()
+        return
+    table_sql = str(table_sql_row[0] or "")
+    if all(f"'{status}'" in table_sql for status in _TASK102_FINDING_STATUSES):
+        if connection.in_transaction():
+            connection.commit()
+        return
+    expected_columns = {
+        "id",
+        "tenant_id",
+        "observation_id",
+        "artifact_id",
+        "schema_version",
+        "title",
+        "severity",
+        "description",
+        "status",
+        "finding_key",
+        "created_at",
+        "metadata_json",
+        "dedup_key",
+    }
+    actual_columns = {
+        str(row[1])
+        for row in connection.exec_driver_sql(
+            "PRAGMA table_info(canonical_findings)"
+        ).fetchall()
+    }
+    if actual_columns != expected_columns:
+        if connection.in_transaction():
+            connection.rollback()
+        raise MigrationError(
+            "canonical finding status repair encountered an unexpected schema"
+        )
+    successor = "canonical_findings_task102_status_successor"
+    if connection.exec_driver_sql(
+        "SELECT 1 FROM sqlite_master WHERE name=?",
+        (successor,),
+    ).fetchone() is not None:
+        if connection.in_transaction():
+            connection.rollback()
+        raise MigrationError(
+            "canonical finding status repair successor already exists"
+        )
+    finding_triggers = connection.exec_driver_sql(
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+        "AND (tbl_name='canonical_findings' "
+        "OR lower(sql) LIKE '%canonical_findings%') ORDER BY name"
+    ).fetchall()
+    unexpected_triggers = {
+        str(row[0]) for row in finding_triggers
+    } - _CANONICAL_FINDING_TRIGGER_NAMES
+    if unexpected_triggers or any(row[1] is None for row in finding_triggers):
+        if connection.in_transaction():
+            connection.rollback()
+        raise MigrationError(
+            "canonical finding status repair encountered an unexpected trigger"
+        )
+    if connection.in_transaction():
+        connection.commit()
+    connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+    if connection.in_transaction():
+        connection.commit()
+    foreign_keys_disabled = int(
+        connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one()
+    ) == 0
+    if connection.in_transaction():
+        connection.commit()
+    if not foreign_keys_disabled:
+        raise MigrationError(
+            "canonical finding status repair could not suspend foreign keys"
+        )
+    columns = (
+        "id,tenant_id,observation_id,artifact_id,schema_version,title,severity,"
+        "description,status,finding_key,created_at,metadata_json,dedup_key"
+    )
+    try:
+        with connection.begin():
+            connection.exec_driver_sql(
+                f"""
+                CREATE TABLE {successor} (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    observation_id TEXT NOT NULL,
+                    artifact_id TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 500),
+                    severity TEXT NOT NULL CHECK(severity IN ('critical','high','medium','low','informational')),
+                    description TEXT NOT NULL CHECK(length(description) BETWEEN 1 AND 8000),
+                    status TEXT NOT NULL CHECK(status IN ('open','in_progress','verified','false_positive','remediated','accepted_risk','unknown')),
+                    finding_key TEXT,
+                    created_at TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{{}}',
+                    dedup_key TEXT,
+                    UNIQUE(tenant_id, id),
+                    UNIQUE(tenant_id, id, observation_id),
+                    FOREIGN KEY(tenant_id, observation_id) REFERENCES canonical_observations(tenant_id, id) ON DELETE RESTRICT,
+                    FOREIGN KEY(tenant_id, artifact_id, observation_id) REFERENCES canonical_artifact_refs(tenant_id, id, observation_id) ON DELETE RESTRICT
+                )
+                """
+            )
+            connection.exec_driver_sql(
+                f"INSERT INTO {successor} ({columns}) "
+                f"SELECT {columns} FROM canonical_findings"
+            )
+            for trigger_name, _trigger_sql in finding_triggers:
+                connection.exec_driver_sql(
+                    f"DROP TRIGGER IF EXISTS {trigger_name}"
+                )
+            connection.exec_driver_sql("DROP TABLE canonical_findings")
+            connection.exec_driver_sql(
+                f"ALTER TABLE {successor} RENAME TO canonical_findings"
+            )
+            for _trigger_name, trigger_sql in finding_triggers:
+                connection.exec_driver_sql(str(trigger_sql))
+            if connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall():
+                raise MigrationError(
+                    "canonical finding status repair failed foreign-key verification"
+                )
+    finally:
+        if connection.in_transaction():
+            connection.rollback()
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        if connection.in_transaction():
+            connection.commit()
+        foreign_keys_enabled = int(
+            connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one()
+        ) == 1
+        if connection.in_transaction():
+            connection.commit()
+        if not foreign_keys_enabled:
+            raise MigrationError(
+                "canonical finding status repair did not restore foreign keys"
+            )
+
+
 def _task102_schema_repair(connection: Connection) -> None:
     """Add Task 102 custody columns/tables to already-applied v1 databases."""
     def columns(table: str) -> set[str]:
@@ -2380,6 +2558,7 @@ def _task102_schema_repair(connection: Connection) -> None:
         )
     """)
     for statement in (
+        "CREATE INDEX IF NOT EXISTS ix_canonical_finding_lineage ON canonical_findings(tenant_id, observation_id, artifact_id)",
         "CREATE INDEX IF NOT EXISTS ix_canonical_finding_dedup ON canonical_findings(tenant_id, dedup_key)",
         "CREATE INDEX IF NOT EXISTS ix_canonical_finding_observation_lineage ON canonical_finding_observations(tenant_id, finding_id, observation_id)",
         "CREATE INDEX IF NOT EXISTS ix_canonical_finding_observation_seen ON canonical_finding_observations(tenant_id, finding_id, last_seen_at)",
@@ -2407,14 +2586,32 @@ def _task102_schema_repair(connection: Connection) -> None:
             comparisons += (
                 " OR (NEW.manifest_digest IS NOT OLD.manifest_digest AND NOT ("
                 "OLD.manifest_digest IS NULL AND NEW.manifest_digest IS NOT NULL "
-                "AND length(NEW.manifest_digest)=71 "
-                "AND substr(NEW.manifest_digest,1,7)='sha256:' "
-                "AND NEW.manifest_digest GLOB 'sha256:*'))"
+                f"AND ({_sha256_guard('NEW.manifest_digest')})))"
             )
         connection.exec_driver_sql(f"CREATE TRIGGER IF NOT EXISTS {table}_custody_immutable_update BEFORE UPDATE ON {table} WHEN {comparisons} BEGIN SELECT RAISE(ABORT, 'immutable custody record is immutable'); END")
         connection.exec_driver_sql(f"CREATE TRIGGER IF NOT EXISTS {table}_custody_no_delete BEFORE DELETE ON {table} BEGIN SELECT RAISE(ABORT, 'immutable custody record cannot be deleted'); END")
     connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS canonical_finding_observations_no_update BEFORE UPDATE ON canonical_finding_observations BEGIN SELECT RAISE(ABORT, 'finding observation links are immutable'); END")
     connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS canonical_finding_observations_no_delete BEFORE DELETE ON canonical_finding_observations BEGIN SELECT RAISE(ABORT, 'finding observation links cannot be deleted'); END")
+    connection.exec_driver_sql(
+        "DROP TRIGGER IF EXISTS canonical_finding_observation_tenant_guard"
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER canonical_finding_observation_tenant_guard
+        BEFORE INSERT ON canonical_finding_observations
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_findings f
+          WHERE f.tenant_id=NEW.tenant_id AND f.id=NEW.finding_id)
+          OR NOT EXISTS(
+          SELECT 1 FROM canonical_observations o
+          WHERE o.tenant_id=NEW.tenant_id AND o.id=NEW.observation_id)
+          OR (NEW.artifact_id IS NOT NULL AND NOT EXISTS(
+          SELECT 1 FROM canonical_artifact_refs a
+          WHERE a.tenant_id=NEW.tenant_id AND a.id=NEW.artifact_id
+            AND a.observation_id=NEW.observation_id))
+        BEGIN SELECT RAISE(ABORT, 'finding observation tenant lineage mismatch'); END
+        """
+    )
     connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS canonical_evidence_access_audit_no_update BEFORE UPDATE ON canonical_evidence_access_audit BEGIN SELECT RAISE(ABORT, 'evidence access audit is append-only'); END")
     connection.exec_driver_sql("CREATE TRIGGER IF NOT EXISTS canonical_evidence_access_audit_no_delete BEFORE DELETE ON canonical_evidence_access_audit BEGIN SELECT RAISE(ABORT, 'evidence access audit cannot be deleted'); END")
     connection.exec_driver_sql(
@@ -2511,6 +2708,527 @@ def _task102_schema_repair(connection: Connection) -> None:
     )
     for statement in _metadata_integrity_guard_sql(guarded_task102_tables):
         connection.exec_driver_sql(statement)
+
+
+def _task102_database_custody_root(connection: Connection) -> Path | None:
+    """Resolve the server-owned custody sibling for a file-backed SQLite DB."""
+    for _sequence, name, raw_path in connection.exec_driver_sql(
+        "PRAGMA database_list"
+    ).fetchall():
+        if str(name) != "main" or not raw_path:
+            continue
+        database_path = Path(str(raw_path))
+        if not database_path.is_absolute():
+            return None
+        return database_path.parent / "evidence-custody"
+    return None
+
+
+def _task102_migrate_legacy_evidence(connection: Connection) -> int:
+    """Move available legacy evidence bytes into canonical local custody.
+
+    The Task 101 normalization intentionally creates an unknown placeholder
+    artifact because it has no byte store.  Once the Task 102 tables and
+    guards exist, this successor preserves each verifiably available legacy
+    payload as a protected original plus an ordinary redacted derivative,
+    links it to the already-migrated observation, and clears mutable raw/path
+    columns only in the same database transaction.  Missing or unsafe legacy
+    paths remain represented by the existing unknown placeholder.
+    """
+    tables = {
+        str(row[0])
+        for row in connection.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    required_tables = {
+        "findings",
+        "canonical_findings",
+        "canonical_observations",
+        "canonical_artifact_refs",
+        "canonical_artifact_manifests",
+        "canonical_observation_artifacts",
+    }
+    if not required_tables <= tables:
+        if connection.in_transaction():
+            connection.commit()
+        return 0
+    finding_columns = {
+        str(row[1])
+        for row in connection.exec_driver_sql(
+            "PRAGMA table_info(findings)"
+        ).fetchall()
+    }
+    raw_columns = tuple(
+        column
+        for column in (
+            "request_raw",
+            "response_raw",
+            "screenshot_path",
+            "console_capture_path",
+            "pcap_path",
+        )
+        if column in finding_columns
+    )
+    if not raw_columns or "id" not in finding_columns:
+        if connection.in_transaction():
+            connection.commit()
+        return 0
+    selected_columns = tuple(
+        column
+        for column in (
+            "id",
+            "tenant_id",
+            "target",
+            "url",
+            "module",
+            "verification",
+            *raw_columns,
+        )
+        if column in finding_columns
+    )
+    legacy_rows = connection.exec_driver_sql(
+        "SELECT " + ",".join(selected_columns) + " FROM findings ORDER BY id"
+    ).mappings().all()
+    if connection.in_transaction():
+        connection.commit()
+
+    from common.db import _legacy_evidence_payloads, _strip_legacy_raw_evidence
+    from common.evidence_custody import (
+        ArtifactNotFound,
+        EvidenceCustodyStore,
+    )
+
+    custody_root = _task102_database_custody_root(connection)
+    if connection.in_transaction():
+        connection.commit()
+    stores: dict[str, Any] = {}
+    migrated = 0
+    evidence_field_names = frozenset(raw_columns)
+
+    def store_for_tenant(tenant_id: str) -> Any | None:
+        if custody_root is None:
+            return None
+        store = stores.get(tenant_id)
+        if store is None:
+            store = EvidenceCustodyStore(custody_root, tenant_id)
+            stores[tenant_id] = store
+        return store
+
+    for legacy_row in legacy_rows:
+        data = dict(legacy_row)
+        direct_present = any(
+            data.get(column) not in (None, "") for column in raw_columns
+        )
+        decoded_verification: Any = None
+        verification_value = data.get("verification")
+        if isinstance(verification_value, str) and verification_value:
+            try:
+                decoded_verification = json.loads(verification_value)
+            except (TypeError, json.JSONDecodeError):
+                decoded_verification = None
+
+        payloads: list[tuple[str, bytes, str]] = [
+            (field, payload, media_type)
+            for field, payload, media_type in _legacy_evidence_payloads(data)
+        ]
+        nested_sensitive_found = False
+        visited_nodes = 0
+
+        def collect_nested(value: Any, path: tuple[str, ...] = ()) -> None:
+            nonlocal nested_sensitive_found, visited_nodes
+            visited_nodes += 1
+            if visited_nodes > 1_000 or len(path) > 8:
+                raise MigrationError(
+                    "legacy verification evidence exceeds migration bounds"
+                )
+            if isinstance(value, Mapping):
+                for raw_key, child in value.items():
+                    key = str(raw_key).strip().lower()
+                    child_path = (*path, key or "field")
+                    if key in evidence_field_names:
+                        nested_sensitive_found = True
+                        origin = ".".join(child_path)
+                        origin_token = hashlib.sha256(
+                            origin.encode("utf-8")
+                        ).hexdigest()[:12]
+                        for _field, payload, media_type in _legacy_evidence_payloads(
+                            {key: child}
+                        ):
+                            payloads.append(
+                                (
+                                    f"verification_{key}_{origin_token}",
+                                    payload,
+                                    media_type,
+                                )
+                            )
+                    else:
+                        collect_nested(child, child_path)
+            elif isinstance(value, (list, tuple)):
+                for index, child in enumerate(value):
+                    collect_nested(child, (*path, str(index)))
+
+        if isinstance(decoded_verification, (Mapping, list, tuple)):
+            collect_nested(decoded_verification)
+        if len(payloads) > 64:
+            raise MigrationError(
+                "legacy finding contains too many evidence payloads"
+            )
+        if not direct_present and not nested_sensitive_found:
+            # A legacy finding with unavailable evidence still has a valid
+            # canonical default-read projection.  Initialize its private,
+            # server-owned tenant custody namespace during migration so the
+            # dashboard read boundary never needs to create filesystem state.
+            if custody_root is not None:
+                unavailable_tenant_id = _canonical_legacy_key(
+                    data.get("tenant_id") or "default",
+                    kind="tenant",
+                    tenant_id="forge-legacy",
+                )
+                store_for_tenant(unavailable_tenant_id)
+            continue
+        if payloads and custody_root is None:
+            raise MigrationError(
+                "available legacy evidence requires a file-backed custody root"
+            )
+
+        raw_tenant = data.get("tenant_id") or "default"
+        tenant_id = _canonical_legacy_key(
+            raw_tenant,
+            kind="tenant",
+            tenant_id="forge-legacy",
+        )
+        raw_finding = data.get("id")
+        finding_id = _canonical_legacy_key(
+            raw_finding or "legacy",
+            kind="finding",
+            tenant_id=tenant_id,
+        )
+        canonical_row = connection.exec_driver_sql(
+            "SELECT f.observation_id,f.metadata_json,o.asset_id,a.display_name "
+            "FROM canonical_findings f "
+            "JOIN canonical_observations o ON o.tenant_id=f.tenant_id "
+            "AND o.id=f.observation_id "
+            "JOIN canonical_assets a ON a.tenant_id=o.tenant_id "
+            "AND a.id=o.asset_id "
+            "WHERE f.tenant_id=? AND f.id=?",
+            (tenant_id, finding_id),
+        ).mappings().one_or_none()
+        if connection.in_transaction():
+            connection.commit()
+        if canonical_row is None:
+            raise MigrationError(
+                "legacy evidence has no canonical finding observation"
+            )
+        try:
+            finding_metadata = json.loads(str(canonical_row["metadata_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise MigrationError(
+                "legacy canonical finding metadata is invalid"
+            ) from exc
+        if not isinstance(finding_metadata, Mapping) or finding_metadata.get(
+            "legacy"
+        ) is not True:
+            raise MigrationError(
+                "legacy evidence target is not migration-owned"
+            )
+
+        observation_id = str(canonical_row["observation_id"])
+        asset_id = str(canonical_row["asset_id"])
+        source_target = _legacy_text(
+            data.get("target")
+            or data.get("url")
+            or canonical_row["display_name"]
+            or "legacy-target",
+            default="legacy-target",
+            limit=2_000,
+        )
+        store = store_for_tenant(tenant_id)
+        if store is None:
+            raise MigrationError(
+                "available legacy evidence requires a file-backed custody root"
+            )
+
+        staged: list[tuple[str, Any]] = []
+        rollback_candidates: list[tuple[Any, Any]] = []
+        try:
+            for capture_kind, payload, media_type in payloads:
+                identity_seed = "\x00".join(
+                    (tenant_id, finding_id, capture_kind)
+                )
+                identity_digest = hashlib.sha256(
+                    identity_seed.encode("utf-8")
+                ).hexdigest()
+                artifact_id = f"artifact:{identity_digest[:48]}"
+                authorization_ref = (
+                    "authorization:legacy-migration:" + identity_digest[:48]
+                )
+                created_manifest = False
+                try:
+                    manifest = store.get_manifest(artifact_id)
+                except ArtifactNotFound:
+                    manifest = store.store_artifact(
+                        payload,
+                        source_observation_id=observation_id,
+                        collector_id="collector:legacy-migration",
+                        media_type=media_type,
+                        source_target=source_target,
+                        source_asset_id=asset_id,
+                        retain_original=True,
+                        protected_original_authorization_ref=authorization_ref,
+                        retention_class="legacy",
+                        metadata={
+                            "capture_kind": capture_kind,
+                            "legacy": True,
+                            "migration": "task102",
+                        },
+                        artifact_id=artifact_id,
+                    )
+                    created_manifest = True
+                else:
+                    manifest = store.verify(artifact_id)
+                    expected_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+                    if (
+                        manifest.sha256 != expected_digest
+                        or manifest.byte_size != len(payload)
+                        or manifest.tenant_id != tenant_id
+                        or manifest.source_observation_id != observation_id
+                        or manifest.source_asset_id != asset_id
+                        or manifest.collector_id != "collector:legacy-migration"
+                        or manifest.media_type != media_type
+                        or manifest.protection_state != "protected_original"
+                        or manifest.protected_original_authorization_ref
+                        != authorization_ref
+                        or manifest.metadata.get("capture_kind") != capture_kind
+                        or manifest.metadata.get("legacy") is not True
+                    ):
+                        raise MigrationError(
+                            "legacy custody artifact identity is mismatched"
+                        )
+                staged.append((capture_kind, manifest))
+                if created_manifest:
+                    rollback_candidates.append((store, manifest))
+
+            if connection.in_transaction():
+                connection.commit()
+            with connection.begin():
+                next_sequence = int(
+                    connection.exec_driver_sql(
+                        "SELECT COALESCE(MAX(sequence),-1)+1 "
+                        "FROM canonical_observation_artifacts "
+                        "WHERE tenant_id=? AND observation_id=?",
+                        (tenant_id, observation_id),
+                    ).scalar_one()
+                )
+                for capture_kind, manifest in staged:
+                    artifact_metadata = json.dumps(
+                        {
+                            "capture_kind": capture_kind,
+                            "legacy": True,
+                            "migration": "task102",
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    _insert_or_validate_legacy(
+                        connection,
+                        "canonical_artifact_refs",
+                        {
+                            "id": manifest.artifact_id,
+                            "tenant_id": tenant_id,
+                            "observation_id": observation_id,
+                            "schema_version": CANONICAL_SCHEMA_VERSION,
+                            "reference": manifest.artifact_id,
+                            "digest": manifest.sha256,
+                            "media_type": manifest.media_type,
+                            "size": manifest.byte_size,
+                            "redaction_state": manifest.redaction_state,
+                            "encryption_state": manifest.encryption_state,
+                            "collected_at": manifest.collected_at,
+                            "created_at": manifest.collected_at,
+                            "metadata_json": artifact_metadata,
+                            "collector_id": manifest.collector_id,
+                            "collector_version": "forge-legacy-migration-v1",
+                            "source_target": manifest.source_target or "unknown",
+                            "source_asset_id": manifest.source_asset_id,
+                            "redaction_version": manifest.redaction_version,
+                            "protection_state": manifest.protection_state,
+                            "signer_state": manifest.signer_state,
+                            "integrity_state": manifest.integrity_state,
+                            "retention_class": manifest.retention_class,
+                            "retention_expires_at": manifest.retention_expires_at,
+                            "protected_original_authorization_ref": (
+                                manifest.protected_original_authorization_ref
+                            ),
+                            "derivative_reference": (
+                                manifest.derivative_artifact_id
+                            ),
+                            "manifest_digest": manifest.manifest_digest,
+                        },
+                        identity_columns=("tenant_id", "id"),
+                        label="legacy custody artifact",
+                    )
+                    manifest_metadata = manifest.metadata
+                    _insert_or_validate_legacy(
+                        connection,
+                        "canonical_artifact_manifests",
+                        {
+                            "id": manifest.artifact_id,
+                            "tenant_id": tenant_id,
+                            "artifact_id": manifest.artifact_id,
+                            "observation_id": observation_id,
+                            "schema_version": manifest.schema_version,
+                            "sha256": manifest.sha256,
+                            "byte_size": manifest.byte_size,
+                            "media_type": manifest.media_type,
+                            "collected_at": manifest.collected_at,
+                            "collector_id": manifest.collector_id,
+                            "source_target": manifest.source_target,
+                            "source_asset_id": manifest.source_asset_id,
+                            "redaction_state": manifest.redaction_state,
+                            "redaction_version": manifest.redaction_version,
+                            "protection_state": manifest.protection_state,
+                            "encryption_state": manifest.encryption_state,
+                            "signer_state": manifest.signer_state,
+                            "integrity_state": manifest.integrity_state,
+                            "retention_class": manifest.retention_class,
+                            "retention_expires_at": (
+                                manifest.retention_expires_at
+                            ),
+                            "protected_original_authorization_ref": (
+                                manifest.protected_original_authorization_ref
+                            ),
+                            "original_relative_path": (
+                                manifest.original_relative_path
+                            ),
+                            "derivative_relative_path": (
+                                manifest.derivative_relative_path
+                            ),
+                            "derivative_artifact_id": (
+                                manifest.derivative_artifact_id
+                            ),
+                            "derivative_sha256": manifest.derivative_sha256,
+                            "derivative_size": manifest.derivative_size,
+                            "manifest_digest": manifest.manifest_digest,
+                            "created_at": manifest.collected_at,
+                            "metadata_json": json.dumps(
+                                manifest_metadata,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        },
+                        identity_columns=("tenant_id", "artifact_id"),
+                        label="legacy custody manifest",
+                    )
+                    existing_link = connection.exec_driver_sql(
+                        "SELECT sequence FROM canonical_observation_artifacts "
+                        "WHERE tenant_id=? AND observation_id=? AND artifact_id=?",
+                        (tenant_id, observation_id, manifest.artifact_id),
+                    ).scalar_one_or_none()
+                    sequence = (
+                        int(existing_link)
+                        if existing_link is not None
+                        else next_sequence
+                    )
+                    if existing_link is None:
+                        next_sequence += 1
+                    _insert_or_validate_legacy(
+                        connection,
+                        "canonical_observation_artifacts",
+                        {
+                            "tenant_id": tenant_id,
+                            "observation_id": observation_id,
+                            "artifact_id": manifest.artifact_id,
+                            "role": "legacy",
+                            "sequence": sequence,
+                            "created_at": manifest.collected_at,
+                            "metadata_json": json.dumps(
+                                {
+                                    "legacy": True,
+                                    "manifest_digest": manifest.manifest_digest,
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                        },
+                        identity_columns=(
+                            "tenant_id",
+                            "observation_id",
+                            "artifact_id",
+                        ),
+                        label="legacy observation artifact",
+                    )
+
+                assignments = [f"{column}=NULL" for column in raw_columns]
+                parameters: list[Any] = []
+                if "verification" in finding_columns:
+                    sanitized_verification: Any = {}
+                    if isinstance(decoded_verification, (Mapping, list, tuple)):
+                        sanitized_verification = _strip_legacy_raw_evidence(
+                            decoded_verification
+                        )
+                    assignments.append("verification=?")
+                    parameters.append(
+                        json.dumps(
+                            sanitized_verification,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=True,
+                        )
+                    )
+                parameters.append(raw_finding)
+                where = "id=?"
+                if "tenant_id" in finding_columns:
+                    where += " AND tenant_id=?"
+                    parameters.append(data.get("tenant_id") or "default")
+                result = connection.exec_driver_sql(
+                    "UPDATE findings SET "
+                    + ",".join(assignments)
+                    + " WHERE "
+                    + where,
+                    tuple(parameters),
+                )
+                if result.rowcount != 1:
+                    raise MigrationError(
+                        "legacy evidence mutable-row clearing failed"
+                    )
+            migrated += 1
+        except Exception as exc:
+            if connection.in_transaction():
+                connection.rollback()
+            rollback_errors: list[Exception] = []
+            for staged_store, manifest in reversed(rollback_candidates):
+                try:
+                    staged_store.rollback_artifact(
+                        manifest.artifact_id,
+                        expected_manifest_digest=manifest.manifest_digest,
+                    )
+                except Exception as rollback_exc:
+                    rollback_errors.append(rollback_exc)
+            if rollback_errors:
+                raise MigrationError(
+                    "legacy evidence migration rollback did not complete"
+                ) from rollback_errors[0]
+            raise
+    return migrated
+
+
+def _reconcile_task102_postmigration(connection: Connection) -> None:
+    """Replay every idempotent Task 102 repair and custody successor."""
+    with connection.begin():
+        _audit_existing_canonical_rows(connection)
+        # Complete additive v2 repair before SQLite reparses every trigger
+        # during the finding-table CHECK rebuild.
+        _task102_schema_repair(connection)
+    _expand_task102_finding_status_constraint(connection)
+    with connection.begin():
+        _task102_schema_repair(connection)
+        _audit_existing_canonical_rows(connection)
+        for statement in _runtime_guard_sql():
+            connection.exec_driver_sql(statement)
+    _task102_migrate_legacy_evidence(connection)
+    with connection.begin():
+        _audit_existing_canonical_rows(connection)
 
 
 def _table_sql() -> tuple[str, ...]:
@@ -3301,7 +4019,7 @@ def _evidence_table_sql() -> tuple[str, ...]:
             metadata_json TEXT NOT NULL DEFAULT '{}',
             PRIMARY KEY(tenant_id, observation_id, artifact_id),
             FOREIGN KEY(tenant_id, observation_id) REFERENCES canonical_observations(tenant_id, id) ON DELETE RESTRICT,
-            FOREIGN KEY(tenant_id, artifact_id) REFERENCES canonical_artifact_refs(tenant_id, id) ON DELETE RESTRICT
+            FOREIGN KEY(tenant_id, artifact_id, observation_id) REFERENCES canonical_artifact_refs(tenant_id, id, observation_id) ON DELETE RESTRICT
         )
         """,
         """
@@ -3318,7 +4036,7 @@ def _evidence_table_sql() -> tuple[str, ...]:
             PRIMARY KEY(tenant_id, finding_id, observation_id),
             FOREIGN KEY(tenant_id, finding_id) REFERENCES canonical_findings(tenant_id, id) ON DELETE RESTRICT,
             FOREIGN KEY(tenant_id, observation_id) REFERENCES canonical_observations(tenant_id, id) ON DELETE RESTRICT,
-            FOREIGN KEY(tenant_id, artifact_id) REFERENCES canonical_artifact_refs(tenant_id, id) ON DELETE RESTRICT
+            FOREIGN KEY(tenant_id, artifact_id, observation_id) REFERENCES canonical_artifact_refs(tenant_id, id, observation_id) ON DELETE RESTRICT
         )
         """,
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_canonical_finding_dedup ON canonical_findings(tenant_id, dedup_key) WHERE dedup_key IS NOT NULL",
@@ -3386,11 +4104,11 @@ def _evidence_table_sql() -> tuple[str, ...]:
           OR NEW.derivative_reference IS NOT OLD.derivative_reference
           OR NEW.metadata_json IS NOT OLD.metadata_json
           OR NOT (OLD.manifest_digest IS NULL AND NEW.manifest_digest IS NOT NULL
-            AND length(NEW.manifest_digest)=71
-            AND substr(NEW.manifest_digest,1,7)='sha256:'
-            AND NEW.manifest_digest GLOB 'sha256:*')
+            AND ({manifest_digest_guard}))
         BEGIN SELECT RAISE(ABORT, 'canonical artifact references are immutable'); END
-        """,
+        """.format(
+            manifest_digest_guard=_sha256_guard("NEW.manifest_digest")
+        ),
         """
         CREATE TRIGGER IF NOT EXISTS canonical_artifact_refs_append_only_delete
         BEFORE DELETE ON canonical_artifact_refs
@@ -3477,6 +4195,10 @@ def _evidence_table_sql() -> tuple[str, ...]:
           OR NOT EXISTS(
           SELECT 1 FROM canonical_observations o
           WHERE o.tenant_id=NEW.tenant_id AND o.id=NEW.observation_id)
+          OR (NEW.artifact_id IS NOT NULL AND NOT EXISTS(
+          SELECT 1 FROM canonical_artifact_refs a
+          WHERE a.tenant_id=NEW.tenant_id AND a.id=NEW.artifact_id
+            AND a.observation_id=NEW.observation_id))
         BEGIN SELECT RAISE(ABORT, 'finding observation tenant lineage mismatch'); END
         """,
     )
@@ -3701,12 +4423,13 @@ class MigrationManager:
             if connection.in_transaction():
                 connection.commit()
             if CANONICAL_SCHEMA_VERSION in applied:
-                with connection.begin():
-                    _audit_existing_canonical_rows(connection)
-                    if EVIDENCE_SCHEMA_VERSION in applied:
-                        _task102_schema_repair(connection)
-                    for statement in _runtime_guard_sql():
-                        connection.exec_driver_sql(statement)
+                if EVIDENCE_SCHEMA_VERSION in applied:
+                    _reconcile_task102_postmigration(connection)
+                else:
+                    with connection.begin():
+                        _audit_existing_canonical_rows(connection)
+                        for statement in _runtime_guard_sql():
+                            connection.exec_driver_sql(statement)
             return self.current_version()
         finally:
             if owned:
@@ -3788,12 +4511,14 @@ class MigrationManager:
             }
             if connection.in_transaction():
                 connection.commit()
-            with connection.begin():
-                _audit_existing_canonical_rows(connection)
-                if target == EVIDENCE_SCHEMA_VERSION or evidence_applied:
-                    _task102_schema_repair(connection)
-                for statement in _runtime_guard_sql():
-                    connection.exec_driver_sql(statement)
+            evidence_boundary = target == EVIDENCE_SCHEMA_VERSION or evidence_applied
+            if evidence_boundary:
+                _reconcile_task102_postmigration(connection)
+            else:
+                with connection.begin():
+                    _audit_existing_canonical_rows(connection)
+                    for statement in _runtime_guard_sql():
+                        connection.exec_driver_sql(statement)
             return self.current_version()
         finally:
             if owned:
@@ -3815,6 +4540,41 @@ class MigrationManager:
             if connection.in_transaction():
                 connection.commit()
             keep = set(self.versions[: self.versions.index(target) + 1]) if target else set()
+            removing = {str(row[0]) for row in rows} - keep
+            if EVIDENCE_SCHEMA_VERSION in removing:
+                evidence_tables = (
+                    "canonical_artifact_manifests",
+                    "canonical_observation_artifacts",
+                    "canonical_finding_observations",
+                    "canonical_evidence_access_audit",
+                )
+                present_tables = {
+                    str(row[0])
+                    for row in connection.exec_driver_sql(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if not set(evidence_tables) <= present_tables:
+                    if connection.in_transaction():
+                        connection.rollback()
+                    raise MigrationError(
+                        "evidence schema downgrade encountered incomplete state"
+                    )
+                retained_lineage = any(
+                    int(
+                        connection.exec_driver_sql(
+                            f"SELECT COUNT(*) FROM {table}"
+                        ).scalar_one()
+                    )
+                    > 0
+                    for table in evidence_tables
+                )
+                if connection.in_transaction():
+                    connection.rollback()
+                if retained_lineage:
+                    raise MigrationError(
+                        "evidence schema downgrade would break retained canonical lineage"
+                    )
             for row in rows:
                 version = str(row[0])
                 if version in keep:

@@ -3,13 +3,17 @@ from __future__ import annotations
 
 import math
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, TypedDict
 
 from common.confidence_policy import normalise_finding
-from common.evidence import Evidence  # noqa: F401 — re-exported for callers
+from common.evidence import (  # noqa: F401 — Evidence is re-exported for callers
+    Evidence,
+    ordinary_evidence_projection,
+)
 from common.redaction import redact_value
 
 
@@ -64,6 +68,7 @@ class Finding:
     proof_type:          str                     = "unknown"
     maturity:            str                     = "experimental"
     verification_state:  str                     = "unknown"
+    _canonical_evidence: dict[str, Any] | None    = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.cvss_v31_score is None and self.cvss_v31_vector:
@@ -90,9 +95,31 @@ class Finding:
         self.maturity = truth["maturity"]
         self.verification = truth["verification"]
 
+    def bind_canonical_evidence(self, projection: dict[str, Any]) -> None:
+        """Bind the persisted, ordinary-consumer evidence projection.
+
+        Raw capture fields and local paths can never be rebound onto a finding,
+        even by a compatibility caller.
+        """
+        if not isinstance(projection, dict) or projection.get("state") != "persisted":
+            raise ValueError("canonical evidence projection must be persisted")
+        validated = ordinary_evidence_projection(projection)
+        if validated.get("finding_id") != self.id:
+            raise ValueError("canonical evidence projection belongs to another finding")
+        self._canonical_evidence = deepcopy(validated)
+
+    @property
+    def canonical_evidence(self) -> dict[str, Any] | None:
+        return deepcopy(self._canonical_evidence)
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a plain dict for JSON export."""
-        return redact_value(normalise_finding({
+        canonical_evidence = (
+            deepcopy(self._canonical_evidence)
+            if self._canonical_evidence is not None
+            else None
+        )
+        payload = normalise_finding({
             "id":                  self.id,
             "title":               self.title,
             "severity":            self.severity.value,
@@ -122,15 +149,20 @@ class Finding:
             "verification_state":  self.verification_state,
             "proof_type":          self.proof_type,
             "maturity":            self.maturity,
-            "evidence": {
-                "request_raw":          self.evidence.request_raw,
-                "response_raw":         self.evidence.response_raw,
-                "screenshot_path":      self.evidence.screenshot_path,
-                "console_capture_path": self.evidence.console_capture_path,
-                "pcap_path":            self.evidence.pcap_path,
-                "extra":                self.evidence.extra,
-            },
-        }))
+            "evidence": canonical_evidence
+            if canonical_evidence is not None
+            else self.evidence.to_dict(),
+        })
+        rendered = redact_value(payload)
+        if not isinstance(rendered, dict):
+            raise ValueError("finding serialization failed")
+        if canonical_evidence is not None:
+            # The evidence projection was already structurally validated and
+            # free-form derivatives were centrally redacted.  Preserve its
+            # verified digest references instead of treating hashes as secret
+            # material during the generic finding redaction pass.
+            rendered["evidence"] = canonical_evidence
+        return rendered
 
 
 # ── CVSS 3.1 Base Score Calculator ───────────────────────────────────────────

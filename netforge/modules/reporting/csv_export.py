@@ -14,7 +14,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
-from common.finding import Finding
+from common.evidence import ordinary_finding_projection
 
 
 # All columns we export — ordered for readability in Excel/Sheets
@@ -31,12 +31,7 @@ _CSV_FIELDS = [
 
 def _finding_to_row(f: Any) -> dict:
     """Convert a Finding or dict to a flat CSV-ready dict."""
-    if isinstance(f, dict):
-        d = f
-    elif hasattr(f, "to_dict"):
-        d = f.to_dict()
-    else:
-        d = {"title": str(getattr(f, "title", "")), "severity": "Informational"}
+    d = ordinary_finding_projection(f)
 
     # Flatten list fields to semicolon-separated strings
     for key in ("mitre_attack", "references", "tags", "reproduction_steps"):

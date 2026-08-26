@@ -495,31 +495,18 @@ class TestAgentControlPlane(unittest.IsolatedAsyncioTestCase):
 class TestFindingStatusPersistence(unittest.IsolatedAsyncioTestCase):
     async def test_dashboard_status_patch_updates_persisted_finding(self):
         from common.dashboard.server import DashboardServer
-        from common.db import FindingModel, create_db, save_finding
+        from common.db import create_db
+        from sqlalchemy import text
+        from tests.test_scanbuilder_module_mapping import (
+            _seed_canonical_dashboard_finding,
+        )
 
         srv = DashboardServer(auth=False)
         app = srv.create_app()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            db_path = Path(tmpdir) / "scan_jobs.db"
-            session = create_db(db_path)
-            try:
-                save_finding(
-                    session,
-                    {
-                        "id": "finding-1",
-                        "title": "Stored Finding",
-                        "severity": "High",
-                        "target": "https://example.test",
-                        "module": "header_audit",
-                        "description": "Stored finding",
-                        "evidence": {},
-                    },
-                    run_id="run-1",
-                    allow_legacy_compat=True,
-                )
-            finally:
-                session.close()
+            tmp_path = Path(tmpdir)
+            db_path = tmp_path / "scan_jobs.db"
 
             with patch.object(
                 DashboardServer,
@@ -527,18 +514,38 @@ class TestFindingStatusPersistence(unittest.IsolatedAsyncioTestCase):
                 new_callable=PropertyMock,
                 return_value=db_path,
             ):
+                canonical_id = _seed_canonical_dashboard_finding(
+                    srv,
+                    db_path,
+                    tmp_path,
+                    finding_id="finding-1",
+                    module="header_audit",
+                    target="https://example.test/",
+                    title="Stored Finding",
+                )
                 async with _make_async_client(app) as client:
                     resp = await client.patch(
-                        "/api/v1/findings/finding-1/status",
+                        f"/api/v1/findings/{canonical_id}/status",
                         json={"status": "False Positive"},
                     )
-
-            session = create_db(db_path)
-            try:
-                row = session.query(FindingModel).filter_by(id="finding-1").one()
-                persisted_status = row.status
-            finally:
-                session.close()
+                canonical_db = srv._canonical_database_paths(
+                    srv._canonical_result_roots()[0]
+                )[0]
+                session = create_db(canonical_db)
+                try:
+                    persisted_status = session.execute(
+                        text(
+                            "SELECT status FROM canonical_findings "
+                            "WHERE tenant_id=:tenant_id AND id=:finding_id"
+                        ),
+                        {
+                            "tenant_id": srv.tenant_id,
+                            "finding_id": canonical_id,
+                        },
+                    ).scalar_one()
+                    session.rollback()
+                finally:
+                    session.close()
 
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertTrue(resp.json()["persisted"])

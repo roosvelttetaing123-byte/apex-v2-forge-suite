@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
+from common.evidence import ordinary_finding_projection
 
 COLUMNS = ["id", "title", "severity", "cvss_score", "cvss_vector", "target",
            "module", "port", "service", "description", "remediation",
@@ -17,6 +18,7 @@ COLUMNS = ["id", "title", "severity", "cvss_score", "cvss_vector", "target",
 
 
 def findings_to_csv(findings: list[dict]) -> str:
+    findings = [ordinary_finding_projection(finding) for finding in findings]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=COLUMNS, extrasaction="ignore")
     writer.writeheader()

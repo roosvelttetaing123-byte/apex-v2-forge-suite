@@ -10,6 +10,7 @@ from xml.dom import minidom
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
+from common.evidence import ordinary_finding_projection
 
 _BURP_SEVERITY = {
     "Critical": "High",
@@ -28,6 +29,7 @@ _BURP_CONFIDENCE = {
 
 
 def findings_to_burp_xml(findings: list[dict], target: str) -> str:
+    findings = [ordinary_finding_projection(finding) for finding in findings]
     root = ET.Element("issues", burpVersion="2024.x", exportTime=__import__("datetime").datetime.utcnow().isoformat())
     for f in findings:
         sev = f.get("severity", "Informational")

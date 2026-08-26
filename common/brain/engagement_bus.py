@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine
 
 from common.confidence_policy import normalise_finding
+from common.evidence import ordinary_finding_projection
 
 log = logging.getLogger("forge.brain.engagement_bus")
 
@@ -667,21 +668,27 @@ class EngagementBus:
     async def publish(self, framework: str, finding: dict[str, Any]) -> str:
         """Publish a finding from any framework.
 
-        Stores in SQLite, notifies subscribers, detects chains,
-        and optionally triggers brain analysis and planner.
+        Projects to the ordinary persisted-evidence boundary, stores in SQLite,
+        notifies subscribers, detects chains, and optionally triggers brain
+        analysis and planner.
 
         Args:
             framework: Source framework (netforge/webforge/adforge/aiforge).
-            finding:   Finding dict (from Finding.to_dict() or raw dict).
+            finding:   Finding dict from a canonical or compatibility producer.
 
         Returns:
             The finding ID.
         """
-        confidence_fields = normalise_finding(finding)
-        finding["confidence"] = confidence_fields["confidence"]
-        if "evidence" in confidence_fields:
-            finding["evidence"] = confidence_fields["evidence"]
-        finding["verification"] = confidence_fields["verification"]
+        normalized = normalise_finding(dict(finding))
+        projected = ordinary_finding_projection(normalized)
+        verification = normalized.get("verification")
+        if isinstance(verification, dict):
+            # Verification remains workflow metadata, but caller-controlled
+            # probe/evidence structures do not cross this ordinary boundary.
+            projected["verification"] = {
+                "confidence": normalized["confidence"],
+            }
+        finding = normalise_finding(projected)
 
         # Store
         finding_id = self._store.store_finding(framework, finding)

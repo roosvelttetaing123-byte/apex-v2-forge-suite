@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -35,6 +36,145 @@ def _web_launch_contract(job_id: str, target: str = "http://127.0.0.1:8080") -> 
             action="scan",
         ).to_dict(),
     }
+
+
+def _seed_canonical_dashboard_finding(
+    server,
+    scan_jobs_db: Path,
+    tmp_path: Path,
+    *,
+    finding_id: str,
+    module: str,
+    target: str,
+    title: str,
+) -> str:
+    from common.action_authorization import (
+        AuthorizationContext,
+        ConfirmationMethod,
+        OperatorRole,
+        SafetyMode,
+        consume_authorization,
+        issue_authorization,
+    )
+    from common.canonical_evidence import (
+        CanonicalEvidenceContext,
+        CanonicalEvidenceService,
+    )
+    from common.db import ScanJobModel, create_db
+    from common.evidence import Evidence
+    from common.finding import Finding, Severity
+
+    scan_id = f"canonical-source-{finding_id}"
+    server._scan_results_dir = tmp_path / "scan-results"
+    server._scan_results_dir.mkdir(mode=0o700)
+    result_root = server._allocate_scan_results_dir(scan_id)
+    authorization_context = AuthorizationContext(
+        tenant_id=server.tenant_id,
+        engagement_id="engagement-retest-fixture",
+        run_id="run-retest-fixture",
+        job_id=scan_id,
+        operator_id="operator-retest-fixture",
+        operator_role=OperatorRole.OPERATOR,
+        engine="webforge",
+        module_id=module,
+        action_kind="module.execute",
+        requested_target=target,
+        resolved_target=target,
+        allowed_scope=[target],
+        excluded_scope=[],
+        scope_policy_version="scope-policy-v1",
+        safety_mode=SafetyMode.ACTIVE,
+        confirmation_method=ConfirmationMethod.CLI_PROMPT,
+        confirmed_by="operator-retest-fixture",
+    )
+    scan_session = create_db(scan_jobs_db)
+    try:
+        issued = issue_authorization(
+            session=scan_session,
+            context=authorization_context,
+            confirmation=ActionConfirmation.create(
+                job_id=scan_id,
+                target=target,
+                engine="webforge",
+                action="module.execute",
+            ),
+        )
+        assert issued.allowed is True
+        consumed = consume_authorization(
+            session=scan_session,
+            envelope=issued.envelope,
+            expected=authorization_context,
+            boundary="webforge.module",
+        )
+        assert consumed.allowed is True
+        scan_session.add(
+            ScanJobModel(
+                id=scan_id,
+                tenant_id=server.tenant_id,
+                status="completed",
+                target=target,
+                frameworks=json.dumps(["webforge"]),
+                modules=json.dumps([module]),
+                results_dir=str(result_root),
+                logs=json.dumps({}),
+                authorization_state="allow",
+                authorization_decision_id=issued.envelope.decision_id,
+                authorization_action_id=issued.envelope.action_id,
+            )
+        )
+        scan_session.commit()
+    finally:
+        scan_bind = scan_session.bind
+        scan_session.close()
+        if scan_bind is not None:
+            scan_bind.dispose()
+    context = CanonicalEvidenceContext.from_authorization(issued.envelope)
+    finding_session = create_db(result_root / "webforge.db")
+    try:
+        projection = CanonicalEvidenceService(
+            finding_session,
+            result_root / "evidence-custody",
+            context,
+        ).persist_finding(
+            Finding(
+                id=finding_id,
+                title=title,
+                severity=Severity.HIGH,
+                target=target,
+                url=target,
+                module=module,
+                description="Persisted canonical retest fixture.",
+                reproduction_steps=["Inspect the deterministic fixture."],
+                remediation="Apply the fixture remediation.",
+                references=[],
+                confidence="HIGH",
+                evidence=Evidence(
+                    extra={
+                        "route": "/",
+                        "check_id": module,
+                    }
+                ),
+            )
+        )
+    finally:
+        finding_bind = finding_session.bind
+        finding_session.close()
+        if finding_bind is not None:
+            finding_bind.dispose()
+
+    connection = sqlite3.connect(scan_jobs_db)
+    try:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute("PRAGMA journal_mode=DELETE")
+    finally:
+        connection.close()
+    assert server._canonical_result_roots() == [result_root]
+    canonical_id = str(projection["id"])
+    assert server._find_finding_metadata(
+        canonical_id,
+        actor_id="scanbuilder-test",
+    ) is not None
+    return canonical_id
 
 
 class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
@@ -171,30 +311,11 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                 session.close()
 
     async def test_retest_finding_without_canonical_lineage_fails_before_dry_run_persistence(self):
-        from common.dashboard.event_bus import Event, EventType
         from common.dashboard.server import DashboardServer
         from common.db import FindingRetestModel, create_db
 
         srv = DashboardServer(auth=False)
         app = srv.create_app()
-        srv.state_store._on_finding(
-            Event(
-                EventType.FINDING_NEW,
-                source="sqli_scanner",
-                data={
-                    "id": "finding-123",
-                    "title": "SQL Injection",
-                    "severity": "High",
-                    "module": "sqli_scanner",
-                    "target": "http://127.0.0.1:8080",
-                    "url": "http://127.0.0.1:8080/login?id=1",
-                    "description": "Time delay observed",
-                    "confidence": "HIGH",
-                    "evidence": {"request_raw": "GET /login?id=1"},
-                    "verification": {"param": "id", "payload_class": "time-based-sqli"},
-                },
-            )
-        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -221,9 +342,18 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                 patch.object(DashboardServer, "_track_scan_process"),
                 patch("subprocess.Popen", return_value=mock_proc) as mock_popen,
             ):
+                canonical_id = _seed_canonical_dashboard_finding(
+                    srv,
+                    scan_jobs_db,
+                    tmp_path,
+                    finding_id="finding-123",
+                    module="sqli_scanner",
+                    target="http://127.0.0.1:8080/login?id=1",
+                    title="SQL Injection",
+                )
                 async with _make_async_client(app) as client:
                     resp = await client.post(
-                        "/api/v1/findings/finding-123/retest",
+                        f"/api/v1/findings/{canonical_id}/retest",
                         json={
                             "job_id": "retest-dry-plan",
                             "scope": ["127.0.0.1/32"],
@@ -245,26 +375,12 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                 session.close()
 
     async def test_active_retest_without_canonical_lineage_fails_closed(self):
-        from common.dashboard.event_bus import Event, EventType
         from common.dashboard.server import DashboardServer
 
-        target = "http://127.0.0.1:8080"
+        target = "http://127.0.0.1:8080/"
         job_id = "retest-active"
         srv = DashboardServer(auth=False)
         app = srv.create_app()
-        srv.state_store._on_finding(
-            Event(
-                EventType.FINDING_NEW,
-                source="header_audit",
-                data={
-                    "id": "finding-active-retest",
-                    "title": "Header Missing",
-                    "severity": "Low",
-                    "module": "header_audit",
-                    "target": target,
-                },
-            )
-        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -284,9 +400,18 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                 patch.object(DashboardServer, "_track_scan_process"),
                 patch("subprocess.Popen", return_value=process) as popen,
             ):
+                canonical_id = _seed_canonical_dashboard_finding(
+                    srv,
+                    tmp_path / "scan_jobs.db",
+                    tmp_path,
+                    finding_id="finding-active-retest",
+                    module="header_audit",
+                    target=target,
+                    title="Header Missing",
+                )
                 async with _make_async_client(app) as client:
                     response = await client.post(
-                        "/api/v1/findings/finding-active-retest/retest",
+                        f"/api/v1/findings/{canonical_id}/retest",
                         json={
                             "job_id": job_id,
                             "scope": ["127.0.0.1/32"],

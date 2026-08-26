@@ -15,7 +15,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
-from common.evidence import Evidence
+from common.evidence import Evidence, ordinary_finding_projection
 from common.finding import Severity
 from common.version import VERSION
 
@@ -40,7 +40,10 @@ class PdfReport(BaseModule):
     async def run(self) -> ModuleResult:
         start = time.monotonic()
 
-        all_findings: list[dict[str, Any]] = self.config.extra.get("all_findings", [])
+        all_findings = [
+            ordinary_finding_projection(finding)
+            for finding in self.config.extra.get("all_findings", [])
+        ]
         if not all_findings:
             self.log.info("No findings to report")
             return self._make_result(start, skipped=True, skip_reason="no findings")
@@ -70,6 +73,9 @@ class PdfReport(BaseModule):
         return self._make_result(start)
 
     def _generate_reportlab(self, findings: list[dict[str, Any]], output: Path) -> None:
+        findings = [
+            ordinary_finding_projection(finding) for finding in findings
+        ]
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -91,7 +97,7 @@ class PdfReport(BaseModule):
         body_style = styles["BodyText"]
         small_style = ParagraphStyle("Small", parent=body_style, fontSize=8, textColor=colors.grey)
 
-        target = self.config.target
+        target = html.escape(str(self.config.target))
         scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         severity_counts = {s: 0 for s in SEVERITY_ORDER}
@@ -149,30 +155,34 @@ class PdfReport(BaseModule):
 
             story.append(Paragraph(
                 f'<font color="#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}">'
-                f"[{sev}]</font> {i}. {f.get('title', 'Untitled')}",
+                f"[{html.escape(str(sev))}]</font> {i}. "
+                f"{html.escape(str(f.get('title', 'Untitled')))}",
                 ParagraphStyle("FindingTitle", parent=styles["Heading3"], fontSize=11),
             ))
 
-            story.append(Paragraph(f"<b>Module:</b> {f.get('module', 'N/A')}", body_style))
+            story.append(Paragraph(
+                f"<b>Module:</b> {html.escape(str(f.get('module', 'N/A')))}",
+                body_style,
+            ))
 
             cvss31 = f.get("cvss_v31_score")
             cvss40 = f.get("cvss_v40_score")
             if cvss31 or cvss40:
                 cvss_parts = []
                 if cvss31:
-                    cvss_parts.append(f"CVSS 3.1: {cvss31}")
+                    cvss_parts.append(f"CVSS 3.1: {html.escape(str(cvss31))}")
                 if cvss40:
-                    cvss_parts.append(f"CVSS 4.0: {cvss40}")
+                    cvss_parts.append(f"CVSS 4.0: {html.escape(str(cvss40))}")
                 story.append(Paragraph(f"<b>Score:</b> {' | '.join(cvss_parts)}", body_style))
 
-            desc = f.get("description", "")[:800]
+            desc = html.escape(str(f.get("description", ""))[:800])
             story.append(Paragraph(f"<b>Description:</b> {desc}", body_style))
 
-            remed = f.get("remediation", "")
+            remed = html.escape(str(f.get("remediation", "")))
             if remed:
                 story.append(Paragraph(f"<b>Remediation:</b> {remed}", body_style))
 
-            refs = f.get("references", [])
+            refs = [html.escape(str(ref)) for ref in f.get("references", [])]
             if refs:
                 story.append(Paragraph(f"<b>References:</b> {', '.join(refs)}", body_style))
 
@@ -187,6 +197,9 @@ class PdfReport(BaseModule):
 
     def _generate_text_fallback(self, findings: list[dict[str, Any]], output: Path) -> None:
         """Plain-text fallback when ReportLab is not available."""
+        findings = [
+            ordinary_finding_projection(finding) for finding in findings
+        ]
         target = self.config.target
         scan_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 

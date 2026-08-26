@@ -1,6 +1,7 @@
 """HTML report generator — self-contained HTML from findings list."""
 from __future__ import annotations
 
+from html import escape
 import sys
 import time
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
+from common.evidence import ordinary_evidence_artifacts, ordinary_finding_projection
 from common.finding import Finding, Severity
 
 SEVERITY_COLORS = {
@@ -30,15 +32,18 @@ def _sev_badge(sev: Severity) -> str:
     color = SEVERITY_COLORS.get(sev, "#999")
     return (
         f'<span style="background:{color};color:#fff;padding:2px 8px;'
-        f'border-radius:3px;font-size:0.85em;font-weight:bold;">{sev.value}</span>'
+        f'border-radius:3px;font-size:0.85em;font-weight:bold;">{escape(sev.value)}</span>'
     )
 
 
-def _count_by_severity(findings: list[Finding]) -> dict[str, int]:
-    counts: dict[str, int] = {s.value: 0 for s in SEVERITY_ORDER}
-    for f in findings:
-        counts[f.severity.value] = counts.get(f.severity.value, 0) + 1
-    return counts
+def _format_discovered(value: object) -> str:
+    rendered = str(value) if value is not None else "N/A"
+    try:
+        return datetime.fromisoformat(rendered).astimezone(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M UTC"
+        )
+    except ValueError:
+        return rendered
 
 
 def generate_html(
@@ -49,9 +54,13 @@ def generate_html(
     assessor: str = "WebForge",
 ) -> str:
     """Generate self-contained HTML report string from findings list."""
+    projected_findings = [ordinary_finding_projection(finding) for finding in findings]
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    counts = _count_by_severity(findings)
-    total = len(findings)
+    counts: dict[str, int] = {s.value: 0 for s in SEVERITY_ORDER}
+    for finding in projected_findings:
+        severity = str(finding.get("severity", Severity.INFORMATIONAL.value))
+        counts[severity] = counts.get(severity, 0) + 1
+    total = len(projected_findings)
 
     # Executive summary rows
     exec_rows = "".join(
@@ -62,60 +71,74 @@ def generate_html(
 
     # Sort findings by severity then title
     sorted_findings = sorted(
-        findings,
-        key=lambda f: (SEVERITY_ORDER.index(f.severity), f.title),
+        projected_findings,
+        key=lambda f: (
+            SEVERITY_ORDER.index(
+                Severity(
+                    str(f.get("severity", Severity.INFORMATIONAL.value))
+                )
+            ),
+            str(f.get("title", "")),
+        ),
     )
 
     detail_blocks = []
     for idx, f in enumerate(sorted_findings, 1):
+        severity = str(f.get("severity", Severity.INFORMATIONAL.value))
+        severity_enum = Severity(severity)
         repro_html = "".join(
-            f"<li>{step}</li>" for step in (f.reproduction_steps or [])
+            f"<li>{escape(str(step))}</li>"
+            for step in (f.get("reproduction_steps") or [])
         )
         refs_html = "".join(
-            f'<li><a href="{r}" style="color:#1a73e8">{r}</a></li>'
-            if r.startswith("http") else f"<li>{r}</li>"
-            for r in (f.references or [])
+            f'<li><a href="{escape(str(r), quote=True)}" style="color:#1a73e8">{escape(str(r))}</a></li>'
+            if str(r).startswith("http") else f"<li>{escape(str(r))}</li>"
+            for r in (f.get("references") or [])
         )
-        mitre_html = ", ".join(f.mitre_attack) if f.mitre_attack else "N/A"
+        mitre_html = ", ".join(
+            escape(str(item)) for item in (f.get("mitre_attack") or [])
+        ) or "N/A"
         cvss_str = (
-            f"{f.cvss_v31_vector} (Score: {f.cvss_v31_score})"
-            if f.cvss_v31_vector else "N/A"
+            f"{escape(str(f.get('cvss_v31_vector')))} (Score: {escape(str(f.get('cvss_v31_score')))})"
+            if f.get("cvss_v31_vector") else "N/A"
         )
-        screenshot = ""
-        if f.evidence and f.evidence.screenshot_path:
-            screenshot = (
-                f'<p><b>Screenshot:</b><br>'
-                f'<img src="{f.evidence.screenshot_path}" style="max-width:100%;border:1px solid #ddd;" /></p>'
-            )
-        evidence_extra = ""
-        if f.evidence and f.evidence.extra:
-            items = "".join(
-                f"<li><b>{k}:</b> {v}</li>"
-                for k, v in f.evidence.extra.items()
-            )
-            evidence_extra = f"<ul>{items}</ul>"
+        evidence_items = []
+        for artifact in ordinary_evidence_artifacts(f.get("evidence")):
+            kind = escape(str(artifact.get("capture_kind", "evidence")))
+            media_type = escape(str(artifact.get("media_type", "unknown")))
+            derivative = str(artifact.get("derivative", ""))
+            if str(artifact.get("media_type", "")).startswith(("text/", "application/json", "application/xml")):
+                evidence_items.append(
+                    f"<li><b>{kind}</b> ({media_type}): "
+                    f"{escape(derivative)}</li>"
+                )
+            else:
+                evidence_items.append(
+                    f"<li><b>{kind}</b> ({media_type}): binary derivative receipt</li>"
+                )
+        evidence_html = f"<ul>{''.join(evidence_items)}</ul>" if evidence_items else ""
+        discovered = escape(_format_discovered(f.get("discovered_at")))
 
         detail_blocks.append(f"""
         <div style="border:1px solid #ddd;border-radius:6px;margin:18px 0;padding:18px;background:#fafafa;">
-          <h3 style="margin:0 0 8px 0;">#{idx} — {f.title} &nbsp;{_sev_badge(f.severity)}</h3>
+          <h3 style="margin:0 0 8px 0;">#{idx} — {escape(str(f.get("title", "")))} &nbsp;{_sev_badge(severity_enum)}</h3>
           <table style="width:100%;font-size:0.9em;border-collapse:collapse;">
-            <tr><td style="width:150px;color:#555;padding:4px 0"><b>Finding ID</b></td><td>{f.id}</td></tr>
-            <tr><td style="color:#555;padding:4px 0"><b>Target</b></td><td>{f.target}</td></tr>
-            <tr><td style="color:#555;padding:4px 0"><b>Module</b></td><td>{f.module}</td></tr>
+            <tr><td style="width:150px;color:#555;padding:4px 0"><b>Finding ID</b></td><td>{escape(str(f.get("id", "")))}</td></tr>
+            <tr><td style="color:#555;padding:4px 0"><b>Target</b></td><td>{escape(str(f.get("target", "")))}</td></tr>
+            <tr><td style="color:#555;padding:4px 0"><b>Module</b></td><td>{escape(str(f.get("module", "")))}</td></tr>
             <tr><td style="color:#555;padding:4px 0"><b>CVSS 3.1</b></td><td>{cvss_str}</td></tr>
             <tr><td style="color:#555;padding:4px 0"><b>MITRE ATT&amp;CK</b></td><td>{mitre_html}</td></tr>
-            <tr><td style="color:#555;padding:4px 0"><b>Discovered</b></td><td>{f.discovered_at.strftime("%Y-%m-%d %H:%M UTC")}</td></tr>
+            <tr><td style="color:#555;padding:4px 0"><b>Discovered</b></td><td>{discovered}</td></tr>
           </table>
           <h4 style="margin:14px 0 4px 0">Description</h4>
-          <p style="margin:0;white-space:pre-wrap">{f.description}</p>
+          <p style="margin:0;white-space:pre-wrap">{escape(str(f.get("description", "")))}</p>
           <h4 style="margin:14px 0 4px 0">Reproduction Steps</h4>
           <ol>{repro_html}</ol>
           <h4 style="margin:14px 0 4px 0">Remediation</h4>
-          <p style="margin:0;background:#e8f5e9;padding:10px;border-radius:4px">{f.remediation}</p>
+          <p style="margin:0;background:#e8f5e9;padding:10px;border-radius:4px">{escape(str(f.get("remediation", "")))}</p>
           <h4 style="margin:14px 0 4px 0">References</h4>
           <ul>{refs_html}</ul>
-          {screenshot}
-          {evidence_extra}
+          {evidence_html}
         </div>""")
 
     details_html = "\n".join(detail_blocks)
@@ -138,8 +161,8 @@ def generate_html(
 <body>
 <div class="page">
   <h1>WebForge Security Assessment Report</h1>
-  <p style="color:#555">Target: <b>{target}</b> &nbsp;|&nbsp; Generated: <b>{now}</b> &nbsp;|&nbsp; Assessor: <b>{assessor}</b></p>
-  <p>Scan Start: {scan_start or "N/A"} &nbsp;|&nbsp; Scan End: {scan_end or "N/A"}</p>
+  <p style="color:#555">Target: <b>{escape(str(target))}</b> &nbsp;|&nbsp; Generated: <b>{escape(now)}</b> &nbsp;|&nbsp; Assessor: <b>{escape(str(assessor))}</b></p>
+  <p>Scan Start: {escape(str(scan_start or "N/A"))} &nbsp;|&nbsp; Scan End: {escape(str(scan_end or "N/A"))}</p>
 
   <h2>Executive Summary</h2>
   <p>Total findings: <b>{total}</b></p>

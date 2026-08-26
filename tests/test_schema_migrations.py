@@ -1267,6 +1267,24 @@ def test_legacy_gate0_records_migrate_to_unknown_reduced_claims(tmp_path: Path) 
             text("SELECT id FROM canonical_artifact_refs")
         ).scalar_one()
         manifest_digest = "sha256:" + "d" * 64
+        with pytest.raises(IntegrityError):
+            archive_session.execute(
+                text(
+                    "UPDATE canonical_artifact_refs SET manifest_digest=:digest "
+                    "WHERE id=:id"
+                ),
+                {
+                    "digest": "sha256:" + "g" * 64,
+                    "id": migrated_artifact_id,
+                },
+            )
+        archive_session.rollback()
+        assert archive_session.execute(
+            text(
+                "SELECT manifest_digest FROM canonical_artifact_refs WHERE id=:id"
+            ),
+            {"id": migrated_artifact_id},
+        ).scalar_one() is None
         archive_session.execute(
             text(
                 "UPDATE canonical_findings SET title='Triaged title',"
@@ -1602,6 +1620,322 @@ def test_contradictory_legacy_authorization_is_not_promoted_to_allow(tmp_path: P
     finally:
         session.close()
 
+
+def test_task102_legacy_evidence_migrates_available_bytes_and_keeps_unknown_paths(
+    tmp_path: Path,
+) -> None:
+    from common.canonical_evidence import CanonicalEvidenceReader
+    from common.evidence_custody import make_original_authorization
+    from common.redaction import clear_sensitive_values, register_sensitive_values
+
+    request_canary = "CANARY_LEGACY_MIGRATION_REQUEST"
+    response_canary = "CANARY_LEGACY_MIGRATION_RESPONSE"
+    screenshot_canary = b"CANARY_LEGACY_MIGRATION_SCREENSHOT"
+    nested_canary = "CANARY_LEGACY_MIGRATION_NESTED"
+    unavailable_canary = b"CANARY_LEGACY_MIGRATION_UNAVAILABLE"
+    register_sensitive_values(
+        (request_canary, response_canary, nested_canary)
+    )
+    screenshot = tmp_path / "legacy-shot.png"
+    screenshot.write_bytes(screenshot_canary)
+    screenshot.chmod(0o600)
+    outside = tmp_path / "legacy-outside.pcap"
+    outside.write_bytes(unavailable_canary)
+    outside.chmod(0o600)
+    linked = tmp_path / "legacy-linked.pcap"
+    linked.symlink_to(outside)
+
+    session = create_db(tmp_path / "legacy-evidence.db")
+    try:
+        manager = MigrationManager(session.get_bind())
+        assert manager.downgrade(target=CURRENT_SCHEMA_VERSION) == CURRENT_SCHEMA_VERSION
+        session.add(
+            FindingModel(
+                id="legacy-evidence-finding",
+                tenant_id="legacy-evidence-tenant",
+                title="Legacy evidence",
+                severity="High",
+                target="fixture.invalid",
+                module="legacy-module",
+                description="Legacy evidence migration fixture",
+                request_raw=f"GET /?password={request_canary} HTTP/1.1",
+                response_raw=f"HTTP/1.1 200 OK\n\n{response_canary}",
+                screenshot_path=str(screenshot),
+                console_capture_path=str(tmp_path / "missing-console.html"),
+                pcap_path=str(linked),
+                verification=json.dumps(
+                    {"nested": {"request_raw": nested_canary}}
+                ),
+            )
+        )
+        session.commit()
+
+        assert manager.upgrade() == CURRENT_SCHEMA_VERSION
+        mutable = session.execute(
+            text(
+                "SELECT request_raw,response_raw,screenshot_path,"
+                "console_capture_path,pcap_path,verification FROM findings "
+                "WHERE id='legacy-evidence-finding'"
+            )
+        ).mappings().one()
+        assert all(
+            mutable[field] is None
+            for field in (
+                "request_raw",
+                "response_raw",
+                "screenshot_path",
+                "console_capture_path",
+                "pcap_path",
+            )
+        )
+        assert "CANARY" not in str(mutable["verification"])
+
+        tenant_id = _canonical_legacy_key(
+            "legacy-evidence-tenant",
+            kind="tenant",
+            tenant_id="forge-legacy",
+        )
+        finding_id = _canonical_legacy_key(
+            "legacy-evidence-finding",
+            kind="finding",
+            tenant_id=tenant_id,
+        )
+        counts = session.execute(
+            text(
+                "SELECT "
+                "(SELECT COUNT(*) FROM canonical_artifact_refs WHERE tenant_id=:tenant_id) AS refs,"
+                "(SELECT COUNT(*) FROM canonical_artifact_manifests WHERE tenant_id=:tenant_id) AS manifests,"
+                "(SELECT COUNT(*) FROM canonical_observation_artifacts WHERE tenant_id=:tenant_id) AS links"
+            ),
+            {"tenant_id": tenant_id},
+        ).mappings().one()
+        # One unknown placeholder plus four verifiably available payloads.
+        assert counts == {"refs": 5, "manifests": 4, "links": 4}
+        unknown = session.execute(
+            text(
+                "SELECT digest,integrity_state,protection_state "
+                "FROM canonical_artifact_refs WHERE tenant_id=:tenant_id "
+                "AND digest IS NULL"
+            ),
+            {"tenant_id": tenant_id},
+        ).mappings().one()
+        assert unknown == {
+            "digest": None,
+            "integrity_state": "unknown",
+            "protection_state": "legacy_unknown",
+        }
+
+        reader = CanonicalEvidenceReader(
+            session,
+            tmp_path / "evidence-custody",
+            tenant_id,
+            audit_actor_id="operator:legacy-review",
+            expected_original_operator_id="operator:legacy-review",
+        )
+        projection = reader.get_finding_projection(finding_id)
+        assert projection is not None
+        rendered = json.dumps(projection, sort_keys=True)
+        assert request_canary not in rendered
+        assert response_canary not in rendered
+        assert nested_canary not in rendered
+        assert unavailable_canary.decode("ascii") not in rendered
+        artifacts = projection["evidence"]["observations"][0]["artifacts"]
+        assert len(artifacts) == 4
+
+        screenshot_artifact = next(
+            artifact
+            for artifact in artifacts
+            if artifact["capture_kind"] == "screenshot_path"
+        )
+        binding = session.execute(
+            text(
+                "SELECT protected_original_authorization_ref "
+                "FROM canonical_artifact_refs WHERE tenant_id=:tenant_id AND id=:artifact_id"
+            ),
+            {
+                "tenant_id": tenant_id,
+                "artifact_id": screenshot_artifact["artifact_id"],
+            },
+        ).scalar_one()
+        session.rollback()
+        authorization = make_original_authorization(
+            tenant_id=tenant_id,
+            artifact_id=screenshot_artifact["artifact_id"],
+            authorization_ref=binding,
+            operator_id="operator:legacy-review",
+            reason="verify protected migration fixture",
+        )
+        assert reader.read_protected_original(
+            screenshot_artifact["artifact_id"], authorization
+        ) == screenshot_canary
+        assert session.execute(
+            text(
+                "SELECT COUNT(*) FROM canonical_evidence_access_audit "
+                "WHERE tenant_id=:tenant_id AND access_kind='protected_original'"
+            ),
+            {"tenant_id": tenant_id},
+        ).scalar_one() == 1
+        session.rollback()
+
+        assert manager.upgrade() == CURRENT_SCHEMA_VERSION
+        repeated = session.execute(
+            text(
+                "SELECT "
+                "(SELECT COUNT(*) FROM canonical_artifact_refs WHERE tenant_id=:tenant_id),"
+                "(SELECT COUNT(*) FROM canonical_artifact_manifests WHERE tenant_id=:tenant_id),"
+                "(SELECT COUNT(*) FROM canonical_observation_artifacts WHERE tenant_id=:tenant_id)"
+            ),
+            {"tenant_id": tenant_id},
+        ).one()
+        assert tuple(repeated) == (5, 4, 4)
+        session.rollback()
+        with pytest.raises(
+            MigrationError,
+            match="downgrade would break retained canonical lineage",
+        ):
+            manager.downgrade(target=CURRENT_SCHEMA_VERSION)
+        assert session.execute(
+            text(
+                "SELECT state FROM canonical_migration_journal "
+                "WHERE version=:version"
+            ),
+            {"version": EVIDENCE_SCHEMA_VERSION},
+        ).scalar_one() == "applied"
+        assert session.execute(
+            text(
+                "SELECT COUNT(*) FROM canonical_artifact_manifests "
+                "WHERE tenant_id=:tenant_id"
+            ),
+            {"tenant_id": tenant_id},
+        ).scalar_one() == 4
+    finally:
+        clear_sensitive_values()
+        session.close()
+
+
+def test_task102_legacy_evidence_database_failure_compensates_custody(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import common.schema_migrations as migrations
+
+    session = create_db(tmp_path / "legacy-compensation.db")
+    try:
+        manager = MigrationManager(session.get_bind())
+        assert manager.downgrade(target=CURRENT_SCHEMA_VERSION) == CURRENT_SCHEMA_VERSION
+        session.add(
+            FindingModel(
+                id="legacy-compensation-finding",
+                tenant_id="legacy-compensation-tenant",
+                title="Legacy compensation",
+                severity="High",
+                target="fixture.invalid",
+                module="legacy-module",
+                description="Legacy evidence compensation fixture",
+                request_raw="CANARY_LEGACY_COMPENSATION",
+            )
+        )
+        session.commit()
+
+        original_insert = migrations._insert_or_validate_legacy
+
+        def fail_manifest(*args, **kwargs):
+            table = args[1] if len(args) > 1 else kwargs.get("table")
+            if table == "canonical_artifact_manifests":
+                raise MigrationError("injected legacy manifest failure")
+            return original_insert(*args, **kwargs)
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(migrations, "_insert_or_validate_legacy", fail_manifest)
+            with pytest.raises(MigrationError, match="injected legacy manifest"):
+                manager.upgrade()
+
+        session.rollback()
+        assert session.execute(
+            text(
+                "SELECT request_raw FROM findings "
+                "WHERE id='legacy-compensation-finding'"
+            )
+        ).scalar_one() == "CANARY_LEGACY_COMPENSATION"
+        assert session.execute(
+            text("SELECT COUNT(*) FROM canonical_artifact_manifests")
+        ).scalar_one() == 0
+        custody_files = [
+            path
+            for path in (tmp_path / "evidence-custody").rglob("*")
+            if path.is_file()
+        ]
+        assert custody_files == []
+        session.rollback()
+
+        assert manager.upgrade() == CURRENT_SCHEMA_VERSION
+        assert session.execute(
+            text(
+                "SELECT request_raw FROM findings "
+                "WHERE id='legacy-compensation-finding'"
+            )
+        ).scalar_one() is None
+        assert session.execute(
+            text("SELECT COUNT(*) FROM canonical_artifact_manifests")
+        ).scalar_one() == 1
+    finally:
+        session.close()
+
+
+def test_task102_legacy_unavailable_evidence_has_read_only_projection(
+    tmp_path: Path,
+) -> None:
+    from common.canonical_evidence import CanonicalEvidenceReader
+
+    session = create_db(tmp_path / "legacy-unavailable-evidence.db")
+    try:
+        manager = MigrationManager(session.get_bind())
+        assert manager.downgrade(target=CURRENT_SCHEMA_VERSION) == CURRENT_SCHEMA_VERSION
+        session.add(
+            FindingModel(
+                id="legacy-unavailable-finding",
+                tenant_id="legacy-unavailable-tenant",
+                title="Legacy unavailable evidence",
+                severity="Medium",
+                target="fixture.invalid",
+                module="legacy-module",
+                description="Legacy finding without available evidence bytes",
+            )
+        )
+        session.commit()
+
+        assert manager.upgrade() == CURRENT_SCHEMA_VERSION
+        tenant_id = _canonical_legacy_key(
+            "legacy-unavailable-tenant",
+            kind="tenant",
+            tenant_id="forge-legacy",
+        )
+        finding_id = _canonical_legacy_key(
+            "legacy-unavailable-finding",
+            kind="finding",
+            tenant_id=tenant_id,
+        )
+        custody_root = tmp_path / "evidence-custody"
+        assert custody_root.is_dir()
+        assert custody_root.stat().st_mode & 0o077 == 0
+
+        projection = CanonicalEvidenceReader(
+            session,
+            custody_root,
+            tenant_id,
+        ).get_finding_projection(finding_id)
+        assert projection is not None
+        assert projection["evidence"] == {
+            "observations": [],
+            "state": "unavailable",
+        }
+    finally:
+        session.close()
+
+
+def test_legacy_authorization_mutations_and_collisions_fail_closed(
+    tmp_path: Path,
+) -> None:
     for mutation in (
         "extra_field",
         "binding_tamper",

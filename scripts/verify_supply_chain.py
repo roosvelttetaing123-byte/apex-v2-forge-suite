@@ -143,6 +143,7 @@ _NONCANDIDATE_ROOT_DIRECTORIES = {
     "evidence",
     "extracted_images",
     "htmlcov",
+    "node_modules",
     "reports",
     "results",
     "secrets",

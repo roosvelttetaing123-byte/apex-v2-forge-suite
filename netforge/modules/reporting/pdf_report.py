@@ -7,6 +7,7 @@ Falls back to a markdown stub if reportlab isn't installed.
 """
 from __future__ import annotations
 
+from html import escape
 import sys
 import time
 from datetime import datetime, timezone
@@ -16,7 +17,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 from common.base_module import BaseModule, ModuleResult
-from common.finding import Finding, Severity
+from common.evidence import ordinary_finding_projection
 from common.version import VERSION
 
 
@@ -41,12 +42,8 @@ _CONFIDENCE_RGB = {
 
 
 def _finding_to_dict(f: Any) -> dict:
-    """Normalize a finding to a dict regardless of input type."""
-    if isinstance(f, dict):
-        return f
-    if hasattr(f, "to_dict"):
-        return f.to_dict()
-    return {"title": str(getattr(f, "title", "")), "severity": "Informational"}
+    """Normalize a finding through the ordinary redacted projection."""
+    return ordinary_finding_projection(f)
 
 
 def generate_pdf(
@@ -60,6 +57,7 @@ def generate_pdf(
     attack_chain_stats: dict[str, Any] | None = None,
 ) -> None:
     """Generate a professional PDF report from findings dicts."""
+    findings = [_finding_to_dict(finding) for finding in findings]
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -147,11 +145,11 @@ def generate_pdf(
     story.append(Spacer(1, 2*mm))
 
     # ── Metadata ──────────────────────────────────────────────────────────
-    meta_parts = [f"<b>Target:</b> {target}"]
+    meta_parts = [f"<b>Target:</b> {escape(str(target))}"]
     if engagement:
-        meta_parts.append(f"<b>Engagement:</b> {engagement}")
+        meta_parts.append(f"<b>Engagement:</b> {escape(str(engagement))}")
     if mode:
-        meta_parts.append(f"<b>Mode:</b> {mode.upper()}")
+        meta_parts.append(f"<b>Mode:</b> {escape(str(mode).upper())}")
     meta_parts.append(f"<b>Date:</b> {scan_date}")
     meta_parts.append(f"<b>Findings:</b> {len(findings)}")
     if live_hosts:
@@ -240,35 +238,41 @@ def generate_pdf(
         # Finding header
         header = (
             f'<font color="#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}">'
-            f'[{sev}]</font> {f.get("title", "")}'
+            f'[{escape(str(sev))}]</font> {escape(str(f.get("title", "")))}'
         )
         story.append(Paragraph(header, h3_style))
 
         # Metadata line
         meta_items = []
         if f.get("target"):
-            meta_items.append(f'<b>Target:</b> {f["target"]}')
+            meta_items.append(f'<b>Target:</b> {escape(str(f["target"]))}')
         if f.get("port"):
-            meta_items.append(f'<b>Port:</b> {f["port"]}')
+            meta_items.append(f'<b>Port:</b> {escape(str(f["port"]))}')
         if f.get("service"):
-            meta_items.append(f'<b>Service:</b> {f["service"]}')
+            meta_items.append(f'<b>Service:</b> {escape(str(f["service"]))}')
         if f.get("cvss_v31_score"):
-            meta_items.append(f'<b>CVSS 3.1:</b> {f["cvss_v31_score"]}')
+            meta_items.append(
+                f'<b>CVSS 3.1:</b> {escape(str(f["cvss_v31_score"]))}'
+            )
         if f.get("cvss_v40_score"):
-            meta_items.append(f'<b>CVSS 4.0:</b> {f["cvss_v40_score"]}')
+            meta_items.append(
+                f'<b>CVSS 4.0:</b> {escape(str(f["cvss_v40_score"]))}'
+            )
         if f.get("module"):
-            meta_items.append(f'<b>Module:</b> {f["module"]}')
+            meta_items.append(f'<b>Module:</b> {escape(str(f["module"]))}')
         if f.get("confidence"):
-            meta_items.append(f'<b>Confidence:</b> {f["confidence"]}')
+            meta_items.append(
+                f'<b>Confidence:</b> {escape(str(f["confidence"]))}'
+            )
         if f.get("vpr_score"):
-            meta_items.append(f'<b>VPR:</b> {f["vpr_score"]}')
+            meta_items.append(f'<b>VPR:</b> {escape(str(f["vpr_score"]))}')
         story.append(Paragraph(" | ".join(meta_items), meta_style))
         story.append(Spacer(1, 2*mm))
 
         # Description
         desc = f.get("description", "")
         if desc:
-            story.append(Paragraph(desc[:2000], body_style))
+            story.append(Paragraph(escape(str(desc)[:2000]), body_style))
             story.append(Spacer(1, 2*mm))
 
         # Reproduction steps
@@ -276,22 +280,32 @@ def generate_pdf(
         if steps:
             story.append(Paragraph("<b>Reproduction Steps:</b>", body_style))
             for i, s in enumerate(steps, 1):
-                story.append(Paragraph(f"{i}. <font face='Courier' size='7'>{s}</font>", body_style))
+                story.append(Paragraph(
+                    f"{i}. <font face='Courier' size='7'>{escape(str(s))}</font>",
+                    body_style,
+                ))
 
         # MITRE ATT&CK
         mitre = f.get("mitre_attack", [])
         if mitre:
-            story.append(Paragraph(f'<b>MITRE ATT&amp;CK:</b> {", ".join(mitre)}', body_style))
+            story.append(Paragraph(
+                '<b>MITRE ATT&amp;CK:</b> '
+                + ", ".join(escape(str(item)) for item in mitre),
+                body_style,
+            ))
 
         # Remediation
         remediation = f.get("remediation", "")
         if remediation:
-            story.append(Paragraph(f'<b>Remediation:</b> {remediation}', body_style))
+            story.append(Paragraph(
+                f'<b>Remediation:</b> {escape(str(remediation))}',
+                body_style,
+            ))
 
         # References
         refs = f.get("references", [])
         if refs:
-            ref_str = ", ".join(refs[:5])
+            ref_str = ", ".join(escape(str(ref)) for ref in refs[:5])
             story.append(Paragraph(f'<b>References:</b> {ref_str}', meta_style))
 
         story.append(Spacer(1, 6*mm))
@@ -328,9 +342,7 @@ class PdfReport(BaseModule):
     async def run(self) -> ModuleResult:
         start = time.monotonic()
         findings_raw: list = self.config.extra.get("findings", [])
-        normalized = [_finding_to_dict(f) for f in findings_raw]
-
-        if not normalized:
+        if not findings_raw:
             return self._make_result(start, skipped=True, skip_reason="no findings")
 
         out_dir = Path(self.config.extra.get("output_dir", self.results_dir))
@@ -338,7 +350,7 @@ class PdfReport(BaseModule):
         out_file = out_dir / "netforge_report.pdf"
 
         generate_pdf(
-            findings=normalized,
+            findings=findings_raw,
             target=self.config.target,
             output_path=out_file,
             engagement=self.config.extra.get("engagement", self.config.engagement),
@@ -347,7 +359,7 @@ class PdfReport(BaseModule):
             credentials_found=self.config.extra.get("credentials_found", 0),
             attack_chain_stats=self.config.extra.get("attack_chain_stats"),
         )
-        self.log.info("PDF report written: %s (%d findings)", out_file, len(normalized))
+        self.log.info("PDF report written: %s (%d findings)", out_file, len(findings_raw))
         return self._make_result(start)
 
 
@@ -359,7 +371,13 @@ class TestPdfReport:
 
     def test_finding_to_dict_from_dict(self) -> None:
         d = {"title": "test", "severity": "High"}
-        assert _finding_to_dict(d) == d
+        projected = _finding_to_dict(d)
+        assert projected["title"] == "test"
+        assert projected["severity"] == "High"
+        assert projected["evidence"] == {
+            "observations": [],
+            "state": "unavailable",
+        }
 
     def test_severity_rgb_coverage(self) -> None:
         for s in _SEVERITY_ORDER:

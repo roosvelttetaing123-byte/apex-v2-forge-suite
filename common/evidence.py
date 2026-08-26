@@ -1,15 +1,16 @@
 """Evidence collection dataclass and helpers."""
 from __future__ import annotations
 
-import base64
 import hashlib
+import json
+import math
 import os
 import re
 import secrets
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from common.artifact_io import (
     ArtifactBoundaryError,
@@ -25,7 +26,7 @@ from common.artifact_io import (
     prepare_owner_controlled_directory,
     read_verified_regular_file,
 )
-from common.redaction import redact_text, redact_value
+from common.redaction import redact_text
 
 # Task 102 custody is kept in a focused module so legacy ``Evidence`` callers
 # remain source-compatible.  Re-export the typed custody API here because
@@ -50,6 +51,443 @@ EvidenceIntegrityError = ArtifactIntegrityError
 EvidenceManifest = ArtifactManifest
 EvidenceCustodyError = CustodyError
 _SAFE_FINDING_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_SAFE_SHA256_REFERENCE = re.compile(r"sha256:[0-9a-f]{64}")
+_SAFE_DEDUP_KEY = re.compile(r"finding-v[0-9]+:[0-9a-f]{64}")
+_MAX_ORDINARY_DERIVATIVE_CHARS = 20_000
+_FORBIDDEN_ORDINARY_EVIDENCE_KEYS = frozenset(
+    {
+        "request_raw",
+        "response_raw",
+        "screenshot_path",
+        "console_capture_path",
+        "pcap_path",
+        "original_relative_path",
+        "derivative_relative_path",
+    }
+)
+_ORDINARY_FINDING_FIELDS = frozenset(
+    {
+        "confidence",
+        "cvss_score",
+        "cvss_v31_score",
+        "cvss_v31_vector",
+        "cvss_v40_score",
+        "cvss_v40_vector",
+        "dedup_key",
+        "description",
+        "discovered_at",
+        "finding_key",
+        "id",
+        "maturity",
+        "mitre",
+        "mitre_attack",
+        "module",
+        "operator_confirmed",
+        "port",
+        "proof_type",
+        "references",
+        "remediation",
+        "reproduction_steps",
+        "service",
+        "severity",
+        "status",
+        "tags",
+        "target",
+        "timestamp",
+        "title",
+        "url",
+        "verification_state",
+        "vpr",
+        "vpr_priority",
+        "vpr_score",
+    }
+)
+
+
+class EvidenceCaptureError(ValueError):
+    """A transient evidence bundle could not be consumed safely."""
+
+
+@dataclass(frozen=True)
+class CapturedEvidenceArtifact:
+    """One immutable artifact value produced by a one-shot capture.
+
+    These values may only cross into the custody service.  They are never a
+    finding, API, event, report, or export representation.
+    """
+
+    kind: str
+    content: bytes
+    media_type: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def ordinary_evidence_projection(value: Any) -> dict[str, Any]:
+    """Return the only evidence shape ordinary consumers may render.
+
+    Missing or legacy inline evidence becomes an explicit unavailable state.
+    A value claiming to be persisted is validated strictly so a malformed or
+    raw-bearing projection cannot be rendered as trusted custody output.
+    """
+    unavailable = {"observations": [], "state": "unavailable"}
+    if not isinstance(value, Mapping) or value.get("state") != "persisted":
+        return unavailable
+
+    def _reject_forbidden(item: Any) -> None:
+        pending = [item]
+        visited: set[int] = set()
+        inspected = 0
+        while pending:
+            current = pending.pop()
+            if not isinstance(current, (Mapping, list, tuple)):
+                continue
+            identity = id(current)
+            if identity in visited:
+                continue
+            visited.add(identity)
+            inspected += 1
+            if inspected > 25_000:
+                raise EvidenceCaptureError(
+                    "persisted evidence projection is too complex"
+                )
+            if isinstance(current, Mapping):
+                for raw_key, child in current.items():
+                    if str(raw_key) in _FORBIDDEN_ORDINARY_EVIDENCE_KEYS:
+                        raise EvidenceCaptureError(
+                            "persisted evidence projection contains raw or path data"
+                        )
+                    pending.append(child)
+            else:
+                pending.extend(current)
+
+    def _text_value(
+        item: Any,
+        field_name: str,
+        *,
+        limit: int = 2_000,
+        allow_empty: bool = False,
+    ) -> str:
+        if (
+            not isinstance(item, str)
+            or (not allow_empty and not item)
+            or len(item) > limit
+        ):
+            raise EvidenceCaptureError(
+                f"persisted evidence {field_name} is invalid"
+            )
+        return redact_text(item)
+
+    def _digest_value(item: Any, field_name: str, *, optional: bool = False) -> str | None:
+        if optional and item is None:
+            return None
+        if not isinstance(item, str) or _SAFE_SHA256_REFERENCE.fullmatch(item) is None:
+            raise EvidenceCaptureError(
+                f"persisted evidence {field_name} is invalid"
+            )
+        return item
+
+    def _size_value(item: Any, field_name: str) -> int:
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise EvidenceCaptureError(
+                f"persisted evidence {field_name} is invalid"
+            )
+        return item
+
+    _reject_forbidden(value)
+    finding_id = _text_value(value.get("finding_id"), "finding_id", limit=300)
+    raw_observations = value.get("observations")
+    if (
+        not isinstance(raw_observations, list)
+        or not raw_observations
+        or len(raw_observations) > 10_000
+    ):
+        raise EvidenceCaptureError(
+            "persisted evidence observations are invalid"
+        )
+    observations: list[dict[str, Any]] = []
+    observation_fields = (
+        "asset_id",
+        "check_id",
+        "collection_status",
+        "engagement_id",
+        "identity_ref",
+        "job_id",
+        "location",
+        "module_execution_id",
+        "observed_at",
+        "parameter",
+        "proof_type",
+        "route",
+    )
+    for raw_observation in raw_observations:
+        if not isinstance(raw_observation, Mapping):
+            raise EvidenceCaptureError(
+                "persisted evidence observation is invalid"
+            )
+        observation_id = _text_value(
+            raw_observation.get("observation_id"),
+            "observation_id",
+            limit=300,
+        )
+        raw_artifacts = raw_observation.get("artifacts")
+        if not isinstance(raw_artifacts, list) or not raw_artifacts or len(raw_artifacts) > 256:
+            raise EvidenceCaptureError(
+                "persisted evidence artifacts are invalid"
+            )
+        artifacts: list[dict[str, Any]] = []
+        for raw_artifact in raw_artifacts:
+            if not isinstance(raw_artifact, Mapping):
+                raise EvidenceCaptureError(
+                    "persisted evidence artifact is invalid"
+                )
+            artifacts.append(
+                {
+                    "artifact_id": _text_value(
+                        raw_artifact.get("artifact_id"),
+                        "artifact_id",
+                        limit=300,
+                    ),
+                    "capture_kind": _text_value(
+                        raw_artifact.get("capture_kind"),
+                        "capture_kind",
+                        limit=100,
+                    ),
+                    "derivative": redact_text(
+                        _text_value(
+                            raw_artifact.get("derivative"),
+                            "derivative",
+                            limit=_MAX_ORDINARY_DERIVATIVE_CHARS,
+                            allow_empty=True,
+                        )
+                    ),
+                    "derivative_sha256": _digest_value(
+                        raw_artifact.get("derivative_sha256"),
+                        "derivative_sha256",
+                    ),
+                    "derivative_size": _size_value(
+                        raw_artifact.get("derivative_size"),
+                        "derivative_size",
+                    ),
+                    "integrity_state": _text_value(
+                        raw_artifact.get("integrity_state"),
+                        "integrity_state",
+                        limit=100,
+                    ),
+                    "manifest_digest": _digest_value(
+                        raw_artifact.get("manifest_digest"),
+                        "manifest_digest",
+                    ),
+                    "media_type": _text_value(
+                        raw_artifact.get("media_type"),
+                        "media_type",
+                        limit=200,
+                    ),
+                    "primary_sha256": _digest_value(
+                        raw_artifact.get("primary_sha256"),
+                        "primary_sha256",
+                        optional=True,
+                    ),
+                    "primary_size": _size_value(
+                        raw_artifact.get("primary_size"),
+                        "primary_size",
+                    ),
+                    "redaction_state": _text_value(
+                        raw_artifact.get("redaction_state"),
+                        "redaction_state",
+                        limit=100,
+                    ),
+                    "role": _text_value(
+                        raw_artifact.get("role"),
+                        "role",
+                        limit=100,
+                    ),
+                    "sequence": _size_value(
+                        raw_artifact.get("sequence"),
+                        "sequence",
+                    ),
+                }
+            )
+        observation: dict[str, Any] = {
+            "artifacts": artifacts,
+            "observation_id": observation_id,
+        }
+        for field_name in observation_fields:
+            field_value = raw_observation.get(field_name)
+            observation[field_name] = (
+                None
+                if field_value is None
+                else _text_value(field_value, field_name, limit=1_000)
+            )
+        observations.append(observation)
+    return {
+        "finding_id": finding_id,
+        "observations": observations,
+        "state": "persisted",
+    }
+
+
+def ordinary_finding_projection(value: Any) -> dict[str, Any]:
+    """Return a bounded finding projection for UI, report, and export use."""
+    if not isinstance(value, Mapping):
+        serializer = getattr(value, "to_dict", None)
+        if not callable(serializer):
+            raise EvidenceCaptureError(
+                "ordinary finding projection must be an object"
+            )
+        value = serializer()
+    if not isinstance(value, Mapping):
+        raise EvidenceCaptureError("ordinary finding projection must be an object")
+    evidence = ordinary_evidence_projection(value.get("evidence"))
+    text_limits = {
+        "confidence": 100,
+        "cvss_v31_vector": 500,
+        "cvss_v40_vector": 500,
+        "description": 8_000,
+        "discovered_at": 100,
+        "finding_key": 300,
+        "id": 300,
+        "maturity": 100,
+        "module": 300,
+        "proof_type": 100,
+        "remediation": 8_000,
+        "service": 500,
+        "status": 100,
+        "target": 2_000,
+        "timestamp": 100,
+        "title": 500,
+        "url": 2_000,
+        "verification_state": 100,
+        "vpr": 100,
+        "vpr_priority": 100,
+    }
+    sequence_limits = {
+        "mitre": (256, 500),
+        "mitre_attack": (256, 500),
+        "references": (256, 2_000),
+        "reproduction_steps": (256, 4_000),
+        "tags": (256, 500),
+    }
+    numeric_fields = {
+        "cvss_score",
+        "cvss_v31_score",
+        "cvss_v40_score",
+        "vpr_score",
+    }
+    rendered: dict[str, Any] = {}
+    for key in sorted(_ORDINARY_FINDING_FIELDS):
+        if key not in value or key in {"severity", "dedup_key"}:
+            continue
+        item = value[key]
+        if key in text_limits:
+            if item is None:
+                rendered[key] = None
+            elif not isinstance(item, str) or len(item) > text_limits[key]:
+                raise EvidenceCaptureError(
+                    f"ordinary finding {key} is invalid"
+                )
+            else:
+                rendered[key] = redact_text(item)
+        elif key in sequence_limits:
+            max_items, max_item_length = sequence_limits[key]
+            if item is None:
+                rendered[key] = []
+            elif (
+                not isinstance(item, (list, tuple))
+                or len(item) > max_items
+                or any(
+                    not isinstance(entry, str)
+                    or len(entry) > max_item_length
+                    for entry in item
+                )
+            ):
+                raise EvidenceCaptureError(
+                    f"ordinary finding {key} is invalid"
+                )
+            else:
+                rendered[key] = [redact_text(entry) for entry in item]
+        elif key in numeric_fields:
+            if item is None:
+                rendered[key] = None
+            elif (
+                isinstance(item, bool)
+                or not isinstance(item, (int, float))
+                or not math.isfinite(float(item))
+            ):
+                raise EvidenceCaptureError(
+                    f"ordinary finding {key} is invalid"
+                )
+            else:
+                rendered[key] = item
+        elif key == "port":
+            if item is None:
+                rendered[key] = None
+            elif (
+                isinstance(item, bool)
+                or not isinstance(item, int)
+                or not 0 <= item <= 65_535
+            ):
+                raise EvidenceCaptureError("ordinary finding port is invalid")
+            else:
+                rendered[key] = item
+        elif key == "operator_confirmed":
+            if not isinstance(item, bool):
+                raise EvidenceCaptureError(
+                    "ordinary finding operator_confirmed is invalid"
+                )
+            rendered[key] = item
+        else:
+            raise EvidenceCaptureError(f"ordinary finding {key} is unsupported")
+
+    if "dedup_key" in value:
+        dedup_key = value.get("dedup_key")
+        if dedup_key is None:
+            rendered["dedup_key"] = None
+        elif not isinstance(dedup_key, str) or _SAFE_DEDUP_KEY.fullmatch(
+            dedup_key
+        ) is None:
+            raise EvidenceCaptureError("ordinary finding dedup_key is invalid")
+        else:
+            # A validated identity digest is a reference, not secret material.
+            rendered["dedup_key"] = dedup_key
+    if "severity" in value:
+        raw_severity = value.get("severity")
+        if not isinstance(raw_severity, str):
+            raise EvidenceCaptureError("ordinary finding severity is invalid")
+        severity = raw_severity.strip().lower()
+        severity_labels = {
+            "critical": "Critical",
+            "high": "High",
+            "medium": "Medium",
+            "low": "Low",
+            "informational": "Informational",
+            "info": "Informational",
+        }
+        if severity not in severity_labels:
+            raise EvidenceCaptureError("ordinary finding severity is invalid")
+        rendered["severity"] = severity_labels[severity]
+    if evidence["state"] == "persisted" and rendered.get("id") != evidence.get(
+        "finding_id"
+    ):
+        raise EvidenceCaptureError(
+            "ordinary finding evidence belongs to another finding"
+        )
+    rendered["evidence"] = evidence
+    return rendered
+
+
+def ordinary_evidence_artifacts(value: Any) -> list[dict[str, Any]]:
+    """Flatten verified derivative records for ordinary presentation."""
+    projection = ordinary_evidence_projection(value)
+    artifacts: list[dict[str, Any]] = []
+    for observation in projection.get("observations", []):
+        for artifact in observation.get("artifacts", []):
+            artifacts.append(
+                {
+                    **artifact,
+                    "observation_id": observation["observation_id"],
+                }
+            )
+    return artifacts
 
 
 def _ensure_artifact_directory(path: Path) -> None:
@@ -373,45 +811,164 @@ verify_evidence_manifest = EvidenceCustodyStore.verify
 
 @dataclass
 class Evidence:
-    """Full evidence bundle attached to every finding."""
+    """Source-compatible, one-shot input to canonical evidence custody."""
     request_raw:          str | None = None   # Raw HTTP request
     response_raw:         str | None = None   # Raw HTTP response
     screenshot_path:      str | None = None   # PNG screenshot path
     console_capture_path: str | None = None   # Rich HTML console export path
     pcap_path:            str | None = None   # PCAP file path
     extra:                dict[str, Any] = field(default_factory=dict)
+    _consumed:            bool = field(default=False, init=False, repr=False)
+
+    _CAPTURE_FIELDS = frozenset(
+        {
+            "request_raw",
+            "response_raw",
+            "screenshot_path",
+            "console_capture_path",
+            "pcap_path",
+            "extra",
+        }
+    )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if (
+            name in self._CAPTURE_FIELDS
+            and getattr(self, "_consumed", False)
+        ):
+            raise EvidenceCaptureError("evidence capture has already been consumed")
+        object.__setattr__(self, name, value)
+
+    def _pending_kinds(self) -> list[str]:
+        kinds: list[str] = []
+        if self.request_raw is not None:
+            kinds.append("request")
+        if self.response_raw is not None:
+            kinds.append("response")
+        if self.screenshot_path:
+            kinds.append("screenshot")
+        if self.console_capture_path:
+            kinds.append("console_capture")
+        if self.pcap_path:
+            kinds.append("pcap")
+        if self.extra:
+            kinds.append("structured_proof")
+        return kinds
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize evidence for events, storage, and reports."""
-        return redact_value({
+        """Return content-free capture state for non-custody consumers."""
+        kinds = [] if self._consumed else self._pending_kinds()
+        return {
+            "artifact_count": len(kinds),
+            "capture_kinds": kinds,
+            "state": "consumed" if self._consumed else ("pending_custody" if kinds else "empty"),
+        }
+
+    def consume(self) -> tuple[CapturedEvidenceArtifact, ...]:
+        """Read all capture inputs exactly once, then discard their references.
+
+        Caller-controlled file paths are read only through Forge's verified
+        regular-file boundary.  A supplied but unreadable path fails the whole
+        capture; it is never silently omitted from canonical lineage.
+        """
+        if self._consumed:
+            raise EvidenceCaptureError("evidence capture has already been consumed")
+        artifacts: list[CapturedEvidenceArtifact] = []
+        try:
+            if self.request_raw is not None:
+                artifacts.append(
+                    CapturedEvidenceArtifact(
+                        kind="request",
+                        content=self.request_raw.encode("utf-8"),
+                        media_type="text/http; msgtype=request",
+                    )
+                )
+            if self.response_raw is not None:
+                artifacts.append(
+                    CapturedEvidenceArtifact(
+                        kind="response",
+                        content=self.response_raw.encode("utf-8"),
+                        media_type="text/http; msgtype=response",
+                    )
+                )
+            for kind, path, media_type in (
+                ("screenshot", self.screenshot_path, "image/png"),
+                ("console_capture", self.console_capture_path, "text/html"),
+                ("pcap", self.pcap_path, "application/vnd.tcpdump.pcap"),
+            ):
+                if not path:
+                    continue
+                try:
+                    content = read_verified_regular_file(path)
+                except (ArtifactBoundaryError, FileNotFoundError, OSError) as exc:
+                    raise EvidenceCaptureError(
+                        f"{kind} source failed the verified file boundary"
+                    ) from exc
+                artifacts.append(
+                    CapturedEvidenceArtifact(
+                        kind=kind,
+                        content=content,
+                        media_type=media_type,
+                    )
+                )
+            if self.extra:
+                try:
+                    structured = json.dumps(
+                        self.extra,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    ).encode("utf-8")
+                except (TypeError, ValueError) as exc:
+                    raise EvidenceCaptureError(
+                        "structured evidence must be JSON serializable"
+                    ) from exc
+                artifacts.append(
+                    CapturedEvidenceArtifact(
+                        kind="structured_proof",
+                        content=structured,
+                        media_type="application/json",
+                    )
+                )
+            return tuple(artifacts)
+        finally:
+            object.__setattr__(self, "request_raw", None)
+            object.__setattr__(self, "response_raw", None)
+            object.__setattr__(self, "screenshot_path", None)
+            object.__setattr__(self, "console_capture_path", None)
+            object.__setattr__(self, "pcap_path", None)
+            for value in self.extra.values():
+                if isinstance(value, bytearray):
+                    value[:] = b"\x00" * len(value)
+                    value.clear()
+            self.extra.clear()
+            object.__setattr__(self, "_consumed", True)
+
+    def _legacy_custody_payload(self) -> dict[str, Any]:
+        """Return transient inputs only for the explicit legacy custody writer.
+
+        This is intentionally private and must never feed an event, report,
+        API, UI, or export.  It preserves Gate-0 fixture compatibility while
+        ordinary ``to_dict`` remains content-free.
+        """
+        if self._consumed:
+            raise EvidenceCaptureError("evidence capture has already been consumed")
+        return {
             "request_raw": self.request_raw,
             "response_raw": self.response_raw,
             "screenshot_path": self.screenshot_path,
             "console_capture_path": self.console_capture_path,
             "pcap_path": self.pcap_path,
             "extra": self.extra,
-        })
+        }
 
     def screenshot_as_base64(self) -> str | None:
-        """Return screenshot as base64 data URI for HTML embedding."""
-        if not self.screenshot_path:
-            return None
-        try:
-            content = read_verified_regular_file(self.screenshot_path)
-        except ArtifactBoundaryError:
-            return None
-        data = base64.b64encode(content).decode()
-        return f"data:image/png;base64,{data}"
+        """Disable pre-custody original previews for ordinary consumers."""
+        return None
 
     def console_capture_as_html(self) -> str | None:
-        """Return Rich console capture HTML content."""
-        if not self.console_capture_path:
-            return None
-        try:
-            content = read_verified_regular_file(self.console_capture_path)
-        except ArtifactBoundaryError:
-            return None
-        return redact_text(content.decode("utf-8", errors="replace"))
+        """Disable pre-custody console previews for ordinary consumers."""
+        return None
 
     def has_screenshot(self) -> bool:
         """Return True if a screenshot file exists."""
@@ -424,39 +981,9 @@ class Evidence:
         return True
 
     def copy_to(self, dest_dir: Path) -> "Evidence":
-        """Copy all evidence files to dest_dir and return updated Evidence."""
+        """Preserve the legacy signature without copying pre-custody bytes."""
         _ensure_artifact_directory(dest_dir)
-        new = Evidence(
-            request_raw=redact_text(self.request_raw or "") or None,
-            response_raw=redact_text(self.response_raw or "") or None,
-            extra=redact_value(dict(self.extra)),
-        )
-        screenshot = self._read_source(self.screenshot_path)
-        if screenshot is not None and self.screenshot_path:
-            dst = dest_dir / Path(self.screenshot_path).name
-            _owner_only_write_bytes(dst, screenshot)
-            new.screenshot_path = str(dst)
-        console_capture = self._read_source(self.console_capture_path)
-        if console_capture is not None and self.console_capture_path:
-            dst = dest_dir / Path(self.console_capture_path).name
-            _owner_only_write_bytes(dst, console_capture)
-            new.console_capture_path = str(dst)
-        pcap = self._read_source(self.pcap_path)
-        if pcap is not None and self.pcap_path:
-            dst = dest_dir / Path(self.pcap_path).name
-            _owner_only_write_bytes(dst, pcap)
-            new.pcap_path = str(dst)
-        return new
-
-    @staticmethod
-    def _read_source(path: str | None) -> bytes | None:
-        """Return source bytes only through the descriptor-backed read boundary."""
-        if not path:
-            return None
-        try:
-            return read_verified_regular_file(path)
-        except ArtifactBoundaryError:
-            return None
+        return Evidence()
 
 
 def save_http_evidence(
@@ -498,6 +1025,6 @@ class TestEvidence:
         e = Evidence(screenshot_path=str(ss))
         dst = tmp_path / "dst"
         new_e = e.copy_to(dst)
-        assert new_e.has_screenshot()
-        assert new_e.screenshot_path is not None
-        assert Path(new_e.screenshot_path).parent == dst
+        assert not new_e.has_screenshot()
+        assert new_e.screenshot_path is None
+        assert list(dst.iterdir()) == []

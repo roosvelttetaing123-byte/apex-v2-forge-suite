@@ -207,20 +207,29 @@ def test_cis_benchmark_module_emits_findings_from_supplied_facts(
             ],
         },
     )
-    module = CisBenchmark(
-        config=config,
-        scope=Scope(["linux01"]),
-        db_session=_Db(),
-        results_dir=tmp_path,
-        run_id=run_id,
-    )
+    session = create_db(tmp_path / "cis-findings.db")
+    try:
+        module = CisBenchmark(
+            config=config,
+            scope=Scope(["linux01"]),
+            db_session=session,
+            results_dir=tmp_path,
+            run_id=run_id,
+        )
 
-    result = asyncio.run(module.run())
+        result = asyncio.run(module.run())
+    finally:
+        session.close()
 
     assert result.skipped is False
     assert len(result.findings) >= 5
     assert all(finding.service == "local-facts" for finding in result.findings)
-    assert all(finding.evidence.extra["network_activity"] == "none" for finding in result.findings)
+    assert module._request_count == 0
+    for finding in result.findings:
+        projection = finding.canonical_evidence
+        assert projection is not None
+        assert projection["state"] == "persisted"
+        assert projection["observations"][0]["check_id"].startswith("linux-")
 
 
 @pytest.mark.parametrize(

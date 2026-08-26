@@ -591,6 +591,7 @@ class CisBenchmark(BaseModule):
             evidence=Evidence(
                 extra={
                     "host": result.host,
+                    "check_id": check.check_id,
                     "check": result.to_dict(),
                     "passive": True,
                     "network_activity": "none",

@@ -4,6 +4,7 @@ import html as html_mod, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from common.base_module import BaseModule, ModuleResult
+from common.evidence import ordinary_finding_projection
 
 SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFORMATIONAL": 4}
 
@@ -18,6 +19,7 @@ class PdfReport(BaseModule):
         findings = self.config.extra.get("findings", [])
         if not findings:
             return self._make_result(start, skipped=True, skip_reason="no findings")
+        findings = [ordinary_finding_projection(finding) for finding in findings]
 
         out_dir = Path(self.config.extra.get("output_dir", self.results_dir))
         out_dir.mkdir(parents=True, exist_ok=True)

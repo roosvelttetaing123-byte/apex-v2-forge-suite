@@ -469,10 +469,10 @@ class EvidenceCustodyStore:
     def _derivative(self, payload: bytes, media_type: str) -> bytes:
         """Generate a redacted derivative before ordinary access.
 
-        Text and JSON are redacted as UTF-8.  Binary media is retained byte for
-        byte; the manifest still records the derivative and its independent
-        digest, and binary consumers never receive the protected original by
-        default.
+        Text and JSON are redacted as UTF-8.  Binary media is represented by a
+        deterministic, content-free receipt.  Returning binary input as its
+        own "derivative" would expose the protected bytes through the default
+        read path.
         """
         normalized_media_type = media_type.split(";", 1)[0].strip().lower()
         if normalized_media_type.startswith("text/") or "json" in normalized_media_type or "xml" in normalized_media_type or "javascript" in normalized_media_type:
@@ -480,7 +480,18 @@ class EvidenceCustodyStore:
             # Work Package 007's emergency redaction remains mandatory,
             # including when a caller supplied a custom hook.
             return redact_text(candidate).encode("utf-8")
-        return bytes(payload)
+        withheld = {
+            "byte_size": len(payload),
+            "media_type": normalized_media_type or "application/octet-stream",
+            "sha256": _digest(payload),
+            "state": "binary_withheld",
+        }
+        return json.dumps(
+            withheld,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
 
     def _write_manifest(self, manifest: ArtifactManifest) -> None:
         encoded = json.dumps(manifest.to_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -532,12 +543,13 @@ class EvidenceCustodyStore:
         collector = _id(collector_id, "collector_id")
         artifact = _artifact_id(artifact_id) if artifact_id is not None else "artifact:" + uuid.uuid4().hex
         media = _text(media_type or mimetypes.guess_type("artifact.bin")[0] or "application/octet-stream", "media_type", required=True, limit=200) or "application/octet-stream"
-        normalized_media_type = media.split(";", 1)[0].strip().lower()
-        textual = normalized_media_type.startswith("text/") or "json" in normalized_media_type or "xml" in normalized_media_type or "javascript" in normalized_media_type
-        # Textual content is never allowed to opt out of redaction. The
-        # compatibility flag only affects explicitly binary media.
-        redaction_applied = redaction_required or textual
-        derivative = self._derivative(payload, media) if redaction_applied else payload
+        # Keep the historical argument for source compatibility, but custody
+        # never permits a caller to make raw bytes the ordinary derivative.
+        # Text is centrally redacted and binary input becomes a content-free
+        # receipt regardless of the legacy opt-out value.
+        _ = redaction_required
+        redaction_applied = True
+        derivative = self._derivative(payload, media)
         if retain_original and not protected_original_authorization_ref:
             raise ArtifactAccessDenied(
                 "retaining a protected original requires an explicit authorization reference"
@@ -562,16 +574,20 @@ class EvidenceCustodyStore:
                 raise CustodyError("artifact identity already exists")
             artifact_dir.mkdir(mode=0o700)
             if retain_original:
-                atomic_write_bytes(original_path, payload, mode=0o400)  # type: ignore[arg-type]
                 created.append(original_path)  # type: ignore[arg-type]
-            atomic_write_bytes(derivative_path, derivative, mode=0o600)
+                atomic_write_bytes(original_path, payload, mode=0o400)  # type: ignore[arg-type]
             created.append(derivative_path)
+            atomic_write_bytes(derivative_path, derivative, mode=0o600)
+            primary_payload = payload if retain_original else derivative
             manifest_values: dict[str, Any] = {
                 "artifact_id": artifact,
                 "tenant_id": self.tenant_id,
                 "source_observation_id": observation_id,
-                "sha256": _digest(payload),
-                "byte_size": len(payload),
+                # The primary digest always describes bytes that were actually
+                # retained.  For a protected original it binds original.bin;
+                # otherwise it binds the only retained bytes, derivative.bin.
+                "sha256": _digest(primary_payload),
+                "byte_size": len(primary_payload),
                 "media_type": media,
                 "collected_at": _iso(_utc_now()),
                 "collector_id": collector,
@@ -599,8 +615,8 @@ class EvidenceCustodyStore:
             }
             manifest_values["manifest_digest"] = _manifest_digest(manifest_values)
             manifest = ArtifactManifest(**manifest_values)
-            self._write_manifest(manifest)
             created.append(manifest_path)
+            self._write_manifest(manifest)
             # Read-back verification closes the write transaction from the
             # filesystem's perspective before the manifest is returned.
             self._load_manifest(artifact)
@@ -647,7 +663,7 @@ class EvidenceCustodyStore:
         artifact_id: str,
         *,
         include_original: bool = False,
-        authorization: ProtectedOriginalAuthorization | str | None = None,
+        authorization: ProtectedOriginalAuthorization | None = None,
         actor_id: str | None = None,
     ) -> bytes:
         manifest = self.verify(artifact_id)
@@ -657,36 +673,36 @@ class EvidenceCustodyStore:
             return payload
         if manifest.original_relative_path is None or manifest.protection_state != "protected_original":
             raise ArtifactAccessDenied("protected original is not retained")
-        audit_actor: str | None
-        if isinstance(authorization, ProtectedOriginalAuthorization):
-            authorized = (
-                authorization.tenant_id == self.tenant_id
-                and authorization.artifact_id == manifest.artifact_id
-                and authorization.authorization_ref == manifest.protected_original_authorization_ref
-                and authorization.valid_now()
+        if self.audit_sink is None:
+            raise ArtifactAccessDenied(
+                "protected-original access requires an active audit sink"
             )
-            audit_actor = authorization.operator_id
-            reason = authorization.reason
-        else:
-            candidate_ref: str | None = None
-            if isinstance(authorization, str):
-                candidate_ref = _authorization_ref(authorization)
-            authorized = bool(
-                candidate_ref
-                and candidate_ref == manifest.protected_original_authorization_ref
-            )
-            audit_actor = actor_id
-            reason = "exact authorization reference"
+        authorized = bool(
+            isinstance(authorization, ProtectedOriginalAuthorization)
+            and authorization.tenant_id == self.tenant_id
+            and authorization.artifact_id == manifest.artifact_id
+            and authorization.authorization_ref
+            == manifest.protected_original_authorization_ref
+            and authorization.valid_now()
+        )
         if not authorized:
             self._audit("artifact.read.original.denied", manifest, actor_id=actor_id)
             raise ArtifactAccessDenied("exact protected-original authorization is required")
+        assert isinstance(authorization, ProtectedOriginalAuthorization)
+        # Audit before releasing bytes.  Sink failures propagate so a caller
+        # can never receive a protected original without a durable audit event.
+        self._audit(
+            "artifact.read.original.authorized",
+            manifest,
+            actor_id=authorization.operator_id,
+            reason=authorization.reason,
+        )
         payload = self._verify_bytes(self._original_path(manifest.artifact_id), manifest.sha256, manifest.byte_size, label="original")
-        self._audit("artifact.read.original.authorized", manifest, actor_id=audit_actor, reason=reason)
         return payload
 
     read_artifact = read
 
-    def export(self, artifact_id: str, *, authorization: ProtectedOriginalAuthorization | str | None = None) -> bytes:
+    def export(self, artifact_id: str, *, authorization: ProtectedOriginalAuthorization | None = None) -> bytes:
         """Export follows the ordinary redacted path unless explicitly authorized."""
         return self.read(artifact_id, include_original=authorization is not None, authorization=authorization)
 

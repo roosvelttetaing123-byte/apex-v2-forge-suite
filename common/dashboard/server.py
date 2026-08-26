@@ -36,13 +36,15 @@ from pathlib import Path
 from typing import Any, Mapping, NoReturn, cast
 from urllib.parse import quote, urlsplit
 
+from sqlalchemy import text as sql_text
+
 log = logging.getLogger("forge.dashboard.server")
 
 # ── Conditional imports (graceful fallback) ───────────────────────────
 try:
     from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
     from fastapi import HTTPException, Depends, Query
-    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
     from fastapi.staticfiles import StaticFiles
     from fastapi.templating import Jinja2Templates
     HAS_FASTAPI = True
@@ -61,6 +63,13 @@ from common.dashboard.event_bus import (
 )
 from common.dashboard.state_store import StateStore
 from common.confidence_policy import normalise_finding
+from common.canonical import FindingStatus as CanonicalFindingStatus
+from common.canonical_evidence import CanonicalEvidenceReader
+from common.evidence import (
+    ordinary_evidence_artifacts,
+    ordinary_evidence_projection,
+    ordinary_finding_projection,
+)
 from common.action_authorization import (
     AUTHORIZATION_DB_ENV,
     AUTHORIZATION_ENVELOPES_ENV,
@@ -119,7 +128,6 @@ from common.dashboard.auth import (
 )
 from common.db import (
     AuditLogModel,
-    FindingModel,
     FindingRetestModel,
     ScanJobModel,
     audit_log_to_dict,
@@ -260,6 +268,7 @@ DASHBOARD_API_ROUTE_POLICY: dict[tuple[str, str], tuple[str, Role | None]] = {
     ("GET", "/api/v1/supervisor"): ("dashboard_identity", Role.OPERATOR),
     ("GET", "/api/v1/state"): ("dashboard_identity", Role.VIEWER),
     ("GET", "/api/v1/findings"): ("dashboard_identity", Role.VIEWER),
+    ("POST", "/api/v1/findings/export"): ("dashboard_identity", Role.VIEWER),
     ("GET", "/api/v1/targets"): ("dashboard_identity", Role.VIEWER),
     ("GET", "/api/v1/metrics"): ("dashboard_identity", Role.VIEWER),
     ("GET", "/api/v1/kill-chain"): ("dashboard_identity", Role.VIEWER),
@@ -367,6 +376,9 @@ DASHBOARD_MUTATION_ROUTE_TEMPLATES = frozenset(
 _PUBLIC_RATE_LIMIT = 30
 _PUBLIC_RATE_WINDOW_SECONDS = 60.0
 _WEBSOCKET_CONNECTION_LIMIT = 64
+_CANONICAL_RESULT_DATABASE_NAMES = frozenset(
+    {"adforge.db", "aiforge.db", "netforge.db", "webforge.db"}
+)
 
 
 def _normalize_dashboard_host(value: Any) -> str:
@@ -1177,14 +1189,15 @@ class DashboardServer:
 
         # Active scan subprocess tracking
         self._active_scans: dict[str, dict[str, Any]] = {}  # scan_id → {proc, type, target, ...}
-        self._last_results_dir: Path | None = None
         forge_root = Path(__file__).parent.parent.parent
         self._dashboard_state_root = _configured_dashboard_state_root()
         transient_root = self._dashboard_state_root or forge_root / "tmp"
         self._scan_logs_dir = transient_root / "dashboard_scans"
         self._control_dir = transient_root / "dashboard_controls"
+        self._scan_results_dir = transient_root / "dashboard_results"
         _ensure_private_artifact_directory(self._scan_logs_dir)
         _ensure_private_artifact_directory(self._control_dir)
+        _ensure_private_artifact_directory(self._scan_results_dir)
 
         # Subscribe to all events for WebSocket broadcast
         self.event_bus.subscribe(None, self._on_event)
@@ -1503,9 +1516,245 @@ class DashboardServer:
             return value
         return str(value)[:500]
 
+    def _allocate_scan_results_dir(self, scan_id: str) -> Path:
+        """Allocate one private, server-owned result root for a scan job."""
+        candidate = self._scan_results_dir / _artifact_identifier(scan_id)
+        if _artifact_lstat(candidate) is not None:
+            raise DashboardArtifactError("scan result directory already exists")
+        _ensure_private_artifact_directory(candidate)
+        return candidate
+
+    @staticmethod
+    def _verified_canonical_result_root(value: Any) -> Path:
+        """Validate one durable job-bound result root without following links."""
+        if not isinstance(value, str) or not value.strip():
+            raise DashboardArtifactError("canonical result root is unavailable")
+        supplied = Path(value.strip())
+        if not supplied.is_absolute():
+            raise DashboardArtifactError("canonical result root must be absolute")
+        candidate = _artifact_path(supplied)
+        descriptor = -1
+        try:
+            descriptor = _open_artifact_directory(candidate, create=False)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise DashboardArtifactError(
+                    "canonical result root must be owner-only"
+                )
+            return candidate
+        except FileNotFoundError:
+            raise DashboardArtifactError(
+                "canonical result root is unavailable"
+            ) from None
+        finally:
+            if descriptor >= 0:
+                _close_artifact_descriptor(descriptor)
+
+    @staticmethod
+    def _canonical_database_paths(root: Path) -> list[Path]:
+        """Discover only bounded, owner-only engine databases below a job root."""
+        candidates: list[Path] = []
+        visited = 0
+        for current, directories, files in os.walk(root, topdown=True, followlinks=False):
+            current_path = _artifact_path(Path(current))
+            try:
+                depth = len(current_path.relative_to(root).parts)
+            except ValueError:
+                raise DashboardArtifactError(
+                    "canonical result traversal escaped its root"
+                ) from None
+            visited += 1
+            if visited > 512:
+                raise DashboardArtifactError(
+                    "canonical result directory bound exceeded"
+                )
+            safe_directories: list[str] = []
+            if depth < 4:
+                for name in sorted(directories):
+                    if not _ARTIFACT_ID_RE.fullmatch(name):
+                        continue
+                    child = current_path / name
+                    metadata = _artifact_lstat(child)
+                    if metadata is None or not stat.S_ISDIR(metadata.st_mode):
+                        continue
+                    if (
+                        hasattr(os, "getuid")
+                        and metadata.st_uid != os.getuid()
+                    ) or stat.S_IMODE(metadata.st_mode) & 0o077:
+                        raise DashboardArtifactError(
+                            "canonical result directory must be owner-only"
+                        )
+                    safe_directories.append(name)
+            directories[:] = safe_directories
+            found_database = False
+            for name in sorted(set(files) & _CANONICAL_RESULT_DATABASE_NAMES):
+                candidate = current_path / name
+                metadata = _artifact_lstat(candidate)
+                if metadata is None:
+                    continue
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                ):
+                    raise DashboardArtifactError(
+                        "canonical result database must be owner-only"
+                    )
+                candidates.append(candidate)
+                found_database = True
+                if len(candidates) > 32:
+                    raise DashboardArtifactError(
+                        "canonical result database bound exceeded"
+                    )
+            if found_database:
+                directories[:] = []
+        return sorted(set(candidates))
+
+    def _canonical_result_roots(self) -> list[Path]:
+        roots: set[Path] = set()
+        for record in self._load_scan_jobs_read_only(limit=1000):
+            if record.get("authorization_state") != "allow":
+                continue
+            roots.add(self._job_bound_canonical_result_root(record))
+        return sorted(roots)
+
+    def _job_bound_canonical_result_root(
+        self,
+        record: Mapping[str, Any],
+    ) -> Path:
+        """Resolve only the server-generated root bound to one authorized job."""
+        if record.get("authorization_state") != "allow":
+            raise DashboardArtifactError(
+                "canonical result root requires an authorized job"
+            )
+        if not all(
+            isinstance(record.get(field), str) and record.get(field)
+            for field in (
+                "authorization_decision_id",
+                "authorization_action_id",
+            )
+        ):
+            raise DashboardArtifactError(
+                "canonical result root authorization binding is unavailable"
+            )
+        scan_id = _artifact_identifier(str(record.get("scan_id") or ""))
+        raw_root = record.get("results_dir")
+        if not isinstance(raw_root, str) or not raw_root.strip():
+            raise DashboardArtifactError("canonical result root is unavailable")
+        supplied = _artifact_path(Path(raw_root.strip()))
+        expected = _artifact_path(self._scan_results_dir / scan_id)
+        if supplied != expected:
+            raise DashboardArtifactError(
+                "canonical result root does not match its durable job"
+            )
+        return self._verified_canonical_result_root(str(supplied))
+
+    def _canonical_projection_rows(
+        self,
+        *,
+        actor_id: str | None = None,
+        roots: list[Path] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read verified tenant projections from job-bound canonical stores."""
+        selected_roots = self._canonical_result_roots() if roots is None else roots
+        by_id: dict[str, dict[str, Any]] = {}
+        for root in selected_roots:
+            verified_root = self._verified_canonical_result_root(str(root))
+            for database_path in self._canonical_database_paths(verified_root):
+                custody_root = database_path.parent / "evidence-custody"
+                try:
+                    session = create_db(database_path)
+                    try:
+                        finding_count = int(
+                            session.execute(
+                                sql_text(
+                                    "SELECT COUNT(*) FROM canonical_findings "
+                                    "WHERE tenant_id=:tenant_id"
+                                ),
+                                {"tenant_id": self.tenant_id},
+                            ).scalar_one()
+                        )
+                        session.rollback()
+                        if finding_count == 0:
+                            continue
+                        self._verified_canonical_result_root(str(custody_root))
+                        reader = CanonicalEvidenceReader(
+                            session,
+                            custody_root,
+                            self.tenant_id,
+                            audit_actor_id=actor_id,
+                        )
+                        rows = reader.list_finding_projections()
+                    finally:
+                        session.close()
+                except Exception as exc:
+                    log.warning(
+                        "Canonical finding read failed reason=%s",
+                        type(exc).__name__,
+                    )
+                    raise DashboardArtifactError(
+                        "canonical finding source failed verification"
+                    ) from None
+                for row in rows:
+                    finding_id = str(row.get("id") or "")
+                    if not finding_id:
+                        raise DashboardArtifactError(
+                            "canonical finding projection is invalid"
+                        )
+                    previous = by_id.get(finding_id)
+                    if previous is not None and previous != row:
+                        raise DashboardArtifactError(
+                            "canonical finding identity conflicts across stores"
+                        )
+                    by_id[finding_id] = row
+        return sorted(
+            by_id.values(),
+            key=lambda row: (str(row.get("timestamp") or ""), str(row["id"])),
+            reverse=True,
+        )
+
+    def _canonical_export(
+        self,
+        finding_ids: list[str],
+        *,
+        actor_id: str,
+    ) -> bytes:
+        """Build one deterministic backend export from persisted projections."""
+        requested = sorted(set(finding_ids))
+        if not requested or len(requested) > 200:
+            raise DashboardArtifactError("finding export selection is invalid")
+        if any(
+            not isinstance(item, str) or _ARTIFACT_ID_RE.fullmatch(item) is None
+            for item in requested
+        ):
+            raise DashboardArtifactError("finding export selection is invalid")
+        available = {
+            str(row["id"]): self._public_finding(row)
+            for row in self._canonical_projection_rows(actor_id=actor_id)
+        }
+        if any(finding_id not in available for finding_id in requested):
+            raise DashboardArtifactError("canonical finding is unavailable")
+        return json.dumps(
+            {
+                "findings": [available[finding_id] for finding_id in requested],
+                "schema_version": "forge-canonical-finding-export-v1",
+                "tenant_id": self.tenant_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+
     def _public_finding(self, finding: Mapping[str, Any]) -> dict[str, Any]:
         """Serialize one finding after central truth normalization."""
-        finding = normalise_finding(dict(finding))
+        finding = ordinary_finding_projection(
+            normalise_finding(dict(finding))
+        )
         allowed = (
             "id",
             "title",
@@ -1526,14 +1775,34 @@ class DashboardServer:
             "verification_state",
             "proof_type",
             "maturity",
+            "finding_key",
+            "dedup_key",
+            "reproduction_steps",
+            "remediation",
+            "evidence",
         )
-        return {
-            key: self._bounded_public_value(finding.get(key))
-            for key in allowed
-            if key in finding
-        }
+        result: dict[str, Any] = {}
+        for key in allowed:
+            if key not in finding or key == "evidence":
+                continue
+            if key == "dedup_key":
+                # The ordinary projector validates this versioned identity
+                # digest.  Preserve it as an opaque canonical reference rather
+                # than treating its hash-shaped bytes as credential material.
+                result[key] = finding[key]
+            else:
+                result[key] = self._bounded_public_value(finding.get(key))
+        result["evidence"] = ordinary_evidence_projection(
+            finding.get("evidence")
+        )
+        return result
 
-    def _public_state_snapshot(self, role: Role) -> dict[str, Any]:
+    def _public_state_snapshot(
+        self,
+        role: Role,
+        *,
+        actor_id: str | None = None,
+    ) -> dict[str, Any]:
         """Return tenant-bound state with role-aware secret/evidence omission."""
         raw = self.state_store.snapshot()
         safe: dict[str, Any] = {
@@ -1556,11 +1825,10 @@ class DashboardServer:
                 "timeline",
             )
         }
-        safe["findings"] = [
-            self._public_finding(item)
-            for item in raw.get("findings", [])[:1000]
-            if isinstance(item, Mapping)
-        ]
+        safe["findings"] = self._public_findings(
+            limit=1000,
+            actor_id=actor_id,
+        )
         if role in {Role.OPERATOR, Role.ADMIN}:
             safe["credentials"] = [
                 {
@@ -1622,16 +1890,16 @@ class DashboardServer:
         *,
         severity: str | None = None,
         limit: int = 100,
+        actor_id: str | None = None,
     ) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 1000))
-        return [
+        findings = [
             self._public_finding(item)
-            for item in self.state_store.findings_snapshot(
-                severity=severity,
-                limit=limit,
-            )
-            if isinstance(item, Mapping)
+            for item in self._canonical_projection_rows(actor_id=actor_id)
+            if severity is None
+            or str(item.get("severity") or "").lower() == severity.lower()
         ]
+        return findings[:limit]
 
     def _public_event(self, event: Event) -> dict[str, Any]:
         """Serialize an event through a type-specific field allowlist."""
@@ -2351,7 +2619,12 @@ class DashboardServer:
         async def api_state(request: Request):
             """Full state snapshot for dashboard initialization."""
             payload = _require_auth(request)
-            return JSONResponse(server._public_state_snapshot(payload.role))
+            return JSONResponse(
+                server._public_state_snapshot(
+                    payload.role,
+                    actor_id=payload.username,
+                )
+            )
 
         @app.get("/api/v1/findings")
         async def api_findings(
@@ -2363,10 +2636,11 @@ class DashboardServer:
             offset: int = Query(default=0, ge=0),
         ):
             """Paginated findings with filters."""
-            _require_auth(request)
+            payload = _require_auth(request)
             findings = server._public_findings(
                 severity=severity,
-                limit=limit + offset,
+                limit=1000,
+                actor_id=payload.username,
             )
             # Apply additional filters
             if module:
@@ -2375,14 +2649,58 @@ class DashboardServer:
                 findings = [f for f in findings if f.get("target") == target]
             return {
                 "findings": findings[offset:offset + limit],
-                "total": len(server.state_store.findings),
+                "total": len(findings),
             }
+
+        @app.post("/api/v1/findings/export")
+        async def api_export_findings(request: Request):
+            """Export selected findings from verified persisted derivatives."""
+            payload = _require_auth(request)
+            try:
+                body = await request.json()
+            except Exception:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Finding export selection is invalid",
+                ) from None
+            finding_ids = body.get("finding_ids") if isinstance(body, dict) else None
+            if (
+                not isinstance(finding_ids, list)
+                or not finding_ids
+                or len(finding_ids) > 200
+                or any(not isinstance(item, str) for item in finding_ids)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Finding export selection is invalid",
+                )
+            try:
+                content = server._canonical_export(
+                    finding_ids,
+                    actor_id=payload.username,
+                )
+            except DashboardArtifactError:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Canonical finding export is unavailable",
+                ) from None
+            return Response(
+                content=content,
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": (
+                        'attachment; filename="forge_findings.json"'
+                    )
+                },
+            )
 
         @app.get("/api/v1/targets")
         async def api_targets(request: Request):
             """Target status map."""
             payload = _require_auth(request)
-            snap = server._public_state_snapshot(payload.role)
+            snap = server._public_state_snapshot(
+                payload.role, actor_id=payload.username
+            )
             return {"targets": snap.get("targets", {})}
 
         @app.get("/api/v1/metrics")
@@ -2401,7 +2719,9 @@ class DashboardServer:
         async def api_credentials(request: Request):
             """Discovered credentials (masked)."""
             payload = _require_auth(request, Role.OPERATOR)
-            snap = server._public_state_snapshot(payload.role)
+            snap = server._public_state_snapshot(
+                payload.role, actor_id=payload.username
+            )
             return {"credentials": snap.get("credentials", [])}
 
         @app.post("/api/v1/credentials/analyze")
@@ -2446,14 +2766,18 @@ class DashboardServer:
         async def api_sessions(request: Request):
             """Active shell sessions."""
             payload = _require_auth(request, Role.OPERATOR)
-            snap = server._public_state_snapshot(payload.role)
+            snap = server._public_state_snapshot(
+                payload.role, actor_id=payload.username
+            )
             return {"sessions": snap.get("sessions", [])}
 
         @app.get("/api/v1/timeline")
         async def api_timeline(request: Request, limit: int = Query(default=100, le=500)):
             """Threat timeline events."""
             payload = _require_auth(request)
-            snapshot = server._public_state_snapshot(payload.role)
+            snapshot = server._public_state_snapshot(
+                payload.role, actor_id=payload.username
+            )
             return {"timeline": snapshot.get("timeline", [])[-limit:]}
 
         @app.get("/api/v1/audit-logs")
@@ -3081,6 +3405,14 @@ class DashboardServer:
                     "actions": action_decisions,
                 }
 
+            try:
+                results_root = server._allocate_scan_results_dir(job_id)
+            except DashboardArtifactError:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Scan result boundary is unavailable",
+                ) from None
+
             # Escalation is separately approved before DNS; the current answer must
             # then include the exact approved network target before any process exists.
             if scan_type == "vapt":
@@ -3121,6 +3453,7 @@ class DashboardServer:
                     ],
                     "modules": [],
                     "logs": {},
+                    "results_dir": str(results_root),
                     "created_at": datetime.now(timezone.utc),
                 },
             )
@@ -3168,6 +3501,7 @@ class DashboardServer:
                         "--engagement", engagement,
                         "--dashboard-url", dash_url,
                         "--control-file", str(control_file),
+                        "--output", str(results_root / "netforge"),
                     ]
                     server._append_scope_args(
                         cmd,
@@ -3184,6 +3518,7 @@ class DashboardServer:
                     "--dashboard-url", dash_url,
                     "--control-file", str(control_file),
                     "--report-format", "html,json",
+                    "--output", str(results_root / "webforge"),
                 ]
                 # Non-secret auth args — username, login_url, header_name are safe in argv
                 if mode != "blackbox":
@@ -3290,6 +3625,7 @@ class DashboardServer:
                     "control_file": str(control_file),
                     "command": server._sanitize_cmd(cmd),
                     "dashboard_url": dash_url,
+                    "results_dir": str(results_root),
                 }
                 server._track_scan_process(key, server._active_scans[key])
                 launched.append(framework_name)
@@ -3304,6 +3640,7 @@ class DashboardServer:
                 target=target,
                 frameworks=launched,
                 modules=[],
+                results_dir=str(results_root),
                 authorization=web_authorization or net_authorization,
             )
 
@@ -3506,7 +3843,16 @@ class DashboardServer:
         ):
             """Delete a scan from dashboard history; optionally purge result artifacts."""
             payload = _require_auth(request, Role.OPERATOR)
-            deleted = server._delete_scan_record(scan_id, purge_artifacts=purge_artifacts)
+            try:
+                deleted = server._delete_scan_record(
+                    scan_id,
+                    purge_artifacts=purge_artifacts,
+                )
+            except DashboardArtifactError:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Scan deletion would break canonical evidence lineage",
+                ) from None
             if not deleted.get("found"):
                 raise HTTPException(status_code=404, detail="Scan not found")
             server.event_bus.emit_simple(
@@ -3580,19 +3926,24 @@ class DashboardServer:
             payload = _require_auth(request, Role.OPERATOR)
             body = await request.json()
             new_status = body.get("status", "").strip()
-            valid = {"Open", "Fixed", "Accepted", "False Positive"}
+            valid = {
+                "Open",
+                "In Progress",
+                "Fixed",
+                "Accepted",
+                "False Positive",
+            }
             if new_status not in valid:
                 raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid)}")
-            # Update in StateStore
-            updated = False
-            for f in server.state_store.findings:
-                if getattr(f, "id", "") == finding_id:
-                    f.status = new_status
-                    updated = True
-                    break
             persisted = server._persist_finding_status(finding_id, new_status)
-            if not updated and not persisted:
+            if not persisted:
                 raise HTTPException(status_code=404, detail="Finding not found")
+            # The event cache is a projection only. Update it after canonical
+            # persistence succeeds so it can never become authoritative.
+            for finding_entry in server.state_store.findings:
+                if getattr(finding_entry, "id", "") == finding_id:
+                    finding_entry.status = new_status
+                    break
             server.event_bus.emit_simple(
                 EventType.FINDING_UPDATED, source="dashboard",
                 finding_id=finding_id, status=new_status,
@@ -3640,7 +3991,10 @@ class DashboardServer:
                     ),
                 )
                 server._raise_scope_denial(decision)
-            finding = server._find_finding_metadata(finding_id)
+            finding = server._find_finding_metadata(
+                finding_id,
+                actor_id=payload.username,
+            )
             if not finding:
                 raise HTTPException(status_code=404, detail="Finding not found")
 
@@ -4203,6 +4557,14 @@ class DashboardServer:
                     "actions": action_decisions,
                 }
 
+            try:
+                results_root = server._allocate_scan_results_dir(job_id)
+            except DashboardArtifactError:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Scan result boundary is unavailable",
+                ) from None
+
             if scan_type == "vapt":
                 try:
                     hostname = urlsplit(target).hostname or ""
@@ -4241,6 +4603,7 @@ class DashboardServer:
                     ],
                     "modules": web_modules + net_modules,
                     "logs": {},
+                    "results_dir": str(results_root),
                     "created_at": datetime.now(timezone.utc),
                 },
             )
@@ -4286,6 +4649,7 @@ class DashboardServer:
                     '--report-format', 'html,json',
                     '--rate', rate_arg,
                     '--workers', str(max_threads),
+                    '--output', str(results_root / 'webforge'),
                 ]
                 if mode != "blackbox":
                     cmd += ['--auth-type', auth_type]
@@ -4315,6 +4679,7 @@ class DashboardServer:
                     '--rate', rate_arg,
                     '--workers', str(max_threads),
                     '--bf-timeout', str(timeout_seconds),
+                    '--output', str(results_root / 'netforge'),
                 ]
                 if net_modules:
                     cmd += ['--modules', ','.join(net_modules)]
@@ -4421,6 +4786,7 @@ class DashboardServer:
                     'actual_modules': actual_modules,
                     'scan_options': scan_options,
                     'control': control_metadata,
+                    'results_dir': str(results_root),
                 }
                 server._track_scan_process(key, server._active_scans[key])
                 launched.append(framework_name)
@@ -4447,6 +4813,7 @@ class DashboardServer:
                 target=target,
                 frameworks=launched,
                 modules=(web_modules + net_modules),
+                results_dir=str(results_root),
                 authorization=web_authorization or net_authorization,
             )
 
@@ -4856,7 +5223,9 @@ class DashboardServer:
                     if payload.is_expired():
                         await server._expire_websocket_session(websocket)
                         return
-                    snapshot = server._public_state_snapshot(payload.role)
+                    snapshot = server._public_state_snapshot(
+                        payload.role, actor_id=payload.username
+                    )
                     if payload.is_expired():
                         await server._expire_websocket_session(websocket)
                         return
@@ -4940,7 +5309,9 @@ class DashboardServer:
         if action == "ping":
             await ws.send_json({"type": "pong", "ts": time.time()})
         elif action == "get_state":
-            snapshot = self._public_state_snapshot(payload.role)
+            snapshot = self._public_state_snapshot(
+                payload.role, actor_id=payload.username
+            )
             if payload.is_expired():
                 await self._expire_websocket_session(ws)
                 return
@@ -4969,7 +5340,11 @@ class DashboardServer:
                     "reason_code": "websocket_limit_invalid",
                 })
                 return
-            findings = self._public_findings(severity=severity, limit=raw_limit)
+            findings = self._public_findings(
+                severity=severity,
+                limit=raw_limit,
+                actor_id=payload.username,
+            )
             if payload.is_expired():
                 await self._expire_websocket_session(ws)
                 return
@@ -7966,25 +8341,61 @@ class DashboardServer:
 
     def _persist_finding_status(self, finding_id: str, status: str) -> bool:
         """Persist finding status changes in the canonical findings table."""
-        canonical = self._canonical_finding_status(status)
-
-        def _update(session: Any) -> bool:
-            row = (
-                session.query(FindingModel)
-                .filter(
-                    FindingModel.id == finding_id,
-                    FindingModel.tenant_id == self.tenant_id,
-                )
-                .one_or_none()
-            )
-            if row is None:
-                return False
-            row.status = canonical
-            session.commit()
-            return True
-
         try:
-            return bool(self._with_scan_jobs_session(_update))
+            canonical = CanonicalFindingStatus(
+                self._canonical_finding_status(status)
+            ).value
+            matches: list[Path] = []
+            for root in self._canonical_result_roots():
+                for database_path in self._canonical_database_paths(root):
+                    session = create_db(database_path)
+                    try:
+                        count = int(
+                            session.execute(
+                                sql_text(
+                                    "SELECT COUNT(*) FROM canonical_findings "
+                                    "WHERE tenant_id=:tenant_id AND id=:finding_id"
+                                ),
+                                {
+                                    "tenant_id": self.tenant_id,
+                                    "finding_id": finding_id,
+                                },
+                            ).scalar_one()
+                        )
+                        session.rollback()
+                    finally:
+                        session.close()
+                    if count:
+                        matches.append(database_path)
+            if not matches:
+                return False
+            if len(matches) != 1:
+                raise DashboardArtifactError(
+                    "canonical finding identity conflicts across stores"
+                )
+            session = create_db(matches[0])
+            try:
+                if session.in_transaction():
+                    session.rollback()
+                with session.begin():
+                    result = session.execute(
+                        sql_text(
+                            "UPDATE canonical_findings SET status=:status "
+                            "WHERE tenant_id=:tenant_id AND id=:finding_id"
+                        ),
+                        {
+                            "status": canonical,
+                            "tenant_id": self.tenant_id,
+                            "finding_id": finding_id,
+                        },
+                    )
+                    if getattr(result, "rowcount", None) != 1:
+                        raise DashboardArtifactError(
+                            "canonical finding status update failed"
+                        )
+            finally:
+                session.close()
+            return True
         except Exception as exc:
             log.warning(
                 "Could not persist dashboard finding status reason=%s",
@@ -8207,7 +8618,7 @@ class DashboardServer:
             },
         }
 
-    def _load_scan_jobs_read_only(
+    def _load_scan_jobs_read_only_once(
         self,
         *,
         scan_id: str | None = None,
@@ -8334,19 +8745,33 @@ class DashboardServer:
                     if sidecar_entry is not None:
                         sidecars_stable = False
                     continue
+                if sidecar_entry is None:
+                    sidecars_stable = False
+                    continue
                 initial_sidecar = sidecar_initial_metadata[suffix]
                 final_sidecar = os.fstat(descriptor)
-                if (
-                    sidecar_entry is None
-                    or not _is_safe_database(final_sidecar)
-                    or not _is_safe_database(sidecar_entry)
-                    or not _artifact_read_snapshot_is_stable(
+                safe_sidecar = (
+                    sidecar_entry is not None
+                    and _is_safe_database(final_sidecar)
+                    and _is_safe_database(sidecar_entry)
+                )
+                if suffix == "-shm":
+                    # SQLite readers legitimately update the shared-memory
+                    # coordination file. Pin its owner-controlled inode, but
+                    # do not mistake our own lock bookkeeping for data drift.
+                    safe_sidecar = safe_sidecar and all(
+                        (metadata.st_dev, metadata.st_ino)
+                        == (initial_sidecar.st_dev, initial_sidecar.st_ino)
+                        for metadata in (final_sidecar, sidecar_entry)
+                    )
+                else:
+                    safe_sidecar = safe_sidecar and _artifact_read_snapshot_is_stable(
                         initial_sidecar,
                         final_sidecar,
                         sidecar_entry,
                         require_owner=True,
                     )
-                ):
+                if not safe_sidecar:
                     sidecars_stable = False
             if (
                 not _is_safe_database(final_metadata)
@@ -8397,6 +8822,59 @@ class DashboardServer:
             if parent_descriptor >= 0:
                 _close_artifact_descriptor(parent_descriptor)
         return result
+
+    def _load_scan_jobs_read_only(
+        self,
+        *,
+        scan_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Return one fully stable snapshot, tolerating bounded local WAL churn."""
+        def _path_identity() -> tuple[int, int, int, int] | None:
+            parent_descriptor = -1
+            try:
+                path = _artifact_path(self._scan_jobs_db_path)
+                entry = _artifact_lstat(path)
+                if entry is None:
+                    return None
+                parent_descriptor = _open_artifact_directory(
+                    path.parent,
+                    create=False,
+                )
+                parent = os.fstat(parent_descriptor)
+            except (DashboardArtifactError, FileNotFoundError, OSError):
+                return None
+            finally:
+                if parent_descriptor >= 0:
+                    _close_artifact_descriptor(parent_descriptor)
+            return (
+                parent.st_dev,
+                parent.st_ino,
+                entry.st_dev,
+                entry.st_ino,
+            )
+
+        pinned_identity = _path_identity()
+        if pinned_identity is None:
+            return []
+        for attempt in range(4):
+            rows = self._load_scan_jobs_read_only_once(
+                scan_id=scan_id,
+                limit=limit,
+            )
+            if rows:
+                return rows
+            # Retry only while the same main database and parent directory
+            # remain pinned. Entry or ancestor replacement is a hard boundary
+            # failure, not SQLite coordination churn.
+            if _path_identity() != pinned_identity:
+                return []
+            if attempt < 3:
+                # Each attempt repeats every inode/content stability check. A
+                # short retry permits the dashboard's own completed audit
+                # transaction to settle without accepting a changing snapshot.
+                time.sleep(0.025)
+        return []
 
     def _load_scan_jobs(self, limit: int = 200) -> list[dict[str, Any]]:
         """Load durable scan job rows newest-first."""
@@ -8463,101 +8941,46 @@ class DashboardServer:
                 type(exc).__name__,
             )
 
-    def _find_finding_metadata(self, finding_id: str) -> dict[str, Any] | None:
-        """Find canonical metadata for a finding from live state, result files, or DB."""
-        for finding in self.state_store.findings:
-            if getattr(finding, "id", "") == finding_id:
-                return finding.to_dict()
-
-        forge_root = Path(__file__).parent.parent.parent
-        for record in self._load_scan_history(limit=500):
-            for finding_row in self._findings_for_scan(forge_root, record):
-                if finding_row.get("id") == finding_id:
-                    return finding_row
-
-        def _load(session: Any) -> dict[str, Any] | None:
-            row = (
-                session.query(FindingModel)
-                .filter(
-                    FindingModel.id == finding_id,
-                    FindingModel.tenant_id == self.tenant_id,
-                )
-                .one_or_none()
-            )
-            if row is None:
-                return None
-            evidence = {
-                "request_raw": row.request_raw,
-                "response_raw": row.response_raw,
-                "screenshot_path": row.screenshot_path,
-                "console_capture_path": row.console_capture_path,
-                "pcap_path": row.pcap_path,
-            }
-            return {
-                "id": row.id,
-                "title": row.title,
-                "severity": row.severity,
-                "target": row.target,
-                "url": row.url,
-                "port": row.port,
-                "service": row.service,
-                "module": row.module,
-                "description": row.description,
-                "reproduction_steps": json.loads(row.reproduction_steps or "[]"),
-                "remediation": row.remediation,
-                "references": json.loads(row.references or "[]"),
-                "confidence": row.confidence or "UNVERIFIED",
-                "status": row.status or "open",
-                "verification": json.loads(row.verification or "{}"),
-                "verification_state": row.verification_state or "unknown",
-                "proof_type": row.proof_type or "unknown",
-                "maturity": row.maturity or "experimental",
-                "evidence": evidence,
-            }
-
-        try:
-            return self._with_scan_jobs_session(_load)
-        except Exception as exc:
-            log.warning(
-                "Could not load dashboard retest finding reason=%s",
-                type(exc).__name__,
-            )
-            return None
+    def _find_finding_metadata(
+        self,
+        finding_id: str,
+        *,
+        actor_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Find one tenant-bound persisted canonical finding."""
+        for finding in self._canonical_projection_rows(actor_id=actor_id):
+            if finding.get("id") == finding_id:
+                return self._public_finding(finding)
+        return None
 
     def _finding_retest_metadata(self, finding: dict[str, Any]) -> dict[str, Any]:
         """Extract stable retest metadata from a finding payload."""
-        evidence = finding.get("evidence") or {}
-        verification = finding.get("verification") or {}
-        if not isinstance(evidence, dict):
-            evidence = {}
-        if not isinstance(verification, dict):
-            verification = {}
+        evidence_projection = ordinary_evidence_projection(
+            finding.get("evidence")
+        )
+        evidence_artifacts = ordinary_evidence_artifacts(evidence_projection)
+        capture_kinds = {
+            str(artifact.get("capture_kind") or "")
+            for artifact in evidence_artifacts
+        }
+        observation_parameters = [
+            str(observation["parameter"])
+            for observation in evidence_projection.get("observations", [])
+            if observation.get("parameter")
+        ]
         return {
             "module": finding.get("module", ""),
             "target": finding.get("target", ""),
             "url": finding.get("url") or finding.get("target", ""),
-            "param": (
-                verification.get("param")
-                or verification.get("parameter")
-                or evidence.get("param")
-                or evidence.get("parameter")
-            ),
-            "payload_class": (
-                verification.get("payload_class")
-                or evidence.get("payload_class")
-                or finding.get("module", "")
-            ),
-            "session_ref": (
-                verification.get("session_ref")
-                or evidence.get("session_ref")
-                or evidence.get("screenshot_path")
-                or evidence.get("pcap_path")
-            ),
+            "param": observation_parameters[0] if observation_parameters else None,
+            "payload_class": finding.get("module", ""),
+            "session_ref": None,
             "evidence": {
                 "proof_summary": finding.get("description", ""),
                 "source_confidence": finding.get("confidence", "UNVERIFIED"),
-                "request_present": bool(evidence.get("request_raw")),
-                "response_present": bool(evidence.get("response_raw")),
+                "artifact_count": len(evidence_artifacts),
+                "request_present": "request" in capture_kinds,
+                "response_present": "response" in capture_kinds,
                 "dry_run_note": "Retest job records module rerun wiring; scanner output determines final status.",
             },
             "finding_snapshot": {
@@ -8658,6 +9081,13 @@ class DashboardServer:
             self._raise_scope_denial(decision_for_reason(ScopeReason.INVALID_CONFIRMATION))
 
         scan_id = job_id
+        try:
+            results_root = self._allocate_scan_results_dir(scan_id)
+        except DashboardArtifactError:
+            raise HTTPException(
+                status_code=500,
+                detail="Retest result boundary is unavailable",
+            ) from None
         forge_root = Path(__file__).parent.parent.parent
         control_file = self._init_control_file(scan_id)
 
@@ -8673,6 +9103,8 @@ class DashboardServer:
             str(control_file),
             "--modules",
             module,
+            "--output",
+            str(results_root / framework),
         ]
         if framework == "webforge":
             cmd.extend(["--mode", "blackbox", "--report-format", "json"])
@@ -8716,6 +9148,7 @@ class DashboardServer:
             "dashboard_url": "",
             "retest_id": retest_id,
             "finding_id": finding["id"],
+            "results_dir": str(results_root),
         }
         self._track_scan_process(key, self._active_scans[key])
         self._write_scan_job(
@@ -8723,6 +9156,7 @@ class DashboardServer:
             target=target,
             frameworks=[framework],
             modules=[module],
+            results_dir=str(results_root),
             authorization=authorization,
         )
 
@@ -9065,8 +9499,11 @@ class DashboardServer:
             ),
             None,
         )
-        read_only_jobs = self._load_scan_jobs_read_only(scan_id=scan_id, limit=1)
-        job = read_only_jobs[0] if read_only_jobs else None
+        # This is an authenticated mutation path. Its mandatory pre-dispatch
+        # audit write can legitimately change the SQLite WAL, so use the
+        # descriptor-bound transactional loader rather than the viewer-only
+        # stable-snapshot reader.
+        job = self._load_scan_job(scan_id)
         found = (
             record is not None
             or job is not None
@@ -9074,6 +9511,11 @@ class DashboardServer:
         )
         if not found:
             return {"found": False, "scan_id": scan_id}
+
+        if job is not None and self._scan_job_has_canonical_lineage(job):
+            raise DashboardArtifactError(
+                "scan deletion would break canonical evidence lineage"
+            )
 
         removed_processes: list[str] = []
         for key, info in list(self._active_scans.items()):
@@ -9145,6 +9587,38 @@ class DashboardServer:
             "files_deleted": removed_files,
             "artifacts_deleted": removed_artifacts,
         }
+
+    def _scan_job_has_canonical_lineage(
+        self,
+        record: Mapping[str, Any],
+    ) -> bool:
+        """Return whether a durable job owns observations that must be retained."""
+        if record.get("authorization_state") != "allow":
+            return False
+        root = self._job_bound_canonical_result_root(record)
+        for database_path in self._canonical_database_paths(root):
+            try:
+                session = create_db(database_path)
+                try:
+                    count = int(
+                        session.execute(
+                            sql_text(
+                                "SELECT COUNT(*) FROM canonical_observations "
+                                "WHERE tenant_id=:tenant_id"
+                            ),
+                            {"tenant_id": self.tenant_id},
+                        ).scalar_one()
+                    )
+                    session.rollback()
+                finally:
+                    session.close()
+            except Exception:
+                raise DashboardArtifactError(
+                    "canonical lineage could not be verified for deletion"
+                ) from None
+            if count:
+                return True
+        return False
 
     def _purge_scan_artifacts(self, record: dict) -> list[str]:
         """Keep unbound legacy result artifacts outside dashboard deletion."""
@@ -9310,14 +9784,25 @@ class DashboardServer:
         return []
 
     def _findings_for_scan(self, forge_root: Path, record: dict) -> list[dict]:
-        """Return no findings from tenant-unbound legacy result files."""
-        del forge_root, record
-        return []
+        """Return verified canonical findings for one tenant-bound scan job."""
+        del forge_root
+        if record.get("authorization_state") != "allow":
+            return []
+        root = self._job_bound_canonical_result_root(record)
+        return [
+            self._public_finding(row)
+            for row in self._canonical_projection_rows(
+                actor_id="dashboard-scan-history",
+                roots=[root],
+            )
+        ]
 
     def _count_findings(self, findings: list[dict]) -> dict:
         counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0, "total": 0}
         for finding in findings:
             sev = (finding.get("severity") or "info").lower()
+            if sev == "informational":
+                sev = "info"
             if sev in counts:
                 counts[sev] += 1
             counts["total"] += 1
