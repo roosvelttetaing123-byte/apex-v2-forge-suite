@@ -42,8 +42,7 @@ from common.canonical import (
     ProvenanceSourceType,
     Report,
     ReportMembership,
-    Retest,
-    RetestStatus,
+    RetestRequest,
     ScopeDecision,
     Tenant,
     deserialize_contract,
@@ -157,7 +156,7 @@ def test_task103_attempt_link_is_additive_to_accepted_observation_bytes(
         session.close()
 
 
-def test_optional_intelligence_retest_report_export_links_share_finding(tmp_path: Path) -> None:
+def test_optional_intelligence_report_export_links_share_finding(tmp_path: Path) -> None:
     session, store, graph = _graph(tmp_path)
     try:
         source = IntelligenceSource(tenant_id=graph["tenant"].id, name="fixture-feed", source_kind="feed")
@@ -173,7 +172,6 @@ def test_optional_intelligence_retest_report_export_links_share_finding(tmp_path
             check_pack_snapshot_id=checkpack.id,
             provenance_id=provenance.id,
         )
-        retest = Retest(tenant_id=graph["tenant"].id, finding_id=graph["finding"].id, source_observation_id=graph["observation"].id, status=RetestStatus.NOT_RUN, job_id=graph["job"].id)
         report = Report(tenant_id=graph["tenant"].id, name="fixture report")
         membership = ReportMembership(tenant_id=graph["tenant"].id, report_id=report.id, finding_id=graph["finding"].id, observation_id=graph["observation"].id)
         export = Export(tenant_id=graph["tenant"].id, finding_id=graph["finding"].id, source_observation_id=graph["observation"].id, format="json", report_id=report.id, provenance_id=provenance.id)
@@ -203,12 +201,11 @@ def test_optional_intelligence_retest_report_export_links_share_finding(tmp_path
             store.create_lineage(**lineage_context, provenance=cross_tenant_provenance)
         result = store.create_lineage(
             **lineage_context, provenance=provenance,
-            retest=retest, report=report, report_membership=membership, export=export,
+            report=report, report_membership=membership, export=export,
         )
-        assert result["retest"].finding_id == graph["finding"].id
         assert result["report_membership"].observation_id == graph["observation"].id
         assert result["export"].report_id == report.id
-        assert session.execute(text("SELECT COUNT(*) FROM canonical_retests WHERE tenant_id=:t AND finding_id=:f"), {"t": graph["tenant"].id, "f": graph["finding"].id}).scalar_one() == 1
+        assert session.execute(text("SELECT COUNT(*) FROM canonical_retests"), {}).scalar_one() == 0
     finally:
         session.close()
 
@@ -288,7 +285,6 @@ def test_orphan_artifact_finding_retest_membership_and_export_fail(tmp_path: Pat
         statements = [
             "INSERT INTO canonical_artifact_refs(id,tenant_id,observation_id,schema_version,reference,digest,media_type,size,redaction_state,encryption_state,collected_at,created_at,metadata_json) VALUES ('a','t','missing','forge-canonical-v1','artifact:x','sha256:" + "a" * 64 + "','text/plain',0,'redacted','reference_only','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{}')",
             "INSERT INTO canonical_findings(id,tenant_id,observation_id,artifact_id,schema_version,title,severity,description,status,created_at,metadata_json) VALUES ('f','t','missing','missing','forge-canonical-v1','x','high','x','open','2026-01-01T00:00:00Z','{}')",
-            "INSERT INTO canonical_retests(id,tenant_id,finding_id,source_observation_id,schema_version,status,created_at,metadata_json) VALUES ('r','t','missing','missing','forge-canonical-v1','not_run','2026-01-01T00:00:00Z','{}')",
             "INSERT INTO canonical_report_memberships(id,tenant_id,report_id,finding_id,observation_id,schema_version,created_at,metadata_json) VALUES ('rm','t','missing','missing','missing','forge-canonical-v1','2026-01-01T00:00:00Z','{}')",
             "INSERT INTO canonical_exports(id,tenant_id,finding_id,source_observation_id,schema_version,format,status,created_at,metadata_json) VALUES ('e','t','missing','missing','forge-canonical-v1','json','created','2026-01-01T00:00:00Z','{}')",
         ]
@@ -297,6 +293,50 @@ def test_orphan_artifact_finding_retest_membership_and_export_fail(tmp_path: Pat
                 session.execute(text(statement))
                 session.commit()
             session.rollback()
+        orphan_retest = RetestRequest(
+            id="r",
+            tenant_id="t",
+            engagement_id="missing-current-engagement",
+            original_engagement_id="missing-original-engagement",
+            finding_id="missing-finding",
+            source_observation_id="missing-observation",
+            source_artifact_id="missing-artifact",
+            source_proof_artifact_id="missing-proof-artifact",
+            source_snapshot_id="missing-source-snapshot",
+            original_job_id="missing-original-job",
+            original_attempt_id="missing-original-attempt",
+            original_action_id="missing-original-action",
+            original_authorization_decision_id="missing-original-decision",
+            original_module_version_id="missing-module-version",
+            asset_id="missing-asset",
+            current_operator_id="missing-operator",
+            current_role_id="missing-role",
+            current_scope_decision_id="missing-current-decision",
+            authorization_decision_id="missing-current-decision",
+            authorization_action_id="missing-current-action",
+            new_job_id="missing-current-job",
+            module_id="header_audit",
+            check_id="header_audit",
+            module_version="1",
+            content_snapshot_digest="sha256:" + "a" * 64,
+            policy_snapshot="header-audit-csp-proof-v1",
+            target_url="https://fixture.test/",
+            route="/",
+            method="GET",
+            mutation_class="passive_header_get",
+            proof_expectation="csp_missing",
+            proof_policy_version="header-audit-csp-proof-v1",
+            evidence_baseline_digest="sha256:" + "b" * 64,
+            session_policy_digest="sha256:" + "c" * 64,
+            verifier_id="webforge.header_audit.csp",
+            verifier_version="1",
+            verifier_policy_id="missing-verifier-policy",
+            idempotency_key="orphan-retest",
+            state="authorized",
+        )
+        with pytest.raises(IntegrityError):
+            CanonicalStore(session).insert(orphan_retest)
+        session.rollback()
     finally:
         session.close()
 

@@ -225,6 +225,10 @@ EVIDENCE_SCHEMA_VERSION = "forge-evidence-v1"
 # attempts, leases, events, and attempt-bound observation links are versioned
 # independently by the migration journal.
 JOB_STATE_SCHEMA_VERSION = "forge-jobs-v1"
+# Task 104 adds an evidence-backed retest contract without changing the
+# accepted canonical wire version.  The migration journal records the new
+# request/attempt/proof boundary independently.
+RETEST_SCHEMA_VERSION = "forge-retest-v1"
 CURRENT_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
 JOURNAL_TABLE = "canonical_migration_journal"
 
@@ -3566,6 +3570,10 @@ def _table_sql() -> tuple[str, ...]:
             FOREIGN KEY(tenant_id, artifact_id, observation_id) REFERENCES canonical_artifact_refs(tenant_id, id, observation_id) ON DELETE RESTRICT
         )
         """,
+        # Task 101's downstream placeholder is created only so databases can
+        # upgrade through the accepted historical boundary. Task 104 archives
+        # it and replaces this table name with immutable request lineage plus a
+        # separate exact-seven-verdict attempt table.
         """
         CREATE TABLE IF NOT EXISTS canonical_retests (
             id TEXT PRIMARY KEY,
@@ -4908,6 +4916,841 @@ def _job_state_drop_sql() -> tuple[str, ...]:
     )
 
 
+_RETEST_UPGRADE_MARKER = "-- forge-retest-v1 upgrade"
+_RETEST_DOWNGRADE_MARKER = "-- forge-retest-v1 downgrade"
+
+
+def _retest_table_sql() -> tuple[str, ...]:
+    """Return the single transactional Task 104 migration marker."""
+
+    return (_RETEST_UPGRADE_MARKER,)
+
+
+def _retest_drop_sql() -> tuple[str, ...]:
+    """Return the guarded Task 104 downgrade marker."""
+
+    return (_RETEST_DOWNGRADE_MARKER,)
+
+
+def _apply_retest_upgrade(connection: Connection) -> None:
+    """Replace the Task 101 placeholder with normalized Task 104 records.
+
+    The old downstream placeholder cannot express an immutable request,
+    durable attempt, proof, or evidence links.  Preserve it byte-for-byte in a
+    compatibility archive, then make the canonical table name authoritative
+    for the new request contract.  This function is called inside the migration
+    transaction, so an interruption rolls back the complete structural swap.
+    """
+
+    tables = {
+        str(row[0])
+        for row in connection.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "canonical_retests" not in tables:
+        raise MigrationError("Task 104 requires the canonical retest placeholder")
+    columns = {
+        str(row[1])
+        for row in connection.exec_driver_sql(
+            "PRAGMA table_info(canonical_retests)"
+        ).fetchall()
+    }
+    if "proof_policy_version" in columns:
+        # Idempotent replay after the DDL committed but before an externally
+        # reconstructed journal was restored.  Reinstall the guards below.
+        pass
+    else:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE IF NOT EXISTS canonical_retests_legacy_v103 (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                finding_id TEXT NOT NULL,
+                source_observation_id TEXT NOT NULL,
+                job_id TEXT,
+                schema_version TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN (
+                    'not_run','fixed','still_vulnerable','inconclusive',
+                    'failed','not_authorized','unsupported'
+                )),
+                created_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(tenant_id,id),
+                FOREIGN KEY(tenant_id,finding_id,source_observation_id)
+                    REFERENCES canonical_findings(tenant_id,id,observation_id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(tenant_id,source_observation_id)
+                    REFERENCES canonical_observations(tenant_id,id)
+                    ON DELETE RESTRICT,
+                FOREIGN KEY(tenant_id,job_id)
+                    REFERENCES canonical_jobs(tenant_id,id) ON DELETE RESTRICT
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            INSERT OR IGNORE INTO canonical_retests_legacy_v103(
+                id,tenant_id,finding_id,source_observation_id,job_id,
+                schema_version,status,created_at,metadata_json
+            )
+            SELECT id,tenant_id,finding_id,source_observation_id,job_id,
+                   schema_version,status,created_at,metadata_json
+            FROM canonical_retests
+            """
+        )
+        source_count = int(
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM canonical_retests"
+            ).scalar_one()
+        )
+        archive_count = int(
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM canonical_retests_legacy_v103"
+            ).scalar_one()
+        )
+        if source_count != archive_count:
+            raise MigrationError("Task 104 legacy retest archive is incomplete")
+        for name in (
+            "canonical_retest_source_guard",
+            "canonical_retest_source_update_guard",
+            "canonical_schema_version_guard_canonical_retests",
+            "canonical_schema_version_update_guard_canonical_retests",
+            "canonical_metadata_bound_guard_canonical_retests",
+            "canonical_metadata_bound_update_guard_canonical_retests",
+            "canonical_metadata_integrity_guard_insert_canonical_retests",
+            "canonical_metadata_integrity_guard_update_canonical_retests",
+        ):
+            connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS {name}")
+        connection.exec_driver_sql("DROP TABLE canonical_retests")
+
+    connection.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_retest_source_snapshots (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            finding_id TEXT NOT NULL,
+            source_observation_id TEXT NOT NULL,
+            source_artifact_id TEXT NOT NULL,
+            source_proof_artifact_id TEXT NOT NULL,
+            original_action_id TEXT NOT NULL,
+            original_authorization_decision_id TEXT NOT NULL,
+            method TEXT NOT NULL CHECK(method='GET'),
+            session_reference TEXT CHECK(
+                session_reference IS NULL OR
+                session_reference GLOB 'cred:*' OR
+                session_reference GLOB 'credential:*' OR
+                session_reference GLOB 'secret:*'
+            ),
+            session_policy_digest TEXT NOT NULL CHECK(
+                length(session_policy_digest)=71 AND
+                substr(session_policy_digest,1,7)='sha256:'
+            ),
+            proof_expectation TEXT NOT NULL CHECK(
+                proof_expectation IN ('csp_missing','csp_weak')
+            ),
+            evidence_baseline_digest TEXT NOT NULL CHECK(
+                length(evidence_baseline_digest)=71 AND
+                substr(evidence_baseline_digest,1,7)='sha256:'
+            ),
+            schema_version TEXT NOT NULL CHECK(schema_version='forge-canonical-v1'),
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(tenant_id,id),
+            FOREIGN KEY(tenant_id)
+                REFERENCES canonical_tenants(id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,finding_id,source_observation_id)
+                REFERENCES canonical_finding_observations(
+                    tenant_id,finding_id,observation_id
+                ) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,source_artifact_id,source_observation_id)
+                REFERENCES canonical_artifact_refs(tenant_id,id,observation_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,source_proof_artifact_id,source_observation_id)
+                REFERENCES canonical_artifact_refs(tenant_id,id,observation_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,original_action_id)
+                REFERENCES canonical_actions(tenant_id,id) ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_retest_verifier_policies (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            module_id TEXT NOT NULL,
+            check_id TEXT NOT NULL,
+            source_version TEXT NOT NULL,
+            content_snapshot_digest TEXT NOT NULL CHECK(
+                length(content_snapshot_digest)=71 AND
+                substr(content_snapshot_digest,1,7)='sha256:'
+            ),
+            policy_snapshot TEXT NOT NULL,
+            mutation_class TEXT NOT NULL,
+            verifier_id TEXT NOT NULL,
+            verifier_version TEXT NOT NULL,
+            proof_policy_version TEXT NOT NULL,
+            schema_version TEXT NOT NULL CHECK(schema_version='forge-canonical-v1'),
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(tenant_id,id),
+            FOREIGN KEY(tenant_id)
+                REFERENCES canonical_tenants(id) ON DELETE RESTRICT,
+            CHECK(
+                (
+                    module_id='header_audit' AND
+                    check_id IN ('header_audit','Content-Security-Policy') AND
+                    source_version='5.0.0' AND
+                    content_snapshot_digest=
+                      'sha256:5c2a0887403fbd0959ccd9e2a08cc9b5ac6d355305cb9511478f241509daad84' AND
+                    policy_snapshot='header-audit-csp-proof-v1' AND
+                    mutation_class='passive_header_get' AND
+                    verifier_id='webforge.header_audit.csp' AND
+                    verifier_version='1.0.0' AND
+                    proof_policy_version='header-audit-csp-proof-v1'
+                ) OR (
+                    content_snapshot_digest=
+                      'sha256:5c2a0887403fbd0959ccd9e2a08cc9b5ac6d355305cb9511478f241509daad84' AND
+                    policy_snapshot='unsupported' AND
+                    mutation_class='passive_header_get' AND
+                    verifier_id='unsupported' AND
+                    verifier_version='0' AND
+                    proof_policy_version='unsupported'
+                )
+            )
+        )
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_retests (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            engagement_id TEXT NOT NULL,
+            original_engagement_id TEXT NOT NULL,
+            finding_id TEXT NOT NULL,
+            source_observation_id TEXT NOT NULL,
+            source_artifact_id TEXT NOT NULL,
+            source_proof_artifact_id TEXT NOT NULL,
+            source_snapshot_id TEXT NOT NULL,
+            original_job_id TEXT NOT NULL,
+            original_attempt_id TEXT NOT NULL,
+            original_action_id TEXT NOT NULL,
+            original_authorization_decision_id TEXT NOT NULL,
+            original_module_version_id TEXT NOT NULL,
+            asset_id TEXT NOT NULL,
+            current_operator_id TEXT NOT NULL,
+            current_role_id TEXT NOT NULL,
+            current_scope_decision_id TEXT NOT NULL,
+            authorization_decision_id TEXT NOT NULL,
+            authorization_action_id TEXT NOT NULL,
+            new_job_id TEXT NOT NULL,
+            module_id TEXT NOT NULL,
+            check_id TEXT NOT NULL,
+            module_version TEXT NOT NULL,
+            content_snapshot_digest TEXT NOT NULL CHECK(
+                length(content_snapshot_digest)=71 AND
+                substr(content_snapshot_digest,1,7)='sha256:'
+            ),
+            policy_snapshot TEXT NOT NULL,
+            target_url TEXT NOT NULL,
+            route TEXT NOT NULL,
+            method TEXT NOT NULL,
+            parameter TEXT,
+            location TEXT,
+            identity_ref TEXT,
+            session_reference TEXT CHECK(
+                session_reference IS NULL OR
+                session_reference GLOB 'cred:*' OR
+                session_reference GLOB 'credential:*' OR
+                session_reference GLOB 'secret:*'
+            ),
+            session_policy_digest TEXT NOT NULL CHECK(
+                length(session_policy_digest)=71 AND
+                substr(session_policy_digest,1,7)='sha256:'
+            ),
+            mutation_class TEXT NOT NULL,
+            proof_expectation TEXT NOT NULL,
+            proof_policy_version TEXT NOT NULL,
+            evidence_baseline_digest TEXT NOT NULL CHECK(
+                length(evidence_baseline_digest)=71 AND
+                substr(evidence_baseline_digest,1,7)='sha256:'
+            ),
+            verifier_id TEXT NOT NULL,
+            verifier_version TEXT NOT NULL,
+            verifier_policy_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN (
+                'planned','authorized','queued','running','terminal','canceled'
+            )),
+            schema_version TEXT NOT NULL CHECK(schema_version='forge-canonical-v1'),
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(tenant_id,id),
+            UNIQUE(tenant_id,idempotency_key),
+            FOREIGN KEY(tenant_id,engagement_id)
+                REFERENCES canonical_engagements(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,finding_id,source_observation_id)
+                REFERENCES canonical_finding_observations(
+                    tenant_id,finding_id,observation_id
+                ) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,source_artifact_id,source_observation_id)
+                REFERENCES canonical_artifact_refs(tenant_id,id,observation_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,source_proof_artifact_id,source_observation_id)
+                REFERENCES canonical_artifact_refs(tenant_id,id,observation_id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,source_snapshot_id)
+                REFERENCES canonical_retest_source_snapshots(tenant_id,id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,original_job_id)
+                REFERENCES canonical_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,original_attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,original_module_version_id)
+                REFERENCES canonical_module_versions(tenant_id,id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,asset_id)
+                REFERENCES canonical_assets(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,current_operator_id)
+                REFERENCES canonical_operators(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,current_role_id)
+                REFERENCES canonical_roles(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,current_scope_decision_id)
+                REFERENCES canonical_scope_decisions(tenant_id,id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,authorization_action_id)
+                REFERENCES canonical_actions(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,new_job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,verifier_policy_id)
+                REFERENCES canonical_retest_verifier_policies(tenant_id,id)
+                ON DELETE RESTRICT,
+            CHECK(current_scope_decision_id=authorization_decision_id)
+        )
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_retest_attempts (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            retest_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            durable_attempt_id TEXT NOT NULL,
+            verifier_id TEXT NOT NULL,
+            verifier_version TEXT NOT NULL,
+            proof_policy_version TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN (
+                'planned','running','terminal','canceled'
+            )),
+            verdict TEXT CHECK(verdict IS NULL OR verdict IN (
+                'fixed','still_vulnerable','inconclusive','failed',
+                'not_applicable','not_authorized','unsupported'
+            )),
+            reason_code TEXT,
+            proof_id TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            schema_version TEXT NOT NULL CHECK(schema_version='forge-canonical-v1'),
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(tenant_id,id),
+            UNIQUE(tenant_id,retest_id,idempotency_key),
+            UNIQUE(tenant_id,durable_attempt_id),
+            FOREIGN KEY(tenant_id,retest_id)
+                REFERENCES canonical_retests(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,durable_attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,proof_id)
+                REFERENCES canonical_retest_proofs(tenant_id,id)
+                ON DELETE RESTRICT,
+            CHECK(
+                (state='terminal' AND verdict IS NOT NULL) OR
+                (state<>'terminal' AND verdict IS NULL)
+            )
+        )
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_retest_proofs (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            retest_id TEXT NOT NULL,
+            retest_attempt_id TEXT NOT NULL,
+            durable_job_id TEXT NOT NULL,
+            durable_attempt_id TEXT NOT NULL,
+            original_observation_id TEXT NOT NULL,
+            observation_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            verifier_id TEXT NOT NULL,
+            verifier_version TEXT NOT NULL,
+            proof_policy_version TEXT NOT NULL,
+            proof_expectation TEXT NOT NULL,
+            observed_condition TEXT NOT NULL,
+            route TEXT NOT NULL,
+            method TEXT NOT NULL,
+            response_status INTEGER CHECK(
+                response_status IS NULL OR response_status BETWEEN 100 AND 599
+            ),
+            sufficient INTEGER NOT NULL CHECK(sufficient IN (0,1)),
+            header_value_digest TEXT CHECK(
+                header_value_digest IS NULL OR
+                (length(header_value_digest)=71 AND
+                 substr(header_value_digest,1,7)='sha256:')
+            ),
+            proof_digest TEXT NOT NULL CHECK(
+                length(proof_digest)=71 AND substr(proof_digest,1,7)='sha256:'
+            ),
+            schema_version TEXT NOT NULL CHECK(schema_version='forge-canonical-v1'),
+            created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(tenant_id,id),
+            UNIQUE(tenant_id,retest_attempt_id),
+            FOREIGN KEY(tenant_id,retest_id)
+                REFERENCES canonical_retests(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,retest_attempt_id)
+                REFERENCES canonical_retest_attempts(tenant_id,id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,durable_job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,durable_attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id)
+                ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,original_observation_id)
+                REFERENCES canonical_observations(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,observation_id)
+                REFERENCES canonical_observations(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,artifact_id,observation_id)
+                REFERENCES canonical_artifact_refs(tenant_id,id,observation_id)
+                ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_retest_proof_artifacts (
+            tenant_id TEXT NOT NULL,
+            proof_id TEXT NOT NULL,
+            observation_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('primary','supporting')),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(tenant_id,proof_id,artifact_id),
+            FOREIGN KEY(tenant_id,proof_id)
+                REFERENCES canonical_retest_proofs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,artifact_id,observation_id)
+                REFERENCES canonical_artifact_refs(tenant_id,id,observation_id)
+                ON DELETE RESTRICT
+        )
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TABLE IF NOT EXISTS canonical_retest_attempt_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            retest_id TEXT NOT NULL,
+            retest_attempt_id TEXT NOT NULL,
+            from_state TEXT,
+            to_state TEXT NOT NULL,
+            verdict TEXT,
+            reason_code TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            FOREIGN KEY(tenant_id,retest_id)
+                REFERENCES canonical_retests(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,retest_attempt_id)
+                REFERENCES canonical_retest_attempts(tenant_id,id)
+                ON DELETE RESTRICT
+        )
+        """
+    )
+    for statement in (
+        "CREATE INDEX IF NOT EXISTS ix_canonical_retest_finding ON canonical_retests(tenant_id,finding_id,created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_retest_attempt_job ON canonical_retest_attempts(tenant_id,job_id,durable_attempt_id)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_retest_proof_observation ON canonical_retest_proofs(tenant_id,observation_id,artifact_id)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_retest_events ON canonical_retest_attempt_events(tenant_id,retest_attempt_id,sequence)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_retest_source_snapshot ON canonical_retest_source_snapshots(tenant_id,source_observation_id,source_artifact_id,source_proof_artifact_id)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_retest_verifier_policy ON canonical_retest_verifier_policies(tenant_id,module_id,check_id,source_version)",
+    ):
+        connection.exec_driver_sql(statement)
+
+    trigger_sql = (
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_source_guard
+        BEFORE INSERT ON canonical_retests
+        WHEN NOT EXISTS(
+            SELECT 1
+            FROM canonical_finding_observations fo
+            JOIN canonical_observations o
+              ON o.tenant_id=fo.tenant_id AND o.id=fo.observation_id
+            JOIN canonical_artifact_refs a
+              ON a.tenant_id=fo.tenant_id AND a.id=NEW.source_artifact_id
+             AND a.observation_id=o.id
+            JOIN canonical_artifact_manifests source_manifest
+              ON source_manifest.tenant_id=a.tenant_id
+             AND source_manifest.artifact_id=a.id
+             AND source_manifest.observation_id=a.observation_id
+             AND json_extract(
+                    source_manifest.metadata_json,'$.capture_kind'
+                 )='request'
+            JOIN canonical_artifact_refs proof_artifact
+              ON proof_artifact.tenant_id=fo.tenant_id
+             AND proof_artifact.id=NEW.source_proof_artifact_id
+             AND proof_artifact.observation_id=o.id
+            JOIN canonical_artifact_manifests proof_manifest
+              ON proof_manifest.tenant_id=proof_artifact.tenant_id
+             AND proof_manifest.artifact_id=proof_artifact.id
+             AND proof_manifest.observation_id=proof_artifact.observation_id
+             AND json_extract(
+                    proof_manifest.metadata_json,'$.capture_kind'
+                 )='structured_proof'
+            JOIN canonical_retest_source_snapshots source_snapshot
+              ON source_snapshot.tenant_id=NEW.tenant_id
+             AND source_snapshot.id=NEW.source_snapshot_id
+             AND source_snapshot.finding_id=NEW.finding_id
+             AND source_snapshot.source_observation_id=NEW.source_observation_id
+             AND source_snapshot.source_artifact_id=NEW.source_artifact_id
+             AND source_snapshot.source_proof_artifact_id=
+                 NEW.source_proof_artifact_id
+             AND source_snapshot.original_action_id=NEW.original_action_id
+             AND source_snapshot.original_authorization_decision_id=
+                 NEW.original_authorization_decision_id
+             AND source_snapshot.method=NEW.method
+             AND source_snapshot.session_reference IS NEW.session_reference
+             AND source_snapshot.session_policy_digest=NEW.session_policy_digest
+             AND source_snapshot.proof_expectation=NEW.proof_expectation
+             AND source_snapshot.evidence_baseline_digest=
+                 NEW.evidence_baseline_digest
+            JOIN canonical_retest_verifier_policies verifier_policy
+              ON verifier_policy.tenant_id=NEW.tenant_id
+             AND verifier_policy.id=NEW.verifier_policy_id
+             AND verifier_policy.module_id=NEW.module_id
+             AND verifier_policy.check_id=NEW.check_id
+             AND verifier_policy.source_version=NEW.module_version
+             AND verifier_policy.content_snapshot_digest=
+                 NEW.content_snapshot_digest
+             AND verifier_policy.policy_snapshot=NEW.policy_snapshot
+             AND verifier_policy.mutation_class=NEW.mutation_class
+             AND verifier_policy.verifier_id=NEW.verifier_id
+             AND verifier_policy.verifier_version=NEW.verifier_version
+             AND verifier_policy.proof_policy_version=
+                 NEW.proof_policy_version
+            JOIN canonical_module_versions mv
+              ON mv.tenant_id=o.tenant_id AND mv.id=o.module_version_id
+            JOIN canonical_assets source_asset
+              ON source_asset.tenant_id=o.tenant_id AND source_asset.id=o.asset_id
+            JOIN canonical_actions original_action
+              ON original_action.tenant_id=o.tenant_id
+             AND original_action.id=o.action_id
+            JOIN durable_job_state_attempts original_attempt
+              ON original_attempt.tenant_id=o.tenant_id
+             AND original_attempt.id=o.attempt_id
+             AND original_attempt.job_id=o.job_id
+            JOIN canonical_scope_decisions current_scope
+              ON current_scope.tenant_id=NEW.tenant_id
+             AND current_scope.id=NEW.current_scope_decision_id
+            JOIN canonical_actions current_action
+              ON current_action.tenant_id=NEW.tenant_id
+             AND current_action.id=NEW.authorization_action_id
+            JOIN durable_job_state_jobs new_job
+              ON new_job.tenant_id=NEW.tenant_id
+             AND new_job.id=NEW.new_job_id
+            WHERE fo.tenant_id=NEW.tenant_id
+              AND fo.finding_id=NEW.finding_id
+              AND fo.observation_id=NEW.source_observation_id
+              AND fo.artifact_id=NEW.source_artifact_id
+              AND o.engagement_id=NEW.original_engagement_id
+              AND o.job_id=NEW.original_job_id
+              AND o.attempt_id=NEW.original_attempt_id
+              AND o.action_id=NEW.original_action_id
+              AND o.module_version_id=NEW.original_module_version_id
+              AND o.asset_id=NEW.asset_id
+              AND original_action.authorization_decision_id=
+                  NEW.original_authorization_decision_id
+              AND mv.module_id=NEW.module_id
+              AND mv.version=NEW.module_version
+              AND source_asset.canonical_uri=NEW.target_url
+              AND o.check_id=NEW.check_id
+              AND o.route=NEW.route
+              AND o.parameter IS NEW.parameter
+              AND o.location IS NEW.location
+              AND o.identity_ref IS NEW.identity_ref
+              AND current_scope.engagement_id=NEW.engagement_id
+              AND current_scope.operator_id=NEW.current_operator_id
+              AND current_scope.role_id=NEW.current_role_id
+              AND current_scope.outcome='allow'
+              AND current_action.engagement_id=NEW.engagement_id
+              AND current_action.job_id=NEW.new_job_id
+              AND current_action.authorization_decision_id=
+                  NEW.authorization_decision_id
+              AND new_job.engagement_id=NEW.engagement_id
+              AND new_job.authorization_decision_id=
+                  NEW.authorization_decision_id
+              AND new_job.authorization_action_id=NEW.authorization_action_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'retest request lineage mismatch'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_requests_no_update
+        BEFORE UPDATE ON canonical_retests
+        BEGIN SELECT RAISE(ABORT, 'canonical retest requests are immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_requests_no_delete
+        BEFORE DELETE ON canonical_retests
+        BEGIN SELECT RAISE(ABORT, 'canonical retest requests cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_source_snapshots_no_update
+        BEFORE UPDATE ON canonical_retest_source_snapshots
+        BEGIN SELECT RAISE(ABORT, 'canonical retest source snapshots are immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_source_snapshot_guard
+        BEFORE INSERT ON canonical_retest_source_snapshots
+        WHEN NOT EXISTS(
+            SELECT 1
+            FROM canonical_finding_observations fo
+            JOIN canonical_observations o
+              ON o.tenant_id=fo.tenant_id AND o.id=fo.observation_id
+            JOIN canonical_actions action
+              ON action.tenant_id=o.tenant_id AND action.id=o.action_id
+            JOIN canonical_artifact_manifests request_manifest
+              ON request_manifest.tenant_id=o.tenant_id
+             AND request_manifest.observation_id=o.id
+             AND request_manifest.artifact_id=NEW.source_artifact_id
+             AND json_extract(
+                    request_manifest.metadata_json,'$.capture_kind'
+                 )='request'
+            JOIN canonical_artifact_manifests proof_manifest
+              ON proof_manifest.tenant_id=o.tenant_id
+             AND proof_manifest.observation_id=o.id
+             AND proof_manifest.artifact_id=NEW.source_proof_artifact_id
+             AND json_extract(
+                    proof_manifest.metadata_json,'$.capture_kind'
+                 )='structured_proof'
+            WHERE fo.tenant_id=NEW.tenant_id
+              AND fo.finding_id=NEW.finding_id
+              AND fo.observation_id=NEW.source_observation_id
+              AND o.action_id=NEW.original_action_id
+              AND action.authorization_decision_id=
+                  NEW.original_authorization_decision_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'retest source snapshot lineage mismatch'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_source_snapshots_no_delete
+        BEFORE DELETE ON canonical_retest_source_snapshots
+        BEGIN SELECT RAISE(ABORT, 'canonical retest source snapshots cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_verifier_policies_no_update
+        BEFORE UPDATE ON canonical_retest_verifier_policies
+        BEGIN SELECT RAISE(ABORT, 'canonical retest verifier policies are immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_verifier_policies_no_delete
+        BEFORE DELETE ON canonical_retest_verifier_policies
+        BEGIN SELECT RAISE(ABORT, 'canonical retest verifier policies cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_attempt_lineage_guard
+        BEFORE INSERT ON canonical_retest_attempts
+        WHEN NOT EXISTS(
+            SELECT 1 FROM canonical_retests r
+            JOIN durable_job_state_attempts a
+              ON a.tenant_id=r.tenant_id AND a.id=NEW.durable_attempt_id
+            WHERE r.tenant_id=NEW.tenant_id AND r.id=NEW.retest_id
+              AND r.new_job_id=NEW.job_id AND a.job_id=NEW.job_id
+              AND r.verifier_id=NEW.verifier_id
+              AND r.verifier_version=NEW.verifier_version
+              AND r.proof_policy_version=NEW.proof_policy_version
+        )
+        BEGIN SELECT RAISE(ABORT, 'retest attempt lineage mismatch'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_attempt_identity_immutable
+        BEFORE UPDATE ON canonical_retest_attempts
+        WHEN NEW.id IS NOT OLD.id OR NEW.tenant_id IS NOT OLD.tenant_id
+          OR NEW.retest_id IS NOT OLD.retest_id OR NEW.job_id IS NOT OLD.job_id
+          OR NEW.durable_attempt_id IS NOT OLD.durable_attempt_id
+          OR NEW.verifier_id IS NOT OLD.verifier_id
+          OR NEW.verifier_version IS NOT OLD.verifier_version
+          OR NEW.proof_policy_version IS NOT OLD.proof_policy_version
+          OR NEW.idempotency_key IS NOT OLD.idempotency_key
+          OR NEW.schema_version IS NOT OLD.schema_version
+          OR NEW.created_at IS NOT OLD.created_at
+          OR NEW.metadata_json IS NOT OLD.metadata_json
+        BEGIN SELECT RAISE(ABORT, 'retest attempt identity is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_attempt_transition_guard
+        BEFORE UPDATE OF state ON canonical_retest_attempts
+        WHEN NOT (
+            (OLD.state='planned' AND NEW.state IN ('running','terminal','canceled')) OR
+            (OLD.state='running' AND NEW.state IN ('terminal','canceled'))
+        )
+        BEGIN SELECT RAISE(ABORT, 'illegal retest attempt transition'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_attempt_terminal_immutable
+        BEFORE UPDATE ON canonical_retest_attempts
+        WHEN OLD.state IN ('terminal','canceled')
+        BEGIN SELECT RAISE(ABORT, 'terminal retest attempt is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_attempt_no_delete
+        BEFORE DELETE ON canonical_retest_attempts
+        BEGIN SELECT RAISE(ABORT, 'canonical retest attempts cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_proof_lineage_guard
+        BEFORE INSERT ON canonical_retest_proofs
+        WHEN NOT EXISTS(
+            SELECT 1 FROM canonical_retest_attempts ra
+            JOIN canonical_retests r
+              ON r.tenant_id=ra.tenant_id AND r.id=ra.retest_id
+            JOIN canonical_observations o
+              ON o.tenant_id=ra.tenant_id AND o.id=NEW.observation_id
+            JOIN canonical_artifact_refs a
+              ON a.tenant_id=o.tenant_id AND a.id=NEW.artifact_id
+             AND a.observation_id=o.id
+            WHERE ra.tenant_id=NEW.tenant_id
+              AND ra.id=NEW.retest_attempt_id
+              AND ra.retest_id=NEW.retest_id
+              AND ra.job_id=NEW.durable_job_id
+              AND ra.durable_attempt_id=NEW.durable_attempt_id
+              AND r.source_observation_id=NEW.original_observation_id
+              AND o.job_id=NEW.durable_job_id
+              AND o.attempt_id=NEW.durable_attempt_id
+              AND r.verifier_id=NEW.verifier_id
+              AND r.verifier_version=NEW.verifier_version
+              AND r.proof_policy_version=NEW.proof_policy_version
+        )
+        BEGIN SELECT RAISE(ABORT, 'retest proof lineage mismatch'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_proofs_no_update
+        BEFORE UPDATE ON canonical_retest_proofs
+        BEGIN SELECT RAISE(ABORT, 'canonical retest proofs are immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_proofs_no_delete
+        BEFORE DELETE ON canonical_retest_proofs
+        BEGIN SELECT RAISE(ABORT, 'canonical retest proofs cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_proof_artifacts_no_update
+        BEFORE UPDATE ON canonical_retest_proof_artifacts
+        BEGIN SELECT RAISE(ABORT, 'retest proof artifact links are immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_proof_artifacts_no_delete
+        BEFORE DELETE ON canonical_retest_proof_artifacts
+        BEGIN SELECT RAISE(ABORT, 'retest proof artifact links cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_events_no_update
+        BEFORE UPDATE ON canonical_retest_attempt_events
+        BEGIN SELECT RAISE(ABORT, 'retest attempt events are append-only'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_events_no_delete
+        BEFORE DELETE ON canonical_retest_attempt_events
+        BEGIN SELECT RAISE(ABORT, 'retest attempt events cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retests_legacy_no_update
+        BEFORE UPDATE ON canonical_retests_legacy_v103
+        BEGIN SELECT RAISE(ABORT, 'legacy retest history is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retests_legacy_no_delete
+        BEFORE DELETE ON canonical_retests_legacy_v103
+        BEGIN SELECT RAISE(ABORT, 'legacy retest history cannot be deleted'); END
+        """,
+    )
+    for statement in trigger_sql:
+        connection.exec_driver_sql(statement)
+    for statement in _metadata_integrity_guard_sql(
+        (
+            "canonical_retests",
+            "canonical_retest_attempts",
+            "canonical_retest_proofs",
+            "canonical_retest_source_snapshots",
+            "canonical_retest_verifier_policies",
+        )
+    ):
+        connection.exec_driver_sql(statement)
+    if connection.exec_driver_sql("PRAGMA foreign_key_check").fetchone() is not None:
+        raise MigrationError("Task 104 retest migration failed foreign-key verification")
+
+
+def _apply_retest_downgrade(connection: Connection) -> None:
+    """Restore the Task 103 placeholder after non-empty safety is checked."""
+
+    for name in (
+        "canonical_retests_legacy_no_delete",
+        "canonical_retests_legacy_no_update",
+    ):
+        connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS {name}")
+    for table in (
+        "canonical_retest_attempt_events",
+        "canonical_retest_proof_artifacts",
+        "canonical_retest_proofs",
+        "canonical_retest_attempts",
+        "canonical_retests",
+        "canonical_retest_source_snapshots",
+        "canonical_retest_verifier_policies",
+    ):
+        connection.exec_driver_sql(f"DROP TABLE IF EXISTS {table}")
+    tables = {
+        str(row[0])
+        for row in connection.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    if "canonical_retests_legacy_v103" not in tables:
+        raise MigrationError("Task 104 legacy retest archive is unavailable")
+    connection.exec_driver_sql(
+        "ALTER TABLE canonical_retests_legacy_v103 RENAME TO canonical_retests"
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_source_guard
+        BEFORE INSERT ON canonical_retests
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_findings f
+          WHERE f.tenant_id=NEW.tenant_id AND f.id=NEW.finding_id
+            AND f.observation_id=NEW.source_observation_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'retest source observation does not match finding'); END
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_retest_source_update_guard
+        BEFORE UPDATE OF tenant_id,finding_id,source_observation_id ON canonical_retests
+        WHEN NOT EXISTS(
+          SELECT 1 FROM canonical_findings f
+          WHERE f.tenant_id=NEW.tenant_id AND f.id=NEW.finding_id
+            AND f.observation_id=NEW.source_observation_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'retest source observation does not match finding'); END
+        """
+    )
+    for statement in _runtime_guard_sql():
+        connection.exec_driver_sql(statement)
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=CANONICAL_SCHEMA_VERSION,
@@ -4929,6 +5772,13 @@ MIGRATIONS: tuple[Migration, ...] = (
         upgrade_sql=_job_state_table_sql(),
         downgrade_sql=_job_state_drop_sql(),
         description="Task 103 durable single-node job state machine",
+    ),
+    Migration(
+        version=RETEST_SCHEMA_VERSION,
+        order=104,
+        upgrade_sql=_retest_table_sql(),
+        downgrade_sql=_retest_drop_sql(),
+        description="Task 104 evidence-backed real retest",
     ),
 )
 
@@ -5019,6 +5869,7 @@ class MigrationManager:
             elif str(row[0]) in {
                 EVIDENCE_SCHEMA_VERSION,
                 JOB_STATE_SCHEMA_VERSION,
+                RETEST_SCHEMA_VERSION,
             }:
                 version = CANONICAL_SCHEMA_VERSION
             else:
@@ -5215,6 +6066,43 @@ class MigrationManager:
                 connection.commit()
             keep = set(self.versions[: self.versions.index(target) + 1]) if target else set()
             removing = {str(row[0]) for row in rows} - keep
+            if RETEST_SCHEMA_VERSION in removing:
+                retest_tables = (
+                    "canonical_retests",
+                    "canonical_retest_attempts",
+                    "canonical_retest_proofs",
+                    "canonical_retest_proof_artifacts",
+                    "canonical_retest_attempt_events",
+                    "canonical_retest_source_snapshots",
+                    "canonical_retest_verifier_policies",
+                )
+                present_tables = {
+                    str(row[0])
+                    for row in connection.exec_driver_sql(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if not set(retest_tables) <= present_tables:
+                    if connection.in_transaction():
+                        connection.rollback()
+                    raise MigrationError(
+                        "retest schema downgrade encountered incomplete state"
+                    )
+                retained_retest_history = any(
+                    int(
+                        connection.exec_driver_sql(
+                            f"SELECT COUNT(*) FROM {table}"
+                        ).scalar_one()
+                    )
+                    > 0
+                    for table in retest_tables
+                )
+                if connection.in_transaction():
+                    connection.rollback()
+                if retained_retest_history:
+                    raise MigrationError(
+                        "retest schema downgrade would destroy retained history"
+                    )
             if JOB_STATE_SCHEMA_VERSION in removing:
                 job_tables = (
                     "durable_job_state_agents",
@@ -5317,7 +6205,10 @@ class MigrationManager:
                 migration = _migration_by_version(version)
                 with connection.begin():
                     for statement in migration.downgrade_sql:
-                        connection.exec_driver_sql(statement)
+                        if statement == _RETEST_DOWNGRADE_MARKER:
+                            _apply_retest_downgrade(connection)
+                        else:
+                            connection.exec_driver_sql(statement)
                     connection.exec_driver_sql(f"DELETE FROM {JOURNAL_TABLE} WHERE version=?", (version,))
             return self.current_version()
         finally:
@@ -5406,7 +6297,10 @@ class MigrationManager:
                         }
                         if "attempt_id" in observation_columns:
                             continue
-                    connection.exec_driver_sql(statement)
+                    if statement == _RETEST_UPGRADE_MARKER:
+                        _apply_retest_upgrade(connection)
+                    else:
+                        connection.exec_driver_sql(statement)
                     if fail_after is not None and index >= fail_after:
                         raise MigrationInterruptedError(f"migration interrupted at {migration.version}:{index}")
                 # Normalize existing Gate-0 rows before retaining the bounded
@@ -5532,7 +6426,7 @@ def migration_versions() -> tuple[str, ...]:
 
 
 __all__ = [
-    "CANONICAL_MIGRATION_PREFIX", "CANONICAL_SCHEMA_VERSION", "CURRENT_SCHEMA_VERSION", "EVIDENCE_SCHEMA_VERSION", "JOB_STATE_SCHEMA_VERSION",
+    "CANONICAL_MIGRATION_PREFIX", "CANONICAL_SCHEMA_VERSION", "CURRENT_SCHEMA_VERSION", "EVIDENCE_SCHEMA_VERSION", "JOB_STATE_SCHEMA_VERSION", "RETEST_SCHEMA_VERSION",
     "JOURNAL_TABLE", "MIGRATIONS", "Migration", "MigrationError", "MigrationInterruptedError",
     "MigrationManager", "UnsupportedMigrationError", "current_version", "downgrade", "migration_versions",
     "archive_legacy_records", "recover", "upgrade",

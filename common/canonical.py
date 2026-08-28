@@ -3,9 +3,9 @@
 Task 101 keeps the domain contract independent from engine and dashboard
 objects.  The models in this module are deliberately small immutable-ish
 dataclasses: they validate the values that cross a process boundary while
-``CanonicalStore`` persists only their normalized relationships.  Raw
-artifact bytes and durable job/retest behaviour remain owned by later work
-packages; this store records references and lineage only.
+``CanonicalStore`` persists only their normalized relationships.  Raw artifact
+bytes remain owned by Task 102, durable execution by Task 103, and retest
+verdict policy by Task 104; this store records their typed lineage.
 """
 from __future__ import annotations
 
@@ -220,13 +220,33 @@ class FindingStatus(str, Enum):
 
 
 class RetestStatus(str, Enum):
-    NOT_RUN = "not_run"
     FIXED = "fixed"
     STILL_VULNERABLE = "still_vulnerable"
     INCONCLUSIVE = "inconclusive"
     FAILED = "failed"
+    NOT_APPLICABLE = "not_applicable"
     NOT_AUTHORIZED = "not_authorized"
     UNSUPPORTED = "unsupported"
+
+
+class RetestRequestState(str, Enum):
+    """Planning/execution state kept deliberately separate from verdict truth."""
+
+    PLANNED = "planned"
+    AUTHORIZED = "authorized"
+    QUEUED = "queued"
+    RUNNING = "running"
+    TERMINAL = "terminal"
+    CANCELED = "canceled"
+
+
+class RetestAttemptState(str, Enum):
+    """Lifecycle of one verifier attempt; a lifecycle state is not a verdict."""
+
+    PLANNED = "planned"
+    RUNNING = "running"
+    TERMINAL = "terminal"
+    CANCELED = "canceled"
 
 
 class RedactionState(str, Enum):
@@ -394,6 +414,8 @@ class _Contract:
                 "collection_status",
                 "integrity_state",
                 "level",
+                "state",
+                "verdict",
             }:
                 enum_type = _enum_type_for_name(item.name)
                 if item.name == "status":
@@ -402,10 +424,16 @@ class _Contract:
                         "Job": JobStatus,
                         "ModuleExecution": ModuleExecutionStatus,
                         "Finding": FindingStatus,
-                        "Retest": RetestStatus,
                         "Report": ReportStatus,
                         "Export": ExportStatus,
                     }.get(cls.__name__))
+                if item.name == "state":
+                    enum_type = cast(type[Enum] | None, {
+                        "RetestRequest": RetestRequestState,
+                        "RetestAttempt": RetestAttemptState,
+                    }.get(cls.__name__))
+                if item.name == "verdict":
+                    enum_type = RetestStatus
                 if item.name == "level":
                     enum_type = LogLevel
                 if enum_type is not None:
@@ -1174,24 +1202,293 @@ class Finding(_Contract):
 
 
 @dataclass(frozen=True)
-class Retest(_Contract):
+class RetestRequest(_Contract):
+    """Immutable evidence-backed request for the exact original condition."""
+
     tenant_id: str
+    engagement_id: str
+    original_engagement_id: str
     finding_id: str
     source_observation_id: str
-    status: RetestStatus = RetestStatus.NOT_RUN
-    job_id: str | None = None
+    source_artifact_id: str
+    source_proof_artifact_id: str
+    source_snapshot_id: str
+    original_job_id: str
+    original_attempt_id: str
+    original_action_id: str
+    original_authorization_decision_id: str
+    original_module_version_id: str
+    asset_id: str
+    current_operator_id: str
+    current_role_id: str
+    current_scope_decision_id: str
+    module_id: str
+    check_id: str
+    module_version: str
+    content_snapshot_digest: str
+    policy_snapshot: str
+    target_url: str
+    route: str
+    method: str
+    mutation_class: str
+    proof_expectation: str
+    proof_policy_version: str
+    evidence_baseline_digest: str
+    verifier_id: str
+    verifier_version: str
+    verifier_policy_id: str
+    idempotency_key: str
+    session_policy_digest: str
+    state: RetestRequestState = RetestRequestState.PLANNED
+    authorization_decision_id: str | None = None
+    authorization_action_id: str | None = None
+    new_job_id: str | None = None
+    parameter: str | None = None
+    location: str | None = None
+    identity_ref: str | None = None
+    session_reference: str | None = None
     id: str = field(default_factory=server_id)
     schema_version: str = CANONICAL_SCHEMA_VERSION
     created_at: datetime = field(default_factory=utc_now)
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        for name in ("tenant_id", "finding_id", "source_observation_id"):
+        for name in (
+            "tenant_id",
+            "engagement_id",
+            "original_engagement_id",
+            "finding_id",
+            "source_observation_id",
+            "source_artifact_id",
+            "source_proof_artifact_id",
+            "source_snapshot_id",
+            "original_job_id",
+            "original_attempt_id",
+            "original_action_id",
+            "original_authorization_decision_id",
+            "original_module_version_id",
+            "asset_id",
+            "current_operator_id",
+            "current_role_id",
+            "current_scope_decision_id",
+            "idempotency_key",
+            "verifier_policy_id",
+        ):
             object.__setattr__(self, name, _identifier(getattr(self, name), name))
-        if self.job_id is not None:
-            object.__setattr__(self, "job_id", _identifier(self.job_id, "job_id"))
-        object.__setattr__(self, "status", RetestStatus(self.status))
+        for name in (
+            "authorization_decision_id",
+            "authorization_action_id",
+            "new_job_id",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _identifier(value, name))
+        for name, maximum in (
+            ("module_id", 200),
+            ("check_id", 200),
+            ("module_version", 100),
+            ("policy_snapshot", 200),
+            ("target_url", 2_000),
+            ("route", 2_000),
+            ("mutation_class", 100),
+            ("proof_expectation", 200),
+            ("proof_policy_version", 100),
+            ("verifier_id", 200),
+            ("verifier_version", 100),
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _text(getattr(self, name), name, max_length=maximum),
+            )
+        method = _text(self.method, "method", max_length=20).upper()
+        if not re.fullmatch(r"[A-Z]+", method):
+            raise CanonicalContractError("retest method is malformed")
+        object.__setattr__(self, "method", method)
+        if not self.route.startswith("/"):
+            raise CanonicalContractError("retest route must be absolute")
+        parsed_target = urlsplit(self.target_url)
+        if (
+            parsed_target.scheme.lower() not in {"http", "https"}
+            or not parsed_target.netloc
+            or parsed_target.username is not None
+            or parsed_target.password is not None
+            or parsed_target.query
+            or parsed_target.fragment
+            or (parsed_target.path or "/") != self.route
+        ):
+            raise CanonicalContractError(
+                "retest target_url must bind the exact credential-free route"
+            )
+        for name in (
+            "content_snapshot_digest",
+            "evidence_baseline_digest",
+            "session_policy_digest",
+        ):
+            if not _DIGEST_RE.fullmatch(getattr(self, name)):
+                raise CanonicalContractError(f"{name} must be sha256:<hex>")
+        for name in ("parameter", "location", "identity_ref"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    name,
+                    _text(value, name, max_length=1_000),
+                )
+        if self.session_reference is not None:
+            reference = _text(
+                self.session_reference,
+                "session_reference",
+                max_length=300,
+            )
+            if not _REFERENCE_RE.fullmatch(reference):
+                raise CanonicalContractError(
+                    "session_reference must be an opaque protected reference"
+                )
+            object.__setattr__(self, "session_reference", reference)
+        object.__setattr__(self, "state", RetestRequestState(self.state))
         self._validate_common()
+
+
+@dataclass(frozen=True)
+class RetestAttempt(_Contract):
+    """Attempt identity and terminal verdict bound to one Task 103 attempt."""
+
+    tenant_id: str
+    retest_id: str
+    job_id: str
+    verifier_id: str
+    verifier_version: str
+    proof_policy_version: str
+    idempotency_key: str
+    state: RetestAttemptState = RetestAttemptState.PLANNED
+    durable_attempt_id: str | None = None
+    verdict: RetestStatus | None = None
+    reason_code: str | None = None
+    proof_id: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    id: str = field(default_factory=server_id)
+    schema_version: str = CANONICAL_SCHEMA_VERSION
+    created_at: datetime = field(default_factory=utc_now)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in ("tenant_id", "retest_id", "job_id", "idempotency_key"):
+            object.__setattr__(self, name, _identifier(getattr(self, name), name))
+        for name in ("durable_attempt_id", "proof_id"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _identifier(value, name))
+        for name, maximum in (
+            ("verifier_id", 200),
+            ("verifier_version", 100),
+            ("proof_policy_version", 100),
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _text(getattr(self, name), name, max_length=maximum),
+            )
+        if self.reason_code is not None:
+            object.__setattr__(
+                self,
+                "reason_code",
+                _text(self.reason_code, "reason_code", max_length=100),
+            )
+        object.__setattr__(self, "state", RetestAttemptState(self.state))
+        if self.verdict is not None:
+            object.__setattr__(self, "verdict", RetestStatus(self.verdict))
+        if self.state is RetestAttemptState.TERMINAL and self.verdict is None:
+            raise CanonicalContractError("terminal retest attempt requires a verdict")
+        if self.state is not RetestAttemptState.TERMINAL and self.verdict is not None:
+            raise CanonicalContractError("nonterminal retest attempt cannot carry a verdict")
+        for name in ("started_at", "finished_at"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, ensure_utc(value))
+        self._validate_common()
+
+
+@dataclass(frozen=True)
+class RetestProof(_Contract):
+    """Immutable proof that authorizes one terminal retest verdict."""
+
+    tenant_id: str
+    retest_id: str
+    retest_attempt_id: str
+    durable_job_id: str
+    durable_attempt_id: str
+    original_observation_id: str
+    observation_id: str
+    artifact_id: str
+    verifier_id: str
+    verifier_version: str
+    proof_policy_version: str
+    proof_expectation: str
+    observed_condition: str
+    route: str
+    method: str
+    sufficient: bool
+    proof_digest: str
+    response_status: int | None = None
+    header_value_digest: str | None = None
+    id: str = field(default_factory=server_id)
+    schema_version: str = CANONICAL_SCHEMA_VERSION
+    created_at: datetime = field(default_factory=utc_now)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "tenant_id",
+            "retest_id",
+            "retest_attempt_id",
+            "durable_job_id",
+            "durable_attempt_id",
+            "original_observation_id",
+            "observation_id",
+            "artifact_id",
+        ):
+            object.__setattr__(self, name, _identifier(getattr(self, name), name))
+        for name, maximum in (
+            ("verifier_id", 200),
+            ("verifier_version", 100),
+            ("proof_policy_version", 100),
+            ("proof_expectation", 200),
+            ("observed_condition", 200),
+            ("route", 2_000),
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _text(getattr(self, name), name, max_length=maximum),
+            )
+        method = _text(self.method, "method", max_length=20).upper()
+        if not re.fullmatch(r"[A-Z]+", method):
+            raise CanonicalContractError("retest proof method is malformed")
+        object.__setattr__(self, "method", method)
+        if type(self.sufficient) is not bool:
+            raise CanonicalContractError("retest proof sufficient must be boolean")
+        if not _DIGEST_RE.fullmatch(self.proof_digest):
+            raise CanonicalContractError("retest proof digest must be sha256:<hex>")
+        if self.header_value_digest is not None and not _DIGEST_RE.fullmatch(
+            self.header_value_digest
+        ):
+            raise CanonicalContractError(
+                "retest header value digest must be sha256:<hex>"
+            )
+        if self.response_status is not None and (
+            isinstance(self.response_status, bool)
+            or not isinstance(self.response_status, int)
+            or not 100 <= self.response_status <= 599
+        ):
+            raise CanonicalContractError("retest response status is invalid")
+        self._validate_common()
+
+
+# ``Retest`` was the Task 101 downstream placeholder name.  Keep the import
+# stable while making the request contract authoritative for Task 104.
+Retest = RetestRequest
 
 
 @dataclass(frozen=True)
@@ -1321,7 +1618,9 @@ _TABLE_TYPES: dict[type[_Contract], str] = {
     Observation: "canonical_observations",
     ArtifactReference: "canonical_artifact_refs",
     Finding: "canonical_findings",
-    Retest: "canonical_retests",
+    RetestRequest: "canonical_retests",
+    RetestAttempt: "canonical_retest_attempts",
+    RetestProof: "canonical_retest_proofs",
     Report: "canonical_reports",
     ReportMembership: "canonical_report_memberships",
     Export: "canonical_exports",
@@ -1575,8 +1874,87 @@ class CanonicalStore:
             return base | {"observation_id": record.observation_id, "reference": record.reference, "digest": record.digest, "media_type": record.media_type, "size": record.size, "redaction_state": record.redaction_state.value, "encryption_state": record.encryption_state, "collected_at": _iso(record.collected_at), "collector_id": record.collector_id, "collector_version": record.collector_version, "source_target": record.source_target, "source_asset_id": record.source_asset_id, "redaction_version": record.redaction_version, "protection_state": record.protection_state, "signer_state": record.signer_state, "integrity_state": record.integrity_state.value, "retention_class": record.retention_class, "retention_expires_at": _iso(record.retention_expires_at) if record.retention_expires_at else None, "protected_original_authorization_ref": record.protected_original_authorization_ref, "derivative_reference": record.derivative_reference, "manifest_digest": record.manifest_digest}
         if isinstance(record, Finding):
             return base | {"observation_id": record.observation_id, "artifact_id": record.artifact_id, "title": record.title, "severity": record.severity.value, "description": record.description, "status": record.status.value, "finding_key": record.finding_key, "dedup_key": record.dedup_key}
-        if isinstance(record, Retest):
-            return base | {"finding_id": record.finding_id, "source_observation_id": record.source_observation_id, "job_id": record.job_id, "status": record.status.value}
+        if isinstance(record, RetestRequest):
+            return base | {
+                "engagement_id": record.engagement_id,
+                "original_engagement_id": record.original_engagement_id,
+                "finding_id": record.finding_id,
+                "source_observation_id": record.source_observation_id,
+                "source_artifact_id": record.source_artifact_id,
+                "source_proof_artifact_id": record.source_proof_artifact_id,
+                "source_snapshot_id": record.source_snapshot_id,
+                "original_job_id": record.original_job_id,
+                "original_attempt_id": record.original_attempt_id,
+                "original_action_id": record.original_action_id,
+                "original_authorization_decision_id": record.original_authorization_decision_id,
+                "original_module_version_id": record.original_module_version_id,
+                "asset_id": record.asset_id,
+                "current_operator_id": record.current_operator_id,
+                "current_role_id": record.current_role_id,
+                "current_scope_decision_id": record.current_scope_decision_id,
+                "authorization_decision_id": record.authorization_decision_id,
+                "authorization_action_id": record.authorization_action_id,
+                "new_job_id": record.new_job_id,
+                "module_id": record.module_id,
+                "check_id": record.check_id,
+                "module_version": record.module_version,
+                "content_snapshot_digest": record.content_snapshot_digest,
+                "policy_snapshot": record.policy_snapshot,
+                "target_url": record.target_url,
+                "route": record.route,
+                "method": record.method,
+                "parameter": record.parameter,
+                "location": record.location,
+                "identity_ref": record.identity_ref,
+                "session_reference": record.session_reference,
+                "session_policy_digest": record.session_policy_digest,
+                "mutation_class": record.mutation_class,
+                "proof_expectation": record.proof_expectation,
+                "proof_policy_version": record.proof_policy_version,
+                "evidence_baseline_digest": record.evidence_baseline_digest,
+                "verifier_id": record.verifier_id,
+                "verifier_version": record.verifier_version,
+                "verifier_policy_id": record.verifier_policy_id,
+                "idempotency_key": record.idempotency_key,
+                "state": record.state.value,
+            }
+        if isinstance(record, RetestAttempt):
+            return base | {
+                "retest_id": record.retest_id,
+                "job_id": record.job_id,
+                "durable_attempt_id": record.durable_attempt_id,
+                "verifier_id": record.verifier_id,
+                "verifier_version": record.verifier_version,
+                "proof_policy_version": record.proof_policy_version,
+                "idempotency_key": record.idempotency_key,
+                "state": record.state.value,
+                "verdict": record.verdict.value if record.verdict is not None else None,
+                "reason_code": record.reason_code,
+                "proof_id": record.proof_id,
+                "started_at": _iso(record.started_at) if record.started_at else None,
+                "finished_at": _iso(record.finished_at) if record.finished_at else None,
+            }
+        if isinstance(record, RetestProof):
+            return base | {
+                "retest_id": record.retest_id,
+                "retest_attempt_id": record.retest_attempt_id,
+                "durable_job_id": record.durable_job_id,
+                "durable_attempt_id": record.durable_attempt_id,
+                "original_observation_id": record.original_observation_id,
+                "observation_id": record.observation_id,
+                "artifact_id": record.artifact_id,
+                "verifier_id": record.verifier_id,
+                "verifier_version": record.verifier_version,
+                "proof_policy_version": record.proof_policy_version,
+                "proof_expectation": record.proof_expectation,
+                "observed_condition": record.observed_condition,
+                "route": record.route,
+                "method": record.method,
+                "response_status": record.response_status,
+                "sufficient": int(record.sufficient),
+                "header_value_digest": record.header_value_digest,
+                "proof_digest": record.proof_digest,
+            }
         if isinstance(record, Report):
             return base | {"name": record.name, "version": record.version, "status": record.status.value, "created_by": record.created_by}
         if isinstance(record, ReportMembership):
@@ -1650,14 +2028,18 @@ class CanonicalStore:
         provenance: Provenance | None = None,
         feed_snapshot: FeedSnapshot | None = None,
         check_pack_snapshot: CheckPackSnapshot | None = None,
-        retest: Retest | None = None,
+        retest: RetestRequest | None = None,
         report: Report | None = None,
         report_membership: ReportMembership | None = None,
         export: Export | None = None,
     ) -> dict[str, _Contract]:
         records: list[_Contract] = [tenant, engagement, job, module_version, asset, observation, artifact, finding]
         records.extend(record for record in (client, project, operator, role, scope_decision) if record is not None)
-        records.extend(record for record in (module_execution, action, intelligence_source, provenance, feed_snapshot, check_pack_snapshot, retest, report, report_membership, export) if record is not None)
+        if retest is not None:
+            raise CanonicalContractError(
+                "Task 104 retest requests require the canonical RetestService"
+            )
+        records.extend(record for record in (module_execution, action, intelligence_source, provenance, feed_snapshot, check_pack_snapshot, report, report_membership, export) if record is not None)
         tenant_id = self._assert_same_tenant(records)
         if project is not None and client is not None and project.client_id != client.id:
             raise CanonicalLineageError("project client link is inconsistent")
@@ -1742,10 +2124,6 @@ class CanonicalStore:
                     )
         elif observation.action_id is not None:
             raise CanonicalLineageError("observation references an unprovided action")
-        if retest is not None and (retest.finding_id != finding.id or retest.source_observation_id != observation.id):
-            raise CanonicalLineageError("retest finding/source observation link is inconsistent")
-        if retest is not None and retest.job_id is not None and retest.job_id != job.id:
-            raise CanonicalLineageError("retest job link is inconsistent")
         if report_membership is not None and report is None:
             raise CanonicalLineageError("report membership requires its report context")
         if report_membership is not None and (report_membership.finding_id != finding.id or report_membership.observation_id != observation.id):
@@ -1883,7 +2261,7 @@ class CanonicalStore:
                     "metadata_json": _metadata_json({"source": "canonical_lineage"}),
                 },
             )
-            for downstream_record in (retest, report_membership, export):
+            for downstream_record in (report_membership, export):
                 if downstream_record is not None:
                     self._insert(downstream_record)
         result: dict[str, _Contract] = {"tenant": tenant, "engagement": engagement, "job": job, "module_version": module_version, "asset": asset, "observation": observation, "artifact": artifact, "finding": finding}
@@ -1891,7 +2269,7 @@ class CanonicalStore:
             result["client"] = client
         if project is not None:
             result["project"] = project
-        optional_records: tuple[tuple[str, _Contract | None], ...] = (("operator", operator), ("role", role), ("scope_decision", scope_decision), ("action", action), ("module_execution", module_execution), ("intelligence_source", intelligence_source), ("provenance", provenance), ("feed_snapshot", feed_snapshot), ("check_pack_snapshot", check_pack_snapshot), ("retest", retest), ("report", report), ("report_membership", report_membership), ("export", export))
+        optional_records: tuple[tuple[str, _Contract | None], ...] = (("operator", operator), ("role", role), ("scope_decision", scope_decision), ("action", action), ("module_execution", module_execution), ("intelligence_source", intelligence_source), ("provenance", provenance), ("feed_snapshot", feed_snapshot), ("check_pack_snapshot", check_pack_snapshot), ("report", report), ("report_membership", report_membership), ("export", export))
         for name, optional_record in optional_records:
             if optional_record is not None:
                 result[name] = optional_record
@@ -3143,7 +3521,7 @@ __all__ = [
     "ExportStatus", "FeedSnapshot", "Finding", "FindingSeverity", "FindingStatus", "IntelligenceSource", "Job",
     "JobStatus", "Log", "LogLevel", "MissingCanonicalContextError", "ModuleExecution", "ModuleExecutionStatus", "ModuleVersion",
     "ModuleCheckVersion", "Observation", "ObservationStatus", "Operator", "Project", "Provenance",
-    "ProvenanceSourceType", "RedactionState", "Report", "ReportMembership", "ReportStatus", "Retest", "RetestStatus", "Role",
+    "ProvenanceSourceType", "RedactionState", "Report", "ReportMembership", "ReportStatus", "Retest", "RetestAttempt", "RetestAttemptState", "RetestProof", "RetestRequest", "RetestRequestState", "RetestStatus", "Role",
     "ScopeDecision", "ScopeOutcome", "SCHEMA_VERSION", "Tenant", "bounded_metadata", "deserialize_contract",
     "ensure_utc", "isoformat_utc", "normalize_asset_identity", "parse_utc", "serialize_contract",
     "server_id", "utc_now",

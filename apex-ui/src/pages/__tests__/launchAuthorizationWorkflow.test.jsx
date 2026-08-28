@@ -124,9 +124,8 @@ describe('dashboard launch authorization workflow', () => {
       if (path.endsWith('/api/v1/findings/finding-1/retest')) {
         calls.push(['retest', JSON.parse(options.body)]);
         return jsonResponse(200, {
-          status: 'running',
-          still_vulnerable: null,
-          confidence: 'UNVERIFIED',
+          state: 'terminal',
+          retest_verdict: 'unsupported',
         });
       }
       return jsonResponse(404, {});

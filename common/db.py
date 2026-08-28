@@ -455,7 +455,13 @@ class RouteHealthInvalidationModel(Base):
 
 
 class FindingRetestModel(Base):
-    """ORM model for finding retest attempts and evidence."""
+    """Fixture-only Gate-0 compatibility row with no product authority.
+
+    Task 104 production requests, attempts, proofs, verdicts, and evidence use
+    ``common.retest`` plus the normalized canonical tables.  This mutable shape
+    remains solely to read/preserve historical fixtures and is never an API,
+    dashboard, report, job, evidence, or verdict source.
+    """
     __tablename__ = "finding_retests"
 
     id               = Column(String(36), primary_key=True)

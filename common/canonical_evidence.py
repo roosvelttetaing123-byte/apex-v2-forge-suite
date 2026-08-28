@@ -366,6 +366,10 @@ class CanonicalEvidenceReader:
                 raise CanonicalEvidenceError(
                     "persisted artifact metadata is malformed"
                 ) from exc
+            if not isinstance(manifest_metadata, dict):
+                raise CanonicalEvidenceError(
+                    "persisted artifact metadata is malformed"
+                )
             observation["artifacts"].append(
                 {
                     "artifact_id": artifact_id,
@@ -447,11 +451,193 @@ class CanonicalEvidenceReader:
             "vpr_priority": finding_metadata.get("vpr_priority"),
             "vpr_score": finding_metadata.get("vpr_score"),
         }
+        retest = self.session.execute(
+            text(
+                "SELECT r.id AS retest_id,ra.id AS retest_attempt_id,"
+                "ra.job_id,ra.durable_attempt_id,ra.state AS retest_state,"
+                "ra.verdict AS retest_verdict,ra.reason_code,p.observation_id "
+                "AS retest_observation_id,p.artifact_id AS retest_artifact_id,"
+                "p.sufficient AS retest_proof_sufficient,p.proof_digest AS "
+                "retest_proof_digest,pm.manifest_digest AS retest_manifest_digest,"
+                "ro.asset_id AS retest_asset_id,ro.engagement_id AS "
+                "retest_engagement_id,ro.check_id AS retest_check_id,"
+                "ro.collection_status AS retest_collection_status,"
+                "ro.identity_ref AS retest_identity_ref,ro.location AS retest_location,"
+                "ro.module_execution_id AS retest_module_execution_id,"
+                "ro.observed_at AS retest_observed_at,ro.parameter AS retest_parameter,"
+                "ro.proof_type AS retest_proof_type,ro.route AS retest_route,"
+                "pa.digest AS retest_primary_sha256,pa.media_type AS retest_media_type,"
+                "pa.size AS retest_primary_size,pa.redaction_state AS "
+                "retest_redaction_state,pa.integrity_state AS retest_integrity_state,"
+                "pm.derivative_sha256 AS retest_derivative_sha256,"
+                "pm.derivative_size AS retest_derivative_size,pm.metadata_json AS "
+                "retest_manifest_metadata "
+                "FROM canonical_retests r "
+                "JOIN canonical_retest_attempts ra "
+                "ON ra.tenant_id=r.tenant_id AND ra.retest_id=r.id "
+                "LEFT JOIN canonical_retest_proofs p "
+                "ON p.tenant_id=ra.tenant_id AND p.id=ra.proof_id "
+                "LEFT JOIN canonical_artifact_manifests pm "
+                "ON pm.tenant_id=p.tenant_id AND pm.artifact_id=p.artifact_id "
+                "AND pm.observation_id=p.observation_id "
+                "LEFT JOIN canonical_observations ro "
+                "ON ro.tenant_id=p.tenant_id AND ro.id=p.observation_id "
+                "LEFT JOIN canonical_artifact_refs pa "
+                "ON pa.tenant_id=p.tenant_id AND pa.id=p.artifact_id "
+                "AND pa.observation_id=p.observation_id "
+                "WHERE r.tenant_id=:tenant_id AND r.finding_id=:finding_id "
+                "ORDER BY COALESCE(ra.finished_at,ra.started_at,ra.created_at) "
+                "DESC,ra.id DESC LIMIT 1"
+            ),
+            {"tenant_id": self.tenant_id, "finding_id": finding_id},
+        ).mappings().first()
+        if retest is None:
+            projection.update(
+                {
+                    "retest_status": "not_retested",
+                    "retest_state": "not_started",
+                    "retest_verdict": None,
+                }
+            )
+        else:
+            verdict = (
+                str(retest["retest_verdict"])
+                if retest["retest_verdict"] is not None
+                else None
+            )
+            if verdict is not None:
+                if (
+                    retest["retest_artifact_id"] is None
+                    or retest["retest_observation_id"] is None
+                    or retest["retest_proof_digest"] is None
+                    or retest["retest_manifest_digest"] is None
+                ):
+                    raise CanonicalEvidenceError(
+                        "terminal retest verdict is missing immutable proof"
+                    )
+                retest_manifest = self.custody.verify(
+                    str(retest["retest_artifact_id"])
+                )
+                if (
+                    retest_manifest.source_observation_id
+                    != str(retest["retest_observation_id"])
+                    or retest_manifest.manifest_digest
+                    != str(retest["retest_manifest_digest"])
+                    or retest_manifest.sha256
+                    != str(retest["retest_proof_digest"])
+                ):
+                    raise CanonicalEvidenceError(
+                        "terminal retest proof does not match custody"
+                    )
+                if verdict in {"fixed", "still_vulnerable"} and int(
+                    retest["retest_proof_sufficient"] or 0
+                ) != 1:
+                    raise CanonicalEvidenceError(
+                        "terminal retest proof is insufficient for its verdict"
+                    )
+                derivative = self.custody.read(
+                    str(retest["retest_artifact_id"]),
+                    actor_id=self.audit_actor_id,
+                )
+                try:
+                    retest_manifest_metadata = json.loads(
+                        str(retest["retest_manifest_metadata"])
+                    )
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise CanonicalEvidenceError(
+                        "terminal retest artifact metadata is malformed"
+                    ) from exc
+                if not isinstance(retest_manifest_metadata, dict):
+                    raise CanonicalEvidenceError(
+                        "terminal retest artifact metadata is malformed"
+                    )
+                retest_observations = evidence.get("observations")
+                if not isinstance(retest_observations, list):
+                    raise CanonicalEvidenceError(
+                        "terminal retest evidence projection is malformed"
+                    )
+                retest_observations.append(
+                    {
+                        "artifacts": [
+                            {
+                                "artifact_id": str(retest["retest_artifact_id"]),
+                                "capture_kind": retest_manifest_metadata.get(
+                                    "capture_kind", "retest_proof"
+                                ),
+                                "derivative": redact_text(
+                                    derivative.decode("utf-8", errors="replace")
+                                ),
+                                "derivative_sha256": retest[
+                                    "retest_derivative_sha256"
+                                ],
+                                "derivative_size": retest["retest_derivative_size"],
+                                "integrity_state": retest["retest_integrity_state"],
+                                "manifest_digest": retest["retest_manifest_digest"],
+                                "media_type": retest["retest_media_type"],
+                                "primary_sha256": retest["retest_primary_sha256"],
+                                "primary_size": retest["retest_primary_size"],
+                                "redaction_state": retest["retest_redaction_state"],
+                                "role": "retest_proof",
+                                "sequence": 0,
+                            }
+                        ],
+                        "asset_id": str(retest["retest_asset_id"]),
+                        "check_id": retest["retest_check_id"],
+                        "collection_status": retest["retest_collection_status"],
+                        "engagement_id": str(retest["retest_engagement_id"]),
+                        "identity_ref": retest["retest_identity_ref"],
+                        "job_id": str(retest["job_id"]),
+                        "location": retest["retest_location"],
+                        "module_execution_id": retest[
+                            "retest_module_execution_id"
+                        ],
+                        "observation_id": str(retest["retest_observation_id"]),
+                        "observed_at": retest["retest_observed_at"],
+                        "parameter": retest["retest_parameter"],
+                        "proof_type": retest["retest_proof_type"],
+                        "route": retest["retest_route"],
+                    }
+                )
+            projection.update(
+                {
+                    "retest_id": str(retest["retest_id"]),
+                    "retest_attempt_id": str(retest["retest_attempt_id"]),
+                    "retest_job_id": str(retest["job_id"]),
+                    "retest_durable_attempt_id": str(
+                        retest["durable_attempt_id"]
+                    ),
+                    "retest_state": str(retest["retest_state"]),
+                    "retest_verdict": verdict,
+                    "retest_status": verdict or str(retest["retest_state"]),
+                    "retest_reason_code": str(retest["reason_code"] or ""),
+                    "retest_observation_id": (
+                        str(retest["retest_observation_id"])
+                        if retest["retest_observation_id"] is not None
+                        else None
+                    ),
+                    "retest_artifact_id": (
+                        str(retest["retest_artifact_id"])
+                        if retest["retest_artifact_id"] is not None
+                        else None
+                    ),
+                }
+            )
         # Finding metadata is contract-bounded and redacted at persistence.
         # Apply the emergency redactor again to all presentation fields while
         # preserving custody IDs/digests already verified above.
         for key in tuple(projection):
-            if key in {"dedup_key", "evidence", "finding_key", "id"}:
+            if key in {
+                "dedup_key",
+                "evidence",
+                "finding_key",
+                "id",
+                "retest_artifact_id",
+                "retest_attempt_id",
+                "retest_durable_attempt_id",
+                "retest_id",
+                "retest_job_id",
+                "retest_observation_id",
+            }:
                 continue
             projection[key] = redact_value(projection[key])
         return projection
@@ -720,6 +906,16 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
         payload: Mapping[str, Any],
         source_target: str,
         outcome: str,
+        module_id: str | None = None,
+        module_version: str = VERSION,
+        module_kind: str = "job_result",
+        proof_type: str = "unknown",
+        check_id: str = "job-result",
+        route: str | None = None,
+        parameter: str | None = None,
+        location: str | None = None,
+        identity_ref: str | None = None,
+        capture_kind: str = "job_result",
         transaction_guard: (
             Callable[[Session, Mapping[str, Any]], None] | None
         ) = None,
@@ -848,12 +1044,12 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
         # ordinary, redacted label, so represent this aggregate delivery with
         # a stable engine-level adapter identity. The exact module-set binding
         # remains protected by the linked authorization decision.
-        canonical_module_id = f"{context.engine}-job-result"
+        canonical_module_id = module_id or f"{context.engine}-job-result"
         module_version_id = _stable_id(
             "module-version",
             context.tenant_id,
             canonical_module_id,
-            VERSION,
+            module_version,
         )
         module_execution_id = _stable_id(
             "module-execution",
@@ -874,9 +1070,13 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
             asset_id=asset.id,
             action_id=context.action_id,
             status=observation_status,
-            proof_type="unknown",
+            proof_type=proof_type,
             collection_status=collection_status,
-            check_id="job-result",
+            check_id=check_id,
+            route=route,
+            parameter=parameter,
+            location=location,
+            identity_ref=identity_ref,
         )
         tenant = Tenant(id=context.tenant_id, name=context.tenant_id)
         engagement = Engagement(
@@ -938,12 +1138,12 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
             action_kind=context.action_kind,
             authorization_decision_id=context.decision_id,
         )
-        module_version = ModuleVersion(
+        module_version_record = ModuleVersion(
             id=module_version_id,
             tenant_id=context.tenant_id,
             module_id=canonical_module_id,
-            version=VERSION,
-            module_kind="job_result",
+            version=module_version,
+            module_kind=module_kind,
         )
         module_execution = ModuleExecution(
             id=module_execution_id,
@@ -985,7 +1185,7 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
                         context.original_authorization_ref
                     ),
                     retention_class="standard",
-                    metadata={"capture_kind": "job_result"},
+                    metadata={"capture_kind": capture_kind},
                     artifact_id=artifact_id,
                 )
                 created_artifact = True
@@ -1002,7 +1202,7 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
                 encryption_state=manifest.encryption_state,
                 collected_at=parse_utc(manifest.collected_at),
                 collector_id=manifest.collector_id,
-                collector_version=VERSION,
+                collector_version=module_version_record.version,
                 source_target=manifest.source_target or "unknown",
                 source_asset_id=manifest.source_asset_id,
                 redaction_version=manifest.redaction_version,
@@ -1020,7 +1220,7 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
                 ),
                 derivative_reference=manifest.derivative_artifact_id,
                 manifest_digest=manifest.manifest_digest,
-                metadata={"capture_kind": "job_result"},
+                metadata={"capture_kind": capture_kind},
             )
             receipt_data = {
                 "tenant_id": context.tenant_id,
@@ -1042,7 +1242,7 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
                 scope_decision=scope_decision,
                 job=job,
                 action=action,
-                module_version=module_version,
+                module_version=module_version_record,
                 module_execution=module_execution,
                 asset=asset,
                 observation=observation,

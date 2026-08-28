@@ -45,6 +45,79 @@ _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
 
+def test_public_finding_events_preserve_all_seven_retest_verdicts_exactly() -> None:
+    from common.dashboard.server import DashboardArtifactError, DashboardServer
+
+    server = object.__new__(DashboardServer)
+    verdicts = {
+        "fixed",
+        "still_vulnerable",
+        "inconclusive",
+        "failed",
+        "not_applicable",
+        "not_authorized",
+        "unsupported",
+    }
+    projected = set()
+    for verdict in verdicts:
+        event = Event(
+            event_type=EventType.FINDING_UPDATED,
+            source="task104-fixture",
+            data={
+                "finding_id": "finding-task104",
+                "action": "retest",
+                "status": "open",
+                "confidence": "HIGH",
+                "retest_id": "retest-task104",
+                "retest_state": "terminal",
+                "retest_status": verdict,
+                "retest_verdict": verdict,
+            },
+        )
+        payload = server._public_event(event)
+        assert payload["data"]["finding_id"] == "finding-task104"
+        assert payload["data"]["retest_state"] == "terminal"
+        assert payload["data"]["retest_status"] == verdict
+        projected.add(payload["data"]["retest_verdict"])
+    assert projected == verdicts
+
+    with pytest.raises(
+        DashboardArtifactError,
+        match="retest event verdict is invalid",
+    ):
+        server._public_event(
+            Event(
+                event_type=EventType.FINDING_UPDATED,
+                source="task104-fixture",
+                data={
+                    "finding_id": "finding-task104",
+                    "action": "retest",
+                    "retest_state": "terminal",
+                    "retest_status": "invented",
+                    "retest_verdict": "invented",
+                },
+            )
+        )
+
+    with pytest.raises(
+        DashboardArtifactError,
+        match="mixes lifecycle and verdict truth",
+    ):
+        server._public_event(
+            Event(
+                event_type=EventType.FINDING_UPDATED,
+                source="task104-fixture",
+                data={
+                    "finding_id": "finding-task104",
+                    "action": "retest",
+                    "retest_state": "running",
+                    "retest_status": "fixed",
+                    "retest_verdict": "fixed",
+                },
+            )
+        )
+
+
 def _async_test(
     function: Callable[_P, Coroutine[Any, Any, _R]],
 ) -> Callable[_P, _R]:

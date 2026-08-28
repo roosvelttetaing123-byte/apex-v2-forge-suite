@@ -117,6 +117,40 @@ describe('Vulnerabilities visible truth contract', () => {
     expect(document.body).not.toHaveTextContent('TRANSIENT_RAW_CANARY');
   });
 
+  it('refreshes canonical retest truth after an authenticated reconnect snapshot', async () => {
+    let calls = 0;
+    const fetchMock = vi.fn(async () => {
+      calls += 1;
+      return response({
+        findings: [visibleFinding({
+          retest_state: 'terminal',
+          retest_status: calls === 1 ? 'inconclusive' : 'unsupported',
+          retest_verdict: calls === 1 ? 'inconclusive' : 'unsupported',
+        })],
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const view = render(<Vulnerabilities authToken="fixture" />);
+    expect(await screen.findByText('inconclusive')).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    socket.lastMessage = {
+      type: 'state_snapshot',
+      data: {
+        findings: [{
+          id: 'finding-visible-truth',
+          retest_verdict: 'fixed',
+          status: 'Fixed',
+        }],
+      },
+    };
+    view.rerender(<Vulnerabilities authToken="fixture" />);
+
+    expect(await screen.findByText('unsupported')).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(document.body).not.toHaveTextContent('fixed');
+  });
+
   it('delegates bulk export to the backend with only selected finding IDs', async () => {
     const backendBlob = new Blob(['BACKEND_EXPORT_RESULT_CANARY'], { type: 'application/json' });
     const blob = vi.fn().mockResolvedValue(backendBlob);

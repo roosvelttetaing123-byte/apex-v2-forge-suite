@@ -47,6 +47,7 @@ def _seed_canonical_dashboard_finding(
     module: str,
     target: str,
     title: str,
+    credential_reference: str = "",
 ) -> str:
     from common.action_authorization import (
         AuthorizationContext,
@@ -63,6 +64,7 @@ def _seed_canonical_dashboard_finding(
     from common.db import ScanJobModel, create_db
     from common.evidence import Evidence
     from common.finding import Finding, Severity
+    from common.job_state import JobState, JobStateService
 
     scan_id = f"canonical-source-{finding_id}"
     server._scan_results_dir = tmp_path / "scan-results"
@@ -84,6 +86,8 @@ def _seed_canonical_dashboard_finding(
         excluded_scope=[],
         scope_policy_version="scope-policy-v1",
         safety_mode=SafetyMode.ACTIVE,
+        credential_approval_required=bool(credential_reference),
+        credential_reference=credential_reference,
         confirmation_method=ConfirmationMethod.CLI_PROMPT,
         confirmed_by="operator-retest-fixture",
     )
@@ -128,7 +132,39 @@ def _seed_canonical_dashboard_finding(
         scan_session.close()
         if scan_bind is not None:
             scan_bind.dispose()
-    context = CanonicalEvidenceContext.from_authorization(issued.envelope)
+    result_jobs = JobStateService(
+        result_root / "webforge.db",
+        authorization_checker=lambda *_args: True,
+    )
+    result_jobs.create_job(
+        tenant_id=server.tenant_id,
+        job_id=issued.envelope.job_id,
+        engagement_id=issued.envelope.engagement_id,
+        run_id=issued.envelope.run_id,
+        job_kind="webforge",
+        target=target,
+        authorization_decision_id=issued.envelope.decision_id,
+        authorization_action_id=issued.envelope.action_id,
+        state=JobState.QUEUED,
+        work_items=(module,),
+    )
+    original_attempt = result_jobs.acquire_lease(
+        issued.envelope.job_id,
+        "fixture-worker",
+        tenant_id=server.tenant_id,
+        attempt_id=f"attempt-{finding_id}",
+        idempotency_key=f"attempt-{finding_id}",
+    )
+    result_jobs.start_attempt(
+        str(original_attempt["id"]),
+        str(original_attempt["lease_token"]),
+        tenant_id=server.tenant_id,
+        worker_id="fixture-worker",
+    )
+    context = CanonicalEvidenceContext.from_authorization(
+        issued.envelope,
+        attempt_id=str(original_attempt["id"]),
+    )
     finding_session = create_db(result_root / "webforge.db")
     try:
         projection = CanonicalEvidenceService(
@@ -148,10 +184,17 @@ def _seed_canonical_dashboard_finding(
                 remediation="Apply the fixture remediation.",
                 references=[],
                 confidence="HIGH",
+                proof_type="passive",
+                verification_state="verified",
                 evidence=Evidence(
+                    request_raw="GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n",
+                    response_raw="HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n",
                     extra={
                         "route": "/",
                         "check_id": module,
+                        "header": "Content-Security-Policy",
+                        "value": None,
+                        "issue": "Missing",
                     }
                 ),
             )
@@ -161,6 +204,7 @@ def _seed_canonical_dashboard_finding(
         finding_session.close()
         if finding_bind is not None:
             finding_bind.dispose()
+        result_jobs.close()
 
     connection = sqlite3.connect(scan_jobs_db)
     try:
@@ -310,7 +354,7 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
             finally:
                 session.close()
 
-    async def test_retest_finding_without_canonical_lineage_fails_before_dry_run_persistence(self):
+    async def test_retest_dry_run_plans_without_legacy_row_or_subprocess(self):
         from common.dashboard.server import DashboardServer
         from common.db import FindingRetestModel, create_db
 
@@ -361,11 +405,9 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                         },
                     )
 
-            self.assertEqual(resp.status_code, 500, resp.text)
-            self.assertEqual(
-                resp.json()["detail"],
-                "Canonical retest context is required; persistence denied",
-            )
+            self.assertEqual(resp.status_code, 200, resp.text)
+            self.assertEqual(resp.json()["state"], "planned")
+            self.assertIsNone(resp.json()["retest_verdict"])
             mock_popen.assert_not_called()
 
             session = create_db(scan_jobs_db)
@@ -374,8 +416,9 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
             finally:
                 session.close()
 
-    async def test_active_retest_without_canonical_lineage_fails_closed(self):
+    async def test_active_header_retest_uses_canonical_verifier_without_subprocess(self):
         from common.dashboard.server import DashboardServer
+        from common.retest import HeaderResponse
 
         target = "http://127.0.0.1:8080/"
         job_id = "retest-active"
@@ -390,6 +433,8 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
             srv._control_dir.mkdir()
             process = MagicMock(pid=8765, stdout=[])
             process.poll.return_value = None
+            async def fetch_headers(target_url, *_args):
+                return HeaderResponse(200, {}, target_url)
             with (
                 patch.object(
                     DashboardServer,
@@ -399,6 +444,7 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                 ),
                 patch.object(DashboardServer, "_track_scan_process"),
                 patch("subprocess.Popen", return_value=process) as popen,
+                patch("common.retest._governed_header_fetch", new=fetch_headers),
             ):
                 canonical_id = _seed_canonical_dashboard_finding(
                     srv,
@@ -425,15 +471,205 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                             ).to_dict(),
                         },
                     )
+                    refreshed = await client.get("/api/v1/findings?limit=20")
+                    exported = await client.post(
+                        "/api/v1/findings/export",
+                        json={"finding_ids": [canonical_id]},
+                    )
 
-        self.assertEqual(response.status_code, 500, response.text)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["retest_verdict"], "still_vulnerable")
+        self.assertEqual(response.json()["state"], "terminal")
+        self.assertEqual(refreshed.status_code, 200, refreshed.text)
+        persisted = next(
+            item
+            for item in refreshed.json()["findings"]
+            if item["id"] == canonical_id
+        )
+        self.assertEqual(persisted["retest_verdict"], "still_vulnerable")
+        self.assertEqual(persisted["retest_status"], "still_vulnerable")
+        self.assertEqual(persisted["status"], "open")
+        self.assertTrue(any(
+            artifact.get("capture_kind") == "retest_proof"
+            for observation in persisted["evidence"]["observations"]
+            for artifact in observation["artifacts"]
+        ))
+        self.assertEqual(exported.status_code, 200, exported.text)
         self.assertEqual(
-            response.json()["detail"],
-            "Authorization handoff persistence failed; execution denied",
+            exported.json()["findings"][0]["retest_verdict"],
+            "still_vulnerable",
         )
         popen.assert_not_called()
 
-    def test_retest_completion_without_canonical_lineage_leaves_legacy_record_unchanged(self):
+    async def test_active_authenticated_header_retest_resolves_only_original_protected_reference(self):
+        from contextlib import contextmanager
+
+        from common.credential_boundary import (
+            CredentialUseApproval,
+            InMemorySecretProvider,
+        )
+        from common.dashboard.server import DashboardServer
+        from common.retest import HeaderResponse
+
+        secret = "DASHBOARD_RETEST_SESSION_SECRET_CANARY"
+        provider = InMemorySecretProvider()
+        reference = provider.put({"Authorization": f"Bearer {secret}"})
+
+        class Resolver:
+            @contextmanager
+            def resolve(
+                self,
+                reference_value,
+                *,
+                approval: CredentialUseApproval,
+                target: str,
+            ):
+                with provider.resolve(
+                    reference_value,
+                    approval=approval,
+                    target=target,
+                ) as values:
+                    yield {"headers": values}
+
+        target = "http://127.0.0.1:8080/"
+        job_id = "retest-active-authenticated"
+        srv = DashboardServer(auth=False, retest_session_resolver=Resolver())
+        app = srv.create_app()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            srv._scan_logs_dir = tmp_path / "logs"
+            srv._control_dir = tmp_path / "controls"
+            srv._scan_logs_dir.mkdir()
+            srv._control_dir.mkdir()
+            process = MagicMock(pid=8766, stdout=[])
+            process.poll.return_value = None
+            fetch_calls = 0
+
+            async def fetch_headers(target_url, _policy, headers, cookies):
+                nonlocal fetch_calls
+                fetch_calls += 1
+                self.assertEqual(headers["Authorization"], f"Bearer {secret}")
+                self.assertEqual(cookies, {})
+                return HeaderResponse(200, {}, target_url)
+
+            with (
+                patch.object(
+                    DashboardServer,
+                    "_scan_jobs_db_path",
+                    new_callable=PropertyMock,
+                    return_value=tmp_path / "scan_jobs.db",
+                ),
+                patch.object(DashboardServer, "_track_scan_process"),
+                patch("subprocess.Popen", return_value=process) as popen,
+                patch("common.retest._governed_header_fetch", new=fetch_headers),
+            ):
+                canonical_id = _seed_canonical_dashboard_finding(
+                    srv,
+                    tmp_path / "scan_jobs.db",
+                    tmp_path,
+                    finding_id="finding-active-authenticated-retest",
+                    module="header_audit",
+                    target=target,
+                    title="Authenticated Header Missing",
+                    credential_reference=reference.value,
+                )
+                async with _make_async_client(app) as client:
+                    response = await client.post(
+                        f"/api/v1/findings/{canonical_id}/retest",
+                        json={
+                            "job_id": job_id,
+                            "scope": ["127.0.0.1/32"],
+                            "exclude": [],
+                            "dry_run": False,
+                            "confirmation": ActionConfirmation.create(
+                                job_id=job_id,
+                                target=target,
+                                engine="webforge",
+                                action="retest",
+                            ).to_dict(),
+                            "credential_reference": "cred:memory:CLIENT_SUBSTITUTION",
+                            "session": secret,
+                        },
+                    )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["retest_verdict"], "still_vulnerable")
+            self.assertNotIn(secret, response.text)
+            self.assertEqual(fetch_calls, 1)
+            self.assertEqual(provider.resolve_calls, 1)
+            popen.assert_not_called()
+            persisted = b"".join(
+                path.read_bytes()
+                for path in tmp_path.rglob("*")
+                if path.is_file()
+            )
+            self.assertNotIn(secret.encode("utf-8"), persisted)
+        provider.discard_all()
+
+    async def test_active_unregistered_retest_returns_unsupported_without_generic_launch(self):
+        from common.dashboard.server import DashboardServer
+
+        target = "http://127.0.0.1:8080/"
+        job_id = "retest-active-unsupported"
+        srv = DashboardServer(auth=False)
+        app = srv.create_app()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            srv._scan_logs_dir = tmp_path / "logs"
+            srv._control_dir = tmp_path / "controls"
+            srv._scan_logs_dir.mkdir()
+            srv._control_dir.mkdir()
+            process = MagicMock(pid=8767, stdout=[])
+            process.poll.return_value = None
+            with (
+                patch.object(
+                    DashboardServer,
+                    "_scan_jobs_db_path",
+                    new_callable=PropertyMock,
+                    return_value=tmp_path / "scan_jobs.db",
+                ),
+                patch.object(DashboardServer, "_track_scan_process"),
+                patch("subprocess.Popen", return_value=process) as popen,
+                patch(
+                    "common.retest._governed_header_fetch",
+                    side_effect=AssertionError("unsupported verifier opened a connection"),
+                ) as fetch,
+            ):
+                canonical_id = _seed_canonical_dashboard_finding(
+                    srv,
+                    tmp_path / "scan_jobs.db",
+                    tmp_path,
+                    finding_id="finding-active-unsupported-retest",
+                    module="sqli_scanner",
+                    target=target,
+                    title="Unsupported Retest Family",
+                )
+                async with _make_async_client(app) as client:
+                    response = await client.post(
+                        f"/api/v1/findings/{canonical_id}/retest",
+                        json={
+                            "job_id": job_id,
+                            "scope": ["127.0.0.1/32"],
+                            "exclude": [],
+                            "dry_run": False,
+                            "confirmation": ActionConfirmation.create(
+                                job_id=job_id,
+                                target=target,
+                                engine="webforge",
+                                action="retest",
+                            ).to_dict(),
+                        },
+                    )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["retest_verdict"], "unsupported")
+            self.assertEqual(response.json()["state"], "terminal")
+            fetch.assert_not_called()
+            popen.assert_not_called()
+
+    def test_legacy_retest_row_is_fixture_only_and_has_no_dashboard_completion_authority(self):
         from common.dashboard.server import DashboardServer
         from common.db import FindingRetestModel, create_db, save_finding_retest
 
@@ -442,13 +678,6 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
             scan_jobs_db = tmp_path / "scan_jobs.db"
-            logs_dir = tmp_path / "logs"
-            logs_dir.mkdir()
-            srv._scan_logs_dir = logs_dir
-            log_path = logs_dir / "retest-rt-1_web.log"
-            log_path.write_text("dry run complete\n", encoding="utf-8")
-            log_path.chmod(0o600)
-
             with patch.object(
                 DashboardServer,
                 "_scan_jobs_db_path",
@@ -471,12 +700,8 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                 finally:
                     session.close()
 
-                srv._complete_finding_retest(
-                    {"retest_id": "rt-1"},
-                    "retest-rt-1_web",
-                    0,
-                    log_path,
-                )
+                self.assertFalse(hasattr(srv, "_complete_finding_retest"))
+                self.assertFalse(hasattr(srv, "_launch_finding_retest_job"))
 
                 session = create_db(scan_jobs_db)
                 try:

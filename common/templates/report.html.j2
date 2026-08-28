@@ -81,7 +81,12 @@
   <tr>
     <td colspan="8" class="detail">
       <strong>Workflow status:</strong> {{ f.status | default('open') | e }} &nbsp;|&nbsp;
-      <strong>Confidence:</strong> {{ f.confidence | default('UNVERIFIED') | e }}<br>
+      <strong>Confidence:</strong> {{ f.confidence | default('UNVERIFIED') | e }} &nbsp;|&nbsp;
+      <strong>Retest verdict:</strong> {{ f.retest_verdict | default('not_retested', true) | e }}
+      ({{ f.retest_state | default('not_started') | e }})<br>
+      {% if f.retest_reason_code %}
+      <strong>Retest reason:</strong> {{ f.retest_reason_code | e }}<br>
+      {% endif %}
       <strong>Description:</strong> {{ f.description | e }}<br>
       <strong>Reproduction:</strong>
       <ol>

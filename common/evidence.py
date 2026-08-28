@@ -53,6 +53,20 @@ EvidenceCustodyError = CustodyError
 _SAFE_FINDING_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SAFE_SHA256_REFERENCE = re.compile(r"sha256:[0-9a-f]{64}")
 _SAFE_DEDUP_KEY = re.compile(r"finding-v[0-9]+:[0-9a-f]{64}")
+_RETEST_VERDICTS = frozenset(
+    {
+        "fixed",
+        "still_vulnerable",
+        "inconclusive",
+        "failed",
+        "not_applicable",
+        "not_authorized",
+        "unsupported",
+    }
+)
+_RETEST_STATES = frozenset(
+    {"not_started", "planned", "authorized", "queued", "running", "terminal", "canceled"}
+)
 _MAX_ORDINARY_DERIVATIVE_CHARS = 20_000
 _FORBIDDEN_ORDINARY_EVIDENCE_KEYS = frozenset(
     {
@@ -88,6 +102,16 @@ _ORDINARY_FINDING_FIELDS = frozenset(
         "references",
         "remediation",
         "reproduction_steps",
+        "retest_artifact_id",
+        "retest_attempt_id",
+        "retest_durable_attempt_id",
+        "retest_id",
+        "retest_job_id",
+        "retest_observation_id",
+        "retest_reason_code",
+        "retest_state",
+        "retest_status",
+        "retest_verdict",
         "service",
         "severity",
         "status",
@@ -350,6 +374,16 @@ def ordinary_finding_projection(value: Any) -> dict[str, Any]:
         "module": 300,
         "proof_type": 100,
         "remediation": 8_000,
+        "retest_artifact_id": 300,
+        "retest_attempt_id": 300,
+        "retest_durable_attempt_id": 300,
+        "retest_id": 300,
+        "retest_job_id": 300,
+        "retest_observation_id": 300,
+        "retest_reason_code": 100,
+        "retest_state": 100,
+        "retest_status": 100,
+        "retest_verdict": 100,
         "service": 500,
         "status": 100,
         "target": 2_000,
@@ -465,6 +499,17 @@ def ordinary_finding_projection(value: Any) -> dict[str, Any]:
         if severity not in severity_labels:
             raise EvidenceCaptureError("ordinary finding severity is invalid")
         rendered["severity"] = severity_labels[severity]
+    verdict = rendered.get("retest_verdict")
+    if verdict is not None and verdict not in _RETEST_VERDICTS:
+        raise EvidenceCaptureError("ordinary finding retest_verdict is invalid")
+    retest_state = rendered.get("retest_state")
+    if retest_state is not None and retest_state not in _RETEST_STATES:
+        raise EvidenceCaptureError("ordinary finding retest_state is invalid")
+    retest_status = rendered.get("retest_status")
+    if retest_status is not None and retest_status not in (
+        _RETEST_VERDICTS | _RETEST_STATES | {"not_retested"}
+    ):
+        raise EvidenceCaptureError("ordinary finding retest_status is invalid")
     if evidence["state"] == "persisted" and rendered.get("id") != evidence.get(
         "finding_id"
     ):

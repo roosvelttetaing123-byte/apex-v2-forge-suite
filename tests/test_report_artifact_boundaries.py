@@ -600,6 +600,62 @@ def test_report_engine_json_replaces_symlink_without_touching_victim(
     assert list(output_dir.glob(".*.tmp")) == []
 
 
+def test_report_engine_preserves_all_seven_retest_verdicts_exactly(
+    tmp_path: Path,
+) -> None:
+    verdicts = (
+        "fixed",
+        "still_vulnerable",
+        "inconclusive",
+        "failed",
+        "not_applicable",
+        "not_authorized",
+        "unsupported",
+    )
+    findings = [
+        {
+            "id": f"finding-{verdict}",
+            "title": f"Retest {verdict}",
+            "severity": "Medium",
+            "target": "https://fixture.test/",
+            "module": "header_audit",
+            "description": "Deterministic report projection fixture.",
+            "reproduction_steps": ["GET /"],
+            "remediation": "Configure CSP.",
+            "references": [],
+            "status": "open",
+            "confidence": "HIGH",
+            "verification_state": "verified",
+            "proof_type": "passive",
+            "maturity": "stable",
+            "retest_state": "terminal",
+            "retest_status": verdict,
+            "retest_verdict": verdict,
+            "retest_reason_code": f"fixture_{verdict}",
+            "evidence": {"observations": [], "state": "unavailable"},
+        }
+        for verdict in verdicts
+    ]
+    output_dir = tmp_path / "retest-report"
+    engine = ReportEngine(
+        findings,
+        ReportConfig(
+            output_dir=str(output_dir),
+            formats=["html", "json"],
+            include_exec_summary=False,
+            include_compliance=False,
+        ),
+    )
+    paths = asyncio.run(engine.generate())
+    payload = json.loads(Path(paths["json"]).read_text(encoding="utf-8"))
+    assert [item["retest_verdict"] for item in payload["findings"]] == list(
+        verdicts
+    )
+    rendered = Path(paths["html"]).read_text(encoding="utf-8")
+    for verdict in verdicts:
+        assert f"<p>{verdict}" in rendered
+
+
 def test_report_engine_pdf_stages_bytes_before_atomic_symlink_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -188,6 +188,12 @@ const Vulnerabilities = ({ authToken }) => {
   useEffect(() => {
     if (!lastMessage) return;
     const { type, event_type, data } = lastMessage;
+    if (type === 'state_snapshot') {
+      // Reconnect truth comes from the canonical HTTP projection. The socket
+      // snapshot is an invalidation signal, never a verdict authority.
+      void refreshPersistedFindings();
+      return;
+    }
     if (type !== 'event') return;
     if (event_type === 'finding_new') {
       // The event is only an invalidation signal. Retrieve the tenant-bound,
@@ -202,7 +208,10 @@ const Vulnerabilities = ({ authToken }) => {
       const truth = normalizeFindingTruth(data);
       const findingId = data.finding_id || data.id;
       const truthPatch = Object.fromEntries(
-        ['confidence', 'verification_state', 'proof_type', 'maturity', 'retest_status']
+        [
+          'confidence', 'verification_state', 'proof_type', 'maturity',
+          'retest_reason_code', 'retest_state', 'retest_status', 'retest_verdict',
+        ]
           .filter(key => Object.prototype.hasOwnProperty.call(data, key))
           .map(key => [key, truth[key]])
       );
@@ -353,6 +362,7 @@ const Vulnerabilities = ({ authToken }) => {
           if (v.id !== findingId) return v;
           return applyRetestTruth(v, data);
         }));
+        void refreshPersistedFindings();
       } else {
         const data = await res.json().catch(() => ({}));
         setRetestError(dashboardErrorMessage(data, `Retest failed (${res.status})`));
@@ -361,7 +371,7 @@ const Vulnerabilities = ({ authToken }) => {
       setRetestError(error instanceof Error ? error.message : 'Retest failed');
     }
     setRetesting(null);
-  }, []);
+  }, [refreshPersistedFindings]);
 
   // Bulk status change
   const bulkStatusChange = useCallback(async (newStatus) => {
@@ -774,6 +784,8 @@ const Vulnerabilities = ({ authToken }) => {
                 <div>Maturity: <strong>{selected.maturity || 'experimental'}</strong></div>
                 <div>Confidence: <strong>{selected.confidence || 'UNVERIFIED'}</strong></div>
                 <div>Retest: <strong>{selected.retest_status || 'not_retested'}</strong></div>
+                <div>Retest state: <strong>{selected.retest_state || 'not_started'}</strong></div>
+                <div>Retest reason: <strong>{selected.retest_reason_code || '—'}</strong></div>
                 <div>Workflow: <strong>{selected.status || 'open'}</strong></div>
               </div>
 

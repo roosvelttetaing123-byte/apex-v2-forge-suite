@@ -732,6 +732,16 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
               <p>{{ f.remediation | e }}</p>
             </div>
 
+            <div class="detail-block">
+              <strong>Retest verdict</strong>
+              <p>{{ f.retest_verdict | default('not_retested', true) | e }}
+                 ({{ f.retest_state | default('not_started') | e }})
+                 {% if f.retest_reason_code %}
+                 — {{ f.retest_reason_code | e }}
+                 {% endif %}
+              </p>
+            </div>
+
             {% if f.references %}
             <div class="detail-block">
               <strong>References</strong>

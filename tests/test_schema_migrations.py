@@ -16,6 +16,19 @@ from common.action_authorization import (
     module_set_binding,
 )
 from common.confirm_gate import ActionConfirmation
+from common.canonical import (
+    ArtifactReference,
+    Asset,
+    AssetKind,
+    CanonicalStore,
+    Engagement,
+    Finding as CanonicalFinding,
+    FindingSeverity,
+    Job,
+    ModuleVersion,
+    Observation,
+    Tenant,
+)
 from common.db import (
     AuthorizationConsumptionModel,
     AuthorizationDecisionModel,
@@ -28,6 +41,7 @@ from common.schema_migrations import (
     CURRENT_SCHEMA_VERSION,
     EVIDENCE_SCHEMA_VERSION,
     JOB_STATE_SCHEMA_VERSION,
+    RETEST_SCHEMA_VERSION,
     MigrationError,
     MigrationInterruptedError,
     MigrationManager,
@@ -235,6 +249,268 @@ def test_task103_migration_downgrades_only_when_history_is_empty(
         ).scalar_one() == 1
     finally:
         retained.close()
+
+
+def test_task104_empty_history_downgrade_and_reupgrade_are_exact(
+    tmp_path: Path,
+) -> None:
+    session = create_db(tmp_path / "empty-task104.db")
+    try:
+        manager = MigrationManager(session.get_bind())
+        assert RETEST_SCHEMA_VERSION in manager.versions
+        manager.downgrade(target=JOB_STATE_SCHEMA_VERSION)
+        tables = {
+            str(row[0])
+            for row in session.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).all()
+        }
+        assert "canonical_retest_attempts" not in tables
+        assert "canonical_retest_proofs" not in tables
+        assert "canonical_retest_source_snapshots" not in tables
+        assert "canonical_retest_verifier_policies" not in tables
+        legacy_columns = {
+            str(row[1])
+            for row in session.execute(
+                text("PRAGMA table_info(canonical_retests)")
+            ).all()
+        }
+        assert "status" in legacy_columns
+        assert "proof_policy_version" not in legacy_columns
+        assert session.execute(
+            text(
+                "SELECT COUNT(*) FROM canonical_migration_journal "
+                "WHERE version=:version AND state='applied'"
+            ),
+            {"version": RETEST_SCHEMA_VERSION},
+        ).scalar_one() == 0
+
+        manager.upgrade(target=RETEST_SCHEMA_VERSION)
+        request_columns = {
+            str(row[1])
+            for row in session.execute(
+                text("PRAGMA table_info(canonical_retests)")
+            ).all()
+        }
+        assert {
+            "source_observation_id",
+            "source_artifact_id",
+            "source_proof_artifact_id",
+            "source_snapshot_id",
+            "original_attempt_id",
+            "new_job_id",
+            "target_url",
+            "session_policy_digest",
+            "proof_policy_version",
+            "verifier_version",
+            "verifier_policy_id",
+        } <= request_columns
+        verdict_sql = str(
+            session.execute(
+                text(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE type='table' AND name='canonical_retest_attempts'"
+                )
+            ).scalar_one()
+        )
+        for verdict in (
+            "fixed",
+            "still_vulnerable",
+            "inconclusive",
+            "failed",
+            "not_applicable",
+            "not_authorized",
+            "unsupported",
+        ):
+            assert f"'{verdict}'" in verdict_sql
+        assert "'not_run'" not in verdict_sql
+    finally:
+        session.close()
+
+
+def test_task104_upgrade_preserves_legacy_retest_history_immutably(
+    tmp_path: Path,
+) -> None:
+    session = create_db(tmp_path / "legacy-task104.db")
+    try:
+        manager = MigrationManager(session.get_bind())
+        manager.downgrade(target=JOB_STATE_SCHEMA_VERSION)
+        tenant = Tenant(id="tenant-legacy-retest", name="Legacy tenant")
+        engagement = Engagement(
+            id="engagement-legacy-retest",
+            tenant_id=tenant.id,
+            name="Legacy engagement",
+        )
+        job = Job(
+            id="job-legacy-retest",
+            tenant_id=tenant.id,
+            engagement_id=engagement.id,
+            job_kind="legacy-fixture",
+        )
+        module = ModuleVersion(
+            id="module-legacy-retest",
+            tenant_id=tenant.id,
+            module_id="header_audit",
+            version="legacy",
+        )
+        asset = Asset(
+            id="asset-legacy-retest",
+            tenant_id=tenant.id,
+            kind=AssetKind.URL,
+            identity_key="https://fixture.test/",
+            display_name="https://fixture.test/",
+            canonical_uri="https://fixture.test/",
+        )
+        observation = Observation(
+            id="observation-legacy-retest",
+            tenant_id=tenant.id,
+            engagement_id=engagement.id,
+            job_id=job.id,
+            module_version_id=module.id,
+            asset_id=asset.id,
+            check_id="header_audit",
+            route="/",
+        )
+        artifact = ArtifactReference(
+            id="artifact-legacy-retest",
+            tenant_id=tenant.id,
+            observation_id=observation.id,
+            reference="artifact:legacy-retest",
+            digest="sha256:" + "a" * 64,
+            media_type="application/json",
+            size=0,
+        )
+        finding = CanonicalFinding(
+            id="finding-legacy-retest",
+            tenant_id=tenant.id,
+            observation_id=observation.id,
+            artifact_id=artifact.id,
+            title="Legacy header finding",
+            severity=FindingSeverity.MEDIUM,
+            description="Legacy downstream retest fixture.",
+        )
+        CanonicalStore(session).create_lineage(
+            tenant=tenant,
+            engagement=engagement,
+            job=job,
+            module_version=module,
+            asset=asset,
+            observation=observation,
+            artifact=artifact,
+            finding=finding,
+        )
+        session.execute(
+            text(
+                "INSERT INTO canonical_retests("
+                "id,tenant_id,finding_id,source_observation_id,job_id,"
+                "schema_version,status,created_at,metadata_json) VALUES("
+                "'legacy-retest','tenant-legacy-retest','finding-legacy-retest',"
+                "'observation-legacy-retest','job-legacy-retest',"
+                "'forge-canonical-v1','fixed','2026-01-01T00:00:00Z','{}')"
+            )
+        )
+        session.commit()
+
+        manager.upgrade(target=RETEST_SCHEMA_VERSION)
+        archived = session.execute(
+            text(
+                "SELECT status FROM canonical_retests_legacy_v103 "
+                "WHERE id='legacy-retest' AND tenant_id='tenant-legacy-retest'"
+            )
+        ).scalar_one()
+        assert archived == "fixed"
+        assert session.execute(
+            text("SELECT COUNT(*) FROM canonical_retests")
+        ).scalar_one() == 0
+        with pytest.raises(IntegrityError):
+            session.execute(
+                text(
+                    "UPDATE canonical_retests_legacy_v103 SET status='failed' "
+                    "WHERE id='legacy-retest'"
+                )
+            )
+            session.commit()
+        session.rollback()
+    finally:
+        session.close()
+
+
+def test_task104_interrupted_migration_rolls_back_and_recovers(
+    tmp_path: Path,
+) -> None:
+    session = create_db(tmp_path / "interrupted-task104.db")
+    try:
+        manager = MigrationManager(session.get_bind())
+        manager.downgrade(target=JOB_STATE_SCHEMA_VERSION)
+        with pytest.raises(MigrationInterruptedError):
+            manager.upgrade(target=RETEST_SCHEMA_VERSION, fail_after=0)
+        journal_state = session.execute(
+            text(
+                "SELECT state FROM canonical_migration_journal "
+                "WHERE version=:version"
+            ),
+            {"version": RETEST_SCHEMA_VERSION},
+        ).scalar_one()
+        assert journal_state == "failed"
+        columns_after_failure = {
+            str(row[1])
+            for row in session.execute(
+                text("PRAGMA table_info(canonical_retests)")
+            ).all()
+        }
+        assert "status" in columns_after_failure
+        assert "proof_policy_version" not in columns_after_failure
+
+        manager.recover()
+        assert session.execute(
+            text(
+                "SELECT state FROM canonical_migration_journal "
+                "WHERE version=:version"
+            ),
+            {"version": RETEST_SCHEMA_VERSION},
+        ).scalar_one() == "applied"
+        recovered_columns = {
+            str(row[1])
+            for row in session.execute(
+                text("PRAGMA table_info(canonical_retests)")
+            ).all()
+        }
+        assert "proof_policy_version" in recovered_columns
+        assert "status" not in recovered_columns
+    finally:
+        session.close()
+
+
+def test_task104_recovery_accepts_idempotent_post_ddl_journal_replay(
+    tmp_path: Path,
+) -> None:
+    session = create_db(tmp_path / "post-ddl-task104.db")
+    try:
+        session.execute(
+            text(
+                "UPDATE canonical_migration_journal SET state='failed' "
+                "WHERE version=:version"
+            ),
+            {"version": RETEST_SCHEMA_VERSION},
+        )
+        session.commit()
+        manager = MigrationManager(session.get_bind())
+        manager.recover()
+        assert session.execute(
+            text(
+                "SELECT state FROM canonical_migration_journal "
+                "WHERE version=:version"
+            ),
+            {"version": RETEST_SCHEMA_VERSION},
+        ).scalar_one() == "applied"
+        assert session.execute(
+            text("SELECT COUNT(*) FROM canonical_retests")
+        ).scalar_one() == 0
+        assert session.execute(
+            text("SELECT COUNT(*) FROM canonical_retests_legacy_v103")
+        ).scalar_one() == 0
+    finally:
+        session.close()
 
 
 def test_ordered_upgrade_downgrade_and_idempotence(tmp_path: Path) -> None:

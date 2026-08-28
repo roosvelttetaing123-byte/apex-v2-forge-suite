@@ -63,7 +63,10 @@ from common.dashboard.event_bus import (
 )
 from common.dashboard.state_store import StateStore
 from common.confidence_policy import normalise_finding
-from common.canonical import FindingStatus as CanonicalFindingStatus
+from common.canonical import (
+    FindingStatus as CanonicalFindingStatus,
+    RetestStatus as CanonicalRetestStatus,
+)
 from common.canonical_evidence import (
     CanonicalEvidenceContext,
     CanonicalEvidenceError,
@@ -120,6 +123,7 @@ from common.artifact_io import (
 from common.scope import (
     ScopeDecision,
     ScopeReason,
+    canonical_target,
     decision_for_reason,
     decide_scope,
     safe_target_display,
@@ -135,18 +139,16 @@ from common.dashboard.auth import (
 )
 from common.db import (
     AuditLogModel,
-    FindingRetestModel,
     ScanJobModel,
     audit_log_to_dict,
     create_db,
     get_authorization_decision,
     get_scan_job,
-    save_finding_retest,
     save_audit_log,
     save_scan_job,
-    update_finding_retest,
     update_scan_job,
 )
+from common.retest import RetestService, SessionReferenceResolver
 from common.job_state import (
     IdempotencyConflict,
     InvalidTransition,
@@ -1331,6 +1333,7 @@ class DashboardServer:
         host: str = "127.0.0.1",
         port: int = 1337,
         auth: bool = True,
+        retest_session_resolver: SessionReferenceResolver | None = None,
     ) -> None:
         self.tenant_id = os.environ.get("FORGE_TENANT_ID", "default").strip() or "default"
         self.event_bus = event_bus or EventBus(run_id="dashboard")
@@ -1349,6 +1352,7 @@ class DashboardServer:
         # identity checks. Keep the argument for call-site compatibility while
         # reporting the effective, fail-closed state truthfully.
         self.auth_enabled = True
+        self._retest_session_resolver = retest_session_resolver
         self.auth_disable_requested = not bool(auth)
         if self.auth_disable_requested:
             log.warning("Dashboard no-auth mode is disabled; authentication remains required")
@@ -1775,9 +1779,6 @@ class DashboardServer:
             )
             self._update_scan_history_status(root_scan_id, info["status"])
             self._sync_scan_job_from_active(root_scan_id, fallback=info["status"])
-            if info.get("retest_id"):
-                self._complete_finding_retest(info, scan_key, rc, log_path)
-
         threading.Thread(
             target=_worker,
             name=f"ScanMonitor-{scan_key}",
@@ -2262,6 +2263,16 @@ class DashboardServer:
             "dedup_key",
             "reproduction_steps",
             "remediation",
+            "retest_artifact_id",
+            "retest_attempt_id",
+            "retest_durable_attempt_id",
+            "retest_id",
+            "retest_job_id",
+            "retest_observation_id",
+            "retest_reason_code",
+            "retest_state",
+            "retest_status",
+            "retest_verdict",
             "evidence",
         )
         result: dict[str, Any] = {}
@@ -2430,6 +2441,7 @@ class DashboardServer:
         }
         finding = {
             "id",
+            "finding_id",
             "title",
             "severity",
             "module",
@@ -2447,6 +2459,14 @@ class DashboardServer:
             "verification_state",
             "proof_type",
             "maturity",
+            "action",
+            "dry_run",
+            "job_id",
+            "retest_id",
+            "retest_reason_code",
+            "retest_state",
+            "retest_status",
+            "retest_verdict",
         }
         credential = {"type", "account", "target", "module", "discovered_by"}
         control = {
@@ -2501,7 +2521,41 @@ class DashboardServer:
             allowed = set()
         event_data: Mapping[str, Any] = event.data
         if event.event_type in {EventType.FINDING_NEW, EventType.FINDING_UPDATED}:
-            event_data = normalise_finding(dict(event.data))
+            if event.data.get("action") == "retest":
+                verdict = event.data.get("retest_verdict")
+                state = str(event.data.get("retest_state") or "")
+                if verdict is not None:
+                    try:
+                        CanonicalRetestStatus(str(verdict))
+                    except ValueError:
+                        raise DashboardArtifactError(
+                            "canonical retest event verdict is invalid"
+                        ) from None
+                if state not in {
+                    "planned",
+                    "authorized",
+                    "queued",
+                    "running",
+                    "terminal",
+                    "canceled",
+                }:
+                    raise DashboardArtifactError(
+                        "canonical retest event state is invalid"
+                    )
+                if (state == "terminal") != (verdict is not None):
+                    raise DashboardArtifactError(
+                        "canonical retest event mixes lifecycle and verdict truth"
+                    )
+                expected_status = str(verdict) if verdict is not None else state
+                if event.data.get("retest_status") != expected_status:
+                    raise DashboardArtifactError(
+                        "canonical retest event status is inconsistent"
+                    )
+            event_data = (
+                dict(event.data)
+                if event.data.get("action") == "retest"
+                else normalise_finding(dict(event.data))
+            )
         data = {
             key: self._bounded_public_value(value)
             for key, value in event_data.items()
@@ -4803,7 +4857,7 @@ class DashboardServer:
 
         @app.post("/api/v1/findings/{finding_id}/retest")
         async def api_retest_finding(request: Request, finding_id: str):
-            """Re-test a specific finding to verify if it's still exploitable."""
+            """Run the exact canonical verifier for one persisted finding."""
             payload = _require_auth(request, Role.OPERATOR)
             _require_not_killed()
             try:
@@ -4855,7 +4909,8 @@ class DashboardServer:
                 )
                 server._raise_scope_denial(decision)
 
-            framework = "netforge" if module in server._netforge_module_names() else "webforge"
+            framework = server._retest_framework(module)
+            credential_reference = server._retest_session_reference(finding_id)
             try:
                 client_job_id = server._client_job_id(body)
             except HTTPException:
@@ -4907,6 +4962,7 @@ class DashboardServer:
                 operator_role=operator_role,
                 safety_mode=SafetyMode.ACTIVE.value,
                 module_id=module_set_binding([module]),
+                credential_reference=credential_reference,
                 prior_decision=submitted_decision,
             )
             authorization: ActionAuthorizationEnvelope | None = None
@@ -4915,51 +4971,68 @@ class DashboardServer:
                     server._raise_scope_denial(
                         decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
                     )
-                authorization = server._commit_launch_authorizations(
-                    [(context, confirmation)],
-                    job_record={
-                        "status": "pending",
-                        "target": target,
-                        "frameworks": [framework],
-                        "modules": [module],
-                        "logs": {},
-                        "created_at": datetime.now(timezone.utc),
-                    },
-                )[0]
-
-            retest_id = str(uuid.uuid4())[:8]
-            from common.canonical import MissingCanonicalContextError
-
-            try:
-                retest = server._create_finding_retest(
-                    retest_id=retest_id,
-                    finding=finding,
-                    dry_run=dry_run,
+                authorization = server._commit_retest_authorization(
+                    context,
+                    confirmation,
                 )
-            except MissingCanonicalContextError:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Canonical retest context is required; persistence denied",
-                ) from None
-            job = server._launch_finding_retest_job(
-                retest_id,
-                finding,
-                dry_run=dry_run,
-                job_id=job_id,
-                framework=framework,
-                allowed_scope=allowed_scope,
-                excluded_scope=excluded_scope,
-                confirmation=confirmation,
-                authorization=authorization,
-                scope_decision=scope_decision,
-            )
+
+            if dry_run:
+                result = {
+                    "schema_version": "forge-real-retest-v1",
+                    "state": "planned",
+                    "retest_verdict": None,
+                    "reason_code": "dry_run_planned",
+                    "finding_id": finding_id,
+                    "retest_id": None,
+                    "retest_attempt_id": None,
+                    "job_id": job_id,
+                    "durable_attempt_id": None,
+                    "observation_id": None,
+                    "artifact_id": None,
+                    "duplicate": False,
+                    "verdict_authority": "none",
+                }
+            else:
+                assert authorization is not None
+                database_path = server._canonical_finding_database(finding_id)
+                service = JobStateService(
+                    database_path,
+                    clock=lambda: server._agent_now().timestamp(),
+                    authorization_checker=server._retest_authorization_allowed,
+                )
+                canonical_session = create_db(database_path)
+                try:
+                    retest_service = RetestService(
+                        canonical_session,
+                        database_path.parent / "evidence-custody",
+                        service,
+                        authorization_session_factory=(
+                            lambda: create_db(server._scan_jobs_db_path)
+                        ),
+                        session_resolver=server._retest_session_resolver,
+                    )
+                    execution = await retest_service.execute(
+                        finding_id=finding_id,
+                        tenant_id=server.tenant_id,
+                        authorization=authorization,
+                        allowed_scope=tuple(allowed_scope),
+                        excluded_scope=tuple(excluded_scope),
+                        idempotency_key=f"dashboard:{authorization.job_id}",
+                    )
+                    result = execution.to_dict()
+                finally:
+                    canonical_session.close()
+                    service.close()
             server.event_bus.emit_simple(
                 EventType.FINDING_UPDATED, source="dashboard",
                 finding_id=finding_id,
                 action="retest",
-                status=retest["status"],
-                retest_id=retest_id,
-                job_id=job.get("job_id"),
+                retest_state=result["state"],
+                retest_verdict=result["retest_verdict"],
+                retest_status=result["retest_verdict"] or result["state"],
+                retest_reason_code=result["reason_code"],
+                retest_id=result["retest_id"],
+                job_id=result["job_id"],
                 dry_run=dry_run,
             )
             _audit(
@@ -4967,26 +5040,24 @@ class DashboardServer:
                 "finding.retest",
                 object_id=finding_id,
                 detail={
-                    "retest_id": retest_id,
-                    "job_id": job.get("job_id"),
+                    "retest_id": result["retest_id"],
+                    "job_id": result["job_id"],
                     "dry_run": dry_run,
+                    "state": result["state"],
+                    "retest_verdict": result["retest_verdict"],
+                    "reason_code": result["reason_code"],
                     "scope_decision": scope_decision.to_dict(),
                 },
                 payload=payload,
             )
             return {
-                "status": retest["status"],
-                "finding_id": finding_id,
-                "retest_id": retest_id,
-                "job_id": job.get("job_id"),
+                **result,
+                "status": result["state"],
+                "retest_status": result["retest_verdict"] or result["state"],
                 "client_job_id": client_job_id,
                 "module": module,
                 "target": target,
                 "dry_run": dry_run,
-                "still_vulnerable": None,
-                "confidence": "UNVERIFIED",
-                "evidence": retest["evidence"],
-                "retested_at": None,
             }
 
         # ── Scan Launch (extended for ScanBuilder) ─────────────────────
@@ -9206,11 +9277,7 @@ class DashboardServer:
                 self._raise_scope_denial(
                     decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
                 )
-            engine = (
-                "netforge"
-                if module in self._netforge_module_names()
-                else "webforge"
-            )
+            engine = self._retest_framework(module)
             actions.append((target, engine, "retest", primary_scope))
 
         decisions: list[ScopeDecision] = []
@@ -11010,288 +11077,227 @@ class DashboardServer:
                 return self._public_finding(finding)
         return None
 
-    def _finding_retest_metadata(self, finding: dict[str, Any]) -> dict[str, Any]:
-        """Extract stable retest metadata from a finding payload."""
-        evidence_projection = ordinary_evidence_projection(
-            finding.get("evidence")
-        )
-        evidence_artifacts = ordinary_evidence_artifacts(evidence_projection)
-        capture_kinds = {
-            str(artifact.get("capture_kind") or "")
-            for artifact in evidence_artifacts
-        }
-        observation_parameters = [
-            str(observation["parameter"])
-            for observation in evidence_projection.get("observations", [])
-            if observation.get("parameter")
-        ]
-        return {
-            "module": finding.get("module", ""),
-            "target": finding.get("target", ""),
-            "url": finding.get("url") or finding.get("target", ""),
-            "param": observation_parameters[0] if observation_parameters else None,
-            "payload_class": finding.get("module", ""),
-            "session_ref": None,
-            "evidence": {
-                "proof_summary": finding.get("description", ""),
-                "source_confidence": finding.get("confidence", "UNVERIFIED"),
-                "artifact_count": len(evidence_artifacts),
-                "request_present": "request" in capture_kinds,
-                "response_present": "response" in capture_kinds,
-                "dry_run_note": "Retest job records module rerun wiring; scanner output determines final status.",
-            },
-            "finding_snapshot": {
-                key: finding.get(key)
-                for key in (
-                    "id",
-                    "title",
-                    "severity",
-                    "target",
-                    "url",
-                    "module",
-                    "confidence",
-                    "status",
-                )
-            },
-        }
+    def _retest_framework(self, module: str) -> str:
+        """Classify an existing module without a generic execution fallback."""
 
-    def _create_finding_retest(
-        self,
-        retest_id: str,
-        finding: dict[str, Any],
-        dry_run: bool,
-    ) -> dict[str, Any]:
-        """Persist an initial retest record."""
-        meta = self._finding_retest_metadata(finding)
-        record = {
-            "id": retest_id,
-            "finding_id": finding["id"],
-            "status": "planned" if dry_run else "pending",
-            "module": meta["module"],
-            "target": meta["target"] or meta["url"],
-            "url": meta["url"],
-            "param": meta["param"],
-            "payload_class": meta["payload_class"],
-            "session_ref": meta["session_ref"],
-            "confidence": "UNVERIFIED",
-            "evidence": meta["evidence"],
-            "metadata_json": {
-                "dry_run": dry_run,
-                "finding_snapshot": meta["finding_snapshot"],
-            },
-        }
-
-        def _save(session: Any) -> None:
-            save_finding_retest(session, record)
-
-        self._with_scan_jobs_session(_save)
-        return record
-
-    def _launch_finding_retest_job(
-        self,
-        retest_id: str,
-        finding: dict[str, Any],
-        dry_run: bool = True,
-        *,
-        job_id: str,
-        framework: str,
-        allowed_scope: list[str],
-        excluded_scope: list[str],
-        confirmation: ActionConfirmation | None,
-        authorization: ActionAuthorizationEnvelope | None,
-        scope_decision: ScopeDecision,
-    ) -> dict[str, Any]:
-        """Launch a bounded module rerun for a finding retest."""
-        module = str(finding.get("module", "")).strip()
-        target = str(finding.get("target") or finding.get("url") or "").strip()
-        if not module or not target:
-            raise HTTPException(status_code=400, detail="Retest requires module and target metadata")
-
-        if dry_run:
-            def _update_plan(session: Any) -> None:
-                update_finding_retest(
-                    session,
-                    retest_id,
-                    status="planned",
-                    job_id=job_id,
-                    evidence={
-                        **self._finding_retest_metadata(finding)["evidence"],
-                        "dry_run": True,
-                        "authorized": False,
-                        "scope_decision": scope_decision.to_dict(),
-                    },
-                )
-
-            self._with_scan_jobs_session(_update_plan)
-            return {
-                "job_id": job_id,
-                "process_id": None,
-                "status": "planned",
-                "dry_run": True,
-                "authorized": False,
-                "scope_decision": scope_decision.to_dict(),
-            }
-
-        if confirmation is None:
-            self._raise_scope_denial(decision_for_reason(ScopeReason.MISSING_CONFIRMATION))
-        if authorization is None:
-            self._raise_scope_denial(decision_for_reason(ScopeReason.INVALID_CONFIRMATION))
-
-        scan_id = job_id
+        if module in self._netforge_module_names():
+            return "netforge"
         try:
-            results_root = self._allocate_scan_results_dir(scan_id)
-        except DashboardArtifactError:
-            raise HTTPException(
-                status_code=500,
-                detail="Retest result boundary is unavailable",
-            ) from None
-        forge_root = Path(__file__).parent.parent.parent
-        control_file = self._init_control_file(scan_id)
+            from webforge.webforge import MODULE_MAP as WEBFORGE_MODULE_MAP
 
-        script = forge_root / framework / f"{framework}.py"
-        cmd = [
-            sys.executable,
-            str(script),
-            "--target",
-            target,
-            "--engagement",
-            f"Retest-{retest_id}",
-            "--control-file",
-            str(control_file),
-            "--modules",
-            module,
-            "--output",
-            str(results_root / framework),
-        ]
-        if framework == "webforge":
-            cmd.extend(["--mode", "blackbox", "--report-format", "json"])
-        else:
-            cmd.extend(["--mode", "external", "--report-format", "json"])
-        self._append_scope_args(cmd, allowed_scope, excluded_scope)
+            if module in WEBFORGE_MODULE_MAP:
+                return "webforge"
+        except Exception:
+            pass
+        return "forge"
 
-        child_env = minimal_child_environment(
-            os.environ,
-            allowlist={"FORGE_TENANT_ID"},
-        )
-        child_env = self._launch_env(
-            child_env,
-            confirmation,
-            authorization,
-            job_id,
-            "retest",
-        )
-        key = f"{scan_id}_{'net' if framework == 'netforge' else 'web'}"
-        prepared = self._prepare_durable_scan_job(
-            scan_id=scan_id,
-            target=target,
-            process_specs=[(key, framework)],
-            authorizations={framework: authorization},
-            modules=[module],
-            results_dir=str(results_root),
-            control_file=control_file,
-            actor_id=authorization.operator_id,
-            actor_role=authorization.operator_role,
-        )
-        intent = cast(Mapping[str, Any], prepared["intents"])[key]
-        child_env = {
-            **child_env,
-            JOB_ATTEMPT_ID_ENV: str(
-                cast(Mapping[str, Any], prepared["attempt"])["id"]
-            ),
-            f"{JOB_ATTEMPT_ID_ENV}_LAUNCH_NONCE": str(
-                intent["launch_nonce"]
-            ),
-        }
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(forge_root),
-                env=child_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
+    def _canonical_finding_database(self, finding_id: str) -> Path:
+        """Resolve the one verified canonical database that owns a finding."""
+
+        matches: list[Path] = []
+        for root in self._canonical_result_roots():
+            for database_path in self._canonical_database_paths(root):
+                session = create_db(database_path)
+                try:
+                    count = int(
+                        session.execute(
+                            sql_text(
+                                "SELECT COUNT(*) FROM canonical_findings "
+                                "WHERE tenant_id=:tenant_id AND id=:finding_id"
+                            ),
+                            {
+                                "tenant_id": self.tenant_id,
+                                "finding_id": finding_id,
+                            },
+                        ).scalar_one()
+                    )
+                    session.rollback()
+                finally:
+                    session.close()
+                if count:
+                    matches.append(database_path)
+        if len(matches) != 1:
+            raise DashboardArtifactError(
+                "canonical finding source is unavailable or ambiguous"
             )
-        except Exception as exc:
-            self._durable_job_state().cancel_job(
-                scan_id,
-                tenant_id=self.tenant_id,
-                actor=TransitionActor(
-                    tenant_id=self.tenant_id,
-                    actor_id="retest-launch-failure",
-                    role="system",
+        return matches[0]
+
+    def _retest_session_reference(self, finding_id: str) -> str:
+        """Load only the original opaque credential reference for authorization.
+
+        The canonical database supplies the exact source action identity; the
+        protected authorization database supplies its signed envelope.  Secret
+        values are never read here and a client-supplied replacement is never
+        accepted.
+        """
+
+        database_path = self._canonical_finding_database(finding_id)
+        canonical_session = create_db(database_path)
+        try:
+            row = canonical_session.execute(
+                sql_text(
+                    "SELECT f.tenant_id,o.engagement_id,o.job_id,o.action_id,"
+                    "mv.module_id,asset.canonical_uri,"
+                    "action.authorization_decision_id "
+                    "FROM canonical_findings f "
+                    "JOIN canonical_observations o "
+                    "ON o.tenant_id=f.tenant_id AND o.id=f.observation_id "
+                    "JOIN canonical_module_versions mv "
+                    "ON mv.tenant_id=o.tenant_id AND mv.id=o.module_version_id "
+                    "JOIN canonical_assets asset "
+                    "ON asset.tenant_id=o.tenant_id AND asset.id=o.asset_id "
+                    "JOIN canonical_actions action "
+                    "ON action.tenant_id=o.tenant_id AND action.id=o.action_id "
+                    "WHERE f.tenant_id=:tenant_id AND f.id=:finding_id"
                 ),
-                reason="retest process launch failed",
-                sla_seconds=0,
-            )
-            raise HTTPException(
-                status_code=500,
-                detail="Retest launch failed",
-            ) from exc
-        now_iso = datetime.now(timezone.utc).isoformat()
-        self._active_scans[key] = {
-            "proc": proc,
-            "type": "retest",
-            "target": target,
-            "started_at": time.time(),
-            "engagement": f"Retest-{retest_id}",
-            "mode": "dry-run" if dry_run else "retest",
-            "status": "leased",
-            "started_dt": now_iso,
-            "control_file": str(control_file),
-            "command": self._sanitize_cmd(cmd),
-            "dashboard_url": "",
-            "retest_id": retest_id,
-            "finding_id": finding["id"],
-            "results_dir": str(results_root),
-        }
-        try:
-            self._activate_durable_scan_processes(
-                scan_id=scan_id,
-                prepared=prepared,
-                control_file=control_file,
-                actor_id=authorization.operator_id,
-                actor_role=authorization.operator_role,
-            )
-        except Exception as exc:
-            self._abort_durable_scan_launch(
-                scan_id=scan_id,
-                prepared=prepared,
-                processes={key: proc},
-                control_file=control_file,
-                reason="retest process identity activation failed",
-            )
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to bind retest process identity; execution denied",
-            ) from exc
-        self._active_scans[key]["status"] = "running"
-        self._track_scan_process(key, self._active_scans[key])
-        self._write_scan_job(
-            scan_id=scan_id,
-            target=target,
-            frameworks=[framework],
-            modules=[module],
-            results_dir=str(results_root),
-            authorization=authorization,
-        )
+                {"tenant_id": self.tenant_id, "finding_id": finding_id},
+            ).mappings().first()
+            canonical_session.rollback()
+        finally:
+            canonical_session.close()
+        if row is None:
+            raise DashboardArtifactError("canonical finding source is unavailable")
 
-        def _update(session: Any) -> None:
-            update_finding_retest(
+        def _load(session: Any) -> str:
+            record = get_authorization_decision(
                 session,
-                retest_id,
-                status="running",
-                job_id=scan_id,
-                evidence={
-                    **self._finding_retest_metadata(finding)["evidence"],
-                    "job_id": scan_id,
-                    "log_path": str(self._scan_logs_dir / f"{key}.log"),
-                    "dry_run": False,
-                    "scope_decision": scope_decision.to_dict(),
-                },
+                str(row["authorization_decision_id"]),
+            )
+            if record is None:
+                return ""
+            try:
+                envelope = ActionAuthorizationEnvelope.from_value(
+                    json.loads(str(record.envelope_json))
+                )
+            except Exception:
+                return ""
+            expected_target = canonical_target(str(row["canonical_uri"]))
+            if not all(
+                (
+                    envelope.decision_outcome == "allow",
+                    envelope.tenant_id == str(row["tenant_id"]),
+                    envelope.engagement_id == str(row["engagement_id"]),
+                    envelope.job_id == str(row["job_id"]),
+                    envelope.action_id == str(row["action_id"]),
+                    envelope.decision_id
+                    == str(row["authorization_decision_id"]),
+                    envelope.module_id
+                    in {
+                        str(row["module_id"]),
+                        module_set_binding([str(row["module_id"])]),
+                    },
+                    envelope.resolved_target == expected_target,
+                )
+            ):
+                return ""
+            return str(envelope.credential_reference or "")
+
+        return str(self._with_scan_jobs_session(_load))
+
+    def _commit_retest_authorization(
+        self,
+        context: AuthorizationContext,
+        confirmation: ActionConfirmation,
+    ) -> ActionAuthorizationEnvelope:
+        """Issue and consume the exact parent/child retest authority only."""
+
+        def _persist(session: Any) -> ActionAuthorizationEnvelope:
+            try:
+                issued = issue_authorization(
+                    session=session,
+                    context=context,
+                    confirmation=confirmation,
+                    commit=False,
+                )
+                if not issued.allowed:
+                    raise ValueError("retest authorization was denied")
+                consumed_parent = consume_authorization(
+                    session=session,
+                    envelope=issued.envelope,
+                    expected=context,
+                    boundary="dashboard.launch",
+                    commit=False,
+                )
+                if not consumed_parent.allowed:
+                    raise ValueError("retest parent authorization was not consumed")
+                child_context = AuthorizationContext(
+                    **{
+                        **context.__dict__,
+                        "action_kind": "engine.execute",
+                        "parent_decision_id": issued.envelope.decision_id,
+                        "confirmation_method": ConfirmationMethod.INHERITED,
+                    }
+                )
+                derived = derive_authorization(
+                    session=session,
+                    parent_envelope=issued.envelope,
+                    context=child_context,
+                    parent_boundary="dashboard.launch",
+                    commit=False,
+                )
+                if not derived.allowed:
+                    raise ValueError("retest execution authorization was denied")
+                consumed_child = consume_authorization(
+                    session=session,
+                    envelope=derived.envelope,
+                    expected=child_context,
+                    boundary="retest.verifier",
+                    commit=False,
+                )
+                if not consumed_child.allowed:
+                    raise ValueError("retest verifier authorization was not consumed")
+                session.commit()
+                return consumed_child.envelope
+            except Exception as exc:
+                session.rollback()
+                record_authorization_denial(
+                    session=session,
+                    context=context,
+                    reason_code=AuthorizationReason.HANDOFF_PERSISTENCE_FAILED,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Retest authorization handoff failed; execution denied",
+                ) from exc
+
+        return self._with_scan_jobs_session(_persist)
+
+    def _retest_authorization_allowed(
+        self,
+        tenant_id: str,
+        job_id: str,
+        decision_id: str,
+        action_id: str,
+    ) -> bool:
+        """Validate one immutable child envelope from the authorization DB."""
+
+        def _load(session: Any) -> bool:
+            record = get_authorization_decision(session, decision_id)
+            if record is None:
+                return False
+            try:
+                envelope = ActionAuthorizationEnvelope.from_value(
+                    json.loads(str(record.envelope_json))
+                )
+                expires = datetime.fromisoformat(
+                    envelope.expires_at.replace("Z", "+00:00")
+                )
+            except Exception:
+                return False
+            return (
+                envelope.decision_outcome == "allow"
+                and envelope.tenant_id == tenant_id
+                and envelope.job_id == job_id
+                and envelope.decision_id == decision_id
+                and envelope.action_id == action_id
+                and envelope.action_kind == "engine.execute"
+                and datetime.now(timezone.utc) < expires.astimezone(timezone.utc)
             )
 
-        self._with_scan_jobs_session(_update)
-        return {"job_id": scan_id, "process_id": key}
+        try:
+            return bool(self._with_scan_jobs_session(_load))
+        except Exception:
+            return False
 
     def _netforge_module_names(self) -> set[str]:
         """Return known netforge module names."""
@@ -11307,95 +11313,6 @@ class DashboardServer:
         except Exception:
             pass
         return names
-
-    def _complete_finding_retest(
-        self,
-        info: dict[str, Any],
-        scan_key: str,
-        return_code: int,
-        log_path: Path,
-    ) -> None:
-        """Project durable retest state after recording process-exit telemetry."""
-        retest_id = str(info.get("retest_id", ""))
-        if not retest_id:
-            return
-        job_id = self._base_scan_id(scan_key)
-        durable = self._durable_job_state().get_job(
-            job_id,
-            tenant_id=self.tenant_id,
-        )
-        status = str(durable["state"]) if durable is not None else "orphaned"
-        evidence = {
-            "job_id": job_id,
-            "process_id": scan_key,
-            "return_code": return_code,
-            "lifecycle_authority": "task103",
-            "durable_job_state": status,
-            "terminal_reason": (
-                durable.get("terminal_reason") if durable is not None else None
-            ),
-            "log_path": str(log_path),
-            "log_tail": self._tail_text(log_path, max_lines=80),
-        }
-
-        def _update(session: Any) -> None:
-            update_finding_retest(
-                session,
-                retest_id,
-                status=status,
-                still_vulnerable=None,
-                confidence=(
-                    "UNVERIFIED"
-                    if status == JobState.COMPLETED.value
-                    else "LOW"
-                ),
-                evidence=evidence,
-                error=(
-                    None
-                    if status == JobState.COMPLETED.value
-                    else str(
-                        (durable or {}).get("terminal_reason")
-                        or "Retest did not reach verified completion"
-                    )
-                ),
-                retested_at=datetime.now(timezone.utc),
-            )
-
-        try:
-            self._with_scan_jobs_session(_update)
-        except Exception as exc:
-            log.warning(
-                "Could not complete dashboard retest reason=%s",
-                type(exc).__name__,
-            )
-
-    def _load_finding_retest(self, retest_id: str) -> dict[str, Any] | None:
-        """Load a finding retest row as a JSON-friendly dict."""
-        def _load(session: Any) -> dict[str, Any] | None:
-            row = session.get(FindingRetestModel, retest_id)
-            if row is None:
-                return None
-            return {
-                "id": row.id,
-                "finding_id": row.finding_id,
-                "status": row.status,
-                "module": row.module,
-                "target": row.target,
-                "url": row.url,
-                "param": row.param,
-                "payload_class": row.payload_class,
-                "session_ref": row.session_ref,
-                "job_id": row.job_id,
-                "still_vulnerable": row.still_vulnerable,
-                "confidence": row.confidence,
-                "evidence": json.loads(row.evidence or "{}"),
-                "metadata": json.loads(row.metadata_json or "{}"),
-                "error": row.error,
-                "created_at": row.created_at.isoformat() if row.created_at else None,
-                "retested_at": row.retested_at.isoformat() if row.retested_at else None,
-            }
-
-        return self._with_scan_jobs_session(_load)
 
     def _write_scan_history(
         self,
