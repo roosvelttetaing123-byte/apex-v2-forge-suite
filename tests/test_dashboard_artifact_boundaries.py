@@ -330,7 +330,7 @@ def test_control_and_kill_switch_replace_links_without_mutating_victims(
     assert _mode(caller) == 0o755
 
 
-def test_agent_state_fails_closed_on_read_link_and_atomic_write_is_redacted(
+def test_legacy_agent_cache_symlink_is_ignored_without_mutation(
     tmp_path: Path,
 ) -> None:
     server = DashboardServer(auth=False)
@@ -341,48 +341,205 @@ def test_agent_state_fails_closed_on_read_link_and_atomic_write_is_redacted(
     victim_before = victim.read_bytes()
     agents_path = caller / "agents.json"
     agents_path.symlink_to(victim)
-    canary = "CANARY_DASHBOARD_AGENT_RESULT_007"
-    digest = "d" * 64
-
-    with patch.object(
-        DashboardServer,
-        "_agents_path",
-        new_callable=PropertyMock,
-        return_value=agents_path,
+    with (
+        patch.object(
+            DashboardServer,
+            "_agents_path",
+            new_callable=PropertyMock,
+            return_value=agents_path,
+        ),
+        patch.object(
+            DashboardServer,
+            "_scan_jobs_db_path",
+            new_callable=PropertyMock,
+            return_value=tmp_path / "legacy-symlink.db",
+        ),
     ):
-        with pytest.raises(server_module.HTTPException) as denied:
-            server._load_agents_state()
-        server._write_agents_state(
-            {
-                "agents": {
-                    "agent-a": {
-                        "id": "agent-a",
-                        "name": canary,
-                        "credential_digest": digest,
-                    }
-                },
-                "jobs": [
-                    {
-                        "id": "job-a",
-                        "lease_digest": digest,
-                        "result": {"password": canary, "note": canary},
-                        "error": canary,
-                    }
-                ],
-            }
-        )
+        durable = server._durable_job_state()
 
-    assert denied.value.status_code == 503
-    assert denied.value.detail == {"reason_code": "agent_state_persistence_failed"}
+    assert durable.list_agents(tenant_id=server.tenant_id) == []
+    assert durable.list_jobs(tenant_id=server.tenant_id) == []
     assert victim.read_bytes() == victim_before
     assert _mode(victim) == 0o640
-    assert not agents_path.is_symlink()
-    assert _mode(agents_path) == 0o600
-    persisted = agents_path.read_text(encoding="utf-8")
-    assert canary not in persisted
-    assert digest in persisted
+    assert agents_path.is_symlink()
+    assert agents_path.stat().st_ino == victim.stat().st_ino
     assert _mode(caller) == 0o755
-    assert not list(caller.glob(".agents.json.*.tmp"))
+    assert not list(caller.glob(".*.tmp"))
+
+
+def test_legacy_agent_cache_import_is_one_time_canceled_and_tenant_bound(
+    tmp_path: Path,
+) -> None:
+    """Legacy JSON may seed history, but never lease or execution authority."""
+
+    server = DashboardServer(auth=False)
+    state_path = tmp_path / "agents.json"
+    database = tmp_path / "legacy-import.db"
+
+    def agent_record(
+        *,
+        tenant_id: str = "default",
+        revoked: bool = False,
+        suffix: str = "fixture",
+    ) -> dict:
+        return {
+            "tenant_id": tenant_id,
+            "credential_digest": f"{suffix}-credential-digest",
+            "key_id": f"{suffix}-key",
+            "scope": ["fixture.local"],
+            "engines": ["netforge"],
+            "capabilities": ["scan"],
+            "excluded_scope": ["excluded.fixture.local"],
+            "name": "Legacy fixture agent",
+            "host": "fixture-host",
+            "platform": "fixture-platform",
+            "version": "fixture-version",
+            "active_scan_enabled": False,
+            "revoked": revoked,
+        }
+
+    with (
+        patch.object(
+            DashboardServer,
+            "_agents_path",
+            new_callable=PropertyMock,
+            return_value=state_path,
+        ),
+        patch.object(
+            DashboardServer,
+            "_scan_jobs_db_path",
+            new_callable=PropertyMock,
+            return_value=database,
+        ),
+    ):
+        durable = server._durable_job_state()
+        durable.register_agent(
+            "existing-agent",
+            tenant_id=server.tenant_id,
+            key_id="existing-key",
+            credential_digest="existing-digest",
+            engines=("netforge",),
+            capabilities=("scan",),
+            scope=("fixture.local",),
+        )
+        durable.create_job(
+            {"source": "preexisting"},
+            tenant_id=server.tenant_id,
+            job_id="existing-job",
+            assigned_agent_id="existing-agent",
+            state="planned",
+            work_items=("existing-work",),
+        )
+        payload = {
+            "agents": {
+                "bad-shape": [],
+                "wrong-tenant": agent_record(tenant_id="tenant-b"),
+                "incomplete": {"tenant_id": "default"},
+                "existing-agent": agent_record(),
+                "new-agent": agent_record(suffix="new"),
+                "revoked-agent": agent_record(revoked=True, suffix="revoked"),
+            },
+            "jobs": [
+                "bad-shape",
+                {"tenant_id": "tenant-b", "agent_id": "new-agent"},
+                {"id": "unknown-agent-job", "agent_id": "missing-agent"},
+                {
+                    "id": "existing-job",
+                    "agent_id": "existing-agent",
+                    "modules": ["existing-work"],
+                },
+                {
+                    "id": "invalid id with spaces",
+                    "agent_id": "new-agent",
+                    "engine": "netforge",
+                    "target": "fixture.local",
+                    "modules": ["module-one"],
+                    "result": {"token": "must-not-survive"},
+                },
+                {
+                    "id": "legacy-valid-job",
+                    "agent_id": "new-agent",
+                    "engine": "netforge",
+                    "target": "fixture.local",
+                    "modules": [],
+                },
+            ],
+        }
+        serialized = json.dumps(payload, sort_keys=True).encode("utf-8")
+        state_path.write_bytes(serialized)
+        state_path.chmod(0o600)
+        server._import_legacy_agent_cache(durable)
+
+        agents = {
+            row["id"]: row
+            for row in durable.list_agents(tenant_id=server.tenant_id)
+        }
+        jobs = durable.list_jobs(tenant_id=server.tenant_id, limit=100)
+        imported_jobs = [
+            row for row in jobs if row["id"] != "existing-job"
+        ]
+        before_repeat = (
+            len(agents),
+            len(jobs),
+            sum(
+                len(durable.list_attempts(row["id"], tenant_id=server.tenant_id))
+                for row in jobs
+            ),
+        )
+        server._import_legacy_agent_cache(durable)
+
+    assert set(agents) == {"existing-agent", "new-agent", "revoked-agent"}
+    assert agents["revoked-agent"]["revoked"] is True
+    assert len(imported_jobs) == 2
+    assert {row["state"] for row in imported_jobs} == {"canceled"}
+    assert all(row["terminal_reason"] for row in imported_jobs)
+    assert all(
+        durable.list_attempts(row["id"], tenant_id=server.tenant_id) == []
+        for row in imported_jobs
+    )
+    assert before_repeat == (3, 3, 0)
+    assert len(durable.list_agents(tenant_id=server.tenant_id)) == 3
+    assert len(durable.list_jobs(tenant_id=server.tenant_id, limit=100)) == 3
+    assert state_path.read_bytes() == serialized
+    assert _mode(state_path) == 0o600
+    durable.close()
+
+
+@pytest.mark.parametrize(
+    ("payload_json", "expected_frameworks", "expected_modules"),
+    [
+        ("not-json", [], []),
+        ("[]", [], []),
+        ('{"frameworks": {}, "modules": "bad"}', [], []),
+        ('{"frameworks": ["webforge"], "modules": ["headers"]}', ["webforge"], ["headers"]),
+    ],
+)
+def test_durable_scan_projection_fails_closed_for_malformed_payload_shapes(
+    payload_json: str,
+    expected_frameworks: list[str],
+    expected_modules: list[str],
+) -> None:
+    row = {
+        "id": "durable-projection",
+        "state": None,
+        "target": "fixture.local",
+        "payload_json": payload_json,
+        "engagement_id": None,
+        "error_reason": None,
+        "run_id": "run-fixture",
+        "version": None,
+    }
+
+    projection = DashboardServer._durable_scan_job_mapping(row)
+
+    assert projection["scan_id"] == "durable-projection"
+    assert projection["status"] == "unknown"
+    assert projection["frameworks"] == expected_frameworks
+    assert projection["requested_modules"] == expected_modules
+    assert projection["actual_modules"] == expected_modules
+    assert projection["lifecycle_authority"] == "task103"
+    assert projection["version"] == 0
+    assert projection["required_work"] == 0
 
 
 def test_agent_state_read_failure_is_opaque(
@@ -392,6 +549,9 @@ def test_agent_state_read_failure_is_opaque(
     server = DashboardServer(auth=False)
     state_path = tmp_path / "agents.json"
     state_path.write_text('{"agents": {}, "jobs": []}', encoding="utf-8")
+    state_path.chmod(0o600)
+    state_before = state_path.stat()
+    state_bytes_before = state_path.read_bytes()
     canary = "CANARY_DASHBOARD_AGENT_READ_FAILURE_007"
     caplog.set_level(logging.WARNING, logger="forge.dashboard.server")
 
@@ -402,18 +562,25 @@ def test_agent_state_read_failure_is_opaque(
             new_callable=PropertyMock,
             return_value=state_path,
         ),
+        patch.object(
+            DashboardServer,
+            "_scan_jobs_db_path",
+            new_callable=PropertyMock,
+            return_value=tmp_path / "legacy-read-failure.db",
+        ),
         patch(
-            "common.dashboard.server._read_artifact_text",
+            "common.dashboard.server._read_artifact_bytes",
             side_effect=OSError(canary),
         ),
-        pytest.raises(server_module.HTTPException) as denied,
     ):
-        server._load_agents_state()
+        durable = server._durable_job_state()
 
-    assert denied.value.status_code == 503
-    assert denied.value.detail == {"reason_code": "agent_state_persistence_failed"}
-    assert canary not in str(denied.value)
+    assert durable.list_agents(tenant_id=server.tenant_id) == []
+    assert durable.list_jobs(tenant_id=server.tenant_id) == []
     assert canary not in caplog.text
+    assert state_path.read_bytes() == state_bytes_before
+    assert state_path.stat().st_ctime_ns == state_before.st_ctime_ns
+    assert _mode(state_path) == 0o600
 
 
 def test_managed_json_and_log_reads_reject_wrong_modes_without_mutation(
@@ -430,19 +597,27 @@ def test_managed_json_and_log_reads_reject_wrong_modes_without_mutation(
     state_before = state_path.stat()
     log_before = log_path.stat()
 
-    with patch.object(
-        DashboardServer,
-        "_agents_path",
-        new_callable=PropertyMock,
-        return_value=state_path,
+    with (
+        patch.object(
+            DashboardServer,
+            "_agents_path",
+            new_callable=PropertyMock,
+            return_value=state_path,
+        ),
+        patch.object(
+            DashboardServer,
+            "_scan_jobs_db_path",
+            new_callable=PropertyMock,
+            return_value=tmp_path / "legacy-wrong-mode.db",
+        ),
     ):
-        with pytest.raises(server_module.HTTPException) as denied:
-            server._load_agents_state()
+        durable = server._durable_job_state()
     with pytest.raises(DashboardArtifactError, match="mode is invalid"):
         server_module._read_artifact_tail(log_path)
     assert server._tail_text(log_path) == ""
 
-    assert denied.value.status_code == 503
+    assert durable.list_agents(tenant_id=server.tenant_id) == []
+    assert durable.list_jobs(tenant_id=server.tenant_id) == []
     assert _mode(state_path) == 0o644
     assert _mode(log_path) == 0o644
     assert state_path.stat().st_ctime_ns == state_before.st_ctime_ns
@@ -453,7 +628,7 @@ def test_managed_json_and_log_reads_reject_wrong_modes_without_mutation(
     log_path.chmod(0o600)
     state_ready = state_path.stat()
     log_ready = log_path.stat()
-    real_fchmod = os.fchmod
+    ready_server = DashboardServer(auth=False)
     with (
         patch.object(
             DashboardServer,
@@ -461,10 +636,17 @@ def test_managed_json_and_log_reads_reject_wrong_modes_without_mutation(
             new_callable=PropertyMock,
             return_value=state_path,
         ),
-        patch.object(server_module.os, "fchmod", wraps=real_fchmod) as fchmod,
+        patch.object(
+            DashboardServer,
+            "_scan_jobs_db_path",
+            new_callable=PropertyMock,
+            return_value=tmp_path / "legacy-wrong-mode.db",
+        ),
     ):
-        assert server._load_agents_state() == {"agents": {}, "jobs": []}
-        assert server._tail_text(log_path) == "fixture log"
+        ready_durable = ready_server._durable_job_state()
+        assert ready_durable.list_agents(tenant_id=ready_server.tenant_id) == []
+    with patch.object(server_module.os, "fchmod") as fchmod:
+        assert ready_server._tail_text(log_path) == "fixture log"
     fchmod.assert_not_called()
     assert state_path.stat().st_ctime_ns == state_ready.st_ctime_ns
     assert log_path.stat().st_ctime_ns == log_ready.st_ctime_ns
@@ -569,7 +751,7 @@ def test_dashboard_writers_reject_public_parent_and_wipe_late_aliases(
     assert not list(private.glob(".*.tmp"))
 
 
-def test_agent_state_hardlink_fails_closed_without_victim_mutation(
+def test_legacy_agent_cache_hardlink_is_ignored_without_victim_mutation(
     tmp_path: Path,
 ) -> None:
     server = DashboardServer(auth=False)
@@ -581,23 +763,31 @@ def test_agent_state_hardlink_fails_closed_without_victim_mutation(
     agents_path = caller / "agents.json"
     os.link(victim, agents_path)
 
-    with patch.object(
-        DashboardServer,
-        "_agents_path",
-        new_callable=PropertyMock,
-        return_value=agents_path,
+    with (
+        patch.object(
+            DashboardServer,
+            "_agents_path",
+            new_callable=PropertyMock,
+            return_value=agents_path,
+        ),
+        patch.object(
+            DashboardServer,
+            "_scan_jobs_db_path",
+            new_callable=PropertyMock,
+            return_value=tmp_path / "legacy-hardlink.db",
+        ),
     ):
-        with pytest.raises(server_module.HTTPException) as denied:
-            server._load_agents_state()
+        durable = server._durable_job_state()
 
-    assert denied.value.status_code == 503
+    assert durable.list_agents(tenant_id=server.tenant_id) == []
+    assert durable.list_jobs(tenant_id=server.tenant_id) == []
     assert agents_path.stat().st_ino == victim.stat().st_ino
     assert victim.read_bytes() == victim_before
     assert _mode(victim) == 0o640
     assert _mode(caller) == 0o755
 
 
-def test_agent_mtls_subject_is_digest_bound_and_redacted_on_disk(
+def test_agent_mtls_subject_is_exactly_bound_in_durable_db(
     tmp_path: Path,
 ) -> None:
     server = DashboardServer(auth=False)
@@ -605,11 +795,19 @@ def test_agent_mtls_subject_is_digest_bound_and_redacted_on_disk(
     canary = "CANARY_DASHBOARD_AGENT_MTLS_SUBJECT_007"
     subject = f"commonName={canary}"
 
-    with patch.object(
-        DashboardServer,
-        "_agents_path",
-        new_callable=PropertyMock,
-        return_value=agents_path,
+    with (
+        patch.object(
+            DashboardServer,
+            "_agents_path",
+            new_callable=PropertyMock,
+            return_value=agents_path,
+        ),
+        patch.object(
+            DashboardServer,
+            "_scan_jobs_db_path",
+            new_callable=PropertyMock,
+            return_value=tmp_path / "agent-mtls.db",
+        ),
     ):
         registration = server._register_scan_agent(
             {
@@ -637,17 +835,40 @@ def test_agent_mtls_subject_is_digest_bound_and_redacted_on_disk(
             },
         )()
         identity = server._require_agent_token(request, allow_bootstrap=False)
+        durable = server._durable_job_state()
+        stored_agent = durable.get_agent(
+            registration["agent"]["id"],
+            tenant_id=server.tenant_id,
+        )
 
-    persisted = agents_path.read_text(encoding="utf-8")
-    state = json.loads(persisted)
-    stored_agent = next(iter(state["agents"].values()))
+        class WrongVerifiedTLS:
+            @staticmethod
+            def getpeercert() -> dict[str, object]:
+                return {"subject": ((('commonName', "different-agent"),),)}
+
+        wrong_request = type(
+            "WrongAgentRequest",
+            (),
+            {
+                "headers": {
+                    "X-Forge-Agent-Credential": registration["credential"],
+                },
+                "scope": {"ssl_object": WrongVerifiedTLS()},
+            },
+        )()
+        with pytest.raises(server_module.HTTPException) as denied:
+            server._require_agent_token(wrong_request, allow_bootstrap=False)
+
     assert identity["kind"] == "agent"
     assert identity["agent_id"] == registration["agent"]["id"]
-    assert canary not in persisted
-    assert stored_agent["mtls_subject"] == "commonName=<redacted>"
+    assert denied.value.status_code == 401
+    assert denied.value.detail == {"reason_code": "agent_credential_invalid"}
+    assert stored_agent is not None
+    assert stored_agent["mtls_subject_digest"] == server._agent_subject_digest(subject)
     assert len(stored_agent["mtls_subject_digest"]) == 64
+    assert subject not in json.dumps(stored_agent)
     assert "mtls_subject_digest" not in registration["agent"]
-    assert _mode(agents_path) == 0o600
+    assert not agents_path.exists()
 
 
 def test_private_directory_setup_failure_cleans_new_chain(tmp_path: Path) -> None:
@@ -832,6 +1053,77 @@ def test_scan_log_stream_replaces_link_redacts_and_rolls_back_on_failure(
     assert failure_canary not in caplog.text
     assert not list(caller.glob(".scan-failure_web.log.*.tmp"))
     assert _mode(caller) == 0o755
+
+
+def test_scan_log_write_failure_still_reconciles_durable_child_exit(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from common.job_state import process_identity
+
+    server = DashboardServer(auth=False)
+    server._scan_logs_dir = _caller_directory(tmp_path, "durable-log-failure")
+    identity = process_identity(
+        7010,
+        start_token="fixture-start",
+        command="inert-fixture-child",
+        boot_id="fixture-boot",
+        launch_nonce="fixture-nonce",
+    )
+
+    class CompletedProcess:
+        stdout = io.StringIO("fixture output\n" * 20_000)
+        pid = identity.pid
+
+        @staticmethod
+        def wait() -> int:
+            return 0
+
+    class FixtureService:
+        exits: list[tuple[object, ...]] = []
+
+        def record_process_exit(self, *args, **_kwargs):
+            self.exits.append(args)
+
+        @staticmethod
+        def get_job(*_args, **_kwargs):
+            return {"state": "completed"}
+
+    service = FixtureService()
+    info = {
+        "proc": CompletedProcess(),
+        "type": "web",
+        "target": "127.0.0.1",
+        "status": "running",
+        "durable_attempt_id": "attempt-fixture",
+        "durable_process_identity": identity.to_dict(),
+        "durable_worker_id": "dashboard",
+        "durable_control_boot_id": "fixture-boot",
+    }
+    caplog.set_level(logging.WARNING, logger="forge.dashboard.server")
+    with (
+        patch.object(
+            server_module,
+            "_atomic_write_text_stream",
+            side_effect=OSError("opaque-log-write-failure"),
+        ),
+        patch.object(server, "_durable_job_state", return_value=service),
+        patch.object(server, "_finalize_durable_scan_after_exit") as finalize,
+        patch.object(server.event_bus, "emit_simple"),
+        patch.object(server, "_update_scan_history_status"),
+        patch.object(server, "_sync_scan_job_from_active"),
+    ):
+        server._track_scan_process("scan-durable_web", info)
+        deadline = time.monotonic() + 3
+        while not service.exits and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    assert info["returncode"] == 0
+    assert info["status"] == "completed"
+    assert len(service.exits) == 1
+    assert service.exits[0][:2] == ("scan-durable", "attempt-fixture")
+    finalize.assert_called_once_with("scan-durable")
+    assert "opaque-log-write-failure" not in caplog.text
 
 
 def test_configured_tls_preserves_caller_modes_and_rejects_links(

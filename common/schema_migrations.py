@@ -220,6 +220,11 @@ CANONICAL_SCHEMA_VERSION = "forge-canonical-v1"
 # rows remain on ``forge-canonical-v1`` so existing adapters do not silently
 # change their wire version when custody is upgraded.
 EVIDENCE_SCHEMA_VERSION = "forge-evidence-v1"
+# Task 103 is an additive single-node control-plane boundary.  Canonical wire
+# records remain on ``forge-canonical-v1`` while the lifecycle extension,
+# attempts, leases, events, and attempt-bound observation links are versioned
+# independently by the migration journal.
+JOB_STATE_SCHEMA_VERSION = "forge-jobs-v1"
 CURRENT_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
 JOURNAL_TABLE = "canonical_migration_journal"
 
@@ -4244,6 +4249,665 @@ def _evidence_drop_sql() -> tuple[str, ...]:
     )
 
 
+def _job_state_table_sql() -> tuple[str, ...]:
+    """Create the Task 103 single-node lifecycle and agent authority.
+
+    The tables extend the accepted canonical job identity instead of creating a
+    second job namespace.  JSON columns are bounded input/projection metadata;
+    every relationship and authority field has its own typed column.
+    """
+
+    return (
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_agents (
+            tenant_id TEXT NOT NULL,
+            id TEXT NOT NULL,
+            key_id TEXT NOT NULL,
+            credential_digest TEXT NOT NULL,
+            enrollment_hint_digest TEXT,
+            mtls_subject_digest TEXT,
+            display_name TEXT NOT NULL DEFAULT '',
+            host_label TEXT NOT NULL DEFAULT '',
+            platform_label TEXT NOT NULL DEFAULT '',
+            version_label TEXT NOT NULL DEFAULT '',
+            active_scan_enabled INTEGER NOT NULL DEFAULT 0
+                CHECK(active_scan_enabled IN (0,1)),
+            state TEXT NOT NULL DEFAULT 'idle'
+                CHECK(state IN ('idle','online','running','paused','offline','revoked')),
+            version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0),
+            issued_at REAL NOT NULL,
+            last_seen_at REAL NOT NULL,
+            revoked_at REAL,
+            PRIMARY KEY(tenant_id,id),
+            UNIQUE(tenant_id,key_id),
+            UNIQUE(tenant_id,credential_digest),
+            FOREIGN KEY(tenant_id) REFERENCES canonical_tenants(id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_agent_engines (
+            tenant_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            engine TEXT NOT NULL,
+            PRIMARY KEY(tenant_id,agent_id,engine),
+            FOREIGN KEY(tenant_id,agent_id)
+                REFERENCES durable_job_state_agents(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_agent_capabilities (
+            tenant_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            capability TEXT NOT NULL,
+            PRIMARY KEY(tenant_id,agent_id,capability),
+            FOREIGN KEY(tenant_id,agent_id)
+                REFERENCES durable_job_state_agents(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_agent_scope (
+            tenant_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK(sequence >= 0),
+            scope_kind TEXT NOT NULL CHECK(scope_kind IN ('allow','exclude')),
+            scope_entry TEXT NOT NULL,
+            PRIMARY KEY(tenant_id,agent_id,scope_kind,sequence),
+            UNIQUE(tenant_id,agent_id,scope_kind,scope_entry),
+            FOREIGN KEY(tenant_id,agent_id)
+                REFERENCES durable_job_state_agents(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_jobs (
+            tenant_id TEXT NOT NULL,
+            id TEXT NOT NULL,
+            engagement_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            job_kind TEXT NOT NULL,
+            target TEXT NOT NULL DEFAULT '',
+            authorization_decision_id TEXT,
+            authorization_action_id TEXT,
+            assigned_agent_id TEXT,
+            idempotency_key TEXT,
+            request_identity TEXT NOT NULL,
+            parent_id TEXT,
+            state TEXT NOT NULL CHECK(state IN (
+                'planned','pending_approval','queued','leased','running',
+                'paused','canceling','canceled','partial','failed',
+                'completed','expired','orphaned'
+            )),
+            payload_json TEXT NOT NULL DEFAULT '{}'
+                CHECK(length(CAST(payload_json AS BLOB)) <= 1048576),
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+                CHECK(length(CAST(metadata_json AS BLOB)) <= 16384),
+            max_attempts INTEGER NOT NULL DEFAULT 1 CHECK(max_attempts > 0),
+            required_work INTEGER NOT NULL DEFAULT 0 CHECK(required_work >= 0),
+            completed_work INTEGER NOT NULL DEFAULT 0 CHECK(completed_work >= 0),
+            skipped_work INTEGER NOT NULL DEFAULT 0 CHECK(skipped_work >= 0),
+            failed_work INTEGER NOT NULL DEFAULT 0 CHECK(failed_work >= 0),
+            truncated_work INTEGER NOT NULL DEFAULT 0 CHECK(truncated_work >= 0),
+            uncollected_work INTEGER NOT NULL DEFAULT 0 CHECK(uncollected_work >= 0),
+            version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0),
+            control_version INTEGER NOT NULL DEFAULT 0 CHECK(control_version >= 0),
+            paused_from_state TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            started_at REAL,
+            terminal_at REAL,
+            terminal_reason TEXT,
+            terminal_reason_code TEXT,
+            terminal_actor TEXT,
+            error_reason TEXT,
+            result_ref TEXT,
+            PRIMARY KEY(tenant_id,id),
+            UNIQUE(tenant_id,id,engagement_id),
+            FOREIGN KEY(tenant_id,id)
+                REFERENCES canonical_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,engagement_id,id)
+                REFERENCES canonical_jobs(tenant_id,engagement_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,parent_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,assigned_agent_id)
+                REFERENCES durable_job_state_agents(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS durable_job_state_uq_job_idempotency
+            ON durable_job_state_jobs(tenant_id,idempotency_key)
+            WHERE idempotency_key IS NOT NULL
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS durable_job_state_ix_job_state
+            ON durable_job_state_jobs(tenant_id,state,updated_at)
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_job_authorizations (
+            tenant_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            authorization_decision_id TEXT NOT NULL,
+            authorization_action_id TEXT NOT NULL,
+            framework TEXT NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 1 CHECK(generation > 0),
+            active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+            is_primary INTEGER NOT NULL DEFAULT 0 CHECK(is_primary IN (0,1)),
+            PRIMARY KEY(tenant_id,job_id,authorization_decision_id),
+            UNIQUE(tenant_id,job_id,framework,generation),
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_attempts (
+            tenant_id TEXT NOT NULL,
+            id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            number INTEGER NOT NULL CHECK(number > 0),
+            idempotency_key TEXT NOT NULL,
+            delivery_idempotency_key TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            authorization_decision_id TEXT,
+            state TEXT NOT NULL CHECK(state IN (
+                'leased','running','paused','canceling','completed','partial',
+                'failed','expired','canceled','orphaned'
+            )),
+            worker_id TEXT NOT NULL,
+            control_boot_id TEXT,
+            lease_token_digest TEXT,
+            lease_generation INTEGER NOT NULL DEFAULT 1 CHECK(lease_generation > 0),
+            lease_expires_at REAL,
+            lease_max_expires_at REAL,
+            launch_nonce TEXT NOT NULL,
+            control_version INTEGER NOT NULL DEFAULT 0 CHECK(control_version >= 0),
+            started_at REAL,
+            finished_at REAL,
+            result_ref TEXT,
+            result_identity TEXT,
+            error_reason TEXT,
+            error_reason_code TEXT,
+            version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0),
+            PRIMARY KEY(tenant_id,id),
+            UNIQUE(tenant_id,job_id,number),
+            UNIQUE(tenant_id,job_id,idempotency_key),
+            UNIQUE(tenant_id,job_id,delivery_idempotency_key),
+            UNIQUE(tenant_id,launch_nonce),
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS durable_job_state_uq_active_attempt
+            ON durable_job_state_attempts(tenant_id,job_id)
+            WHERE state IN ('leased','running','paused','canceling')
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_leases (
+            tenant_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            token_digest TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            generation INTEGER NOT NULL DEFAULT 1 CHECK(generation > 0),
+            issued_at REAL NOT NULL,
+            expires_at REAL NOT NULL,
+            revoked_at REAL,
+            revoke_reason TEXT,
+            PRIMARY KEY(tenant_id,attempt_id),
+            FOREIGN KEY(tenant_id,attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_events (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT,
+            event_type TEXT NOT NULL,
+            from_state TEXT,
+            to_state TEXT,
+            actor TEXT NOT NULL,
+            actor_role TEXT NOT NULL,
+            authorization_decision_id TEXT,
+            reason TEXT NOT NULL,
+            reason_code TEXT NOT NULL,
+            idempotency_key TEXT,
+            job_version INTEGER NOT NULL CHECK(job_version >= 0),
+            data_json TEXT NOT NULL DEFAULT '{}'
+                CHECK(length(CAST(data_json AS BLOB)) <= 16384),
+            occurred_at REAL NOT NULL,
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS durable_job_state_uq_event_idempotency
+            ON durable_job_state_events(tenant_id,job_id,idempotency_key)
+            WHERE idempotency_key IS NOT NULL
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_logs (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            tenant_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT,
+            level TEXT NOT NULL,
+            message TEXT NOT NULL CHECK(length(CAST(message AS BLOB)) <= 8192),
+            data_json TEXT NOT NULL DEFAULT '{}'
+                CHECK(length(CAST(data_json AS BLOB)) <= 16384),
+            occurred_at REAL NOT NULL,
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_work_plan (
+            tenant_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            work_key TEXT NOT NULL,
+            required INTEGER NOT NULL DEFAULT 1 CHECK(required IN (0,1)),
+            created_at REAL NOT NULL,
+            PRIMARY KEY(tenant_id,job_id,work_key),
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_work_items (
+            tenant_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT,
+            attempt_scope TEXT NOT NULL,
+            work_key TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN (
+                'pending','completed','skipped','failed','truncated','uncollected'
+            )),
+            required INTEGER NOT NULL DEFAULT 1 CHECK(required IN (0,1)),
+            reason TEXT,
+            observation_id TEXT,
+            result_ref TEXT,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(tenant_id,job_id,attempt_scope,work_key),
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE INDEX IF NOT EXISTS durable_job_state_ix_work_observation
+            ON durable_job_state_work_items(tenant_id,observation_id)
+            WHERE observation_id IS NOT NULL
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_deliveries (
+            tenant_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'reserved'
+                CHECK(state IN ('reserved','custodied','accepted','rejected')),
+            payload_identity TEXT NOT NULL,
+            observation_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            result_ref TEXT,
+            result_identity TEXT,
+            manifest_digest TEXT NOT NULL,
+            outcome TEXT NOT NULL
+                CHECK(outcome IN ('success','failure','canceled','partial')),
+            work_json TEXT NOT NULL,
+            run_truth_json TEXT NOT NULL,
+            reserved_at REAL NOT NULL,
+            accepted_at REAL,
+            PRIMARY KEY(tenant_id,attempt_id,idempotency_key),
+            UNIQUE(tenant_id,observation_id),
+            UNIQUE(tenant_id,artifact_id),
+            FOREIGN KEY(tenant_id,attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_terminal_proofs (
+            tenant_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            proof_type TEXT NOT NULL
+                CHECK(proof_type IN ('observation_receipt','run_truth')),
+            outcome TEXT NOT NULL
+                CHECK(outcome IN ('success','failure','canceled','partial')),
+            proof_identity TEXT NOT NULL,
+            coverage_identity TEXT NOT NULL,
+            result_ref TEXT NOT NULL,
+            recorded_at REAL NOT NULL,
+            PRIMARY KEY(tenant_id,attempt_id,proof_type,proof_identity),
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_children (
+            tenant_id TEXT NOT NULL,
+            parent_id TEXT NOT NULL,
+            child_id TEXT NOT NULL,
+            identity_key TEXT NOT NULL,
+            required INTEGER NOT NULL DEFAULT 1 CHECK(required IN (0,1)),
+            created_at REAL NOT NULL,
+            PRIMARY KEY(tenant_id,parent_id,identity_key),
+            UNIQUE(tenant_id,parent_id,child_id),
+            FOREIGN KEY(tenant_id,parent_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,child_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_child_processes (
+            tenant_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            identity_key TEXT NOT NULL,
+            launch_nonce TEXT NOT NULL,
+            pid INTEGER NOT NULL,
+            start_token TEXT NOT NULL,
+            boot_id TEXT NOT NULL,
+            command_digest TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'running'
+                CHECK(state IN ('running','paused','canceling','stopped','orphaned')),
+            return_code INTEGER,
+            cancel_requested_at REAL,
+            stopped_at REAL,
+            escalation_count INTEGER NOT NULL DEFAULT 0 CHECK(escalation_count >= 0),
+            PRIMARY KEY(tenant_id,attempt_id,identity_key),
+            UNIQUE(tenant_id,launch_nonce,pid,start_token,command_digest,boot_id),
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_launch_intents (
+            tenant_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            identity_key TEXT NOT NULL,
+            launch_nonce TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'reserved'
+                CHECK(state IN ('reserved','registered','abandoned')),
+            created_at REAL NOT NULL,
+            registered_at REAL,
+            PRIMARY KEY(tenant_id,attempt_id,identity_key),
+            UNIQUE(tenant_id,launch_nonce),
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES durable_job_state_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS durable_job_state_cache_imports (
+            tenant_id TEXT NOT NULL,
+            cache_kind TEXT NOT NULL,
+            source_identity TEXT NOT NULL,
+            imported_at REAL NOT NULL,
+            result TEXT NOT NULL,
+            detail_json TEXT NOT NULL DEFAULT '{}'
+                CHECK(length(CAST(detail_json AS BLOB)) <= 16384),
+            PRIMARY KEY(tenant_id,cache_kind,source_identity),
+            FOREIGN KEY(tenant_id) REFERENCES canonical_tenants(id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        ALTER TABLE canonical_observations ADD COLUMN attempt_id TEXT
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_observation_attempt_guard_insert
+        BEFORE INSERT ON canonical_observations
+        WHEN NEW.attempt_id IS NOT NULL AND NOT EXISTS(
+            SELECT 1 FROM durable_job_state_attempts a
+            WHERE a.tenant_id=NEW.tenant_id AND a.id=NEW.attempt_id
+              AND a.job_id=NEW.job_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'observation attempt lineage mismatch'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_observation_attempt_guard_update
+        BEFORE UPDATE OF tenant_id,job_id,attempt_id ON canonical_observations
+        WHEN NEW.attempt_id IS NOT NULL AND NOT EXISTS(
+            SELECT 1 FROM durable_job_state_attempts a
+            WHERE a.tenant_id=NEW.tenant_id AND a.id=NEW.attempt_id
+              AND a.job_id=NEW.job_id
+        )
+        BEGIN SELECT RAISE(ABORT, 'observation attempt lineage mismatch'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_jobs_no_delete
+        BEFORE DELETE ON durable_job_state_jobs
+        BEGIN SELECT RAISE(ABORT, 'durable job history cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_job_identity_immutable
+        BEFORE UPDATE OF tenant_id,id,engagement_id,job_kind,target,
+            assigned_agent_id,idempotency_key,request_identity,parent_id,
+            max_attempts,required_work,created_at
+        ON durable_job_state_jobs
+        BEGIN SELECT RAISE(ABORT, 'durable job identity is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_terminal_immutable
+        BEFORE UPDATE OF state ON durable_job_state_jobs
+        WHEN OLD.state IN ('canceled','partial','failed','completed')
+          AND NEW.state <> OLD.state
+        BEGIN SELECT RAISE(ABORT, 'durable terminal state is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_attempts_no_delete
+        BEFORE DELETE ON durable_job_state_attempts
+        BEGIN SELECT RAISE(ABORT, 'durable attempt history cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_attempt_identity_immutable
+        BEFORE UPDATE OF tenant_id,id,job_id,number,idempotency_key,
+            delivery_idempotency_key,run_id,authorization_decision_id,
+            worker_id,control_boot_id,lease_max_expires_at,launch_nonce
+        ON durable_job_state_attempts
+        BEGIN SELECT RAISE(ABORT, 'durable attempt identity is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_lease_identity_immutable
+        BEFORE UPDATE OF tenant_id,attempt_id,job_id,owner_id
+        ON durable_job_state_leases
+        BEGIN SELECT RAISE(ABORT, 'durable lease identity is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_authorization_identity_immutable
+        BEFORE UPDATE OF tenant_id,job_id,authorization_decision_id,
+            authorization_action_id,framework,generation,is_primary
+        ON durable_job_state_job_authorizations
+        BEGIN SELECT RAISE(ABORT, 'durable authorization history is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_authorization_no_reactivation
+        BEFORE UPDATE OF active ON durable_job_state_job_authorizations
+        WHEN NEW.active <> OLD.active
+          AND NOT (OLD.active=1 AND NEW.active=0)
+        BEGIN SELECT RAISE(ABORT, 'durable authorization cannot be reactivated'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_authorization_no_delete
+        BEFORE DELETE ON durable_job_state_job_authorizations
+        BEGIN SELECT RAISE(ABORT, 'durable authorization history cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_events_no_update
+        BEFORE UPDATE ON durable_job_state_events
+        BEGIN SELECT RAISE(ABORT, 'durable job events are append-only'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_events_no_delete
+        BEFORE DELETE ON durable_job_state_events
+        BEGIN SELECT RAISE(ABORT, 'durable job events cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_logs_no_update
+        BEFORE UPDATE ON durable_job_state_logs
+        BEGIN SELECT RAISE(ABORT, 'durable job logs are append-only'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_logs_no_delete
+        BEFORE DELETE ON durable_job_state_logs
+        BEGIN SELECT RAISE(ABORT, 'durable job logs cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_work_no_update
+        BEFORE UPDATE ON durable_job_state_work_items
+        BEGIN SELECT RAISE(ABORT, 'durable work history is append-only'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_work_plan_no_update
+        BEFORE UPDATE ON durable_job_state_work_plan
+        BEGIN SELECT RAISE(ABORT, 'durable work plan is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_work_plan_no_delete
+        BEFORE DELETE ON durable_job_state_work_plan
+        BEGIN SELECT RAISE(ABORT, 'durable work plan cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_work_no_delete
+        BEFORE DELETE ON durable_job_state_work_items
+        BEGIN SELECT RAISE(ABORT, 'durable work history cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_proofs_no_update
+        BEFORE UPDATE ON durable_job_state_terminal_proofs
+        BEGIN SELECT RAISE(ABORT, 'durable terminal proofs are append-only'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_proofs_no_delete
+        BEFORE DELETE ON durable_job_state_terminal_proofs
+        BEGIN SELECT RAISE(ABORT, 'durable terminal proofs cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_deliveries_no_delete
+        BEFORE DELETE ON durable_job_state_deliveries
+        BEGIN SELECT RAISE(ABORT, 'durable deliveries cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_delivery_accepted_immutable
+        BEFORE UPDATE ON durable_job_state_deliveries
+        WHEN OLD.state='accepted'
+        BEGIN SELECT RAISE(ABORT, 'accepted delivery is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_children_no_update
+        BEFORE UPDATE ON durable_job_state_children
+        BEGIN SELECT RAISE(ABORT, 'durable child linkage is append-only'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_children_no_delete
+        BEFORE DELETE ON durable_job_state_children
+        BEGIN SELECT RAISE(ABORT, 'durable child linkage cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_process_identity_immutable
+        BEFORE UPDATE OF tenant_id,job_id,attempt_id,identity_key,launch_nonce,
+            pid,start_token,boot_id,command_digest
+        ON durable_job_state_child_processes
+        BEGIN SELECT RAISE(ABORT, 'durable process identity is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_process_no_delete
+        BEFORE DELETE ON durable_job_state_child_processes
+        BEGIN SELECT RAISE(ABORT, 'durable process history cannot be deleted'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_launch_identity_immutable
+        BEFORE UPDATE OF tenant_id,job_id,attempt_id,identity_key,launch_nonce,
+            created_at
+        ON durable_job_state_launch_intents
+        BEGIN SELECT RAISE(ABORT, 'durable launch identity is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS durable_job_state_launch_no_delete
+        BEFORE DELETE ON durable_job_state_launch_intents
+        BEGIN SELECT RAISE(ABORT, 'durable launch history cannot be deleted'); END
+        """,
+    )
+
+
+def _job_state_drop_sql() -> tuple[str, ...]:
+    """Logically reverse an empty Task 103 boundary in dependency order."""
+
+    return (
+        "DROP TRIGGER IF EXISTS durable_job_state_launch_no_delete",
+        "DROP TRIGGER IF EXISTS durable_job_state_launch_identity_immutable",
+        "DROP TRIGGER IF EXISTS durable_job_state_process_no_delete",
+        "DROP TRIGGER IF EXISTS durable_job_state_process_identity_immutable",
+        "DROP TRIGGER IF EXISTS durable_job_state_children_no_delete",
+        "DROP TRIGGER IF EXISTS durable_job_state_children_no_update",
+        "DROP TRIGGER IF EXISTS durable_job_state_delivery_accepted_immutable",
+        "DROP TRIGGER IF EXISTS durable_job_state_deliveries_no_delete",
+        "DROP TRIGGER IF EXISTS durable_job_state_proofs_no_delete",
+        "DROP TRIGGER IF EXISTS durable_job_state_proofs_no_update",
+        "DROP TRIGGER IF EXISTS durable_job_state_work_no_delete",
+        "DROP TRIGGER IF EXISTS durable_job_state_work_no_update",
+        "DROP TRIGGER IF EXISTS durable_job_state_work_plan_no_delete",
+        "DROP TRIGGER IF EXISTS durable_job_state_work_plan_no_update",
+        "DROP TRIGGER IF EXISTS durable_job_state_logs_no_delete",
+        "DROP TRIGGER IF EXISTS durable_job_state_logs_no_update",
+        "DROP TRIGGER IF EXISTS durable_job_state_events_no_delete",
+        "DROP TRIGGER IF EXISTS durable_job_state_events_no_update",
+        "DROP TRIGGER IF EXISTS durable_job_state_attempts_no_delete",
+        "DROP TRIGGER IF EXISTS durable_job_state_lease_identity_immutable",
+        "DROP TRIGGER IF EXISTS durable_job_state_attempt_identity_immutable",
+        "DROP TRIGGER IF EXISTS durable_job_state_authorization_no_delete",
+        "DROP TRIGGER IF EXISTS durable_job_state_authorization_no_reactivation",
+        "DROP TRIGGER IF EXISTS durable_job_state_authorization_identity_immutable",
+        "DROP TRIGGER IF EXISTS durable_job_state_terminal_immutable",
+        "DROP TRIGGER IF EXISTS durable_job_state_job_identity_immutable",
+        "DROP TRIGGER IF EXISTS durable_job_state_jobs_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_observation_attempt_guard_update",
+        "DROP TRIGGER IF EXISTS canonical_observation_attempt_guard_insert",
+        "DROP TABLE IF EXISTS durable_job_state_cache_imports",
+        "DROP TABLE IF EXISTS durable_job_state_launch_intents",
+        "DROP TABLE IF EXISTS durable_job_state_child_processes",
+        "DROP TABLE IF EXISTS durable_job_state_children",
+        "DROP TABLE IF EXISTS durable_job_state_terminal_proofs",
+        "DROP TABLE IF EXISTS durable_job_state_deliveries",
+        "DROP TABLE IF EXISTS durable_job_state_work_items",
+        "DROP TABLE IF EXISTS durable_job_state_work_plan",
+        "DROP TABLE IF EXISTS durable_job_state_logs",
+        "DROP TABLE IF EXISTS durable_job_state_events",
+        "DROP TABLE IF EXISTS durable_job_state_leases",
+        "DROP TABLE IF EXISTS durable_job_state_attempts",
+        "DROP TABLE IF EXISTS durable_job_state_job_authorizations",
+        "DROP TABLE IF EXISTS durable_job_state_jobs",
+        "DROP TABLE IF EXISTS durable_job_state_agent_scope",
+        "DROP TABLE IF EXISTS durable_job_state_agent_capabilities",
+        "DROP TABLE IF EXISTS durable_job_state_agent_engines",
+        "DROP TABLE IF EXISTS durable_job_state_agents",
+        "DROP TABLE IF EXISTS durable_job_state_meta",
+        # SQLite cannot safely drop the additive nullable attempt_id column on
+        # every supported version.  It remains unused after logical downgrade.
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=CANONICAL_SCHEMA_VERSION,
@@ -4258,6 +4922,13 @@ MIGRATIONS: tuple[Migration, ...] = (
         upgrade_sql=_evidence_table_sql(),
         downgrade_sql=_evidence_drop_sql(),
         description="Task 102 immutable observations and evidence custody",
+    ),
+    Migration(
+        version=JOB_STATE_SCHEMA_VERSION,
+        order=103,
+        upgrade_sql=_job_state_table_sql(),
+        downgrade_sql=_job_state_drop_sql(),
+        description="Task 103 durable single-node job state machine",
     ),
 )
 
@@ -4345,7 +5016,10 @@ class MigrationManager:
             # version retained for existing callers.  Evidence custody is an
             # additive migration and must not make v1 contract serializers
             # claim a new payload version merely because its tables exist.
-            elif str(row[0]) == EVIDENCE_SCHEMA_VERSION:
+            elif str(row[0]) in {
+                EVIDENCE_SCHEMA_VERSION,
+                JOB_STATE_SCHEMA_VERSION,
+            }:
                 version = CANONICAL_SCHEMA_VERSION
             else:
                 version = str(row[0])
@@ -4541,6 +5215,67 @@ class MigrationManager:
                 connection.commit()
             keep = set(self.versions[: self.versions.index(target) + 1]) if target else set()
             removing = {str(row[0]) for row in rows} - keep
+            if JOB_STATE_SCHEMA_VERSION in removing:
+                job_tables = (
+                    "durable_job_state_agents",
+                    "durable_job_state_jobs",
+                    "durable_job_state_job_authorizations",
+                    "durable_job_state_attempts",
+                    "durable_job_state_leases",
+                    "durable_job_state_events",
+                    "durable_job_state_logs",
+                    "durable_job_state_work_plan",
+                    "durable_job_state_work_items",
+                    "durable_job_state_deliveries",
+                    "durable_job_state_terminal_proofs",
+                    "durable_job_state_children",
+                    "durable_job_state_child_processes",
+                    "durable_job_state_launch_intents",
+                    "durable_job_state_cache_imports",
+                )
+                present_tables = {
+                    str(row[0])
+                    for row in connection.exec_driver_sql(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if not set(job_tables) <= present_tables:
+                    if connection.in_transaction():
+                        connection.rollback()
+                    raise MigrationError(
+                        "job-state schema downgrade encountered incomplete state"
+                    )
+                retained_job_state = any(
+                    int(
+                        connection.exec_driver_sql(
+                            f"SELECT COUNT(*) FROM {table}"
+                        ).scalar_one()
+                    )
+                    > 0
+                    for table in job_tables
+                )
+                observation_columns = {
+                    str(row[1])
+                    for row in connection.exec_driver_sql(
+                        "PRAGMA table_info(canonical_observations)"
+                    ).fetchall()
+                }
+                retained_attempt_observations = (
+                    "attempt_id" in observation_columns
+                    and int(
+                        connection.exec_driver_sql(
+                            "SELECT COUNT(*) FROM canonical_observations "
+                            "WHERE attempt_id IS NOT NULL"
+                        ).scalar_one()
+                    )
+                    > 0
+                )
+                if connection.in_transaction():
+                    connection.rollback()
+                if retained_job_state or retained_attempt_observations:
+                    raise MigrationError(
+                        "job-state schema downgrade would destroy retained history"
+                    )
             if EVIDENCE_SCHEMA_VERSION in removing:
                 evidence_tables = (
                     "canonical_artifact_manifests",
@@ -4659,6 +5394,17 @@ class MigrationManager:
                             ).fetchall()
                         }
                         if "dedup_key" in finding_columns:
+                            continue
+                    if lowered.strip().startswith(
+                        "alter table canonical_observations add column attempt_id"
+                    ):
+                        observation_columns = {
+                            str(row[1])
+                            for row in connection.exec_driver_sql(
+                                "PRAGMA table_info(canonical_observations)"
+                            ).fetchall()
+                        }
+                        if "attempt_id" in observation_columns:
                             continue
                     connection.exec_driver_sql(statement)
                     if fail_after is not None and index >= fail_after:
@@ -4786,7 +5532,7 @@ def migration_versions() -> tuple[str, ...]:
 
 
 __all__ = [
-    "CANONICAL_MIGRATION_PREFIX", "CANONICAL_SCHEMA_VERSION", "CURRENT_SCHEMA_VERSION", "EVIDENCE_SCHEMA_VERSION",
+    "CANONICAL_MIGRATION_PREFIX", "CANONICAL_SCHEMA_VERSION", "CURRENT_SCHEMA_VERSION", "EVIDENCE_SCHEMA_VERSION", "JOB_STATE_SCHEMA_VERSION",
     "JOURNAL_TABLE", "MIGRATIONS", "Migration", "MigrationError", "MigrationInterruptedError",
     "MigrationManager", "UnsupportedMigrationError", "current_version", "downgrade", "migration_versions",
     "archive_legacy_records", "recover", "upgrade",

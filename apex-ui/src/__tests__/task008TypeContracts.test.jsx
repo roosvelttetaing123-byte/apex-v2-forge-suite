@@ -249,7 +249,7 @@ describe('Task 008 frontend type and generated-contract gates', () => {
     expect(DASHBOARD_API_ROUTES).toContainEqual(DASHBOARD_API.authLogin);
     expect(DASHBOARD_API_ROUTES).toContainEqual(DASHBOARD_API.websocket);
     expect(WS_URL.endsWith(DASHBOARD_API.websocket.path)).toBe(true);
-    expect(DASHBOARD_API_ROUTES).toHaveLength(64);
+    expect(DASHBOARD_API_ROUTES).toHaveLength(68);
   });
 
   it('renders the canonical repository version through the Vite build constant', () => {

@@ -1198,7 +1198,7 @@ async def test_viewer_scan_gets_are_read_only(
     assert logs.status_code == 200
     assert unknown_logs.status_code == 404
     assert cross_tenant_canary not in unknown_logs.text
-    assert history.json()["history"][0]["status"] == "running"
+    assert history.json()["history"][0]["status"] == "orphaned"
     assert history_path.read_bytes() == before
     assert not db_path.exists()
     sync.assert_not_called()

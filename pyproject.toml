@@ -64,8 +64,8 @@ filterwarnings = [
 python = "3.13.9"
 node = "20.19.5"
 coverage_total = 35.0
-expected_collection_minimum = 3238
-expected_collection_sha256 = "ab0b2931af3ea2d57d1faa2a0cd41b49eae66713741b8f41dbd7925a2dee330a"
+expected_collection_minimum = 3344
+expected_collection_sha256 = "74c8b91f7246fdad58ba46d9425dd2719aa28bcee16d3d7bcc72a3522421be4f"
 allowed_skip_node_ids = [
   "tests/test_lab_integration_opt_in.py::test_opt_in_web_lab_is_reachable[dvwa-]",
   "tests/test_lab_integration_opt_in.py::test_opt_in_web_lab_is_reachable[webgoat-]",

@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 from sqlalchemy import text
@@ -40,6 +40,7 @@ from common.canonical import (
     ModuleExecutionStatus,
     ModuleVersion,
     Observation,
+    ObservationStatus,
     Operator,
     RedactionState,
     Role,
@@ -54,6 +55,7 @@ from common.evidence import CapturedEvidenceArtifact
 from common.evidence_custody import (
     ArtifactAccessDenied,
     ArtifactManifest,
+    ArtifactNotFound,
     ArtifactTransactionError,
     EvidenceCustodyStore,
     ProtectedOriginalAuthorization,
@@ -64,6 +66,7 @@ from common.version import VERSION
 
 
 _MAX_DERIVATIVE_PROJECTION_BYTES = 16_384
+JOB_ATTEMPT_ID_ENV = "FORGE_JOB_ATTEMPT_ID"
 
 
 class CanonicalEvidenceError(CanonicalContractError):
@@ -156,6 +159,7 @@ class CanonicalEvidenceContext:
     action_kind: str
     scope_policy_version: str
     scope_reason: str
+    attempt_id: str | None = None
     decided_at: datetime = field(default_factory=utc_now)
 
     @property
@@ -164,7 +168,10 @@ class CanonicalEvidenceContext:
 
     @classmethod
     def from_authorization(
-        cls, envelope: ActionAuthorizationEnvelope
+        cls,
+        envelope: ActionAuthorizationEnvelope,
+        *,
+        attempt_id: str | None = None,
     ) -> "CanonicalEvidenceContext":
         if not isinstance(envelope, ActionAuthorizationEnvelope):
             raise CanonicalEvidenceError(
@@ -188,6 +195,7 @@ class CanonicalEvidenceContext:
             action_kind=envelope.action_kind,
             scope_policy_version=envelope.scope_policy_version,
             scope_reason=envelope.scope_reason,
+            attempt_id=attempt_id,
             decided_at=parse_utc(envelope.issued_at),
         )
 
@@ -564,11 +572,16 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
         session: Session,
         custody_root: str | Path,
         envelope: ActionAuthorizationEnvelope,
+        *,
+        attempt_id: str | None = None,
     ) -> "CanonicalEvidenceService":
         return cls(
             session,
             custody_root,
-            CanonicalEvidenceContext.from_authorization(envelope),
+            CanonicalEvidenceContext.from_authorization(
+                envelope,
+                attempt_id=attempt_id,
+            ),
         )
 
     def _records_for_finding(
@@ -699,6 +712,357 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
                 "staged evidence rollback did not complete"
             ) from errors[0]
 
+    def persist_job_observation(
+        self,
+        *,
+        attempt_id: str,
+        delivery_key: str,
+        payload: Mapping[str, Any],
+        source_target: str,
+        outcome: str,
+        transaction_guard: (
+            Callable[[Session, Mapping[str, Any]], None] | None
+        ) = None,
+    ) -> dict[str, Any]:
+        """Persist one deterministic attempt result and return its receipt."""
+
+        context = self.context
+        if context.attempt_id is None or context.attempt_id != attempt_id:
+            raise CanonicalEvidenceError(
+                "job observation attempt does not match trusted context"
+            )
+        normalized_outcome = str(outcome).strip().lower()
+        outcome_map = {
+            "success": (
+                ObservationStatus.OBSERVED,
+                CollectionStatus.COLLECTED,
+            ),
+            "failure": (
+                ObservationStatus.FAILED,
+                CollectionStatus.FAILED,
+            ),
+            "canceled": (
+                ObservationStatus.CANCELED,
+                CollectionStatus.CANCELED,
+            ),
+            "partial": (
+                ObservationStatus.PARTIAL,
+                CollectionStatus.PARTIAL,
+            ),
+        }
+        if normalized_outcome not in outcome_map:
+            raise CanonicalEvidenceError("unsupported job observation outcome")
+        try:
+            canonical_payload = json.dumps(
+                dict(payload),
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise CanonicalEvidenceError("job observation payload is invalid") from exc
+        if len(canonical_payload) > 1_048_576:
+            raise CanonicalEvidenceError("job observation payload exceeds limit")
+
+        observation_id = _stable_id(
+            "observation",
+            context.tenant_id,
+            context.job_id,
+            attempt_id,
+            delivery_key,
+        )
+        artifact_id = _stable_id(
+            "artifact",
+            context.tenant_id,
+            context.job_id,
+            attempt_id,
+            delivery_key,
+        )
+        existing = self.session.execute(
+            text(
+                "SELECT o.id AS observation_id,a.id AS artifact_id,"
+                "m.manifest_digest,a.reference "
+                "FROM canonical_observations o "
+                "JOIN canonical_artifact_refs a "
+                "ON a.tenant_id=o.tenant_id AND a.observation_id=o.id "
+                "JOIN canonical_artifact_manifests m "
+                "ON m.tenant_id=a.tenant_id AND m.artifact_id=a.id "
+                "AND m.observation_id=o.id "
+                "WHERE o.tenant_id=:tenant_id AND o.job_id=:job_id "
+                "AND o.attempt_id=:attempt_id AND o.id=:observation_id "
+                "AND a.id=:artifact_id LIMIT 1"
+            ),
+            {
+                "tenant_id": context.tenant_id,
+                "job_id": context.job_id,
+                "attempt_id": attempt_id,
+                "observation_id": observation_id,
+                "artifact_id": artifact_id,
+            },
+        ).mappings().first()
+        if existing is not None:
+            manifest = self.custody.verify(artifact_id)
+            expected_digest = "sha256:" + hashlib.sha256(canonical_payload).hexdigest()
+            if (
+                manifest.source_observation_id != observation_id
+                or manifest.sha256 != expected_digest
+                or str(existing["manifest_digest"]) != manifest.manifest_digest
+            ):
+                raise CanonicalEvidenceError(
+                    "job observation replay conflicts with persisted custody"
+                )
+            if self.session.in_transaction():
+                self.session.rollback()
+            return {
+                "tenant_id": context.tenant_id,
+                "job_id": context.job_id,
+                "attempt_id": attempt_id,
+                "observation_id": observation_id,
+                "artifact_id": artifact_id,
+                "result_ref": str(existing["reference"]),
+                "manifest_digest": manifest.manifest_digest,
+                "duplicate": True,
+            }
+        if self.session.in_transaction():
+            self.session.rollback()
+
+        asset_kind, asset_identity = _safe_url_asset(source_target or "unknown")
+        asset = Asset(
+            id=_stable_id(
+                "asset",
+                context.tenant_id,
+                asset_kind.value,
+                asset_identity,
+            ),
+            tenant_id=context.tenant_id,
+            kind=asset_kind,
+            identity_key=asset_identity,
+            display_name=asset_identity,
+            canonical_uri=(
+                asset_identity if asset_kind is AssetKind.URL else None
+            ),
+        )
+        # An authorization may bind a whole module set using a UUID-shaped
+        # control identifier. Canonical ``ModuleVersion.module_id`` is an
+        # ordinary, redacted label, so represent this aggregate delivery with
+        # a stable engine-level adapter identity. The exact module-set binding
+        # remains protected by the linked authorization decision.
+        canonical_module_id = f"{context.engine}-job-result"
+        module_version_id = _stable_id(
+            "module-version",
+            context.tenant_id,
+            canonical_module_id,
+            VERSION,
+        )
+        module_execution_id = _stable_id(
+            "module-execution",
+            context.tenant_id,
+            context.job_id,
+            attempt_id,
+            delivery_key,
+        )
+        observation_status, collection_status = outcome_map[normalized_outcome]
+        observation = Observation(
+            id=observation_id,
+            tenant_id=context.tenant_id,
+            engagement_id=context.engagement_id,
+            job_id=context.job_id,
+            attempt_id=attempt_id,
+            module_version_id=module_version_id,
+            module_execution_id=module_execution_id,
+            asset_id=asset.id,
+            action_id=context.action_id,
+            status=observation_status,
+            proof_type="unknown",
+            collection_status=collection_status,
+            check_id="job-result",
+        )
+        tenant = Tenant(id=context.tenant_id, name=context.tenant_id)
+        engagement = Engagement(
+            id=context.engagement_id,
+            tenant_id=context.tenant_id,
+            name=context.engagement_id,
+            status=EngagementStatus.ACTIVE,
+        )
+        persisted_job = self.session.execute(
+            text(
+                "SELECT status,job_kind FROM canonical_jobs "
+                "WHERE tenant_id=:tenant_id AND id=:job_id"
+            ),
+            {"tenant_id": context.tenant_id, "job_id": context.job_id},
+        ).mappings().first()
+        if self.session.in_transaction():
+            self.session.rollback()
+        job = Job(
+            id=context.job_id,
+            tenant_id=context.tenant_id,
+            engagement_id=context.engagement_id,
+            job_kind=(
+                str(persisted_job["job_kind"])
+                if persisted_job is not None
+                else context.engine
+            ),
+            status=(
+                JobStatus(str(persisted_job["status"]))
+                if persisted_job is not None
+                else JobStatus.RUNNING
+            ),
+        )
+        operator = Operator(
+            id=context.operator_id,
+            tenant_id=context.tenant_id,
+            display_name="Authorized operator",
+        )
+        role = Role(
+            id=_stable_id("role", context.tenant_id, context.operator_role),
+            tenant_id=context.tenant_id,
+            name=context.operator_role,
+        )
+        scope_decision = ScopeDecision(
+            id=context.decision_id,
+            tenant_id=context.tenant_id,
+            engagement_id=context.engagement_id,
+            operator_id=context.operator_id,
+            role_id=role.id,
+            outcome=ScopeOutcome.ALLOW,
+            policy_version=context.scope_policy_version,
+            decision_reason=context.scope_reason,
+            decided_at=context.decided_at,
+        )
+        action = Action(
+            id=context.action_id,
+            tenant_id=context.tenant_id,
+            engagement_id=context.engagement_id,
+            job_id=context.job_id,
+            action_kind=context.action_kind,
+            authorization_decision_id=context.decision_id,
+        )
+        module_version = ModuleVersion(
+            id=module_version_id,
+            tenant_id=context.tenant_id,
+            module_id=canonical_module_id,
+            version=VERSION,
+            module_kind="job_result",
+        )
+        module_execution = ModuleExecution(
+            id=module_execution_id,
+            tenant_id=context.tenant_id,
+            job_id=context.job_id,
+            module_version_id=module_version_id,
+            status=ModuleExecutionStatus.COMPLETED,
+        )
+
+        manifests: list[ArtifactManifest] = []
+        created_artifact = False
+        try:
+            try:
+                manifest = self.custody.get_manifest(artifact_id)
+                self.custody.verify(artifact_id)
+                expected_digest = (
+                    "sha256:" + hashlib.sha256(canonical_payload).hexdigest()
+                )
+                if (
+                    manifest.source_observation_id != observation_id
+                    or manifest.sha256 != expected_digest
+                ):
+                    raise CanonicalEvidenceError(
+                        "orphan custody artifact conflicts with job delivery"
+                    )
+            except ArtifactNotFound:
+                manifest = self.custody.store_artifact(
+                    canonical_payload,
+                    source_observation_id=observation_id,
+                    collector_id=(
+                        "collector:"
+                        + hashlib.sha256(module_execution_id.encode()).hexdigest()[:24]
+                    ),
+                    media_type="application/json",
+                    source_target=source_target,
+                    source_asset_id=asset.id,
+                    retain_original=True,
+                    protected_original_authorization_ref=(
+                        context.original_authorization_ref
+                    ),
+                    retention_class="standard",
+                    metadata={"capture_kind": "job_result"},
+                    artifact_id=artifact_id,
+                )
+                created_artifact = True
+            manifests.append(manifest)
+            artifact = ArtifactReference(
+                id=artifact_id,
+                tenant_id=context.tenant_id,
+                observation_id=observation_id,
+                reference=artifact_id,
+                digest=manifest.sha256,
+                media_type=manifest.media_type,
+                size=manifest.byte_size,
+                redaction_state=RedactionState(manifest.redaction_state),
+                encryption_state=manifest.encryption_state,
+                collected_at=parse_utc(manifest.collected_at),
+                collector_id=manifest.collector_id,
+                collector_version=VERSION,
+                source_target=manifest.source_target or "unknown",
+                source_asset_id=manifest.source_asset_id,
+                redaction_version=manifest.redaction_version,
+                protection_state=manifest.protection_state,
+                signer_state=manifest.signer_state,
+                integrity_state=ArtifactIntegrityState.VERIFIED,
+                retention_class=manifest.retention_class,
+                retention_expires_at=(
+                    parse_utc(manifest.retention_expires_at)
+                    if manifest.retention_expires_at is not None
+                    else None
+                ),
+                protected_original_authorization_ref=(
+                    manifest.protected_original_authorization_ref
+                ),
+                derivative_reference=manifest.derivative_artifact_id,
+                manifest_digest=manifest.manifest_digest,
+                metadata={"capture_kind": "job_result"},
+            )
+            receipt_data = {
+                "tenant_id": context.tenant_id,
+                "job_id": context.job_id,
+                "attempt_id": attempt_id,
+                "observation_id": observation_id,
+                "artifact_id": artifact_id,
+                "result_ref": artifact_id,
+                "manifest_digest": manifest.manifest_digest,
+                "duplicate": False,
+            }
+            self.store.persist_custodied_observation(
+                custody_store=self.custody,
+                manifests=manifests,
+                tenant=tenant,
+                engagement=engagement,
+                operator=operator,
+                role=role,
+                scope_decision=scope_decision,
+                job=job,
+                action=action,
+                module_version=module_version,
+                module_execution=module_execution,
+                asset=asset,
+                observation=observation,
+                primary_artifact=artifact,
+                rollback_manifest_ids=(artifact_id,) if created_artifact else (),
+                transaction_guard=(
+                    (
+                        lambda connection: transaction_guard(
+                            connection,
+                            receipt_data,
+                        )
+                    )
+                    if transaction_guard is not None
+                    else None
+                ),
+            )
+        except Exception:
+            raise
+        return receipt_data
+
     def persist_finding(self, finding: Finding) -> dict[str, Any]:
         """Persist one new observation and bind its verified safe projection."""
         if self.session.in_transaction():
@@ -757,6 +1121,7 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
             module_execution_id=module_execution_id,
             asset_id=asset.id,
             action_id=context.action_id,
+            attempt_id=context.attempt_id,
             proof_type=finding.proof_type or "unknown",
             collection_status=CollectionStatus.COLLECTED,
             check_id=check_id,
@@ -895,4 +1260,5 @@ __all__ = [
     "CanonicalEvidenceError",
     "CanonicalEvidenceReader",
     "CanonicalEvidenceService",
+    "JOB_ATTEMPT_ID_ENV",
 ]

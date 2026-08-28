@@ -1448,7 +1448,10 @@ def test_netforge_exact_loopback_confirmation_reaches_mocked_module_boundary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import common.run_finalization as run_finalization
+
     calls: list[str] = []
+    finalized: dict[str, object] = {}
     confirmation = _confirmation(LAB_NET_TARGET, "netforge")
 
     class FakeOpsec:
@@ -1490,6 +1493,38 @@ def test_netforge_exact_loopback_confirmation_reaches_mocked_module_boundary(
         lambda **kwargs: _FakeReporter(calls, **kwargs),
     )
 
+    def fake_finalize(
+        source_session: object,
+        *,
+        authorization: object,
+        framework: str,
+        target: str,
+        manifest: object,
+    ) -> object:
+        finalized.update(
+            {
+                "source_session": source_session,
+                "authorization": authorization,
+                "framework": framework,
+                "target": target,
+                "manifest": manifest,
+            }
+        )
+        return SimpleNamespace(
+            truth=SimpleNamespace(
+                run_id="run-fixture:netforge",
+                collection_status=SimpleNamespace(value="success"),
+                coverage_complete=True,
+            ),
+            delta={"comparison_state": "baseline"},
+        )
+
+    monkeypatch.setattr(
+        run_finalization,
+        "finalize_authorized_run",
+        fake_finalize,
+    )
+
     result = asyncio.run(
         netforge.run_scan(
             _authorized_config(
@@ -1505,6 +1540,18 @@ def test_netforge_exact_loopback_confirmation_reaches_mocked_module_boundary(
     )
 
     assert result["findings"] == 0
+    assert result["run_truth"] == {
+        "state": "persisted",
+        "run_id": "run-fixture:netforge",
+        "collection_status": "success",
+        "coverage_complete": True,
+        "delta_state": "baseline",
+    }
+    manifest = finalized["manifest"]
+    assert manifest.planned_capabilities == ("probe",)
+    assert manifest.completed_capabilities == ("probe",)
+    assert finalized["framework"] == "netforge"
+    assert finalized["target"] == LAB_NET_TARGET
     assert calls.count("module_init") == 1
     assert calls.count("module_run") == 1
 

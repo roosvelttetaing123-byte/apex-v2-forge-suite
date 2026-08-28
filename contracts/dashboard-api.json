@@ -1,6 +1,6 @@
 {
   "backend_source": "common/dashboard/server.py",
-  "backend_source_sha256": "4b84339289b7c26c36ac03ad5063247e0eebd3f274012734de975b87135acc6d",
+  "backend_source_sha256": "3131d8a9d5d77b6c62a3e3f83dd493381d57f5c34024e8967b36152f2bd3374e",
   "endpoints": {
     "actionConfirmations": {
       "method": "POST",
@@ -313,8 +313,24 @@
       "path": "/api/v1/scans/{scan_id}"
     },
     {
+      "method": "POST",
+      "path": "/api/v1/scans/{scan_id}/cancel"
+    },
+    {
       "method": "GET",
       "path": "/api/v1/scans/{scan_id}/logs"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/scans/{scan_id}/pause"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/scans/{scan_id}/resume"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/scans/{scan_id}/retry"
     },
     {
       "method": "GET",

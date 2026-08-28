@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, ClassVar, Iterable, Mapping, Sequence, TypeVar, cast
+from typing import Any, Callable, ClassVar, Iterable, Mapping, Sequence, TypeVar, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import text
@@ -346,6 +346,14 @@ class _Contract:
             _REFERENCE_RE.fullmatch(reference) or _DIGEST_RE.fullmatch(reference)
         ) and redacted.get("reference") == reference:
             redacted["reference"] = reference
+        if type(self).__name__ == "Observation" and getattr(
+            self,
+            "attempt_id",
+            None,
+        ) is None:
+            # Preserve accepted Task 101/102 serialized bytes when the
+            # additive Task 103 attempt relationship is unused.
+            redacted.pop("attempt_id", None)
         return redacted
 
     def serialize(self) -> str:
@@ -356,6 +364,8 @@ class _Contract:
         if not isinstance(value, Mapping):
             raise CanonicalSerializationError("contract payload must be an object")
         payload = dict(value)
+        if cls.__name__ == "Observation" and "attempt_id" not in payload:
+            payload["attempt_id"] = None
         contract_fields = fields(cls)  # type: ignore[arg-type]
         expected_fields = {item.name for item in contract_fields}
         provided_fields = set(payload)
@@ -1007,6 +1017,7 @@ class Observation(_Contract):
     status: ObservationStatus = ObservationStatus.OBSERVED
     module_execution_id: str | None = None
     action_id: str | None = None
+    attempt_id: str | None = None
     intelligence_snapshot_id: str | None = None
     provenance_id: str | None = None
     id: str = field(default_factory=server_id)
@@ -1026,7 +1037,13 @@ class Observation(_Contract):
         for name in ("tenant_id", "engagement_id", "job_id", "module_version_id", "asset_id"):
             object.__setattr__(self, name, _identifier(getattr(self, name), name))
         object.__setattr__(self, "status", ObservationStatus(self.status))
-        for name in ("module_execution_id", "action_id", "intelligence_snapshot_id", "provenance_id"):
+        for name in (
+            "module_execution_id",
+            "action_id",
+            "attempt_id",
+            "intelligence_snapshot_id",
+            "provenance_id",
+        ):
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _identifier(value, name))
@@ -1530,7 +1547,30 @@ class CanonicalStore:
         if isinstance(record, Asset):
             return base | {"kind": record.kind.value, "identity_key": record.identity_key, "display_name": record.display_name, "canonical_uri": record.canonical_uri}
         if isinstance(record, Observation):
-            return base | {"engagement_id": record.engagement_id, "job_id": record.job_id, "module_version_id": record.module_version_id, "module_execution_id": record.module_execution_id, "asset_id": record.asset_id, "action_id": record.action_id, "intelligence_snapshot_id": record.intelligence_snapshot_id, "provenance_id": record.provenance_id, "status": record.status.value, "observed_at": _iso(record.observed_at), "proof_type": record.proof_type, "collection_status": record.collection_status.value, "check_id": record.check_id, "route": record.route, "parameter": record.parameter, "location": record.location, "identity_ref": record.identity_ref}
+            params = base | {"engagement_id": record.engagement_id, "job_id": record.job_id, "module_version_id": record.module_version_id, "module_execution_id": record.module_execution_id, "asset_id": record.asset_id, "action_id": record.action_id, "intelligence_snapshot_id": record.intelligence_snapshot_id, "provenance_id": record.provenance_id, "status": record.status.value, "observed_at": _iso(record.observed_at), "proof_type": record.proof_type, "collection_status": record.collection_status.value, "check_id": record.check_id, "route": record.route, "parameter": record.parameter, "location": record.location, "identity_ref": record.identity_ref}
+            columns = {
+                str(row[1])
+                for row in self.session.execute(
+                    text("PRAGMA table_info(canonical_observations)")
+                ).all()
+            }
+            if "attempt_id" in columns:
+                migration_applied = self.session.execute(
+                    text(
+                        "SELECT 1 FROM canonical_migration_journal "
+                        "WHERE version='forge-jobs-v1' AND state='applied'"
+                    )
+                ).first()
+                if record.attempt_id is not None and migration_applied is None:
+                    raise CanonicalContractError(
+                        "attempt-bound observation requires the Task 103 migration"
+                    )
+                params["attempt_id"] = record.attempt_id
+            elif record.attempt_id is not None:
+                raise CanonicalContractError(
+                    "attempt-bound observation requires the Task 103 migration"
+                )
+            return params
         if isinstance(record, ArtifactReference):
             return base | {"observation_id": record.observation_id, "reference": record.reference, "digest": record.digest, "media_type": record.media_type, "size": record.size, "redaction_state": record.redaction_state.value, "encryption_state": record.encryption_state, "collected_at": _iso(record.collected_at), "collector_id": record.collector_id, "collector_version": record.collector_version, "source_target": record.source_target, "source_asset_id": record.source_asset_id, "redaction_version": record.redaction_version, "protection_state": record.protection_state, "signer_state": record.signer_state, "integrity_state": record.integrity_state.value, "retention_class": record.retention_class, "retention_expires_at": _iso(record.retention_expires_at) if record.retention_expires_at else None, "protected_original_authorization_ref": record.protected_original_authorization_ref, "derivative_reference": record.derivative_reference, "manifest_digest": record.manifest_digest}
         if isinstance(record, Finding):
@@ -2368,6 +2408,243 @@ class CanonicalStore:
                 ) from rollback_errors[0]
             raise
 
+    def persist_custodied_observation(
+        self,
+        *,
+        custody_store: Any,
+        manifests: Sequence[ArtifactManifest],
+        tenant: Tenant,
+        engagement: Engagement,
+        job: Job,
+        module_version: ModuleVersion,
+        asset: Asset,
+        observation: Observation,
+        primary_artifact: ArtifactReference,
+        supporting_artifacts: Sequence[ArtifactReference] = (),
+        rollback_manifest_ids: Sequence[str] | None = None,
+        operator: Operator | None = None,
+        role: Role | None = None,
+        scope_decision: ScopeDecision | None = None,
+        module_execution: ModuleExecution | None = None,
+        action: Action | None = None,
+        transaction_guard: Callable[[Session], None] | None = None,
+    ) -> dict[str, Any]:
+        """Commit one attempt-bound observation without inventing a finding."""
+
+        typed_manifests = tuple(manifests)
+        artifacts = (primary_artifact, *tuple(supporting_artifacts))
+        rollback_ids = (
+            {item.artifact_id for item in typed_manifests}
+            if rollback_manifest_ids is None
+            else {str(item) for item in rollback_manifest_ids}
+        )
+        rollback_errors: list[Exception] = []
+        try:
+            if self.session.in_transaction():
+                raise CanonicalContractError(
+                    "custodied observation requires an idle database session"
+                )
+            records: list[_Contract] = [
+                tenant,
+                engagement,
+                job,
+                module_version,
+                asset,
+                observation,
+                *artifacts,
+            ]
+            records.extend(
+                item
+                for item in (
+                    operator,
+                    role,
+                    scope_decision,
+                    module_execution,
+                    action,
+                )
+                if item is not None
+            )
+            tenant_id = self._assert_same_tenant(records)
+            if observation.engagement_id != engagement.id:
+                raise CanonicalLineageError(
+                    "observation engagement link is inconsistent"
+                )
+            if observation.job_id != job.id or job.engagement_id != engagement.id:
+                raise CanonicalLineageError("observation job link is inconsistent")
+            if observation.module_version_id != module_version.id:
+                raise CanonicalLineageError(
+                    "observation module-version link is inconsistent"
+                )
+            if observation.asset_id != asset.id:
+                raise CanonicalLineageError("observation asset link is inconsistent")
+            if module_execution is not None:
+                if (
+                    observation.module_execution_id != module_execution.id
+                    or module_execution.job_id != job.id
+                    or module_execution.module_version_id != module_version.id
+                ):
+                    raise CanonicalLineageError(
+                        "observation module-execution link is inconsistent"
+                    )
+            elif observation.module_execution_id is not None:
+                raise CanonicalLineageError(
+                    "observation references an unprovided module execution"
+                )
+            if action is not None:
+                if (
+                    observation.action_id != action.id
+                    or action.job_id != job.id
+                    or action.engagement_id != engagement.id
+                ):
+                    raise CanonicalLineageError(
+                        "observation action link is inconsistent"
+                    )
+                if action.authorization_decision_id is not None and (
+                    scope_decision is None
+                    or scope_decision.id != action.authorization_decision_id
+                    or scope_decision.outcome is not ScopeOutcome.ALLOW
+                ):
+                    raise CanonicalLineageError(
+                        "observation authorization link is inconsistent"
+                    )
+            elif observation.action_id is not None:
+                raise CanonicalLineageError(
+                    "observation references an unprovided action"
+                )
+            if scope_decision is not None:
+                if operator is None or scope_decision.operator_id != operator.id:
+                    raise CanonicalLineageError(
+                        "scope decision operator link is inconsistent"
+                    )
+                if scope_decision.engagement_id != engagement.id:
+                    raise CanonicalLineageError(
+                        "scope decision engagement link is inconsistent"
+                    )
+                if scope_decision.role_id is not None and (
+                    role is None or scope_decision.role_id != role.id
+                ):
+                    raise CanonicalLineageError(
+                        "scope decision role link is inconsistent"
+                    )
+            elif operator is not None or role is not None:
+                raise CanonicalLineageError(
+                    "operator/role context requires a scope decision"
+                )
+            if not typed_manifests or len(typed_manifests) != len(artifacts):
+                raise CanonicalLineageError(
+                    "custodied observation requires one manifest per artifact"
+                )
+            if any(not isinstance(item, ArtifactManifest) for item in typed_manifests):
+                raise CanonicalContractError(
+                    "custodied observation requires typed manifests"
+                )
+            manifest_by_id = {item.artifact_id: item for item in typed_manifests}
+            if len(manifest_by_id) != len(typed_manifests):
+                raise CanonicalLineageError("artifact manifest identity is duplicated")
+            verifier = getattr(custody_store, "verify", None)
+            if not callable(verifier):
+                raise CanonicalContractError(
+                    "custody store does not expose verification"
+                )
+            for artifact in artifacts:
+                manifest = manifest_by_id.get(artifact.id)
+                if manifest is None:
+                    raise CanonicalLineageError(
+                        "artifact has no matching custody manifest"
+                    )
+                manifest.verify()
+                verified = verifier(manifest.artifact_id)
+                if (
+                    not isinstance(verified, ArtifactManifest)
+                    or verified.to_dict() != manifest.to_dict()
+                    or manifest.tenant_id != tenant_id
+                    or manifest.source_observation_id != observation.id
+                    or not _artifact_reference_matches_manifest(artifact, manifest)
+                ):
+                    raise CanonicalLineageError(
+                        "custody manifest does not match observation lineage"
+                    )
+
+            self.session.execute(text("BEGIN IMMEDIATE"))
+            for record in (
+                tenant,
+                engagement,
+                operator,
+                role,
+                scope_decision,
+                job,
+                action,
+                module_version,
+                module_execution,
+                asset,
+            ):
+                if record is not None:
+                    self._insert_or_validate_existing(record)
+            self._insert(observation)
+            link_time = _iso(utc_now())
+            for sequence, artifact in enumerate(artifacts):
+                self._insert(artifact)
+                self.session.execute(
+                    text(
+                        "INSERT INTO canonical_observation_artifacts "
+                        "(tenant_id,observation_id,artifact_id,role,sequence,"
+                        "created_at,metadata_json) VALUES "
+                        "(:tenant_id,:observation_id,:artifact_id,:role,:sequence,"
+                        ":created_at,:metadata_json)"
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "observation_id": observation.id,
+                        "artifact_id": artifact.id,
+                        "role": "primary" if sequence == 0 else "supporting",
+                        "sequence": sequence,
+                        "created_at": link_time,
+                        "metadata_json": _metadata_json(
+                            {"source": "task103_result_receipt"}
+                        ),
+                    },
+                )
+                self.persist_artifact_manifest(
+                    manifest_by_id[artifact.id],
+                    custody_store=custody_store,
+                    artifact=artifact,
+                    observation=observation,
+                    role="primary" if sequence == 0 else "supporting",
+                    sequence=sequence,
+                )
+            if transaction_guard is not None:
+                transaction_guard(self.session)
+            self.session.commit()
+            return {
+                "observation": observation,
+                "artifacts": list(artifacts),
+                "manifests": list(typed_manifests),
+            }
+        except Exception as exc:
+            if self.session.in_transaction():
+                self.session.rollback()
+            if rollback_ids:
+                rollback = getattr(custody_store, "rollback_artifact", None)
+                if not callable(rollback):
+                    raise CanonicalContractError(
+                        "custodied observation failed and rollback is unavailable"
+                    ) from exc
+                for manifest in reversed(typed_manifests):
+                    if manifest.artifact_id not in rollback_ids:
+                        continue
+                    try:
+                        rollback(
+                            manifest.artifact_id,
+                            expected_manifest_digest=manifest.manifest_digest,
+                        )
+                    except Exception as rollback_exc:
+                        rollback_errors.append(rollback_exc)
+            if rollback_errors:
+                raise CanonicalContractError(
+                    "custodied observation rollback did not complete"
+                ) from rollback_errors[0]
+            raise
+
     def record_evidence_access(
         self,
         *,
@@ -2765,6 +3042,7 @@ def _contract_from_row(cls: type[_Contract], row: Mapping[str, Any]) -> _Contrac
             module_execution_id=row.get("module_execution_id"),
             asset_id=str(row["asset_id"]),
             action_id=row.get("action_id"),
+            attempt_id=row.get("attempt_id"),
             intelligence_snapshot_id=row.get("intelligence_snapshot_id"),
             provenance_id=row.get("provenance_id"),
             status=ObservationStatus(str(row["status"])),

@@ -8,9 +8,12 @@ requires both a queued non-dry-run job and --allow-active-scans locally.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import hmac
 import json
 import os
 import platform
+import signal
 import socket
 import ssl
 import subprocess
@@ -53,7 +56,21 @@ from common.confirm_gate import (
     decide_action,
     encode_launch_confirmations,
 )
+from common.db import (
+    PersistedRunTruthValidationError,
+    create_db,
+    load_run_collection_truth,
+)
 from common.scope import ScopeDecision, ScopeReason, decision_for_reason, decide_scope
+from common.canonical_evidence import JOB_ATTEMPT_ID_ENV
+from common.job_state import (
+    JobStateService,
+    LeaseError,
+    ProcessIdentity,
+    ProcessIdentityError,
+    TransitionActor,
+)
+from common.dashboard.server import _DashboardProcessSupervisor
 from common.outbound_policy import (
     OutboundDenied,
     OutboundReason,
@@ -71,6 +88,19 @@ class _NoRedirectHandler(request.HTTPRedirectHandler):
 
 class LeaseHeartbeatLost(RuntimeError):
     """The current assignment lease could not be renewed while work was active."""
+
+
+def _install_parent_death_signal(parent_pid: int) -> None:
+    """Kill a not-yet-registered Linux child if its Forge-agent parent dies."""
+
+    if os.name != "posix" or not Path("/proc/self").exists():
+        raise OSError("parent-death containment is unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, "PR_SET_PDEATHSIG failed")
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 def _json_request(
@@ -241,9 +271,12 @@ def _module_argument_values(value: Any) -> list[str] | None:
 def _job_authorization_db(job: dict[str, Any]) -> Path | None:
     """Resolve only configured or local Forge authorization database paths."""
     configured = os.environ.get(AUTHORIZATION_DB_ENV, "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
     raw = str(job.get("authorization_db") or "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser().resolve()
+        if raw and Path(raw).expanduser().resolve() != configured_path:
+            return None
+        return configured_path
     if not raw:
         return None
     path = Path(raw).expanduser().resolve()
@@ -254,6 +287,66 @@ def _job_authorization_db(job: dict[str, Any]) -> Path | None:
     if not any(path == root or path.is_relative_to(root) for root in roots):
         return None
     return path
+
+
+def _active_job_database(job: dict[str, Any]) -> Path | None:
+    """Require the exact server-delivered local SQLite authority for active work."""
+
+    raw = str(job.get("authorization_db") or "").strip()
+    if not raw:
+        return None
+    raw_path = Path(raw).expanduser()
+    if raw_path.is_symlink():
+        return None
+    resolved = _job_authorization_db(job)
+    if resolved is None or resolved != raw_path.resolve():
+        return None
+    try:
+        metadata = resolved.stat()
+    except OSError:
+        return None
+    if not resolved.is_file() or resolved.is_symlink() or metadata.st_nlink != 1:
+        return None
+    if metadata.st_mode & 0o077:
+        return None
+    return resolved
+
+
+def _verified_active_run_truth_id(
+    job: dict[str, Any],
+    engine: str,
+    database: Path,
+) -> str | None:
+    """Return only an exact persisted, signed truth for this assignment."""
+
+    tenant_id = str(job.get("tenant_id") or "").strip()
+    job_id = str(job.get("id") or "").strip()
+    authorization_run_id = str(job.get("run_id") or "").strip()
+    framework = str(engine or "").strip().lower()
+    if not all((tenant_id, job_id, authorization_run_id, framework)):
+        return None
+    run_truth_id = f"{authorization_run_id}:{framework}"
+    session = create_db(database)
+    try:
+        try:
+            truth = load_run_collection_truth(
+                session,
+                run_truth_id,
+                tenant_id=tenant_id,
+            )
+        except PersistedRunTruthValidationError:
+            return None
+        if (
+            truth is None
+            or truth.tenant_id != tenant_id
+            or truth.job_id != job_id
+            or truth.authorization_run_id != authorization_run_id
+            or truth.framework != framework
+        ):
+            return None
+        return truth.run_id
+    finally:
+        session.close()
 
 
 def _job_runtime_facts(job: dict[str, Any]) -> dict[str, str]:
@@ -306,6 +399,121 @@ def _audit_agent_denial(
         session.close()
 
 
+def _durable_agent_process_context(
+    job: dict[str, Any],
+    database: Path,
+    supervisor: Any,
+) -> tuple[JobStateService, dict[str, str]]:
+    """Bind one active helper launch to the exact co-resident durable attempt."""
+
+    runtime = _job_runtime_facts(job)
+    values = {
+        "tenant_id": str(job.get("tenant_id") or runtime.get("tenant_id") or "").strip(),
+        "job_id": str(job.get("id") or "").strip(),
+        "attempt_id": str(job.get("attempt_id") or "").strip(),
+        "worker_id": str(job.get("agent_id") or "").strip(),
+        "lease_token": str(job.get("lease_token") or "").strip(),
+        "delivery_idempotency_key": str(
+            job.get("delivery_idempotency_key") or ""
+        ).strip(),
+        "attempt_run_id": str(job.get("attempt_run_id") or "").strip(),
+        "authorization_id": str(job.get("authorization_id") or "").strip(),
+        "identity_key": str(job.get("process_identity_key") or "").strip(),
+        "launch_nonce": str(job.get("process_launch_nonce") or "").strip(),
+        "control_boot_id": str(
+            job.get("process_control_boot_id") or ""
+        ).strip(),
+    }
+    if any(not item for item in values.values()):
+        raise ProcessIdentityError("active agent job lacks durable process identity")
+    boot_reader = getattr(supervisor, "_boot_id", None)
+    local_boot_id = str(boot_reader() if callable(boot_reader) else "").strip()
+    if not local_boot_id or not hmac.compare_digest(
+        local_boot_id,
+        values["control_boot_id"],
+    ):
+        raise ProcessIdentityError("active agent is outside the leased control boot")
+
+    service = JobStateService(database, process_supervisor=supervisor)
+    try:
+        durable_job = service.get_job(
+            values["job_id"],
+            tenant_id=values["tenant_id"],
+        )
+        if durable_job is None or not hmac.compare_digest(
+            str(durable_job.get("assigned_agent_id") or ""),
+            values["worker_id"],
+        ):
+            raise ProcessIdentityError("active agent does not own the durable job")
+        attempts = service.list_attempts(
+            values["job_id"],
+            tenant_id=values["tenant_id"],
+        )
+        attempt = next(
+            (
+                item
+                for item in attempts
+                if hmac.compare_digest(
+                    str(item.get("id") or ""),
+                    values["attempt_id"],
+                )
+            ),
+            None,
+        )
+        if attempt is None:
+            raise ProcessIdentityError("active agent attempt is not durable")
+        expected = {
+            "worker_id": values["worker_id"],
+            "control_boot_id": values["control_boot_id"],
+            "delivery_idempotency_key": values["delivery_idempotency_key"],
+            "run_id": values["attempt_run_id"],
+            "authorization_decision_id": values["authorization_id"],
+        }
+        if any(
+            not hmac.compare_digest(str(attempt.get(key) or ""), value)
+            for key, value in expected.items()
+        ):
+            raise ProcessIdentityError("active agent attempt binding is inconsistent")
+        if not service.validate_lease(
+            values["attempt_id"],
+            values["lease_token"],
+            tenant_id=values["tenant_id"],
+            worker_id=values["worker_id"],
+        ):
+            raise LeaseError("active agent lease is not current")
+        intent = service.reserve_process(
+            values["job_id"],
+            values["attempt_id"],
+            values["identity_key"],
+            lease_token=values["lease_token"],
+            worker_id=values["worker_id"],
+            control_boot_id=values["control_boot_id"],
+            expected_launch_nonce=values["launch_nonce"],
+            tenant_id=values["tenant_id"],
+            actor=TransitionActor(
+                tenant_id=values["tenant_id"],
+                actor_id=values["worker_id"],
+                role="agent",
+                authorization_decision_id=values["authorization_id"],
+            ),
+        )
+        if str(intent.get("state") or "") != "reserved":
+            raise ProcessIdentityError("active agent child was already delivered")
+        if any(
+            str(row.get("attempt_id") or "") == values["attempt_id"]
+            and str(row.get("identity_key") or "") == values["identity_key"]
+            for row in service.list_processes(
+                values["job_id"],
+                tenant_id=values["tenant_id"],
+            )
+        ):
+            raise ProcessIdentityError("active agent child is already registered")
+        return service, values
+    except BaseException:
+        service.close()
+        raise
+
+
 def _safe_job_result(
     job: dict[str, Any],
     allow_active_scans: bool,
@@ -314,6 +522,7 @@ def _safe_job_result(
     local_excluded_scope: Any,
     lease_heartbeat: Callable[[], None] | None = None,
     lease_heartbeat_interval: float = 30.0,
+    process_supervisor: Any | None = None,
 ) -> dict[str, Any]:
     """Run a job safely, defaulting to dry-run evidence only."""
     started = datetime.now(timezone.utc).isoformat()
@@ -403,6 +612,19 @@ def _safe_job_result(
                 "summary": "Dry-run scope validated; no authorization or scanner process was created.",
                 "findings": [],
                 "artifacts": [],
+            },
+        }
+
+    durable_database = _active_job_database(job)
+    if durable_database is None:
+        return {
+            "status": "failed",
+            "error": "durable_process_context_invalid",
+            "result": {
+                "job_id": job_id,
+                "dry_run": False,
+                "authorized": False,
+                "scope_decision": decision.to_dict(),
             },
         }
 
@@ -541,6 +763,24 @@ def _safe_job_result(
     effective_excluded = list(
         dict.fromkeys([*agent_excluded_scope, *job_excluded_scope])
     )
+    supervisor = process_supervisor or _DashboardProcessSupervisor()
+    try:
+        durable_service, process_context = _durable_agent_process_context(
+            job,
+            durable_database,
+            supervisor,
+        )
+    except (LeaseError, ProcessIdentityError, KeyError, ValueError):
+        return {
+            "status": "failed",
+            "error": "durable_process_context_invalid",
+            "result": {
+                "job_id": job_id,
+                "dry_run": False,
+                "authorized": False,
+                "scope_decision": decision.to_dict(),
+            },
+        }
     command = _build_scanner_command(
         engine=engine,
         target=target,
@@ -562,29 +802,98 @@ def _safe_job_result(
         [engine_authorization]
     )
     child_env[AUTHORIZATION_DB_ENV] = str(auth_db or default_authorization_db_path())
+    child_env[JOB_ATTEMPT_ID_ENV] = process_context["attempt_id"]
+    child_env[f"{JOB_ATTEMPT_ID_ENV}_LAUNCH_NONCE"] = process_context[
+        "launch_nonce"
+    ]
     child_env.update(authorization_runtime_environment_from_facts(runtime))
+
+    def _heartbeat() -> None:
+        if lease_heartbeat is not None:
+            lease_heartbeat()
+            return
+        renewed = durable_service.renew_lease(
+            process_context["attempt_id"],
+            process_context["lease_token"],
+            lease_seconds=max(1.0, min(60.0, lease_heartbeat_interval * 2)),
+            tenant_id=process_context["tenant_id"],
+            worker_id=process_context["worker_id"],
+            actor=TransitionActor(
+                tenant_id=process_context["tenant_id"],
+                actor_id=process_context["worker_id"],
+                role="agent",
+                authorization_decision_id=process_context["authorization_id"],
+            ),
+        )
+        process_context["lease_token"] = str(renewed["lease_token"])
+        job["lease_token"] = process_context["lease_token"]
+
+    def _process_started(identity: ProcessIdentity) -> None:
+        durable_service.register_process(
+            process_context["job_id"],
+            process_context["attempt_id"],
+            identity,
+            lease_token=process_context["lease_token"],
+            worker_id=process_context["worker_id"],
+            control_boot_id=process_context["control_boot_id"],
+            tenant_id=process_context["tenant_id"],
+            identity_key=process_context["identity_key"],
+            actor=TransitionActor(
+                tenant_id=process_context["tenant_id"],
+                actor_id=process_context["worker_id"],
+                role="agent",
+                authorization_decision_id=process_context["authorization_id"],
+            ),
+        )
+
+    def _process_exited(identity: ProcessIdentity, return_code: int | None) -> None:
+        durable_service.record_process_exit(
+            process_context["job_id"],
+            process_context["attempt_id"],
+            identity,
+            worker_id=process_context["worker_id"],
+            control_boot_id=process_context["control_boot_id"],
+            tenant_id=process_context["tenant_id"],
+            identity_key=process_context["identity_key"],
+            actor=process_context["worker_id"],
+            reason="co-resident agent child process exited",
+            return_code=return_code,
+        )
+
     try:
-        if lease_heartbeat is None:
-            proc = subprocess.run(
-                command,
-                cwd=str(Path(__file__).resolve().parent),
-                env=child_env,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=3600,
+        proc = _run_with_lease_heartbeat(
+            command,
+            cwd=str(Path(__file__).resolve().parent),
+            env=child_env,
+            heartbeat=_heartbeat,
+            heartbeat_interval=lease_heartbeat_interval,
+            timeout=3600.0,
+            launch_nonce=process_context["launch_nonce"],
+            process_supervisor=supervisor,
+            process_started=_process_started,
+            process_exited=_process_exited,
+        )
+    except (
+        LeaseHeartbeatLost,
+        LeaseError,
+        ProcessIdentityError,
+        OSError,
+        subprocess.SubprocessError,
+    ):
+        try:
+            durable_service.abandon_process_launch(
+                process_context["job_id"],
+                process_context["attempt_id"],
+                process_context["identity_key"],
+                worker_id=process_context["worker_id"],
+                control_boot_id=process_context["control_boot_id"],
+                tenant_id=process_context["tenant_id"],
+                actor=process_context["worker_id"],
+                reason="co-resident agent child launch did not become durable",
             )
-        else:
-            proc = _run_with_lease_heartbeat(
-                command,
-                cwd=str(Path(__file__).resolve().parent),
-                env=child_env,
-                heartbeat=lease_heartbeat,
-                heartbeat_interval=lease_heartbeat_interval,
-                timeout=3600.0,
-            )
-    except LeaseHeartbeatLost:
+        except ProcessIdentityError:
+            pass
+        durable_service.close()
         return {
             "status": "failed",
             "error": "lease_renewal_failed",
@@ -596,6 +905,14 @@ def _safe_job_result(
                 "scope_decision": decision.to_dict(),
             },
         }
+    finally:
+        if not getattr(durable_service, "_closed", False):
+            durable_service.close()
+    run_truth_id = _verified_active_run_truth_id(
+        job,
+        engine,
+        durable_database,
+    )
     return {
         "status": "completed" if proc.returncode == 0 else "failed",
         "error": None if proc.returncode == 0 else "scanner exited non-zero",
@@ -608,6 +925,7 @@ def _safe_job_result(
             "target": target,
             "modules": modules,
             "scope_decision": decision.to_dict(),
+            "run_truth_id": run_truth_id,
             "return_code": proc.returncode,
             "log_tail": redact_authorization_value(
                 "\n".join(proc.stdout.splitlines()[-120:])
@@ -624,21 +942,110 @@ def _run_with_lease_heartbeat(
     heartbeat: Callable[[], None],
     heartbeat_interval: float,
     timeout: float,
+    launch_nonce: str,
+    process_supervisor: Any,
+    process_started: Callable[[ProcessIdentity], None],
+    process_exited: Callable[[ProcessIdentity, int | None], None],
 ) -> subprocess.CompletedProcess[str]:
-    """Run one scanner while rotating its lease; stop it if ownership is lost."""
+    """Run one durably registered child while rotating its exact lease."""
+
     interval = max(0.25, min(float(heartbeat_interval), 60.0))
     deadline = time.monotonic() + max(1.0, float(timeout))
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    output = ""
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_signal = getattr(signal, "pidfd_send_signal", None)
+    pidfd_reservation: int | None = None
+    if os.name == "posix":
+        if not callable(pidfd_open) or not callable(pidfd_signal):
+            raise LeaseHeartbeatLost(
+                "PID-safe child signaling is unavailable on this worker"
+            )
+        try:
+            pidfd_reservation = int(pidfd_open(os.getpid(), 0))
+        except OSError as exc:
+            raise LeaseHeartbeatLost(
+                "PID-safe child capability could not be reserved"
+            ) from exc
+    parent_pid = os.getpid()
+    popen_options: dict[str, Any] = {
+        "cwd": cwd,
+        "env": env,
+        "stdin": subprocess.DEVNULL,
+        "text": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+    }
+    if os.name == "posix":
+        popen_options["preexec_fn"] = lambda: _install_parent_death_signal(
+            parent_pid
+        )
     try:
+        process = subprocess.Popen(
+            command,
+            **popen_options,
+        )
+    except BaseException:
+        if pidfd_reservation is not None:
+            os.close(pidfd_reservation)
+        raise
+    process_pid = getattr(process, "pid", None)
+    pidfd: int | None = None
+    if os.name == "posix" and isinstance(process_pid, int):
+        if pidfd_reservation is not None:
+            os.close(pidfd_reservation)
+            pidfd_reservation = None
+        try:
+            assert callable(pidfd_open)
+            pidfd = int(pidfd_open(process_pid, 0))
+        except OSError as exc:
+            capture = getattr(process_supervisor, "capture", None)
+            captured = (
+                capture(process, launch_nonce=launch_nonce)
+                if callable(capture)
+                else None
+            )
+            if process.poll() is None and isinstance(captured, ProcessIdentity):
+                try:
+                    process_supervisor.terminate(captured)
+                    process.communicate(timeout=5.0)
+                except Exception:
+                    pass
+            raise LeaseHeartbeatLost(
+                "PID-safe child capability could not be acquired"
+            ) from exc
+    elif pidfd_reservation is not None:
+        os.close(pidfd_reservation)
+        pidfd_reservation = None
+    output = ""
+    identity: ProcessIdentity | None = None
+    registered = False
+    exit_recorded = False
+
+    def _record_exit() -> None:
+        nonlocal exit_recorded
+        if identity is None or not registered or exit_recorded:
+            return
+        try:
+            process_exited(identity, getattr(process, "returncode", None))
+        except Exception as exc:
+            raise LeaseHeartbeatLost(
+                "child exit could not be persisted"
+            ) from exc
+        exit_recorded = True
+
+    try:
+        capture = getattr(process_supervisor, "capture", None)
+        if not callable(capture):
+            raise LeaseHeartbeatLost("process identity capture is unavailable")
+        identity = capture(process, launch_nonce=launch_nonce)
+        if not isinstance(identity, ProcessIdentity):
+            raise LeaseHeartbeatLost("child process identity could not be captured")
+        try:
+            process_started(identity)
+        except Exception as exc:
+            raise LeaseHeartbeatLost(
+                "child process identity could not be persisted"
+            ) from exc
+        registered = True
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -651,18 +1058,44 @@ def _run_with_lease_heartbeat(
                     heartbeat()
                 except Exception as exc:
                     raise LeaseHeartbeatLost("lease renewal failed") from exc
+        _record_exit()
         return subprocess.CompletedProcess(command, process.returncode, output, None)
     except BaseException:
         if process.poll() is None:
-            process.terminate()
+            if pidfd is not None:
+                signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+            elif os.name == "nt":
+                process.send_signal(signal.SIGTERM)
+            elif not isinstance(process_pid, int):
+                # Inert test doubles have no OS identity. Production POSIX
+                # children are never signaled through this branch.
+                getattr(process, "terminate")()
+            else:
+                raise LeaseHeartbeatLost(
+                    "refusing to signal a child without a PID capability"
+                )
             try:
                 tail, _ = process.communicate(timeout=5.0)
                 output = tail or output
             except subprocess.TimeoutExpired:
-                process.kill()
+                if pidfd is not None:
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                elif os.name == "nt":
+                    process.send_signal(signal.SIGKILL)
+                elif not isinstance(process_pid, int):
+                    getattr(process, "kill")()
+                else:
+                    raise LeaseHeartbeatLost(
+                        "refusing to kill a child without a PID capability"
+                    )
                 tail, _ = process.communicate(timeout=1.0)
                 output = tail or output
+        if process.poll() is not None:
+            _record_exit()
         raise
+    finally:
+        if pidfd is not None:
+            os.close(pidfd)
 
 
 def _lease_heartbeat_interval(job: dict[str, Any]) -> float:
@@ -781,7 +1214,10 @@ def run_agent(args: argparse.Namespace) -> int:
                 args.dashboard_url,
                 f"/api/v1/agents/{agent_id}/jobs/{job['id']}/lease/renew",
                 method="POST",
-                payload={"lease_token": current_token},
+                payload={
+                    "lease_token": current_token,
+                    "attempt_id": job.get("attempt_id"),
+                },
                 token=credential,
                 ssl_context=ssl_context,
             )
@@ -812,6 +1248,9 @@ def run_agent(args: argparse.Namespace) -> int:
             continue
         submission = {
             "lease_token": job.get("lease_token"),
+            "delivery_idempotency_key": job.get(
+                "delivery_idempotency_key"
+            ),
             "outcome": {
                 "completed": "success",
                 "failed": "failure",
@@ -829,6 +1268,11 @@ def run_agent(args: argparse.Namespace) -> int:
             "authorization_id": job.get("authorization_id"),
             "error": result.get("error"),
             "result": result.get("result"),
+            "run_truth_id": (
+                result.get("result", {}).get("run_truth_id")
+                if isinstance(result.get("result"), dict)
+                else None
+            ),
         }
         _json_request(
             args.dashboard_url,

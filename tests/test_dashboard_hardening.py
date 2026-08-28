@@ -669,7 +669,6 @@ class TestDashboardHardeningApi(unittest.IsolatedAsyncioTestCase):
         from common.dashboard.server import DashboardServer
 
         srv = DashboardServer(auth=False)
-        app = srv.create_app()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "scan_jobs.db"
@@ -678,6 +677,7 @@ class TestDashboardHardeningApi(unittest.IsolatedAsyncioTestCase):
                 patch.object(DashboardServer, "_scan_jobs_db_path", new_callable=PropertyMock, return_value=db_path),
                 patch.object(DashboardServer, "_kill_switch_path", new_callable=PropertyMock, return_value=kill_path),
             ):
+                app = srv.create_app()
                 async with _make_async_client(app) as client:
                     kill = await client.post("/api/v1/control/kill-switch", json={"enabled": True, "reason": "test"})
                     blocked = await client.post("/api/v1/scans/launch", json={"target": "http://example.test", "modules": ["sqli"]})
@@ -1534,10 +1534,12 @@ def test_dashboard_nonzero_engine_exit_remains_failed_and_interrupted(
             time.sleep(0.01)
 
     assert info["returncode"] == 1
-    assert info["status"] == "failed"
+    # Process exit is diagnostic only when no Task 103 attempt/identity owns
+    # the child. A non-zero legacy exit therefore remains uncertain.
+    assert info["status"] == "orphaned"
     assert emit.call_args.args[0] is EventType.SCAN_INTERRUPTED
-    update_history.assert_called_once_with("scan-failed", "failed")
-    sync_job.assert_called_once_with("scan-failed", fallback="failed")
+    update_history.assert_called_once_with("scan-failed", "orphaned")
+    sync_job.assert_called_once_with("scan-failed", fallback="orphaned")
 
 
 def test_dashboard_supervisor_metadata_redacts_proxy_credentials() -> None:

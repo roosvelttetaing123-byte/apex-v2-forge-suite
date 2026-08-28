@@ -111,37 +111,46 @@ class TestAgentControlPlane(unittest.IsolatedAsyncioTestCase):
                     job_id = create.json()["job"]["id"]
                     lease = await client.get(f"/api/v1/agents/{agent_id}/jobs/next")
                     leased_job = lease.json()["job"]
+                    submission = {
+                        "lease_token": leased_job["lease_token"],
+                        "delivery_idempotency_key": leased_job[
+                            "delivery_idempotency_key"
+                        ],
+                        "outcome": "success",
+                        "tenant_id": leased_job["tenant_id"],
+                        "job_id": leased_job["id"],
+                        "agent_id": leased_job["agent_id"],
+                        "attempt_id": leased_job["attempt_id"],
+                        "run_id": leased_job["run_id"],
+                        "engine": leased_job["engine"],
+                        "capability": leased_job["capability"],
+                        "module_binding": module_set_binding(leased_job["modules"]),
+                        "target": leased_job["target"],
+                        "authorization_id": leased_job["authorization_id"],
+                        "status": "failed",
+                        "error": "Bearer CANARY_AGENT_ERROR_002",
+                        "result": {
+                            "findings": [],
+                            "token": "must-not-persist",
+                            "nested": {"password": "must-not-persist"},
+                        },
+                    }
                     submit = await client.post(
                         f"/api/v1/agents/{agent_id}/jobs/{job_id}/result",
-                        json={
-                            "lease_token": leased_job["lease_token"],
-                            "outcome": "success",
-                            "tenant_id": leased_job["tenant_id"],
-                            "job_id": leased_job["id"],
-                            "agent_id": leased_job["agent_id"],
-                            "attempt_id": leased_job["attempt_id"],
-                            "run_id": leased_job["run_id"],
-                            "engine": leased_job["engine"],
-                            "capability": leased_job["capability"],
-                            "module_binding": module_set_binding(leased_job["modules"]),
-                            "target": leased_job["target"],
-                            "authorization_id": leased_job["authorization_id"],
-                            "status": "failed",
-                            "error": "Bearer CANARY_AGENT_ERROR_002",
-                            "result": {
-                                "findings": [],
-                                "token": "must-not-persist",
-                                "nested": {"password": "must-not-persist"},
-                            },
-                        },
+                        json=submission,
+                    )
+                    replay = await client.post(
+                        f"/api/v1/agents/{agent_id}/jobs/{job_id}/result",
+                        json=submission,
                     )
                     state = await client.get("/api/v1/agents")
-                    persisted_state = agents_path.read_text(encoding="utf-8")
 
         self.assertEqual(register.status_code, 200, register.text)
         self.assertEqual(create.status_code, 200, create.text)
         self.assertEqual(lease.status_code, 200, lease.text)
         self.assertEqual(submit.status_code, 200, submit.text)
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertEqual(replay.json()["status"], "duplicate")
         self.assertEqual(state.status_code, 200, state.text)
         self.assertEqual(lease.json()["job"]["id"], job_id)
         redacted = submit.json()["job"]["result"]
@@ -149,8 +158,130 @@ class TestAgentControlPlane(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(redacted["nested"]["password"], "<redacted>")
         self.assertNotIn("CANARY_AGENT_ERROR_002", submit.text)
         self.assertNotIn("CANARY_AGENT_ERROR_002", state.text)
-        self.assertNotIn("CANARY_AGENT_ERROR_002", persisted_state)
+        self.assertFalse(agents_path.exists())
+        stored = srv._durable_job_state().get_job(
+            job_id,
+            tenant_id=srv.tenant_id,
+        )
+        self.assertIsNotNone(stored)
+        self.assertNotIn("CANARY_AGENT_ERROR_002", json.dumps(stored))
+        self.assertEqual(
+            srv._durable_job_state().conn.execute(
+                "SELECT COUNT(*) FROM canonical_observations "
+                "WHERE tenant_id=? AND job_id=? AND attempt_id=?",
+                (srv.tenant_id, job_id, leased_job["attempt_id"]),
+            ).fetchone()[0],
+            1,
+        )
         self.assertEqual(state.json()["counts"]["completed_jobs"], 1)
+
+    async def test_agent_retry_preserves_both_attempt_observations_and_evidence(self):
+        from common.dashboard.server import DashboardServer
+
+        srv = DashboardServer(auth=False)
+        app = srv.create_app()
+        async with _make_async_client(app) as client:
+            register = await _register_agent(
+                client,
+                {
+                    "agent_id": "agent-retry",
+                    "engines": ["webforge"],
+                    "scope": ["retry.example.test"],
+                },
+            )
+            agent_id = register.json()["agent"]["id"]
+            create = await client.post(
+                "/api/v1/agents/jobs",
+                json={
+                    "job_id": "agent-retry-job",
+                    "agent_id": agent_id,
+                    "engine": "webforge",
+                    "target": "https://retry.example.test/fixture",
+                    "scope": ["retry.example.test"],
+                    "modules": ["header_audit"],
+                    "max_attempts": 2,
+                },
+            )
+            job_id = create.json()["job"]["id"]
+
+            async def submit_attempt(outcome: str) -> tuple[dict, httpx.Response]:
+                lease = await client.get(
+                    f"/api/v1/agents/{agent_id}/jobs/next"
+                )
+                assert lease.status_code == 200, lease.text
+                assignment = lease.json()["job"]
+                submission = {
+                    "lease_token": assignment["lease_token"],
+                    "delivery_idempotency_key": assignment[
+                        "delivery_idempotency_key"
+                    ],
+                    "outcome": outcome,
+                    "tenant_id": assignment["tenant_id"],
+                    "job_id": assignment["id"],
+                    "agent_id": assignment["agent_id"],
+                    "attempt_id": assignment["attempt_id"],
+                    "run_id": assignment["run_id"],
+                    "engine": assignment["engine"],
+                    "capability": assignment["capability"],
+                    "module_binding": module_set_binding(
+                        assignment["modules"]
+                    ),
+                    "target": assignment["target"],
+                    "authorization_id": assignment["authorization_id"],
+                    "error": (
+                        "fixture first-attempt failure"
+                        if outcome == "failure"
+                        else None
+                    ),
+                    "result": {"attempt_outcome": outcome},
+                }
+                return assignment, await client.post(
+                    f"/api/v1/agents/{agent_id}/jobs/{job_id}/result",
+                    json=submission,
+                )
+
+            first, first_result = await submit_attempt("failure")
+            second, second_result = await submit_attempt("success")
+
+        self.assertEqual(create.status_code, 200, create.text)
+        self.assertEqual(first_result.status_code, 200, first_result.text)
+        self.assertEqual(first_result.json()["job"]["status"], "queued")
+        self.assertEqual(second_result.status_code, 200, second_result.text)
+        self.assertEqual(second_result.json()["job"]["status"], "completed")
+        self.assertNotEqual(first["attempt_id"], second["attempt_id"])
+        service = srv._durable_job_state()
+        self.assertEqual(
+            [
+                attempt["state"]
+                for attempt in service.list_attempts(
+                    job_id,
+                    tenant_id=srv.tenant_id,
+                )
+            ],
+            ["failed", "completed"],
+        )
+        observations = service.conn.execute(
+            "SELECT attempt_id,id FROM canonical_observations "
+            "WHERE tenant_id=? AND job_id=? ORDER BY created_at",
+            (srv.tenant_id, job_id),
+        ).fetchall()
+        self.assertEqual(
+            {str(row["attempt_id"]) for row in observations},
+            {first["attempt_id"], second["attempt_id"]},
+        )
+        self.assertEqual(len(observations), 2)
+        self.assertEqual(
+            service.conn.execute(
+                "SELECT COUNT(*) FROM canonical_artifact_manifests "
+                "WHERE tenant_id=? AND observation_id IN (?,?)",
+                (
+                    srv.tenant_id,
+                    str(observations[0]["id"]),
+                    str(observations[1]["id"]),
+                ),
+            ).fetchone()[0],
+            2,
+        )
 
     async def test_agent_job_rejects_scope_escape_and_secret_fields(self):
         from common.dashboard.server import DashboardServer
@@ -329,15 +460,53 @@ class TestAgentControlPlane(unittest.IsolatedAsyncioTestCase):
                             "scope": ["127.0.0.1/32"],
                             "exclude": [],
                             "dry_run": False,
+                            "max_attempts": 2,
                             "safety_mode": "passive",
                             "confirmation": _confirmation(job_id, target),
                         },
                     )
                     lease = await client.get(f"/api/v1/agents/{agent_id}/jobs/next")
+                    leased_for_result = lease.json().get("job", {})
+                    submit = await client.post(
+                        f"/api/v1/agents/{agent_id}/jobs/"
+                        f"{leased_for_result.get('id')}/result",
+                        json={
+                            "lease_token": leased_for_result.get("lease_token"),
+                            "delivery_idempotency_key": leased_for_result.get(
+                                "delivery_idempotency_key"
+                            ),
+                            "outcome": "success",
+                            "tenant_id": leased_for_result.get("tenant_id"),
+                            "job_id": leased_for_result.get("id"),
+                            "agent_id": leased_for_result.get("agent_id"),
+                            "attempt_id": leased_for_result.get("attempt_id"),
+                            "run_id": leased_for_result.get("run_id"),
+                            "engine": leased_for_result.get("engine"),
+                            "capability": leased_for_result.get("capability"),
+                            "module_binding": module_set_binding(
+                                leased_for_result.get("modules") or []
+                            ),
+                            "target": leased_for_result.get("target"),
+                            "authorization_id": leased_for_result.get(
+                                "authorization_id"
+                            ),
+                            "result": {"return_code": 0},
+                        },
+                    )
+                    retry_without_authorization = await client.get(
+                        f"/api/v1/agents/{agent_id}/jobs/next"
+                    )
 
         self.assertEqual(register.status_code, 200, register.text)
         self.assertEqual(create.status_code, 200, create.text)
         self.assertEqual(lease.status_code, 200, lease.text)
+        self.assertEqual(submit.status_code, 200, submit.text)
+        self.assertEqual(
+            retry_without_authorization.status_code,
+            200,
+            retry_without_authorization.text,
+        )
+        self.assertIsNone(retry_without_authorization.json()["job"])
         leased_job = lease.json()["job"]
         self.assertEqual(leased_job["client_job_id"], job_id)
         self.assertEqual(leased_job["id"], create.json()["job"]["id"])
@@ -349,6 +518,23 @@ class TestAgentControlPlane(unittest.IsolatedAsyncioTestCase):
             SafetyMode.ACTIVE.value,
         )
         self.assertEqual(leased_job["scope_decision"]["reason_code"], ScopeReason.ALLOWED.value)
+        self.assertEqual(
+            submit.json()["job"]["status"],
+            "pending_approval",
+        )
+        durable = srv._durable_job_state().get_job(
+            leased_job["id"],
+            tenant_id=srv.tenant_id,
+        )
+        self.assertEqual(durable["state"], "pending_approval")
+        self.assertIsNone(durable["terminal_at"])
+        self.assertEqual(
+            srv._durable_job_state().list_events(
+                leased_job["id"],
+                tenant_id=srv.tenant_id,
+            )[-1]["reason_code"],
+            "active_retry_requires_fresh_authorization",
+        )
 
     async def test_agent_job_rejects_excluded_stale_mismatched_and_forged_confirmations(self):
         from common.dashboard.server import DashboardServer
@@ -480,16 +666,25 @@ class TestAgentControlPlane(unittest.IsolatedAsyncioTestCase):
                     )
                     lease = await client.get(f"/api/v1/agents/{agent_id}/jobs/next")
 
-            state = json.loads(agents_path.read_text(encoding="utf-8"))
-
         self.assertEqual(created.status_code, 200, created.text)
         self.assertEqual(lease.status_code, 403, lease.text)
         server_job_id = created.json()["job"]["id"]
-        job = next(item for item in state["jobs"] if item["id"] == server_job_id)
-        self.assertEqual(job["client_job_id"], job_id)
-        self.assertEqual(job["status"], "failed")
-        self.assertIsNone(job["leased_at"])
-        self.assertFalse(job["authorized"])
+        job = srv._durable_job_state().get_job(
+            server_job_id,
+            tenant_id=srv.tenant_id,
+        )
+        self.assertIsNotNone(job)
+        self.assertEqual(job["payload"]["client_job_id"], job_id)
+        self.assertEqual(job["state"], "canceled")
+        self.assertEqual(job["terminal_reason"], ScopeReason.TARGET_MISMATCH.value)
+        self.assertEqual(
+            srv._durable_job_state().list_attempts(
+                server_job_id,
+                tenant_id=srv.tenant_id,
+            ),
+            [],
+        )
+        self.assertFalse(agents_path.exists())
 
 
 class TestFindingStatusPersistence(unittest.IsolatedAsyncioTestCase):

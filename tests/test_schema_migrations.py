@@ -27,6 +27,7 @@ from common.db import (
 from common.schema_migrations import (
     CURRENT_SCHEMA_VERSION,
     EVIDENCE_SCHEMA_VERSION,
+    JOB_STATE_SCHEMA_VERSION,
     MigrationError,
     MigrationInterruptedError,
     MigrationManager,
@@ -37,6 +38,7 @@ from common.schema_migrations import (
     recover,
     upgrade,
 )
+from common.job_state import JobStateService
 
 
 def _valid_legacy_authorization_model(
@@ -154,6 +156,85 @@ def _legacy_execution_records(
             claimed_at=model.issued_at,
         ),
     )
+
+
+def test_task103_migration_downgrades_only_when_history_is_empty(
+    tmp_path: Path,
+) -> None:
+    empty = create_db(tmp_path / "empty-task103.db")
+    try:
+        manager = MigrationManager(empty.get_bind())
+        manager.downgrade(target=EVIDENCE_SCHEMA_VERSION)
+        tables = {
+            str(row[0])
+            for row in empty.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).all()
+        }
+        assert "durable_job_state_jobs" not in tables
+        assert empty.execute(
+            text(
+                "SELECT COUNT(*) FROM canonical_migration_journal "
+                "WHERE version=:version AND state='applied'"
+            ),
+            {"version": JOB_STATE_SCHEMA_VERSION},
+        ).scalar_one() == 0
+        manager.upgrade(target=JOB_STATE_SCHEMA_VERSION)
+        assert empty.execute(
+            text(
+                "SELECT COUNT(*) FROM canonical_migration_journal "
+                "WHERE version=:version AND state='applied'"
+            ),
+            {"version": JOB_STATE_SCHEMA_VERSION},
+        ).scalar_one() == 1
+        attempt_columns = {
+            str(row[1])
+            for row in empty.execute(
+                text("PRAGMA table_info(durable_job_state_attempts)")
+            ).all()
+        }
+        assert "control_boot_id" in attempt_columns
+        delivery_columns = {
+            str(row[1])
+            for row in empty.execute(
+                text("PRAGMA table_info(durable_job_state_deliveries)")
+            ).all()
+        }
+        assert {
+            "manifest_digest",
+            "outcome",
+            "work_json",
+            "run_truth_json",
+        } <= delivery_columns
+    finally:
+        empty.close()
+
+    retained_path = tmp_path / "retained-task103.db"
+    service = JobStateService(
+        retained_path,
+        authorization_checker=lambda *_args: True,
+    )
+    try:
+        created = service.create_job(job_id="retained-job")
+    finally:
+        service.close()
+    retained = create_db(retained_path)
+    try:
+        manager = MigrationManager(retained.get_bind())
+        with pytest.raises(
+            MigrationError,
+            match="would destroy retained history",
+        ):
+            manager.downgrade(target=EVIDENCE_SCHEMA_VERSION)
+        assert retained.execute(
+            text(
+                "SELECT COUNT(*) FROM durable_job_state_jobs "
+                "WHERE tenant_id='default' AND id=:job_id"
+            ),
+            {"job_id": created["id"]},
+        ).scalar_one() == 1
+    finally:
+        retained.close()
 
 
 def test_ordered_upgrade_downgrade_and_idempotence(tmp_path: Path) -> None:

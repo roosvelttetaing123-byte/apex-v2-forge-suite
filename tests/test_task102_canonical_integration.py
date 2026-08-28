@@ -229,6 +229,609 @@ def _custody_files(root: Path) -> list[Path]:
     return [path for path in root.rglob("*") if path.is_file()]
 
 
+def test_attempt_result_recovery_preserves_preexisting_custody_on_db_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+    from dataclasses import replace
+
+    from common.canonical_evidence import _safe_url_asset, _stable_id
+    from common.job_state import JobState, JobStateService, ObservationReceipt
+
+    database = tmp_path / "attempt-recovery.db"
+    base_context = _context("tenant-a", run_suffix="attempt-recovery")
+    attempt_id = "attempt-recovery-1"
+    context = replace(base_context, attempt_id=attempt_id)
+    authority = JobStateService(
+        database,
+        authorization_checker=lambda *_args: True,
+    )
+    job = authority.create_job(
+        {"target": "fixture.invalid"},
+        tenant_id=context.tenant_id,
+        job_id=context.job_id,
+        engagement_id=context.engagement_id,
+        run_id=context.run_id,
+        job_kind=context.engine,
+        state=JobState.QUEUED,
+        authorization_decision_id=context.decision_id,
+        authorization_action_id=context.action_id,
+        work_items=("agent-result",),
+    )
+    leased = authority.acquire_lease(
+        str(job["id"]),
+        "fixture-worker",
+        tenant_id=context.tenant_id,
+        attempt_id=attempt_id,
+    )
+    authority.start_attempt(
+        attempt_id,
+        str(leased["lease_token"]),
+        tenant_id=context.tenant_id,
+        worker_id="fixture-worker",
+    )
+    authority.close()
+
+    session = create_db(database)
+    custody_root = tmp_path / "attempt-custody"
+    payload = {"outcome": "success", "result": {"count": 1}}
+    delivery_key = str(leased["delivery_idempotency_key"])
+    observation_id = _stable_id(
+        "observation",
+        context.tenant_id,
+        context.job_id,
+        attempt_id,
+        delivery_key,
+    )
+    artifact_id = _stable_id(
+        "artifact",
+        context.tenant_id,
+        context.job_id,
+        attempt_id,
+        delivery_key,
+    )
+    asset_kind, asset_identity = _safe_url_asset("fixture.invalid")
+    asset_id = _stable_id(
+        "asset",
+        context.tenant_id,
+        asset_kind.value,
+        asset_identity,
+    )
+    canonical_payload = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    evidence = CanonicalEvidenceService(session, custody_root, context)
+    manifest = evidence.custody.store_artifact(
+        canonical_payload,
+        source_observation_id=observation_id,
+        collector_id="collector:attempt-recovery",
+        media_type="application/json",
+        source_target="fixture.invalid",
+        source_asset_id=asset_id,
+        retain_original=True,
+        protected_original_authorization_ref=(
+            context.original_authorization_ref
+        ),
+        retention_class="standard",
+        metadata={"capture_kind": "job_result"},
+        artifact_id=artifact_id,
+    )
+    original_digest = manifest.manifest_digest
+    def fail_insert(_record: object) -> None:
+        raise CanonicalEvidenceError("fixture database interruption")
+
+    monkeypatch.setattr(evidence.store, "_insert", fail_insert)
+    with pytest.raises(CanonicalEvidenceError, match="database interruption"):
+        evidence.persist_job_observation(
+            attempt_id=attempt_id,
+            delivery_key=delivery_key,
+            payload=payload,
+            source_target="fixture.invalid",
+            outcome="success",
+        )
+    verified = evidence.custody.verify(artifact_id)
+    assert verified.manifest_digest == original_digest
+    assert verified.sha256 == "sha256:" + hashlib.sha256(
+        canonical_payload
+    ).hexdigest()
+
+    # Simulate a new process after abrupt death left only the deterministic
+    # custody namespace. The retry must bind those exact bytes, the canonical
+    # rows, and the durable acceptance reservation without duplication.
+    session.close()
+    authority = JobStateService(
+        database,
+        authorization_checker=lambda *_args: True,
+    )
+    session = create_db(database)
+    evidence = CanonicalEvidenceService(session, custody_root, context)
+    work = [{"work_key": "agent-result", "required": True}]
+
+    def reserve(active_session: Any, receipt_data: dict[str, Any]) -> None:
+        authority.reserve_custodied_result(
+            active_session,
+            attempt_id,
+            str(leased["lease_token"]),
+            delivery_key=delivery_key,
+            tenant_id=context.tenant_id,
+            receipt=ObservationReceipt(
+                tenant_id=context.tenant_id,
+                job_id=context.job_id,
+                attempt_id=attempt_id,
+                observation_id=str(receipt_data["observation_id"]),
+                artifact_id=str(receipt_data["artifact_id"]),
+                result_ref=str(receipt_data["result_ref"]),
+                manifest_digest=str(receipt_data["manifest_digest"]),
+            ),
+            outcome="success",
+            work=work,
+            worker_id="fixture-worker",
+        )
+
+    receipt = evidence.persist_job_observation(
+        attempt_id=attempt_id,
+        delivery_key=delivery_key,
+        payload=payload,
+        source_target="fixture.invalid",
+        outcome="success",
+        transaction_guard=reserve,
+    )
+    assert receipt["artifact_id"] == artifact_id
+    assert receipt["manifest_digest"] == original_digest
+    assert receipt["duplicate"] is False
+    observation_receipt = ObservationReceipt(
+        tenant_id=context.tenant_id,
+        job_id=context.job_id,
+        attempt_id=attempt_id,
+        observation_id=str(receipt["observation_id"]),
+        artifact_id=str(receipt["artifact_id"]),
+        result_ref=str(receipt["result_ref"]),
+        manifest_digest=str(receipt["manifest_digest"]),
+    )
+    authority.record_result(
+        attempt_id,
+        str(leased["lease_token"]),
+        delivery_key=delivery_key,
+        tenant_id=context.tenant_id,
+        receipt=observation_receipt,
+        work=work,
+        worker_id="fixture-worker",
+    )
+    authority.finish_attempt(
+        attempt_id,
+        tenant_id=context.tenant_id,
+        lease_token=str(leased["lease_token"]),
+        worker_id="fixture-worker",
+    )
+    assert session.execute(
+        text(
+            "SELECT COUNT(*) FROM canonical_observations "
+            "WHERE tenant_id=:tenant_id AND job_id=:job_id "
+            "AND attempt_id=:attempt_id"
+        ),
+        {
+            "tenant_id": context.tenant_id,
+            "job_id": context.job_id,
+            "attempt_id": attempt_id,
+        },
+    ).scalar_one() == 1
+    assert session.execute(
+        text(
+            "SELECT COUNT(*) FROM durable_job_state_deliveries "
+            "WHERE tenant_id=:tenant_id AND attempt_id=:attempt_id "
+            "AND state='accepted'"
+        ),
+        {"tenant_id": context.tenant_id, "attempt_id": attempt_id},
+    ).scalar_one() == 1
+    session.close()
+    authority.close()
+
+
+def test_revoked_result_with_valid_run_truth_leaves_zero_proof_or_custody(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Truth inspection cannot commit proof/work before the custody guard."""
+
+    import base64
+    from dataclasses import replace
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+
+    import common.run_truth as run_truth_module
+    from common.db import append_run_collection_truth, finding_set_identity
+    from common.job_state import (
+        JobState,
+        JobStateService,
+        LeaseError,
+        ObservationReceipt,
+    )
+    from common.run_truth import (
+        RUN_TRUTH_POLICY,
+        RunCollectionStatus,
+        RunCollectionTruth,
+        run_collection_truth_attestation_payload,
+    )
+
+    database = tmp_path / "revoked-truth-custody.db"
+    tenant = "tenant-a"
+    context = CanonicalEvidenceContext(
+        tenant_id=tenant,
+        engagement_id="engagement-revoked-truth",
+        run_id="run-revoked-truth",
+        job_id="job-revoked-truth",
+        action_id="action-revoked-truth",
+        decision_id="decision-revoked-truth",
+        operator_id="operator-revoked-truth",
+        operator_role="operator",
+        engine="webforge",
+        module_id="webforge.scan",
+        action_kind="webforge.scan",
+        scope_policy_version="scope-policy-v1",
+        scope_reason="local deterministic fixture",
+        attempt_id="attempt-revoked-truth",
+    )
+    authority = JobStateService(
+        database,
+        authorization_checker=lambda *_args: True,
+    )
+    job = authority.create_job(
+        {"target": "fixture.invalid", "dry_run": False},
+        tenant_id=tenant,
+        job_id=context.job_id,
+        engagement_id=context.engagement_id,
+        run_id=context.run_id,
+        job_kind="webforge",
+        state=JobState.QUEUED,
+        authorization_decision_id=context.decision_id,
+        authorization_action_id=context.action_id,
+        authorization_bindings=(
+            {
+                "authorization_decision_id": context.decision_id,
+                "authorization_action_id": context.action_id,
+                "framework": "webforge",
+            },
+        ),
+        work_items=("webforge",),
+    )
+    leased = authority.acquire_lease(
+        str(job["id"]),
+        "fixture-worker",
+        tenant_id=tenant,
+        attempt_id=context.attempt_id,
+    )
+    authority.start_attempt(
+        context.attempt_id,
+        str(leased["lease_token"]),
+        tenant_id=tenant,
+        worker_id="fixture-worker",
+    )
+
+    signer = Ed25519PrivateKey.generate()
+    policy = replace(
+        RUN_TRUTH_POLICY,
+        issuer_public_key=base64.b64encode(
+            signer.public_key().public_bytes_raw()
+        ).decode("ascii"),
+    )
+    monkeypatch.setattr(run_truth_module, "RUN_TRUTH_POLICY", policy)
+    truth_session = create_db(database)
+    try:
+        run_truth_id = f"{context.run_id}:webforge"
+        truth = RunCollectionTruth(
+            run_id=run_truth_id,
+            authorization_run_id=context.run_id,
+            job_id=context.job_id,
+            tenant_id=tenant,
+            framework="webforge",
+            scope_binding="sha256:" + "a" * 64,
+            target_binding="sha256:" + "b" * 64,
+            collection_status=RunCollectionStatus.SUCCESS,
+            coverage_complete=True,
+            coverage_identity="sha256:" + "c" * 64,
+            finding_set_identity=finding_set_identity(
+                truth_session,
+                tenant_id=tenant,
+                run_id=run_truth_id,
+            ),
+            predecessor_run_id="",
+            run_sequence=1,
+            completed_at="2026-08-27T00:00:00+00:00",
+            authorization_decision_id=context.decision_id,
+            authorization_binding="sha256:" + "d" * 64,
+            authority_id="fixture-run-authority",
+            policy_id=policy.policy_id,
+            policy_version=policy.policy_version,
+            issuer_id=policy.issuer_id,
+        )
+        truth = replace(
+            truth,
+            attestation=base64.b64encode(
+                signer.sign(run_collection_truth_attestation_payload(truth))
+            ).decode("ascii"),
+        )
+        append_run_collection_truth(truth_session, truth, policy=policy)
+    finally:
+        truth_session.close()
+
+    inspected = authority.inspect_run_truth(
+        context.attempt_id,
+        str(leased["lease_token"]),
+        run_truth_id,
+        tenant_id=tenant,
+        worker_id="fixture-worker",
+    )
+    authority.revoke_lease(
+        context.attempt_id,
+        tenant_id=tenant,
+        reason="fixture revocation before custody",
+    )
+    session = create_db(database)
+    custody_root = tmp_path / "revoked-truth-custody"
+    evidence = CanonicalEvidenceService(session, custody_root, context)
+    payload = {
+        "outcome": "success",
+        "run_truths": [inspected["receipt"].to_dict()],
+    }
+
+    def reserve(active_session: Any, receipt_data: dict[str, Any]) -> None:
+        authority.reserve_custodied_result(
+            active_session,
+            context.attempt_id,
+            str(leased["lease_token"]),
+            delivery_key=str(leased["delivery_idempotency_key"]),
+            tenant_id=tenant,
+            receipt=ObservationReceipt(
+                tenant_id=tenant,
+                job_id=context.job_id,
+                attempt_id=context.attempt_id,
+                observation_id=str(receipt_data["observation_id"]),
+                artifact_id=str(receipt_data["artifact_id"]),
+                result_ref=str(receipt_data["result_ref"]),
+                manifest_digest=str(receipt_data["manifest_digest"]),
+            ),
+            outcome="success",
+            work=inspected["work"],
+            run_truths=[inspected["receipt"]],
+            worker_id="fixture-worker",
+        )
+
+    with pytest.raises(LeaseError, match="revoked"):
+        evidence.persist_job_observation(
+            attempt_id=context.attempt_id,
+            delivery_key=str(leased["delivery_idempotency_key"]),
+            payload=payload,
+            source_target="fixture.invalid",
+            outcome="success",
+            transaction_guard=reserve,
+        )
+
+    assert authority.coverage_snapshot(context.job_id, tenant_id=tenant)[
+        "completed"
+    ] == 0
+    for table in (
+        "durable_job_state_deliveries",
+        "durable_job_state_terminal_proofs",
+        "canonical_observations",
+        "canonical_artifact_refs",
+        "canonical_artifact_manifests",
+    ):
+        assert session.execute(
+            text(f"SELECT COUNT(*) FROM {table} WHERE tenant_id=:tenant_id"),
+            {"tenant_id": tenant},
+        ).scalar_one() == 0
+    assert _custody_files(custody_root) == []
+    session.close()
+    authority.close()
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="requires fork")
+def test_abrupt_precommit_process_death_recovers_exact_custody_once(
+    tmp_path: Path,
+) -> None:
+    """A real child exit after filesystem staging is restart-recoverable."""
+
+    import hashlib
+    import os
+    from dataclasses import replace
+
+    from common.job_state import (
+        JobState,
+        JobStateService,
+        ObservationReceipt,
+    )
+
+    database = tmp_path / "abrupt-precommit.db"
+    base_context = _context("tenant-a", run_suffix="abrupt-precommit")
+    attempt_id = "attempt-abrupt-precommit"
+    context = replace(base_context, attempt_id=attempt_id)
+    authority = JobStateService(
+        database,
+        authorization_checker=lambda *_args: True,
+    )
+    job = authority.create_job(
+        {"target": "fixture.invalid"},
+        tenant_id=context.tenant_id,
+        job_id=context.job_id,
+        engagement_id=context.engagement_id,
+        run_id=context.run_id,
+        job_kind=context.engine,
+        state=JobState.QUEUED,
+        authorization_decision_id=context.decision_id,
+        authorization_action_id=context.action_id,
+        work_items=("agent-result",),
+    )
+    leased = authority.acquire_lease(
+        str(job["id"]),
+        "fixture-worker",
+        tenant_id=context.tenant_id,
+        attempt_id=attempt_id,
+    )
+    authority.start_attempt(
+        attempt_id,
+        str(leased["lease_token"]),
+        tenant_id=context.tenant_id,
+        worker_id="fixture-worker",
+    )
+    authority.close()
+    custody_root = tmp_path / "abrupt-precommit-custody"
+    payload = {"outcome": "success", "result": {"count": 1}}
+    delivery_key = str(leased["delivery_idempotency_key"])
+
+    child_pid = os.fork()
+    if child_pid == 0:
+        try:
+            child_session = create_db(database)
+            child_evidence = CanonicalEvidenceService(
+                child_session,
+                custody_root,
+                context,
+            )
+
+            def abrupt_exit(*_args: object, **_kwargs: object) -> None:
+                os._exit(23)
+
+            child_evidence.store.persist_custodied_observation = abrupt_exit  # type: ignore[method-assign]
+            child_evidence.persist_job_observation(
+                attempt_id=attempt_id,
+                delivery_key=delivery_key,
+                payload=payload,
+                source_target="fixture.invalid",
+                outcome="success",
+            )
+        except BaseException:
+            os._exit(91)
+        os._exit(92)
+
+    waited_pid, wait_status = os.waitpid(child_pid, 0)
+    assert waited_pid == child_pid
+    assert os.WIFEXITED(wait_status)
+    assert os.WEXITSTATUS(wait_status) == 23
+    staged_files = {
+        str(path.relative_to(custody_root)): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in _custody_files(custody_root)
+    }
+    assert len(staged_files) == 3
+    pre_recovery = create_db(database)
+    try:
+        assert pre_recovery.execute(
+            text(
+                "SELECT COUNT(*) FROM canonical_observations "
+                "WHERE tenant_id=:tenant_id AND job_id=:job_id"
+            ),
+            {"tenant_id": context.tenant_id, "job_id": context.job_id},
+        ).scalar_one() == 0
+        assert pre_recovery.execute(
+            text(
+                "SELECT COUNT(*) FROM durable_job_state_deliveries "
+                "WHERE tenant_id=:tenant_id AND job_id=:job_id"
+            ),
+            {"tenant_id": context.tenant_id, "job_id": context.job_id},
+        ).scalar_one() == 0
+    finally:
+        pre_recovery.close()
+
+    authority = JobStateService(
+        database,
+        authorization_checker=lambda *_args: True,
+    )
+    recovery_session = create_db(database)
+    evidence = CanonicalEvidenceService(
+        recovery_session,
+        custody_root,
+        context,
+    )
+    work = [{"work_key": "agent-result", "required": True}]
+
+    def reserve(active_session: Any, receipt_data: dict[str, Any]) -> None:
+        authority.reserve_custodied_result(
+            active_session,
+            attempt_id,
+            str(leased["lease_token"]),
+            delivery_key=delivery_key,
+            tenant_id=context.tenant_id,
+            receipt=ObservationReceipt(
+                tenant_id=context.tenant_id,
+                job_id=context.job_id,
+                attempt_id=attempt_id,
+                observation_id=str(receipt_data["observation_id"]),
+                artifact_id=str(receipt_data["artifact_id"]),
+                result_ref=str(receipt_data["result_ref"]),
+                manifest_digest=str(receipt_data["manifest_digest"]),
+            ),
+            outcome="success",
+            work=work,
+            worker_id="fixture-worker",
+        )
+
+    receipt_data = evidence.persist_job_observation(
+        attempt_id=attempt_id,
+        delivery_key=delivery_key,
+        payload=payload,
+        source_target="fixture.invalid",
+        outcome="success",
+        transaction_guard=reserve,
+    )
+    receipt = ObservationReceipt(
+        tenant_id=context.tenant_id,
+        job_id=context.job_id,
+        attempt_id=attempt_id,
+        observation_id=str(receipt_data["observation_id"]),
+        artifact_id=str(receipt_data["artifact_id"]),
+        result_ref=str(receipt_data["result_ref"]),
+        manifest_digest=str(receipt_data["manifest_digest"]),
+    )
+    authority.record_result(
+        attempt_id,
+        str(leased["lease_token"]),
+        delivery_key=delivery_key,
+        tenant_id=context.tenant_id,
+        receipt=receipt,
+        work=work,
+        worker_id="fixture-worker",
+    )
+    authority.finish_attempt(
+        attempt_id,
+        tenant_id=context.tenant_id,
+        lease_token=str(leased["lease_token"]),
+        worker_id="fixture-worker",
+    )
+
+    recovered_files = {
+        str(path.relative_to(custody_root)): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in _custody_files(custody_root)
+    }
+    assert recovered_files == staged_files
+    assert recovery_session.execute(
+        text(
+            "SELECT COUNT(*) FROM canonical_observations "
+            "WHERE tenant_id=:tenant_id AND job_id=:job_id"
+        ),
+        {"tenant_id": context.tenant_id, "job_id": context.job_id},
+    ).scalar_one() == 1
+    assert recovery_session.execute(
+        text(
+            "SELECT COUNT(*) FROM durable_job_state_deliveries "
+            "WHERE tenant_id=:tenant_id AND job_id=:job_id "
+            "AND state='accepted'"
+        ),
+        {"tenant_id": context.tenant_id, "job_id": context.job_id},
+    ).scalar_one() == 1
+    recovery_session.close()
+    authority.close()
+
+
 def test_one_finding_links_observations_from_separate_runs(
     tmp_path: Path,
     registered_canaries: None,

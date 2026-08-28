@@ -36,6 +36,7 @@ import asyncio
 import getpass
 import os
 import socket
+import signal
 import sys
 import subprocess
 import logging
@@ -1409,7 +1410,7 @@ def handle_scan(
         if credential_bundle is not None:
             credential_bundle.wipe()
         if dashboard_proc:
-            dashboard_proc.terminate()
+            _stop_background_dashboard(dashboard_proc)
 
 
 def _build_framework_args(args: argparse.Namespace, framework_key: str) -> list[str]:
@@ -1609,6 +1610,15 @@ def _launch_dashboard_background(
         "--port", str(port),
     ]
     try:
+        pidfd_open = getattr(os, "pidfd_open", None)
+        pidfd_signal = getattr(signal, "pidfd_send_signal", None)
+        if os.name == "posix" and (
+            not callable(pidfd_open) or not callable(pidfd_signal)
+        ):
+            log.warning(
+                "Background dashboard not started: PID-safe control unavailable"
+            )
+            return None
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
@@ -1651,6 +1661,10 @@ def _launch_dashboard_background(
                 },
             ),
         )
+        process_pid = getattr(proc, "pid", None)
+        if os.name == "posix" and isinstance(process_pid, int):
+            assert callable(pidfd_open)
+            setattr(proc, "_forge_pidfd", int(pidfd_open(process_pid, 0)))
         return proc
     except Exception as e:
         log.warning(
@@ -1658,6 +1672,28 @@ def _launch_dashboard_background(
             type(e).__name__,
         )
         return None
+
+
+def _stop_background_dashboard(process: subprocess.Popen[Any]) -> None:
+    """Stop the CLI-owned dashboard only through a stable OS capability."""
+
+    pidfd = getattr(process, "_forge_pidfd", None)
+    try:
+        if isinstance(pidfd, int):
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+        elif os.name == "nt":
+            process.send_signal(signal.SIGTERM)
+        elif not isinstance(getattr(process, "pid", None), int):
+            # Unit-test doubles have no OS process identity.
+            getattr(process, "terminate")()
+        else:
+            log.warning(
+                "Refusing to stop background dashboard without PID capability"
+            )
+    finally:
+        if isinstance(pidfd, int):
+            os.close(pidfd)
+            setattr(process, "_forge_pidfd", None)
 
 
 def handle_c2(args: argparse.Namespace) -> int:

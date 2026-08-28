@@ -33,6 +33,7 @@ from common.confirm_gate import (
     LAUNCH_JOB_ID_ENV,
 )
 from common.db import AuthorizationDecisionModel, create_db
+from common.job_state import JobState, JobStateService, ProcessIdentity, process_identity
 from common.scope import ScopeReason
 
 
@@ -66,6 +67,45 @@ class _FakeContext:
 
     def load_cert_chain(self, certfile, keyfile=None) -> None:
         self.loaded_cert_chain = (certfile, keyfile)
+
+
+class _FakeProcessSupervisor:
+    BOOT_ID = "fixture-agent-boot"
+
+    def __init__(self) -> None:
+        self.terminated: list[ProcessIdentity] = []
+        self.killed: list[ProcessIdentity] = []
+
+    @classmethod
+    def _boot_id(cls) -> str:
+        return cls.BOOT_ID
+
+    def capture(self, process, *, launch_nonce: str) -> ProcessIdentity:
+        return process_identity(
+            44_001,
+            start_token="fixture-agent-child",
+            command="fixture-agent-scanner",
+            boot_id=self.BOOT_ID,
+            launch_nonce=launch_nonce,
+        )
+
+    def is_alive(self, _identity: ProcessIdentity) -> bool:
+        return False
+
+    def terminate(self, identity: ProcessIdentity) -> None:
+        self.terminated.append(identity)
+
+    def kill(self, identity: ProcessIdentity) -> None:
+        self.killed.append(identity)
+
+    def pause(self, _identity: ProcessIdentity) -> None:
+        return None
+
+    def resume(self, _identity: ProcessIdentity) -> None:
+        return None
+
+    def discover(self, _launch_nonce: str) -> ProcessIdentity | None:
+        return None
 
 
 def _agent_args(**overrides) -> argparse.Namespace:
@@ -205,6 +245,8 @@ def test_run_agent_stops_before_control_plane_network(monkeypatch) -> None:
 
 def test_scanner_process_renews_lease_while_running(monkeypatch) -> None:
     heartbeats = []
+    started = []
+    exited = []
 
     class _Process:
         returncode = 0
@@ -226,6 +268,7 @@ def test_scanner_process_renews_lease_while_running(monkeypatch) -> None:
 
     process = _Process()
     monkeypatch.setattr(forge_agent.subprocess, "Popen", lambda *args, **kwargs: process)
+    supervisor = _FakeProcessSupervisor()
 
     result = forge_agent._run_with_lease_heartbeat(
         ["scanner"],
@@ -234,15 +277,25 @@ def test_scanner_process_renews_lease_while_running(monkeypatch) -> None:
         heartbeat=lambda: heartbeats.append("renewed"),
         heartbeat_interval=0.25,
         timeout=5.0,
+        launch_nonce="launch-heartbeat-success",
+        process_supervisor=supervisor,
+        process_started=started.append,
+        process_exited=lambda identity, return_code: exited.append(
+            (identity, return_code)
+        ),
     )
 
     assert result.returncode == 0
     assert result.stdout == "fixture complete\n"
     assert heartbeats == ["renewed"]
+    assert len(started) == 1
+    assert exited == [(started[0], 0)]
 
 
 def test_scanner_process_is_terminated_when_lease_renewal_fails(monkeypatch) -> None:
     terminated = []
+    started = []
+    exited = []
 
     class _Process:
         returncode = -15
@@ -275,9 +328,17 @@ def test_scanner_process_is_terminated_when_lease_renewal_fails(monkeypatch) -> 
             heartbeat=lambda: (_ for _ in ()).throw(RuntimeError("revoked")),
             heartbeat_interval=0.25,
             timeout=5.0,
+            launch_nonce="launch-heartbeat-failure",
+            process_supervisor=_FakeProcessSupervisor(),
+            process_started=started.append,
+            process_exited=lambda identity, return_code: exited.append(
+                (identity, return_code)
+            ),
         )
 
     assert terminated == [True]
+    assert len(started) == 1
+    assert exited == [(started[0], -15)]
 
 
 def test_forge_agent_subcommand_exposes_tls_flags() -> None:
@@ -383,20 +444,96 @@ def _authorized_active_job(tmp_path, monkeypatch, **overrides):
     )
     session.close()
     assert child.allowed
+    agent_id = "agent-local"
+    durable = JobStateService(db_path)
+    try:
+        durable.register_agent(
+            agent_id,
+            tenant_id=base.tenant_id,
+            key_id="fixture-key",
+            credential_digest="fixture-credential-digest",
+            engines=[job["engine"]],
+            capabilities=["active_scan", "scoped_jobs"],
+            scope=job["scope"],
+            excluded_scope=job["excluded_scope"],
+            active_scan_enabled=True,
+        )
+        durable.create_job(
+            job,
+            tenant_id=base.tenant_id,
+            job_id=job["id"],
+            engagement_id=base.engagement_id,
+            run_id=base.run_id,
+            job_kind=job["engine"],
+            target=job["target"],
+            authorization_decision_id=issued.envelope.decision_id,
+            authorization_action_id=issued.envelope.action_id,
+            assigned_agent_id=agent_id,
+            state=JobState.QUEUED,
+        )
+        leased = durable.acquire_lease(
+            job["id"],
+            agent_id,
+            tenant_id=base.tenant_id,
+            attempt_authorization_decision_id=child.envelope.decision_id,
+            control_boot_id=_FakeProcessSupervisor.BOOT_ID,
+        )
+        started = durable.start_attempt(
+            str(leased["id"]),
+            str(leased["lease_token"]),
+            tenant_id=base.tenant_id,
+            worker_id=agent_id,
+        )
+        intent = durable.reserve_process(
+            job["id"],
+            str(started["id"]),
+            "agent-main",
+            lease_token=str(leased["lease_token"]),
+            worker_id=agent_id,
+            control_boot_id=_FakeProcessSupervisor.BOOT_ID,
+            tenant_id=base.tenant_id,
+        )
+    finally:
+        durable.close()
     job["authorization_envelope"] = child.envelope.to_dict()
     job["runtime_context"] = load_authorization_runtime_facts(
         authorization_runtime_environment(child.envelope)
     )
     job["authorization_db"] = str(db_path)
+    job.update(
+        {
+            "tenant_id": base.tenant_id,
+            "run_id": base.run_id,
+            "agent_id": agent_id,
+            "attempt_id": started["id"],
+            "attempt_run_id": started["run_id"],
+            "lease_token": leased["lease_token"],
+            "delivery_idempotency_key": started[
+                "delivery_idempotency_key"
+            ],
+            "authorization_id": child.envelope.decision_id,
+            "process_identity_key": intent["identity_key"],
+            "process_launch_nonce": intent["launch_nonce"],
+            "process_control_boot_id": _FakeProcessSupervisor.BOOT_ID,
+        }
+    )
     return job
 
 
-def _execute_job(job, *, allow_active_scans=True, local_scope=None, local_excluded=None):
+def _execute_job(
+    job,
+    *,
+    allow_active_scans=True,
+    local_scope=None,
+    local_excluded=None,
+    process_supervisor=None,
+):
     return forge_agent._safe_job_result(
         job,
         allow_active_scans,
         local_scope=["127.0.0.0/8"] if local_scope is None else local_scope,
         local_excluded_scope=[] if local_excluded is None else local_excluded,
+        process_supervisor=process_supervisor or _FakeProcessSupervisor(),
     )
 
 
@@ -426,7 +563,7 @@ def test_agent_dry_run_validates_scope_without_process_or_authorization(monkeypa
     def forbidden_run(*args, **kwargs):
         raise AssertionError("dry-run must not create a subprocess")
 
-    monkeypatch.setattr(forge_agent.subprocess, "run", forbidden_run)
+    monkeypatch.setattr(forge_agent.subprocess, "Popen", forbidden_run)
     job = _active_job(dry_run=True, confirmation=None)
 
     result = _execute_job(job)
@@ -439,7 +576,11 @@ def test_agent_dry_run_validates_scope_without_process_or_authorization(monkeypa
 
 def test_agent_rejects_non_boolean_dry_run_before_subprocess(monkeypatch) -> None:
     calls = []
-    monkeypatch.setattr(forge_agent.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(
+        forge_agent.subprocess,
+        "Popen",
+        lambda *args, **kwargs: calls.append(args),
+    )
     job = _active_job()
     job["dry_run"] = 0
 
@@ -455,11 +596,42 @@ def test_agent_active_job_revalidates_and_passes_exact_child_context(
     tmp_path,
     monkeypatch,
 ) -> None:
+    import base64
+    from dataclasses import replace
+
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+
+    import common.run_truth as run_truth_module
+    from common.db import append_run_collection_truth, finding_set_identity
+    from common.run_truth import (
+        RUN_TRUTH_POLICY,
+        RunCollectionStatus,
+        RunCollectionTruth,
+        run_collection_truth_attestation_payload,
+    )
+
     calls = []
+    signer = Ed25519PrivateKey.generate()
+    policy = replace(
+        RUN_TRUTH_POLICY,
+        issuer_public_key=base64.b64encode(
+            signer.public_key().public_bytes_raw()
+        ).decode("ascii"),
+    )
+    monkeypatch.setattr(run_truth_module, "RUN_TRUTH_POLICY", policy)
 
     class _Process:
         returncode = 0
-        stdout = "mocked scanner complete\n"
+
+        @staticmethod
+        def communicate(timeout=None):
+            return ("mocked scanner complete\n", None)
+
+        @staticmethod
+        def poll():
+            return 0
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
@@ -481,9 +653,47 @@ def test_agent_active_job_revalidates_and_passes_exact_child_context(
         assert engine_decision.allowed
         assert len(envelopes) == 1
         assert envelopes[0].module_id == module_set_binding(module_value.split(","))
+        run_truth_id = f"{job['run_id']}:webforge"
+        session = create_db(job["authorization_db"])
+        try:
+            truth = RunCollectionTruth(
+                run_id=run_truth_id,
+                authorization_run_id=job["run_id"],
+                job_id=job["id"],
+                tenant_id=job["tenant_id"],
+                framework="webforge",
+                scope_binding="sha256:" + "a" * 64,
+                target_binding="sha256:" + "b" * 64,
+                collection_status=RunCollectionStatus.SUCCESS,
+                coverage_complete=True,
+                coverage_identity="sha256:" + "c" * 64,
+                finding_set_identity=finding_set_identity(
+                    session,
+                    tenant_id=job["tenant_id"],
+                    run_id=run_truth_id,
+                ),
+                predecessor_run_id="",
+                run_sequence=1,
+                completed_at="2026-08-27T00:00:00+00:00",
+                authorization_decision_id=envelopes[0].decision_id,
+                authorization_binding=envelopes[0].binding_digest,
+                authority_id="fixture-run-authority",
+                policy_id=policy.policy_id,
+                policy_version=policy.policy_version,
+                issuer_id=policy.issuer_id,
+            )
+            truth = replace(
+                truth,
+                attestation=base64.b64encode(
+                    signer.sign(run_collection_truth_attestation_payload(truth))
+                ).decode("ascii"),
+            )
+            append_run_collection_truth(session, truth, policy=policy)
+        finally:
+            session.close()
         return _Process()
 
-    monkeypatch.setattr(forge_agent.subprocess, "run", fake_run)
+    monkeypatch.setattr(forge_agent.subprocess, "Popen", fake_run)
     monkeypatch.setenv("FORGE_PASSWORD", "AMBIENT_PASSWORD_MUST_NOT_REACH_CHILD")
     monkeypatch.setenv(
         "HTTPS_PROXY",
@@ -491,10 +701,12 @@ def test_agent_active_job_revalidates_and_passes_exact_child_context(
     )
     monkeypatch.setenv("NO_PROXY", "127.0.0.1")
 
-    result = _execute_job(_authorized_active_job(tmp_path, monkeypatch))
+    job = _authorized_active_job(tmp_path, monkeypatch)
+    result = _execute_job(job)
 
     assert result["status"] == "completed"
     assert result["result"]["authorized"] is True
+    assert result["result"]["run_truth_id"] == f"{job['run_id']}:webforge"
     assert len(calls) == 1
     command, kwargs = calls[0]
     assert "--auto-confirm" not in command
@@ -509,11 +721,138 @@ def test_agent_active_job_revalidates_and_passes_exact_child_context(
     assert LAUNCH_CONFIRMATIONS_ENV in kwargs["env"]
     assert kwargs["env"][LAUNCH_JOB_ID_ENV] == "agent-local-active"
     assert kwargs["env"][LAUNCH_ACTION_ENV] == "scan"
+    assert kwargs["env"]["FORGE_JOB_ATTEMPT_ID"]
+    assert kwargs["env"]["FORGE_JOB_ATTEMPT_ID_LAUNCH_NONCE"]
+    assert callable(kwargs["preexec_fn"])
     assert "FORGE_PASSWORD" not in kwargs["env"]
     assert "HTTPS_PROXY" not in kwargs["env"]
     assert "NO_PROXY" not in kwargs["env"]
     assert "CANARY_AGENT_PROXY" not in repr(kwargs["env"])
     assert kwargs["stdin"] is forge_agent.subprocess.DEVNULL
+    durable = JobStateService(job["authorization_db"])
+    try:
+        processes = durable.list_processes(
+            job["id"],
+            tenant_id=job["tenant_id"],
+        )
+        events = durable.list_events(
+            job["id"],
+            tenant_id=job["tenant_id"],
+        )
+        assert len(processes) == 1
+        assert processes[0]["state"] == "stopped"
+        assert processes[0]["boot_id"] == _FakeProcessSupervisor.BOOT_ID
+        assert [
+            event["event_type"]
+            for event in events
+            if event["event_type"].startswith("child_")
+        ] == ["child_launch_reserved", "child_registered", "child_exited"]
+        assert durable.get_job(
+            job["id"], tenant_id=job["tenant_id"]
+        )["state"] == JobState.RUNNING.value
+    finally:
+        durable.close()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda job: job.update(attempt_id="forged-attempt"),
+        lambda job: job.update(agent_id="forged-agent"),
+        lambda job: job.update(lease_token="forged-lease"),
+        lambda job: job.update(process_launch_nonce="forged-launch"),
+        lambda job: job.update(process_control_boot_id="remote-boot"),
+        lambda job: job.update(authorization_db="/tmp/forged-agent-state.db"),
+    ],
+)
+def test_active_agent_requires_exact_same_node_durable_context_before_popen(
+    tmp_path,
+    monkeypatch,
+    mutate,
+) -> None:
+    job = _authorized_active_job(tmp_path, monkeypatch)
+    mutate(job)
+    calls = []
+    monkeypatch.setattr(
+        forge_agent.subprocess,
+        "Popen",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    result = _execute_job(job)
+
+    assert result["status"] == "failed"
+    assert result["error"] == "durable_process_context_invalid"
+    assert calls == []
+
+
+def test_active_agent_cancel_between_popen_and_register_kills_and_abandons(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    job = _authorized_active_job(tmp_path, monkeypatch)
+    stopped = []
+
+    class _Process:
+        returncode = -15
+
+        @staticmethod
+        def poll():
+            return -15 if stopped else None
+
+        @staticmethod
+        def terminate():
+            stopped.append("terminated")
+
+        @staticmethod
+        def kill():
+            stopped.append("killed")
+
+        @staticmethod
+        def communicate(timeout=None):
+            if stopped:
+                return ("canceled before registration\n", None)
+            raise forge_agent.subprocess.TimeoutExpired(["scanner"], timeout)
+
+    def cancel_before_registration(*_args, **_kwargs):
+        durable = JobStateService(job["authorization_db"])
+        try:
+            durable.cancel_job(
+                job["id"],
+                tenant_id=job["tenant_id"],
+                sla_seconds=0,
+            )
+        finally:
+            durable.close()
+        return _Process()
+
+    monkeypatch.setattr(
+        forge_agent.subprocess,
+        "Popen",
+        cancel_before_registration,
+    )
+
+    result = _execute_job(job)
+
+    assert result["status"] == "failed"
+    assert result["lease_lost"] is True
+    assert stopped == ["terminated"]
+    durable = JobStateService(job["authorization_db"])
+    try:
+        assert durable.get_job(
+            job["id"], tenant_id=job["tenant_id"]
+        )["state"] == JobState.CANCELED.value
+        assert durable.list_processes(
+            job["id"], tenant_id=job["tenant_id"]
+        ) == []
+        intent = durable.conn.execute(
+            "SELECT state FROM durable_job_state_launch_intents "
+            "WHERE tenant_id=? AND attempt_id=? AND identity_key='agent-main'",
+            (job["tenant_id"], job["attempt_id"]),
+        ).fetchone()
+        assert intent["state"] == "abandoned"
+    finally:
+        durable.close()
 
 
 def test_agent_rejects_module_set_mutation_before_subprocess(
@@ -523,7 +862,7 @@ def test_agent_rejects_module_set_mutation_before_subprocess(
     calls = []
     monkeypatch.setattr(
         forge_agent.subprocess,
-        "run",
+        "Popen",
         lambda *args, **kwargs: calls.append(args),
     )
     job = _authorized_active_job(tmp_path, monkeypatch)
@@ -538,7 +877,11 @@ def test_agent_rejects_module_set_mutation_before_subprocess(
 
 def test_agent_enforces_immutable_local_scope_before_subprocess(monkeypatch) -> None:
     calls = []
-    monkeypatch.setattr(forge_agent.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(
+        forge_agent.subprocess,
+        "Popen",
+        lambda *args, **kwargs: calls.append(args),
+    )
 
     result = _execute_job(
         _active_job(),
@@ -552,7 +895,11 @@ def test_agent_enforces_immutable_local_scope_before_subprocess(monkeypatch) -> 
 
 def test_agent_rejects_mutated_action_before_subprocess(monkeypatch) -> None:
     calls = []
-    monkeypatch.setattr(forge_agent.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(
+        forge_agent.subprocess,
+        "Popen",
+        lambda *args, **kwargs: calls.append(args),
+    )
     job = _active_job(action="retest")
 
     result = _execute_job(job)
@@ -567,11 +914,18 @@ def test_agent_builds_argv_from_normalized_target(tmp_path, monkeypatch) -> None
 
     class _Process:
         returncode = 0
-        stdout = ""
+
+        @staticmethod
+        def communicate(timeout=None):
+            return ("", None)
+
+        @staticmethod
+        def poll():
+            return 0
 
     monkeypatch.setattr(
         forge_agent.subprocess,
-        "run",
+        "Popen",
         lambda command, **kwargs: calls.append(command) or _Process(),
     )
     job = _authorized_active_job(tmp_path, monkeypatch)
@@ -581,6 +935,7 @@ def test_agent_builds_argv_from_normalized_target(tmp_path, monkeypatch) -> None
     result = _execute_job(job)
 
     assert result["status"] == "completed"
+    assert result["result"]["run_truth_id"] is None
     assert len(calls) == 1
     command = calls[0]
     assert command[command.index("--target") + 1] == expected
@@ -612,7 +967,11 @@ def test_agent_builds_argv_from_normalized_target(tmp_path, monkeypatch) -> None
 )
 def test_agent_denials_never_reach_subprocess(monkeypatch, mutate, expected_reason) -> None:
     calls = []
-    monkeypatch.setattr(forge_agent.subprocess, "run", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(
+        forge_agent.subprocess,
+        "Popen",
+        lambda *args, **kwargs: calls.append(args),
+    )
     job = _active_job()
     mutate(job)
 

@@ -134,6 +134,29 @@ def test_complete_finding_resolves_mandatory_lineage(tmp_path: Path) -> None:
         session.close()
 
 
+def test_task103_attempt_link_is_additive_to_accepted_observation_bytes(
+    tmp_path: Path,
+) -> None:
+    session, _store, graph = _graph(tmp_path)
+    try:
+        legacy_payload = graph["observation"].to_dict()
+        assert "attempt_id" not in legacy_payload
+        assert Observation.from_dict(legacy_payload) == graph["observation"]
+
+        attempt_bound = Observation.from_dict(
+            {
+                **legacy_payload,
+                "attempt_id": "attempt-fixture",
+            }
+        )
+        assert attempt_bound.to_dict()["attempt_id"] == "attempt-fixture"
+        assert Observation.from_dict(
+            attempt_bound.to_dict()
+        ) == attempt_bound
+    finally:
+        session.close()
+
+
 def test_optional_intelligence_retest_report_export_links_share_finding(tmp_path: Path) -> None:
     session, store, graph = _graph(tmp_path)
     try:

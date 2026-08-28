@@ -1554,6 +1554,17 @@ async def _run_scan_impl(
         excluded=cfg.extra.get("excluded_scope", getattr(args, "exclude", None)),
     )
     run_id = engine_authorization.run_id
+    run = ScanRunModel(
+        id=run_id,
+        tenant_id=engine_authorization.tenant_id,
+        framework=ENGINE_NAME,
+        target=cfg.target,
+        mode=cfg.mode,
+        engagement=cfg.engagement,
+        tester=cfg.tester,
+    )
+    db_session.add(run)
+    db_session.commit()
 
     include = [m.strip() for m in args.modules.split(",")] if args.modules else None
     skip    = [m.strip() for m in args.skip_modules.split(",")] if args.skip_modules else None
@@ -1562,6 +1573,11 @@ async def _run_scan_impl(
     all_module_names = []
     for _, _, phase_mods in PHASES:
         all_module_names.extend(phase_mods)
+    planned_capabilities = tuple(
+        module
+        for phase in _planned_phases(args)
+        for module in phase["modules"]
+    )
 
     # ── Emit: scan_start ──────────────────────────────────────────────
     _emit(bus, Event, EventType, "scan_start", source="netforge",
@@ -1590,6 +1606,7 @@ async def _run_scan_impl(
 
     # Count total modules for progress calculation
     total_modules = 0
+    coverage_completed: set[str] = set()
     for _, pname, pmods in PHASES:
         if args.mode == "external" and pname == "Internal Analysis":
             continue
@@ -1787,6 +1804,7 @@ async def _run_scan_impl(
                     merge_module_output_extra(cfg.extra, module_config.extra)
                     async with _progress_lock:
                         modules_completed += 1
+                        coverage_completed.add(mname)
                         pct = round(modules_completed / total_modules * 100) if total_modules else 0
                     _emit(bus, Event, EventType, "module_complete", source=mname,
                           name=mname, findings_count=len(result.findings))
@@ -1855,6 +1873,9 @@ async def _run_scan_impl(
 
     elapsed = time.monotonic() - start_time
     status = "aborted" if aborted else ("failed" if errors else "completed")
+    run.ended_at = datetime.now(timezone.utc)
+    run.status = status
+    db_session.commit()
 
     if aborted:
         _emit(bus, Event, EventType, "scan_aborted", source="netforge",
@@ -1916,11 +1937,49 @@ async def _run_scan_impl(
             console.print(f"  Chain:    {attack_chain.stats['compromised_hosts']} hosts compromised | {attack_chain.stats['valid_creds']} creds")
         console.print(f"  Results:  {results_dir}")
 
+    run_truth: dict[str, Any]
+    try:
+        from common.run_finalization import (
+            RunCompletionManifest,
+            RunFinalizationError,
+            finalize_authorized_run,
+        )
+
+        finalized = finalize_authorized_run(
+            db_session,
+            authorization=engine_authorization,
+            framework=ENGINE_NAME,
+            target=cfg.target,
+            manifest=RunCompletionManifest(
+                planned_capabilities=planned_capabilities,
+                completed_capabilities=tuple(coverage_completed),
+                status=status,
+                completed_at=run.ended_at,
+                engine_version=VERSION,
+            ),
+        )
+        run_truth = {
+            "state": "persisted",
+            "run_id": finalized.truth.run_id,
+            "collection_status": finalized.truth.collection_status.value,
+            "coverage_complete": finalized.truth.coverage_complete,
+            "delta_state": finalized.delta.get(
+                "comparison_state",
+                "inconclusive",
+            ),
+        }
+    except RunFinalizationError as exc:
+        run_truth = {
+            "state": "unavailable",
+            "reason_code": exc.reason_code,
+        }
+
     return {
         "status": status,
         "findings": len(all_findings),
         "errors": errors,
         "duration": round(elapsed, 1),
+        "run_truth": run_truth,
     }
 
 

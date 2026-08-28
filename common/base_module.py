@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import math
+import os
 import re
 import time
 import uuid
@@ -37,7 +38,7 @@ from common.action_authorization import (
     validate_consumed_authorization,
 )
 from common.canonical import MissingCanonicalContextError
-from common.canonical_evidence import CanonicalEvidenceService
+from common.canonical_evidence import CanonicalEvidenceService, JOB_ATTEMPT_ID_ENV
 from common.outbound_policy import (
     ApprovedEgressRoute,
     AuthorizationDatabaseOutboundAuditSink,
@@ -1151,6 +1152,10 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
                             self.db,
                             self.results_dir / "evidence-custody",
                             self.authorization_envelope,
+                            attempt_id=(
+                                os.environ.get(JOB_ATTEMPT_ID_ENV, "").strip()
+                                or None
+                            ),
                         )
                     )
                 self._canonical_evidence_service.persist_finding(finding)
