@@ -5,12 +5,8 @@ import Button from '../components/Button';
 import Badge from '../components/Badge';
 import { useWebSocket } from '../hooks/useWebSocket';
 import {
-  BUSINESS_OPTIONS,
-  OWNER_OPTIONS,
   PRIORITY_RANK,
   SLA_DAYS,
-  TICKET_STATES,
-  WORKFLOW_STORAGE_KEY,
   addDays,
   applyRetestTruth,
   hydrateWorkflow,
@@ -87,7 +83,11 @@ const persistedFinding = (finding, index) => {
   if (!finding || typeof finding !== 'object' || Array.isArray(finding)) return null;
   return {
     ...normalizeFindingTruth(finding),
-    status: displayStatus(finding.status),
+    status: displayStatus(
+      Number.isInteger(finding.review_version) && finding.review_version > 0
+        ? finding.review_status
+        : finding.status,
+    ),
     id: finding.id || finding.finding_id || `f-${index}`,
     cve: finding.cve || '',
     finding: finding.title || finding.finding || '',
@@ -100,29 +100,17 @@ const persistedFinding = (finding, index) => {
     repro: finding.reproduction_steps || finding.repro || '',
     evidence: renderPersistedEvidence(finding.evidence),
     remediation: finding.remediation || '',
-    owner: finding.owner || 'Unassigned',
+    owner: finding.review_owner_operator_id || 'Unassigned',
     businessImpact: finding.business_impact || finding.businessImpact
       || (finding.severity === 'critical' ? 'Critical Service' : 'Unknown'),
     dueDate: finding.due_date || finding.dueDate
       || addDays(SLA_DAYS[(finding.severity || 'info').toLowerCase()] || 90),
-    ticketState: finding.ticket_state || finding.ticketState || 'Not Filed',
-    ticketId: finding.ticket_id || finding.ticketId || '',
-    queueNote: finding.queue_note || finding.queueNote || '',
+    queueNote: finding.review_notes || '',
+    reviewRevisionId: finding.review_revision_id || null,
+    reviewUpdatedAt: finding.review_updated_at || null,
+    reviewUpdatedBy: finding.review_updated_by_operator_id || null,
+    reviewVersion: Number.isInteger(finding.review_version) ? finding.review_version : 0,
   };
-};
-
-const loadWorkflowMeta = () => {
-  try {
-    return JSON.parse(window.localStorage.getItem(WORKFLOW_STORAGE_KEY)) || {};
-  } catch {
-    return {};
-  }
-};
-
-const saveWorkflowMeta = (meta) => {
-  try {
-    window.localStorage.setItem(WORKFLOW_STORAGE_KEY, JSON.stringify(meta));
-  } catch {}
 };
 
 const Vulnerabilities = ({ authToken }) => {
@@ -136,7 +124,9 @@ const Vulnerabilities = ({ authToken }) => {
   const [filterOwner, setFilterOwner] = useState('all');
   const [filterSla, setFilterSla] = useState('all');
   const [sortBy, setSortBy]         = useState('cvss');
-  const [workflowMeta, setWorkflowMeta] = useState(loadWorkflowMeta);
+  const [reviewDrafts, setReviewDrafts] = useState({});
+  const [reviewError, setReviewError] = useState('');
+  const [reviewSaving, setReviewSaving] = useState(null);
 
   // Slide-out panel
   const [selectedId, setSelectedId] = useState(null);
@@ -154,13 +144,9 @@ const Vulnerabilities = ({ authToken }) => {
   const [statusUpdating, setStatusUpdating] = useState(null);
   const findingsRefreshSequence = useRef(0);
 
-  useEffect(() => {
-    saveWorkflowMeta(workflowMeta);
-  }, [workflowMeta]);
-
   const hydratedVulns = React.useMemo(
-    () => vulns.map(v => hydrateWorkflow(v, workflowMeta)),
-    [vulns, workflowMeta]
+    () => vulns.map(v => hydrateWorkflow(v)),
+    [vulns]
   );
 
   const selected = hydratedVulns.find(v => v.id === selectedId) || null;
@@ -205,23 +191,9 @@ const Vulnerabilities = ({ authToken }) => {
       && data && typeof data === 'object' && !Array.isArray(data)
       && (data.finding_id || data.id)
     ) {
-      const truth = normalizeFindingTruth(data);
-      const findingId = data.finding_id || data.id;
-      const truthPatch = Object.fromEntries(
-        [
-          'confidence', 'verification_state', 'proof_type', 'maturity',
-          'retest_reason_code', 'retest_state', 'retest_status', 'retest_verdict',
-        ]
-          .filter(key => Object.prototype.hasOwnProperty.call(data, key))
-          .map(key => [key, truth[key]])
-      );
-      setVulns(prev => prev.map(v =>
-        (v.id === findingId) ? {
-          ...v,
-          ...truthPatch,
-          status: data.status ? displayStatus(truth.status) : v.status,
-        } : v
-      ));
+      // Reviewer, status, retest, and ownership events are invalidations.
+      // Never let their transient payload replace the persisted projection.
+      void refreshPersistedFindings();
     }
   }, [lastMessage, refreshPersistedFindings]);
 
@@ -279,13 +251,10 @@ const Vulnerabilities = ({ authToken }) => {
     return acc;
   }, { Triage: 0, Ticketing: 0, Remediation: 0, Blocked: 0, Closed: 0, overdue: 0, 'due-soon': 0, healthy: 0, unassigned: 0 });
 
-  const updateWorkflow = useCallback((findingId, patch) => {
-    setWorkflowMeta(prev => ({
+  const updateReviewDraft = useCallback((findingId, note) => {
+    setReviewDrafts(prev => ({
       ...prev,
-      [findingId]: {
-        ...(prev[findingId] || {}),
-        ...patch,
-      },
+      [findingId]: note,
     }));
   }, []);
 
@@ -315,20 +284,66 @@ const Vulnerabilities = ({ authToken }) => {
     }
   };
 
-  // Status update via PATCH
-  const updateStatus = useCallback(async (findingId, newStatus) => {
-    setStatusUpdating(findingId);
-    // Optimistic update
-    setVulns(prev => prev.map(v => v.id === findingId ? { ...v, status: newStatus } : v));
+  const persistReview = useCallback(async (finding, patch) => {
+    if (!finding?.id) return false;
+    setReviewError('');
+    setReviewSaving(finding.id);
+    setStatusUpdating(finding.id);
     try {
-      await apiFetch(`/api/v1/findings/${findingId}/status`, {
+      const response = await apiFetch(`/api/v1/findings/${finding.id}/status`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: newStatus }),
+        body: JSON.stringify({
+          expected_version: finding.reviewVersion || 0,
+          ...patch,
+        }),
       });
-    } catch {}
-    setStatusUpdating(null);
-  }, []);
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        setReviewError(
+          response.status === 409
+            ? 'Reviewer state changed in another session. Persisted truth was refreshed.'
+            : dashboardErrorMessage(payload, `Reviewer update failed (${response.status})`)
+        );
+        await refreshPersistedFindings();
+        return false;
+      }
+      await refreshPersistedFindings();
+      return true;
+    } catch (error) {
+      setReviewError(error instanceof Error ? error.message : 'Reviewer update failed');
+      return false;
+    } finally {
+      setReviewSaving(null);
+      setStatusUpdating(null);
+    }
+  }, [refreshPersistedFindings]);
+
+  // Persist before displaying a changed status; no optimistic promotion.
+  const updateStatus = useCallback(async (findingId, newStatus) => {
+    const finding = hydratedVulns.find(item => item.id === findingId);
+    await persistReview(finding, { status: newStatus });
+  }, [hydratedVulns, persistReview]);
+
+  const saveReviewNotes = useCallback(async (finding) => {
+    const notes = Object.prototype.hasOwnProperty.call(reviewDrafts, finding.id)
+      ? reviewDrafts[finding.id]
+      : finding.queueNote;
+    const saved = await persistReview(finding, { notes });
+    if (saved) {
+      setReviewDrafts(prev => {
+        const next = { ...prev };
+        delete next[finding.id];
+        return next;
+      });
+    }
+  }, [persistReview, reviewDrafts]);
+
+  const toggleReviewOwnership = useCallback(async (finding) => {
+    await persistReview(finding, {
+      ownership: finding.owner === 'Unassigned' ? 'claim' : 'release',
+    });
+  }, [persistReview]);
 
   // Re-test finding
   const retestFinding = useCallback(async (finding) => {
@@ -376,18 +391,12 @@ const Vulnerabilities = ({ authToken }) => {
   // Bulk status change
   const bulkStatusChange = useCallback(async (newStatus) => {
     const ids = [...checked];
-    // Optimistic update first
-    setVulns(prev => prev.map(v => ids.includes(v.id) ? { ...v, status: newStatus } : v));
-    // Fire all PATCH requests in parallel
-    await Promise.all(ids.map(id =>
-      apiFetch(`/api/v1/findings/${id}/status`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status: newStatus }),
-      }).catch(() => {})
-    ));
+    for (const id of ids) {
+      const finding = hydratedVulns.find(item => item.id === id);
+      if (finding) await persistReview(finding, { status: newStatus });
+    }
     setChecked(new Set());
-  }, [checked]);
+  }, [checked, hydratedVulns, persistReview]);
 
   // Bulk export
   const bulkExport = useCallback(async () => {
@@ -410,46 +419,6 @@ const Vulnerabilities = ({ authToken }) => {
       setChecked(new Set());
     } catch {}
   }, [checked]);
-
-  const bulkAssign = useCallback((owner) => {
-    const ids = [...checked];
-    setWorkflowMeta(prev => {
-      const next = { ...prev };
-      ids.forEach(id => {
-        next[id] = { ...(next[id] || {}), owner, ticketState: owner === 'Unassigned' ? 'Not Filed' : 'Ready' };
-      });
-      return next;
-    });
-    setChecked(new Set());
-  }, [checked]);
-
-  const assignTicket = useCallback((v) => {
-    updateWorkflow(v.id, {
-      ticketState: v.ticketState === 'Not Filed' ? 'Ready' : v.ticketState,
-      ticketId: v.ticketId || `APEX-${String(Date.now()).slice(-6)}`,
-    });
-  }, [updateWorkflow]);
-
-  const generateTicketDraft = useCallback((v) => {
-    const ticket = [
-      `[${v.priority}] ${v.finding}`,
-      `Target: ${v.target}`,
-      `Owner: ${v.owner}`,
-      `SLA: ${v.slaDays < 0 ? `${Math.abs(v.slaDays)} days overdue` : `${v.slaDays} days remaining`}`,
-      `Severity: ${v.severity} | CVSS: ${v.cvss || '-'} | VPR: ${v.vpr || '-'}`,
-      '',
-      'Description:',
-      v.description || '-',
-      '',
-      'Evidence:',
-      v.evidence || '-',
-      '',
-      'Remediation:',
-      v.remediation || '-',
-    ].join('\n');
-    navigator.clipboard?.writeText(ticket).catch(() => {});
-    updateWorkflow(v.id, { ticketState: 'Filed', ticketId: v.ticketId || `APEX-${String(Date.now()).slice(-6)}` });
-  }, [updateWorkflow]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -549,7 +518,8 @@ const Vulnerabilities = ({ authToken }) => {
           <Card title="OWNER">
             <select value={filterOwner} onChange={e => setFilterOwner(e.target.value)} style={{ width: '100%', fontSize: '12px' }}>
               <option value="all">All Owners</option>
-              {OWNER_OPTIONS.map(owner => <option key={owner} value={owner}>{owner}</option>)}
+              {[...new Set(['Unassigned', ...hydratedVulns.map(v => v.owner)])]
+                .map(owner => <option key={owner} value={owner}>{owner}</option>)}
             </select>
           </Card>
 
@@ -717,14 +687,6 @@ const Vulnerabilities = ({ authToken }) => {
                 <option value="">Change Status…</option>
                 {STATUS_OPTIONS.map(s => <option key={s} value={s}>{s}</option>)}
               </select>
-              <select
-                value=""
-                onChange={e => { if (e.target.value) bulkAssign(e.target.value); }}
-                style={{ fontSize: '12px', padding: '4px 8px' }}
-              >
-                <option value="">Assign Owner…</option>
-                {OWNER_OPTIONS.map(owner => <option key={owner} value={owner}>{owner}</option>)}
-              </select>
               <Button variant="secondary" style={{ padding: '4px 12px', fontSize: '11px' }} onClick={bulkExport}>
                 Export JSON
               </Button>
@@ -812,7 +774,7 @@ const Vulnerabilities = ({ authToken }) => {
                 </div>
               </div>
 
-              {/* Workflow Editor */}
+              {/* Persisted reviewer editor */}
               <div style={{
                 display: 'grid',
                 gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
@@ -823,35 +785,19 @@ const Vulnerabilities = ({ authToken }) => {
                 borderRadius: '4px',
               }}>
                 <WorkflowField label="Owner">
-                  <select value={selected.owner} onChange={e => updateWorkflow(selected.id, { owner: e.target.value, ticketState: e.target.value === 'Unassigned' ? 'Not Filed' : 'Ready' })}>
-                    {OWNER_OPTIONS.map(owner => <option key={owner} value={owner}>{owner}</option>)}
-                  </select>
+                  <input value={selected.owner} readOnly style={{ color: 'var(--text-secondary)' }} />
                 </WorkflowField>
-                <WorkflowField label="Business Impact">
-                  <select value={selected.businessImpact} onChange={e => updateWorkflow(selected.id, { businessImpact: e.target.value })}>
-                    {BUSINESS_OPTIONS.map(impact => <option key={impact} value={impact}>{impact}</option>)}
-                  </select>
-                </WorkflowField>
-                <WorkflowField label="Due Date">
-                  <input type="date" value={selected.dueDate} onChange={e => updateWorkflow(selected.id, { dueDate: e.target.value })} />
-                </WorkflowField>
-                <WorkflowField label="Ticket State">
-                  <select value={selected.ticketState} onChange={e => updateWorkflow(selected.id, { ticketState: e.target.value })}>
-                    {TICKET_STATES.map(state => <option key={state} value={state}>{state}</option>)}
-                  </select>
-                </WorkflowField>
-                <WorkflowField label="Ticket ID">
-                  <input value={selected.ticketId} placeholder="JIRA-1234" onChange={e => updateWorkflow(selected.id, { ticketId: e.target.value })} />
-                </WorkflowField>
-                <WorkflowField label="Queue State">
-                  <input value={selected.workflowState} readOnly style={{ color: 'var(--text-muted)' }} />
+                <WorkflowField label="Revision">
+                  <input value={`v${selected.reviewVersion}`} readOnly style={{ color: 'var(--text-muted)' }} />
                 </WorkflowField>
                 <div style={{ gridColumn: '1 / -1' }}>
-                  <WorkflowField label="Handoff Note">
+                  <WorkflowField label="Reviewer Notes">
                     <textarea
-                      value={selected.queueNote}
-                      onChange={e => updateWorkflow(selected.id, { queueNote: e.target.value })}
-                      placeholder="Ownership context, compensating controls, rollback window..."
+                      value={Object.prototype.hasOwnProperty.call(reviewDrafts, selected.id)
+                        ? reviewDrafts[selected.id]
+                        : selected.queueNote}
+                      onChange={e => updateReviewDraft(selected.id, e.target.value)}
+                      placeholder="Evidence-backed reviewer notes..."
                       rows={3}
                       style={{
                         width: '100%',
@@ -867,6 +813,25 @@ const Vulnerabilities = ({ authToken }) => {
                     />
                   </WorkflowField>
                 </div>
+                <Button
+                  variant="secondary"
+                  disabled={reviewSaving === selected.id}
+                  onClick={() => toggleReviewOwnership(selected)}
+                >
+                  {selected.owner === 'Unassigned' ? 'Claim Ownership' : 'Release Ownership'}
+                </Button>
+                <Button
+                  variant="secondary"
+                  disabled={reviewSaving === selected.id}
+                  onClick={() => saveReviewNotes(selected)}
+                >
+                  Save Reviewer Notes
+                </Button>
+                {reviewError && (
+                  <div style={{ gridColumn: '1 / -1', color: 'var(--color-critical)', fontSize: '11px' }}>
+                    {reviewError}
+                  </div>
+                )}
               </div>
 
               {/* Detail Rows */}
@@ -881,8 +846,8 @@ const Vulnerabilities = ({ authToken }) => {
                   { label: 'Target', value: selected.target },
                   { label: 'Module', value: selected.module },
                   { label: 'Owner', value: selected.owner },
-                  { label: 'Business Impact', value: selected.businessImpact },
-                  { label: 'Ticket', value: selected.ticketId || selected.ticketState },
+                  { label: 'Reviewer Revision', value: selected.reviewRevisionId || 'Not reviewed' },
+                  { label: 'Updated By', value: selected.reviewUpdatedBy || '—' },
                   { label: 'Attack Vector', value: 'Network' },
                   { label: 'Complexity', value: selected.cvss >= 9 ? 'Low' : 'Medium' },
                   { label: 'Privileges Required', value: selected.cvss >= 9 ? 'None' : 'Low' },
@@ -911,12 +876,6 @@ const Vulnerabilities = ({ authToken }) => {
                     Re-testing…
                   </>
                 ) : 'Re-test'}
-              </Button>
-              <Button variant="secondary" style={{ flex: 1, fontSize: '12px', padding: '8px 12px' }} onClick={() => assignTicket(selected)}>
-                Assign Ticket
-              </Button>
-              <Button variant="secondary" style={{ flex: 1, fontSize: '12px', padding: '8px 12px' }} onClick={() => generateTicketDraft(selected)}>
-                Copy Ticket
               </Button>
             </div>
             {retestError && (

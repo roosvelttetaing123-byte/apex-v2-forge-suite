@@ -430,6 +430,12 @@ def parse_args() -> argparse.Namespace:
         help="Approved absolute canonical source root (required for whitebox mode)",
     )
     parser.add_argument("--modules",       default=None,            help="Comma-separated module list to run")
+    parser.add_argument(
+        "--reference-slice",
+        default=None,
+        choices=["header-audit-csp-v1"],
+        help="Run the exact governed Task 105 header_audit CSP slice",
+    )
     parser.add_argument("--skip-modules",  default=None,            help="Comma-separated modules to skip")
     parser.add_argument("--jwt-token",     default=None,            help="JWT token for jwt_audit module")
     parser.add_argument("--scope",         action="append", default=[], metavar="ENTRY",
@@ -2170,7 +2176,8 @@ async def run_scan(
     status = "aborted" if aborted else ("failed" if errors else "completed")
 
     # Update run record
-    run.ended_at = datetime.now(timezone.utc)
+    completed_at = datetime.now(timezone.utc)
+    run.ended_at = completed_at
     run.status   = status
     db_session.commit()
 
@@ -2186,19 +2193,23 @@ async def run_scan(
         _emit(bus, Event, EventType, "scan_complete", source="webforge",
         target=safe_target_display(cfg.target), findings=len(all_findings), duration=round(elapsed, 1))
 
-    # Generate reports
-    phase_banner(12, 12, "Reporting")
-    formats = [f.strip() for f in args.report_format.split(",")]
-    reporter = BaseReporter(
-        findings=[f.to_dict() for f in all_findings],
-        results_dir=results_dir,
-        engagement=cfg.engagement,
-        target=cfg.target,
-        tester=cfg.tester,
-        framework="WebForge",
-        formats=formats,
-    )
-    report_paths = reporter.generate_all()
+    # Task 105 locks its report from canonical persistence in the control
+    # plane after review/retest. The engine must not create a transient report
+    # from its in-memory finding list for that exact reference slice.
+    report_paths: dict[str, str] = {}
+    if cfg.extra.get("reference_slice") != "header-audit-csp-v1":
+        phase_banner(12, 12, "Reporting")
+        formats = [f.strip() for f in args.report_format.split(",")]
+        reporter = BaseReporter(
+            findings=[f.to_dict() for f in all_findings],
+            results_dir=results_dir,
+            engagement=cfg.engagement,
+            target=cfg.target,
+            tester=cfg.tester,
+            framework="WebForge",
+            formats=formats,
+        )
+        report_paths = reporter.generate_all()
 
     # Final summary
     status_label = "SCAN ABORTED" if aborted else ("SCAN FAILED" if errors else "SCAN COMPLETE")
@@ -2229,7 +2240,10 @@ async def run_scan(
                 planned_capabilities=tuple(all_module_names),
                 completed_capabilities=tuple(coverage_completed),
                 status=status,
-                completed_at=run.ended_at or datetime.now(timezone.utc),
+                # SQLite's legacy DateTime column reloads without tzinfo after
+                # commit.  Preserve the authoritative aware completion value
+                # captured at the lifecycle transition for signed run truth.
+                completed_at=completed_at,
                 engine_version=VERSION,
             ),
         )
@@ -2242,6 +2256,11 @@ async def run_scan(
         }
     except RunFinalizationError as exc:
         run_truth = {"state": "unavailable", "reason_code": exc.reason_code}
+        if cfg.extra.get("reference_slice") == "header-audit-csp-v1":
+            log.error(
+                "Reference run truth unavailable reason_code=%s",
+                exc.reason_code,
+            )
 
     db_session.close()
 
@@ -2393,6 +2412,7 @@ def _summary_exit_code(summary: Mapping[str, Any] | None) -> int:
 
 async def main() -> int:
     args = parse_args()
+    reference_slice = str(getattr(args, "reference_slice", "") or "")
 
     if args.list_modules:
         describe_phases(args.mode)
@@ -2408,6 +2428,15 @@ async def main() -> int:
         sys.exit(1)
     if args.target:
         args.target = _normalize_target(args.target)
+    if reference_slice and (
+        args.mode != "blackbox"
+        or _requested_modules(args) != ["header_audit"]
+        or args.targets
+    ):
+        log.error(
+            "Reference slice rejected: exact blackbox header_audit selection required"
+        )
+        return 1
     if not args.dry_run and _has_direct_secret_args(args):
         log.error(
             "Direct secret-bearing CLI options are disabled; use a protected credential reference"
@@ -2507,6 +2536,21 @@ async def main() -> int:
     cfg.verbose    = args.verbose
     cfg.quiet      = args.quiet
     cfg.dry_run    = args.dry_run
+    if reference_slice:
+        cfg.extra["reference_slice"] = reference_slice
+        raw_reference_timeout = os.environ.get(
+            "FORGE_REFERENCE_TIMEOUT_SECONDS",
+            "30",
+        )
+        try:
+            reference_timeout = int(raw_reference_timeout)
+        except ValueError:
+            reference_timeout = 0
+        if not 5 <= reference_timeout <= 300:
+            log.error("Reference slice timeout binding is invalid")
+            return 1
+        cfg.extra["reference_parent_import"] = True
+        cfg.extra["reference_timeout_seconds"] = reference_timeout
     if args.proxy:
         cfg.proxy  = args.proxy
         cfg.extra["proxy"] = args.proxy
@@ -2540,7 +2584,7 @@ async def main() -> int:
     results_dir = setup_results_dir(args.target, args.engagement, args.resume, args.output)
     log.info("Results directory: %s", results_dir)
 
-    if not args.dry_run:
+    if not args.dry_run and not reference_slice:
         ask_internet_permission(
             "Wappalyzer DB updates, nuclei templates",
             force=args.auto_confirm,

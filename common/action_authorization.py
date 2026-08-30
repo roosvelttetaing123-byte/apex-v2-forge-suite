@@ -37,6 +37,7 @@ from common.db import (
     get_authorization_consumption,
     get_authorization_child_decision,
     get_authorization_decision,
+    open_existing_db,
     save_scan_job,
 )
 from common.scope import canonical_target, decide_scope
@@ -48,6 +49,9 @@ AUTHORIZATION_SCHEMA_VERSION = "forge-action-authorization-v1"
 AUTHORIZATION_CONTEXT_SCHEMA_VERSION = "forge-action-authorizations-v1"
 AUTHORIZATION_ENVELOPES_ENV = "FORGE_ACTION_AUTHORIZATIONS"
 AUTHORIZATION_DB_ENV = "FORGE_AUTHORIZATION_DB"
+AUTHORIZATION_DB_PREINITIALIZED_ENV = (
+    "FORGE_AUTHORIZATION_DB_PREINITIALIZED"
+)
 AUTHORIZATION_TENANT_ENV = "FORGE_AUTHORIZATION_TENANT_ID"
 AUTHORIZATION_ENGAGEMENT_ENV = "FORGE_AUTHORIZATION_ENGAGEMENT_ID"
 AUTHORIZATION_RUN_ENV = "FORGE_AUTHORIZATION_RUN_ID"
@@ -1914,4 +1918,11 @@ def open_authorization_session(path: Path | None = None) -> Session:
     db_path = Path(
         os.path.abspath(os.fspath(Path(configured_path).expanduser()))
     )
+    if os.environ.get(AUTHORIZATION_DB_PREINITIALIZED_ENV, "").strip() == "1":
+        expected = default_authorization_db_path()
+        if db_path != expected:
+            raise ValueError(
+                "preinitialized authorization database path mismatch"
+            )
+        return open_existing_db(db_path)
     return create_db(db_path)

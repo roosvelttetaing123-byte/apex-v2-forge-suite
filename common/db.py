@@ -600,6 +600,31 @@ class _ManagedSQLiteConnection(sqlite3.Connection):
     has an opportunity to dispose it.
     """
 
+    _forge_parent_descriptor: int = -1
+
+    def _pin_parent_descriptor(self, descriptor: int) -> None:
+        """Retain the no-follow parent used for SQLite's stable filename.
+
+        This is a directory descriptor, never a second descriptor for the
+        database or a SQLite sidecar.  Closing an independently opened file
+        descriptor for a SQLite inode can release every POSIX record lock held
+        by the process, so only the ancestor directory may be retained here.
+        """
+
+        if descriptor < 0 or self._forge_parent_descriptor >= 0:
+            raise _DatabaseArtifactError(
+                "database descriptor lifetime binding is invalid"
+            )
+        self._forge_parent_descriptor = descriptor
+
+    def close(self) -> None:
+        descriptor = self._forge_parent_descriptor
+        self._forge_parent_descriptor = -1
+        try:
+            super().close()
+        finally:
+            _safe_close_descriptor(descriptor)
+
     def __del__(self) -> None:
         try:
             self.close()
@@ -782,14 +807,77 @@ def _secure_existing_sqlite_sidecars(
     *,
     expected_parent_identity: _ArtifactIdentity | None = None,
 ) -> None:
-    """Validate and tighten every existing SQLite journal sidecar."""
-    for suffix in _SQLITE_SIDECAR_SUFFIXES:
-        descriptor = _open_owner_only_regular_file(
-            Path(f"{db_path}{suffix}"),
-            create=False,
-            expected_parent_identity=expected_parent_identity,
-        )
-        _safe_close_descriptor(descriptor)
+    """Validate and tighten sidecars without opening their lock inodes.
+
+    POSIX record locks are process-scoped: closing an unrelated descriptor for
+    a database or SHM inode can release SQLite's locks on another connection in
+    the same process.  Descriptor-relative stat/chmod preserves the no-follow
+    boundary without creating that unsafe extra file descriptor.
+    """
+
+    db_path = _absolute_artifact_path(db_path)
+    parent_descriptor = -1
+    try:
+        parent_descriptor = _open_private_directory(db_path.parent)
+        if (
+            expected_parent_identity is not None
+            and _artifact_identity(os.fstat(parent_descriptor))
+            != expected_parent_identity
+        ):
+            raise _DatabaseArtifactError(
+                "database artifact changed during connection"
+            )
+        for suffix in _SQLITE_SIDECAR_SUFFIXES:
+            name = f"{db_path.name}{suffix}"
+            try:
+                metadata = os.stat(
+                    name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(metadata.st_mode):
+                raise _DatabaseArtifactError(
+                    "database artifact is unavailable"
+                )
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (
+                    hasattr(os, "getuid")
+                    and metadata.st_uid != os.getuid()
+                )
+            ):
+                raise _DatabaseArtifactError(
+                    "database artifact must be one unaliased regular file"
+                )
+            os.chmod(
+                name,
+                0o600,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            final = os.stat(
+                name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                _artifact_identity(final) != _artifact_identity(metadata)
+                or not stat.S_ISREG(final.st_mode)
+                or final.st_nlink != 1
+                or stat.S_IMODE(final.st_mode) != 0o600
+            ):
+                raise _DatabaseArtifactError(
+                    "database artifact changed during connection"
+                )
+    except _DatabaseArtifactError:
+        raise
+    except Exception:
+        raise _DatabaseArtifactError("database artifact is unavailable") from None
+    finally:
+        _safe_close_descriptor(parent_descriptor)
 
 
 def _verify_descriptor_path_identity(
@@ -841,23 +929,79 @@ def _verify_descriptor_path_identity(
 def _capture_sqlite_lifetime_identity(
     db_path: Path,
 ) -> tuple[_ArtifactIdentity, _ArtifactIdentity]:
-    """Create/open the database and bind its parent and inode for this engine."""
-    descriptor = _open_owner_only_regular_file(db_path)
+    """Create or stat the database without disturbing live SQLite locks."""
+
+    db_path = _absolute_artifact_path(db_path)
     parent_descriptor = -1
+    created_descriptor = -1
     try:
         parent_descriptor = _open_private_directory(db_path.parent)
         parent_identity = _artifact_identity(os.fstat(parent_descriptor))
-        file_identity = _artifact_identity(os.fstat(descriptor))
-        _verify_descriptor_path_identity(
-            descriptor,
-            db_path,
-            expected_parent_identity=parent_identity,
-            expected_file_identity=file_identity,
+        try:
+            metadata = os.stat(
+                db_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            try:
+                created_descriptor = os.open(
+                    db_path.name,
+                    _FILE_OPEN_FLAGS | os.O_EXCL,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                metadata = os.stat(
+                    db_path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            else:
+                metadata = os.fstat(created_descriptor)
+                os.fchmod(created_descriptor, 0o600)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise _DatabaseArtifactError(
+                "database artifact is unavailable"
+            )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or (
+                hasattr(os, "getuid")
+                and metadata.st_uid != os.getuid()
+            )
+        ):
+            raise _DatabaseArtifactError(
+                "database artifact must be one unaliased regular file"
+            )
+        os.chmod(
+            db_path.name,
+            0o600,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
         )
+        final = os.stat(
+            db_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _artifact_identity(final) != _artifact_identity(metadata)
+            or stat.S_IMODE(final.st_mode) != 0o600
+        ):
+            raise _DatabaseArtifactError(
+                "database artifact changed during connection"
+            )
+        file_identity = _artifact_identity(final)
         return parent_identity, file_identity
+    except _DatabaseArtifactError:
+        raise
+    except Exception:
+        raise _DatabaseArtifactError("database artifact is unavailable") from None
     finally:
+        _safe_close_descriptor(created_descriptor)
         _safe_close_descriptor(parent_descriptor)
-        _safe_close_descriptor(descriptor)
 
 
 def _sqlite_descriptor_path(descriptor: int) -> str | None:
@@ -873,55 +1017,102 @@ def _connect_sqlite_file(
     parent_identity: _ArtifactIdentity | None = None,
     file_identity: _ArtifactIdentity | None = None,
 ) -> sqlite3.Connection:
-    """Connect SQLite to a verified descriptor, keeping WAL artifacts private."""
-    descriptor = _open_owner_only_regular_file(
-        db_path,
-        create=file_identity is None,
-        expected_parent_identity=parent_identity,
-        expected_file_identity=file_identity,
-    )
-    if descriptor < 0:
-        raise _DatabaseArtifactError(
-            "database artifact changed during connection"
+    """Connect through one pinned parent without disturbing SQLite locks."""
+
+    db_path = _absolute_artifact_path(db_path)
+    if parent_identity is None or file_identity is None:
+        parent_identity, file_identity = _capture_sqlite_lifetime_identity(
+            db_path
         )
+    parent_descriptor = -1
+    comparison_parent_descriptor = -1
     connection: sqlite3.Connection | None = None
     try:
-        _verify_descriptor_path_identity(
-            descriptor,
-            db_path,
-            expected_parent_identity=parent_identity,
-            expected_file_identity=file_identity,
-        )
+        parent_descriptor = _open_private_directory(db_path.parent)
+        pinned_parent_identity = _artifact_identity(os.fstat(parent_descriptor))
+        if (
+            parent_identity is not None
+            and pinned_parent_identity != parent_identity
+        ):
+            raise _DatabaseArtifactError(
+                "database artifact changed during connection"
+            )
+        try:
+            entry = os.stat(
+                db_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            raise _DatabaseArtifactError(
+                "database artifact changed during connection"
+            ) from None
+        if (
+            not stat.S_ISREG(entry.st_mode)
+            or stat.S_ISLNK(entry.st_mode)
+            or entry.st_nlink != 1
+            or (
+                file_identity is not None
+                and _artifact_identity(entry) != file_identity
+            )
+            or (
+                hasattr(os, "getuid")
+                and entry.st_uid != os.getuid()
+            )
+        ):
+            raise _DatabaseArtifactError(
+                "database artifact changed during connection"
+            )
         _secure_existing_sqlite_sidecars(
             db_path,
-            expected_parent_identity=parent_identity,
+            expected_parent_identity=pinned_parent_identity,
         )
-        descriptor_path = _sqlite_descriptor_path(descriptor)
-        if descriptor_path is None:
-            raise _DatabaseArtifactError(
-                "descriptor-backed database access is unavailable"
-            )
         connection = sqlite3.connect(
-            descriptor_path,
+            os.fspath(db_path),
             check_same_thread=False,
             factory=_ManagedSQLiteConnection,
         )
+        # ``sqlite3.connect`` itself does not mutate an existing database.
+        # Recheck the exact pinned leaf before the first PRAGMA can create or
+        # alter a WAL sidecar, so a leaf swap cannot touch its victim.
+        comparison_parent_descriptor = _open_private_directory(db_path.parent)
+        if (
+            _artifact_identity(os.fstat(comparison_parent_descriptor))
+            != pinned_parent_identity
+        ):
+            raise _DatabaseArtifactError(
+                "database artifact changed during connection"
+            )
+        final = os.stat(
+            db_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or stat.S_ISLNK(final.st_mode)
+            or final.st_nlink != 1
+            or _artifact_identity(final) != _artifact_identity(entry)
+        ):
+            raise _DatabaseArtifactError(
+                "database artifact changed during connection"
+            )
         cursor = connection.cursor()
         try:
             cursor.execute("PRAGMA journal_mode=WAL")
             cursor.execute("PRAGMA foreign_keys=ON")
         finally:
             cursor.close()
-        _verify_descriptor_path_identity(
-            descriptor,
-            db_path,
-            expected_parent_identity=parent_identity,
-            expected_file_identity=file_identity,
-        )
         _secure_existing_sqlite_sidecars(
             db_path,
-            expected_parent_identity=parent_identity,
+            expected_parent_identity=pinned_parent_identity,
         )
+        if not isinstance(connection, _ManagedSQLiteConnection):
+            raise _DatabaseArtifactError(
+                "managed SQLite connection is unavailable"
+            )
+        connection._pin_parent_descriptor(parent_descriptor)
+        parent_descriptor = -1
         return connection
     except _DatabaseArtifactError:
         if connection is not None:
@@ -938,7 +1129,8 @@ def _connect_sqlite_file(
                 pass
         raise DatabaseInitializationError("database connection failed") from None
     finally:
-        _safe_close_descriptor(descriptor)
+        _safe_close_descriptor(comparison_parent_descriptor)
+        _safe_close_descriptor(parent_descriptor)
 
 
 @contextmanager
@@ -1014,6 +1206,135 @@ def create_db(db_path: Path) -> Session:
         if engine is not None:
             _safe_dispose_engine(engine)
         raise DatabaseInitializationError("database initialization failed") from None
+
+
+_PREINITIALIZED_RUNTIME_TABLES = frozenset(
+    {
+        "authorization_consumptions",
+        "authorization_decisions",
+        "authorization_execution_claims",
+        "canonical_migration_journal",
+        "canonical_tenants",
+        "durable_job_state_attempts",
+        "durable_job_state_jobs",
+        "outbound_decisions",
+    }
+)
+
+
+def open_existing_db(db_path: Path) -> Session:
+    """Open one already initialized database without schema or data migration.
+
+    Runtime dashboard/worker boundaries use this after startup has completed
+    the ordered migration chain.  It never creates a missing database and
+    refuses incomplete or interrupted schema state before returning a session.
+    """
+
+    engine: Any | None = None
+    try:
+        db_path = _absolute_artifact_path(db_path)
+        parent_descriptor = _open_private_directory(db_path.parent)
+        try:
+            parent_identity = _artifact_identity(os.fstat(parent_descriptor))
+            try:
+                metadata = os.stat(
+                    db_path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                raise _DatabaseArtifactError(
+                    "database artifact changed during connection"
+                ) from None
+            if stat.S_ISLNK(metadata.st_mode):
+                raise _DatabaseArtifactError("database artifact is unavailable")
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (
+                    hasattr(os, "getuid")
+                    and metadata.st_uid != os.getuid()
+                )
+            ):
+                raise _DatabaseArtifactError(
+                    "database artifact must be one unaliased regular file"
+                )
+            os.chmod(
+                db_path.name,
+                0o600,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            final = os.stat(
+                db_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                _artifact_identity(final) != _artifact_identity(metadata)
+                or stat.S_IMODE(final.st_mode) != 0o600
+            ):
+                raise _DatabaseArtifactError(
+                    "database artifact changed during connection"
+                )
+            file_identity = _artifact_identity(final)
+        finally:
+            _safe_close_descriptor(parent_descriptor)
+
+        engine = create_engine(
+            URL.create("sqlite+pysqlite", database=os.fspath(db_path)),
+            creator=lambda: _connect_sqlite_file(
+                db_path,
+                parent_identity,
+                file_identity,
+            ),
+            echo=False,
+        )
+
+        @event.listens_for(engine, "connect")
+        def set_sqlite_pragma(dbapi_conn, connection_record):  # type: ignore
+            cursor = dbapi_conn.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+        with engine.connect() as connection:
+            available = {
+                str(row[0])
+                for row in connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            if not _PREINITIALIZED_RUNTIME_TABLES.issubset(available):
+                raise DatabaseInitializationError(
+                    "preinitialized database schema is incomplete"
+                )
+            incomplete = connection.exec_driver_sql(
+                "SELECT version,state FROM canonical_migration_journal "
+                "WHERE state<>'applied' LIMIT 1"
+            ).fetchone()
+            if incomplete is not None:
+                raise DatabaseInitializationError(
+                    "preinitialized database migration is incomplete"
+                )
+            job_migration = connection.exec_driver_sql(
+                "SELECT 1 FROM canonical_migration_journal "
+                "WHERE version='forge-jobs-v1' AND state='applied' LIMIT 1"
+            ).fetchone()
+            if job_migration is None:
+                raise DatabaseInitializationError(
+                    "preinitialized durable-job migration is unavailable"
+                )
+        return _engine_bound_session(engine, autocommit=False, autoflush=False)
+    except _DatabaseArtifactError:
+        if engine is not None:
+            _safe_dispose_engine(engine)
+        raise
+    except Exception:
+        if engine is not None:
+            _safe_dispose_engine(engine)
+        raise DatabaseInitializationError(
+            "preinitialized database open failed"
+        ) from None
 
 
 def _stable_json_bytes(value: Any) -> bytes:

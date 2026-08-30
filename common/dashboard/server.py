@@ -75,13 +75,16 @@ from common.canonical_evidence import (
     JOB_ATTEMPT_ID_ENV,
 )
 from common.evidence import (
+    Evidence,
     ordinary_evidence_artifacts,
     ordinary_evidence_projection,
     ordinary_finding_projection,
 )
+from common.finding import Finding, Severity
 from common.evidence_custody import CustodyError
 from common.action_authorization import (
     AUTHORIZATION_DB_ENV,
+    AUTHORIZATION_DB_PREINITIALIZED_ENV,
     AUTHORIZATION_ENVELOPES_ENV,
     ActionAuthorizationEnvelope,
     AuthorizationContext,
@@ -101,6 +104,7 @@ from common.action_authorization import (
     record_boundary_denial,
     record_authorization_denial,
     redact_authorization_value,
+    validate_consumed_authorization,
 )
 from common.confirm_gate import (
     ActionConfirmation,
@@ -144,11 +148,28 @@ from common.db import (
     create_db,
     get_authorization_decision,
     get_scan_job,
+    open_existing_db,
     save_audit_log,
     save_scan_job,
     update_scan_job,
 )
 from common.retest import RetestService, SessionReferenceResolver
+from common.finding_review import (
+    FindingReviewConflict,
+    FindingReviewError,
+    FindingReviewForbidden,
+    FindingReviewInvalid,
+    FindingReviewService,
+)
+from common.reporting.canonical_report import (
+    CanonicalReportAuthorizationError,
+    CanonicalReportConflict,
+    CanonicalReportError,
+    CanonicalReportNotFound,
+    CanonicalReportService,
+    CanonicalReportSourceIncomplete,
+    report_export_binding,
+)
 from common.job_state import (
     IdempotencyConflict,
     InvalidTransition,
@@ -332,6 +353,7 @@ DASHBOARD_API_ROUTE_POLICY: dict[tuple[str, str], tuple[str, Role | None]] = {
     ("POST", "/api/v1/scans/launch"): ("dashboard_identity", Role.OPERATOR),
     ("GET", "/api/v1/reports/latest"): ("dashboard_identity", Role.VIEWER),
     ("GET", "/api/v1/reports/download"): ("dashboard_identity", Role.VIEWER),
+    ("POST", "/api/v1/reports/download"): ("dashboard_identity", Role.OPERATOR),
     ("GET", "/api/v1/plugins"): ("dashboard_identity", Role.OPERATOR),
     ("GET", "/api/v1/c2/bofs"): ("dashboard_identity", Role.VIEWER),
     ("POST", "/api/v1/c2/bofs/{name}/execute"): ("dashboard_identity", Role.ADMIN),
@@ -341,6 +363,7 @@ DASHBOARD_API_ROUTE_POLICY: dict[tuple[str, str], tuple[str, Role | None]] = {
     ("POST", "/api/v1/c2/emulation/process-injection/plan"): ("dashboard_identity", Role.VIEWER),
     ("GET", "/api/v1/c2/emulation/p2p"): ("dashboard_identity", Role.VIEWER),
     ("GET", "/api/v1/reports"): ("dashboard_identity", Role.VIEWER),
+    ("POST", "/api/v1/reports"): ("dashboard_identity", Role.OPERATOR),
     ("GET", "/api/v1/findings/verification-queue"): ("dashboard_identity", Role.OPERATOR),
 }
 
@@ -382,6 +405,8 @@ DASHBOARD_MUTATION_ROUTE_TEMPLATES = frozenset(
         ("POST", "/api/v1/agents/jobs"),
         ("POST", "/api/v1/auth/test"),
         ("POST", "/api/v1/action-confirmations"),
+        ("POST", "/api/v1/reports"),
+        ("POST", "/api/v1/reports/download"),
         ("POST", "/api/v1/control/pause"),
         ("POST", "/api/v1/control/resume"),
         ("POST", "/api/v1/control/abort"),
@@ -518,6 +543,7 @@ UI_MODULE_MAP: dict[str, tuple[str, str] | None] = {
     "ssti":          ("web", "ssti_scanner"),
     "rce":           ("web", "cmd_inject"),
     "csrf":          ("web", "cookie_audit"),
+    "header_audit":  ("web", "header_audit"),
     "redirect":      ("web", "open_redirect"),
     "dirtraversal":  ("web", "path_traversal"),
     "subdtakeover":  ("web", "subdomain_takeover"),
@@ -2101,11 +2127,51 @@ class DashboardServer:
 
     def _canonical_result_roots(self) -> list[Path]:
         roots: set[Path] = set()
-        for record in self._load_scan_jobs_read_only(limit=1000):
+        for record in self._load_scan_jobs(limit=1000):
             if record.get("authorization_state") != "allow":
+                continue
+            if record.get("reference_slice") == "header-audit-csp-v1":
+                # The engine database is a bounded child-to-parent staging
+                # source.  The parent-owned central import is the only
+                # dashboard/report authority for the reference slice.
+                continue
+            if not str(record.get("results_dir") or "").strip():
+                # Retest and other canonical Task 103 jobs persist directly in
+                # the central authority and do not own an engine result root.
                 continue
             roots.add(self._job_bound_canonical_result_root(record))
         return sorted(roots)
+
+    def _canonical_database_candidates(self) -> list[Path]:
+        """Return verified result databases plus the Task 105 central adapter."""
+
+        candidates = {
+            database_path
+            for root in self._canonical_result_roots()
+            for database_path in self._canonical_database_paths(root)
+        }
+        central = _artifact_path(self._scan_jobs_db_path)
+        metadata = _artifact_lstat(central)
+        if metadata is not None:
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+            ):
+                raise DashboardArtifactError(
+                    "central canonical database must be owner-only"
+                )
+            candidates.add(central)
+        return sorted(candidates)
+
+    def _open_database_session(self, database_path: Path) -> Any:
+        """Open central runtime state without rerunning startup migrations."""
+
+        candidate = _artifact_path(database_path)
+        if candidate == _artifact_path(self._scan_jobs_db_path):
+            return open_existing_db(candidate)
+        return create_db(candidate)
 
     def _job_bound_canonical_result_root(
         self,
@@ -2145,57 +2211,67 @@ class DashboardServer:
         roots: list[Path] | None = None,
     ) -> list[dict[str, Any]]:
         """Read verified tenant projections from job-bound canonical stores."""
-        selected_roots = self._canonical_result_roots() if roots is None else roots
-        by_id: dict[str, dict[str, Any]] = {}
-        for root in selected_roots:
-            verified_root = self._verified_canonical_result_root(str(root))
-            for database_path in self._canonical_database_paths(verified_root):
-                custody_root = database_path.parent / "evidence-custody"
-                try:
-                    session = create_db(database_path)
-                    try:
-                        finding_count = int(
-                            session.execute(
-                                sql_text(
-                                    "SELECT COUNT(*) FROM canonical_findings "
-                                    "WHERE tenant_id=:tenant_id"
-                                ),
-                                {"tenant_id": self.tenant_id},
-                            ).scalar_one()
-                        )
-                        session.rollback()
-                        if finding_count == 0:
-                            continue
-                        self._verified_canonical_result_root(str(custody_root))
-                        reader = CanonicalEvidenceReader(
-                            session,
-                            custody_root,
-                            self.tenant_id,
-                            audit_actor_id=actor_id,
-                        )
-                        rows = reader.list_finding_projections()
-                    finally:
-                        session.close()
-                except Exception as exc:
-                    log.warning(
-                        "Canonical finding read failed reason=%s",
-                        type(exc).__name__,
+        database_paths = (
+            self._canonical_database_candidates()
+            if roots is None
+            else sorted(
+                {
+                    database_path
+                    for root in roots
+                    for database_path in self._canonical_database_paths(
+                        self._verified_canonical_result_root(str(root))
                     )
+                }
+            )
+        )
+        by_id: dict[str, dict[str, Any]] = {}
+        for database_path in database_paths:
+            custody_root = database_path.parent / "evidence-custody"
+            try:
+                session = self._open_database_session(database_path)
+                try:
+                    finding_count = int(
+                        session.execute(
+                            sql_text(
+                                "SELECT COUNT(*) FROM canonical_findings "
+                                "WHERE tenant_id=:tenant_id"
+                            ),
+                            {"tenant_id": self.tenant_id},
+                        ).scalar_one()
+                    )
+                    session.rollback()
+                    if finding_count == 0:
+                        continue
+                    self._verified_canonical_result_root(str(custody_root))
+                    reader = CanonicalEvidenceReader(
+                        session,
+                        custody_root,
+                        self.tenant_id,
+                        audit_actor_id=actor_id,
+                    )
+                    rows = reader.list_finding_projections()
+                finally:
+                    session.close()
+            except Exception as exc:
+                log.warning(
+                    "Canonical finding read failed reason=%s",
+                    type(exc).__name__,
+                )
+                raise DashboardArtifactError(
+                    "canonical finding source failed verification"
+                ) from None
+            for row in rows:
+                finding_id = str(row.get("id") or "")
+                if not finding_id:
                     raise DashboardArtifactError(
-                        "canonical finding source failed verification"
-                    ) from None
-                for row in rows:
-                    finding_id = str(row.get("id") or "")
-                    if not finding_id:
-                        raise DashboardArtifactError(
-                            "canonical finding projection is invalid"
-                        )
-                    previous = by_id.get(finding_id)
-                    if previous is not None and previous != row:
-                        raise DashboardArtifactError(
-                            "canonical finding identity conflicts across stores"
-                        )
-                    by_id[finding_id] = row
+                        "canonical finding projection is invalid"
+                    )
+                previous = by_id.get(finding_id)
+                if previous is not None and previous != row:
+                    raise DashboardArtifactError(
+                        "canonical finding identity conflicts across stores"
+                    )
+                by_id[finding_id] = row
         return sorted(
             by_id.values(),
             key=lambda row: (str(row.get("timestamp") or ""), str(row["id"])),
@@ -2273,9 +2349,26 @@ class DashboardServer:
             "retest_state",
             "retest_status",
             "retest_verdict",
+            "review_notes",
+            "review_owner_operator_id",
+            "review_revision_id",
+            "review_status",
+            "review_updated_at",
+            "review_updated_by_operator_id",
+            "review_version",
             "evidence",
         )
         result: dict[str, Any] = {}
+        canonical_references = {
+            "id",
+            "retest_artifact_id",
+            "retest_attempt_id",
+            "retest_durable_attempt_id",
+            "retest_id",
+            "retest_job_id",
+            "retest_observation_id",
+            "review_revision_id",
+        }
         for key in allowed:
             if key not in finding or key == "evidence":
                 continue
@@ -2284,8 +2377,14 @@ class DashboardServer:
                 # digest.  Preserve it as an opaque canonical reference rather
                 # than treating its hash-shaped bytes as credential material.
                 result[key] = finding[key]
+            elif key in canonical_references:
+                result[key] = str(finding[key])[:300]
             else:
                 result[key] = self._bounded_public_value(finding.get(key))
+        if int(finding.get("review_version") or 0) > 0:
+            result["status"] = self._bounded_public_value(
+                finding.get("review_status")
+            )
         result["evidence"] = ordinary_evidence_projection(
             finding.get("evidence")
         )
@@ -2467,6 +2566,9 @@ class DashboardServer:
             "retest_state",
             "retest_status",
             "retest_verdict",
+            "review_owner_operator_id",
+            "review_revision_id",
+            "review_version",
         }
         credential = {"type", "account", "target", "module", "discovered_by"}
         control = {
@@ -2484,6 +2586,15 @@ class DashboardServer:
             "status_code",
             "duration",
             "reason_code",
+        }
+        report = {
+            "artifact_id",
+            "artifact_sha256",
+            "export_id",
+            "format",
+            "report_id",
+            "report_version",
+            "status",
         }
         if event.event_type in {
             EventType.MODULE_START,
@@ -2517,6 +2628,11 @@ class DashboardServer:
             EventType.RATE_LIMIT_HIT,
         }:
             allowed = metric
+        elif event.event_type in {
+            EventType.REPORT_UPDATED,
+            EventType.EXPORT_COMPLETED,
+        }:
+            allowed = report
         else:
             allowed = set()
         event_data: Mapping[str, Any] = event.data
@@ -3897,7 +4013,6 @@ class DashboardServer:
             _require_not_killed()
             body = await request.json()
             job_id = server._server_job_id()
-
             def _deny_preflight(
                 decision: ScopeDecision,
                 *,
@@ -4134,7 +4249,6 @@ class DashboardServer:
                     "decision": web_decision.to_dict(),
                     "authorization": None,
                 })
-
             if scan_type in {"net", "vapt"}:
                 net_action = "web_to_network" if scan_type == "vapt" else "scan"
                 net_confirmation, submitted_net_decision = server._server_confirmation(
@@ -4522,7 +4636,11 @@ class DashboardServer:
             _require_auth(request)
             running = []
             completed = []
-            durable_rows = server._durable_jobs_for_read_projection(limit=1000)
+            durable_rows = [
+                row
+                for row in server._load_scan_jobs(limit=1000)
+                if row.get("lifecycle_authority") == "task103"
+            ]
             durable_by_id = {
                 str(row.get("scan_id") or ""): row for row in durable_rows
             }
@@ -4814,45 +4932,102 @@ class DashboardServer:
 
         @app.patch("/api/v1/findings/{finding_id}/status")
         async def api_update_finding_status(request: Request, finding_id: str):
-            """Update the status of a finding."""
+            """CAS-update persisted reviewer status, notes, and ownership."""
             payload = _require_auth(request, Role.OPERATOR)
-            body = await request.json()
-            new_status = body.get("status", "").strip()
-            valid = {
-                "Open",
-                "In Progress",
-                "Fixed",
-                "Accepted",
-                "False Positive",
+            try:
+                body = await request.json()
+            except Exception:
+                body = None
+            if not isinstance(body, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason_code": "finding_review_invalid"},
+                )
+            forbidden_identity_fields = {
+                "actor_operator_id",
+                "operator_id",
+                "owner",
+                "owner_operator_id",
+                "tenant_id",
+                "updated_by_operator_id",
             }
-            if new_status not in valid:
-                raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(valid)}")
-            persisted = server._persist_finding_status(finding_id, new_status)
-            if not persisted:
-                raise HTTPException(status_code=404, detail="Finding not found")
+            if forbidden_identity_fields.intersection(body):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason_code": "finding_review_identity_is_server_derived"},
+                )
+            expected_version = body.get("expected_version")
+            if type(expected_version) is not int or expected_version < 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason_code": "finding_review_invalid"},
+                )
+            try:
+                database_path = server._canonical_finding_database(finding_id)
+                review_session = server._open_database_session(database_path)
+                try:
+                    review = FindingReviewService(
+                        review_session,
+                        tenant_id=server.tenant_id,
+                    ).update(
+                        finding_id,
+                        expected_version=expected_version,
+                        actor_operator_id=payload.username,
+                        actor_role=payload.role.value,
+                        status=body.get("status"),
+                        notes=body.get("notes"),
+                        ownership=body.get("ownership", "unchanged"),
+                    )
+                finally:
+                    review_session.close()
+            except FindingReviewConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": exc.reason_code},
+                ) from None
+            except FindingReviewForbidden as exc:
+                raise HTTPException(
+                    status_code=403,
+                    detail={"reason_code": exc.reason_code},
+                ) from None
+            except FindingReviewInvalid as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason_code": exc.reason_code},
+                ) from None
+            except (FindingReviewError, DashboardArtifactError):
+                raise HTTPException(status_code=404, detail="Finding not found") from None
             # The event cache is a projection only. Update it after canonical
             # persistence succeeds so it can never become authoritative.
             for finding_entry in server.state_store.findings:
                 if getattr(finding_entry, "id", "") == finding_id:
-                    finding_entry.status = new_status
+                    finding_entry.status = review.status.value
                     break
             server.event_bus.emit_simple(
                 EventType.FINDING_UPDATED, source="dashboard",
-                finding_id=finding_id, status=new_status,
+                finding_id=finding_id,
+                status=review.status.value,
+                review_owner_operator_id=review.owner_operator_id,
+                review_revision_id=review.revision_id,
+                review_version=review.version,
             )
             _audit(
                 request,
-                "finding.status",
+                "finding.review",
                 object_id=finding_id,
-                detail={"status": new_status, "canonical_status": server._canonical_finding_status(new_status)},
+                detail={
+                    "ownership": body.get("ownership", "unchanged"),
+                    "review_revision_id": review.revision_id,
+                    "review_status": review.status.value,
+                    "review_version": review.version,
+                },
                 payload=payload,
             )
             return {
                 "status": "updated",
                 "finding_id": finding_id,
-                "new_status": new_status,
-                "canonical_status": server._canonical_finding_status(new_status),
-                "persisted": persisted,
+                "persisted": True,
+                "review": review.to_dict(),
             }
 
         @app.post("/api/v1/findings/{finding_id}/retest")
@@ -4965,8 +5140,18 @@ class DashboardServer:
                 credential_reference=credential_reference,
                 prior_decision=submitted_decision,
             )
+            retest_idempotency_key = f"dashboard:{client_job_id}"
+            existing_retest = (
+                server._existing_dashboard_retest(
+                    finding_id,
+                    retest_idempotency_key,
+                    actor_id=operator_id,
+                )
+                if not dry_run
+                else None
+            )
             authorization: ActionAuthorizationEnvelope | None = None
-            if not dry_run:
+            if not dry_run and existing_retest is None:
                 if context is None or confirmation is None:
                     server._raise_scope_denial(
                         decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
@@ -4992,6 +5177,8 @@ class DashboardServer:
                     "duplicate": False,
                     "verdict_authority": "none",
                 }
+            elif existing_retest is not None:
+                result = existing_retest
             else:
                 assert authorization is not None
                 database_path = server._canonical_finding_database(finding_id)
@@ -5000,14 +5187,14 @@ class DashboardServer:
                     clock=lambda: server._agent_now().timestamp(),
                     authorization_checker=server._retest_authorization_allowed,
                 )
-                canonical_session = create_db(database_path)
+                canonical_session = server._open_database_session(database_path)
                 try:
                     retest_service = RetestService(
                         canonical_session,
                         database_path.parent / "evidence-custody",
                         service,
                         authorization_session_factory=(
-                            lambda: create_db(server._scan_jobs_db_path)
+                            lambda: open_existing_db(server._scan_jobs_db_path)
                         ),
                         session_resolver=server._retest_session_resolver,
                     )
@@ -5017,7 +5204,7 @@ class DashboardServer:
                         authorization=authorization,
                         allowed_scope=tuple(allowed_scope),
                         excluded_scope=tuple(excluded_scope),
-                        idempotency_key=f"dashboard:{authorization.job_id}",
+                        idempotency_key=retest_idempotency_key,
                     )
                     result = execution.to_dict()
                 finally:
@@ -5073,6 +5260,18 @@ class DashboardServer:
             _require_not_killed()
             body = await request.json()
             job_id = server._server_job_id()
+            raw_reference_slice = body.get("reference_slice", "")
+            if not isinstance(raw_reference_slice, str):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason_code": "reference_slice_invalid"},
+                )
+            reference_slice = raw_reference_slice.strip()
+            if reference_slice not in {"", "header-audit-csp-v1"}:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason_code": "reference_slice_unsupported"},
+                )
 
             def _deny_preflight(
                 decision: ScopeDecision,
@@ -5254,8 +5453,20 @@ class DashboardServer:
             import os as _os2
             scan_env = minimal_child_environment(
                 _os2.environ,
-                allowlist={"FORGE_TENANT_ID"},
+                allowlist={
+                    "FORGE_TENANT_ID",
+                    "FORGE_RUN_TRUTH_POLICY_ID",
+                    "FORGE_RUN_TRUTH_POLICY_VERSION",
+                    "FORGE_RUN_TRUTH_ISSUER_ID",
+                    "FORGE_RUN_TRUTH_PUBLIC_KEY",
+                    "FORGE_RUN_TRUTH_PRIVATE_KEY_FILE",
+                    "FORGE_RUN_TRUTH_AUTHORITY_ID",
+                },
             )
+            if reference_slice:
+                scan_env["FORGE_REFERENCE_TIMEOUT_SECONDS"] = str(
+                    timeout_seconds
+                )
             if mode != "blackbox":
                 scan_env["FORGE_AUTH_TYPE"] = auth_type
 
@@ -5289,6 +5500,22 @@ class DashboardServer:
                     ),
                 )
 
+            if reference_slice and (
+                modules != ["header_audit"]
+                or web_modules != ["header_audit"]
+                or net_modules
+                or mode != "blackbox"
+            ):
+                _deny_preflight(
+                    decision_for_reason(ScopeReason.INVALID_CONFIRMATION),
+                    original_error=HTTPException(
+                        status_code=400,
+                        detail={
+                            "reason_code": "reference_slice_exact_plan_required"
+                        },
+                    ),
+                )
+
             # Determine scan type from resolved modules
             if web_modules and net_modules:
                 scan_type = "vapt"
@@ -5315,6 +5542,14 @@ class DashboardServer:
                 _deny_preflight(
                     decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
                 )
+            if reference_slice and raw_intensity != 0:
+                _deny_preflight(
+                    decision_for_reason(ScopeReason.INVALID_CONFIRMATION),
+                    original_error=HTTPException(
+                        status_code=400,
+                        detail={"reason_code": "reference_slice_must_be_passive"},
+                    ),
+                )
             intensity_label = intensity_map[raw_intensity]
 
             try:
@@ -5323,6 +5558,8 @@ class DashboardServer:
                 _deny_preflight(
                     decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
                 )
+            if reference_slice:
+                job_id = server._reference_slice_job_id(client_job_id)
             run_id = f"run-{uuid.uuid4().hex}"
             engagement_id = f"engagement-{uuid.uuid5(uuid.NAMESPACE_URL, job_id).hex}"
             operator_id = payload.username if payload else "operator"
@@ -5362,6 +5599,33 @@ class DashboardServer:
                 if not net_scope_decision.allowed:
                     _deny_preflight(net_scope_decision, engine="netforge")
 
+            existing_reference_job: Mapping[str, Any] | None = None
+            if reference_slice:
+                candidate = server._durable_job_state().get_job(
+                    job_id,
+                    tenant_id=server.tenant_id,
+                )
+                if candidate is not None:
+                    payload_value = candidate.get("payload")
+                    assignment = (
+                        dict(payload_value)
+                        if isinstance(payload_value, Mapping)
+                        else {}
+                    )
+                    if (
+                        assignment.get("target") != target
+                        or assignment.get("modules") != ["header_audit"]
+                        or assignment.get("reference_slice")
+                        != "header-audit-csp-v1"
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "reason_code": "reference_slice_idempotency_conflict"
+                            },
+                        )
+                    existing_reference_job = candidate
+
             action_decisions: list[dict[str, Any]] = []
             web_confirmation: ActionConfirmation | None = None
             net_confirmation: ActionConfirmation | None = None
@@ -5396,7 +5660,11 @@ class DashboardServer:
                     run_id=run_id,
                     operator_id=operator_id,
                     operator_role=operator_role,
-                    safety_mode=SafetyMode.ACTIVE.value,
+                    safety_mode=(
+                        SafetyMode.PASSIVE.value
+                        if reference_slice
+                        else SafetyMode.ACTIVE.value
+                    ),
                     module_id=module_set_binding(web_modules),
                     credential_reference=web_credential_reference,
                     prior_decision=submitted_web_decision,
@@ -5407,6 +5675,19 @@ class DashboardServer:
                     "decision": web_decision.to_dict(),
                     "authorization": None,
                 })
+                if existing_reference_job is not None:
+                    return {
+                        "actual_modules": ["header_audit"],
+                        "client_job_id": client_job_id,
+                        "duplicate": True,
+                        "reference_slice": reference_slice,
+                        "requested_modules": ["header_audit"],
+                        "run_id": existing_reference_job.get("run_id"),
+                        "scan_id": job_id,
+                        "scan_type": "web",
+                        "status": existing_reference_job.get("state"),
+                        "target": target,
+                    }
             if scan_type in {"net", "vapt"}:
                 net_action = "web_to_network" if scan_type == "vapt" else "scan"
                 net_confirmation, submitted_net_decision = server._server_confirmation(
@@ -5515,6 +5796,7 @@ class DashboardServer:
                     "results_dir": str(results_root),
                     "created_at": datetime.now(timezone.utc),
                 },
+                persist_legacy_projection=not bool(reference_slice),
             )
             committed_iter = iter(committed)
             if web_context is not None:
@@ -5524,7 +5806,11 @@ class DashboardServer:
             for item, authorization in zip(action_decisions, committed):
                 item["authorization"] = authorization.to_event_payload()
 
-            engagement    = f"ScanBuilder-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
+            engagement = (
+                engagement_id
+                if reference_slice
+                else f"ScanBuilder-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}"
+            )
             scan_id       = job_id
             forge_root    = Path(__file__).parent.parent.parent
             control_file  = server._init_control_file(scan_id)
@@ -5570,6 +5856,11 @@ class DashboardServer:
                     cmd += ['--source-root', source_root]
                 if web_modules:
                     cmd += ['--modules', ','.join(web_modules)]
+                if reference_slice:
+                    cmd += [
+                        '--reference-slice', reference_slice,
+                        '--no-screenshot',
+                    ]
                 server._append_scope_args(
                     cmd,
                     web_allowed_scope,
@@ -5653,6 +5944,7 @@ class DashboardServer:
                 control_file=control_file,
                 actor_id=operator_id,
                 actor_role=operator_role,
+                reference_slice=reference_slice,
             )
             spawned: list[
                 tuple[str, str, list[str], list[str], subprocess.Popen[str]]
@@ -5820,6 +6112,9 @@ class DashboardServer:
                 'processes': process_metadata,
                 'dashboard_url': dash_url,
                 'network_target': network_target,
+                'duplicate': False,
+                'reference_slice': reference_slice or None,
+                'run_id': run_id,
             }
             if unsupported:
                 response_data['unsupported_modules'] = unsupported
@@ -5845,38 +6140,155 @@ class DashboardServer:
 
         @app.get("/api/v1/reports/latest")
         async def api_report_latest(request: Request, fmt: str = "html"):
-            """Return the path of the most recently generated report.
-
-            Query params:
-              fmt: "html" | "pdf" | "json"
-            """
+            """Return the newest tenant-bound locked HTML report metadata."""
             _require_auth(request)
-            if fmt not in {"html", "pdf", "json"}:
+            if fmt != "html":
                 raise HTTPException(status_code=400, detail="Unsupported report format")
-            return JSONResponse(
-                {
-                    "status": "disabled",
-                    "reason_code": "report_artifact_tenant_binding_unavailable",
-                },
-                status_code=503,
-            )
+            reports = server._canonical_reports(limit=1)
+            return {
+                "report": reports[0] if reports else None,
+                "status": "ready" if reports else "empty",
+            }
 
         @app.get("/api/v1/reports/download")
         async def api_report_download(request: Request, fmt: str = "html"):
-            """Download the most recently generated report.
-
-            Query params:
-              fmt: "html" | "pdf" | "json"
-            """
+            """Keep unactioned GET downloads fail-closed."""
             _require_auth(request)
-            if fmt not in {"html", "pdf", "json"}:
+            if fmt != "html":
                 raise HTTPException(status_code=400, detail="Unsupported report format")
             return JSONResponse(
                 {
                     "status": "disabled",
-                    "reason_code": "report_artifact_tenant_binding_unavailable",
+                    "reason_code": "report_export_action_authorization_required",
                 },
-                status_code=503,
+                status_code=403,
+            )
+
+        @app.post("/api/v1/reports/download")
+        async def api_report_download_authorized(request: Request):
+            """Return one persisted locked report after exact authorization."""
+
+            payload = _require_auth(request, Role.OPERATOR)
+            try:
+                body = await request.json()
+            except Exception:
+                body = None
+            if not isinstance(body, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason_code": "report_export_request_invalid"},
+                )
+            report_id = body.get("report_id")
+            if not isinstance(report_id, str) or not report_id.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason_code": "report_export_request_invalid"},
+                )
+            if body.get("format", "html") != "html":
+                raise HTTPException(status_code=400, detail="Unsupported report format")
+            try:
+                client_job_id = server._client_job_id(body)
+                report = server._canonical_report_metadata(report_id.strip())
+            except (CanonicalReportError, DashboardArtifactError):
+                raise HTTPException(status_code=404, detail="Report not found") from None
+            target = str(report.get("target") or "")
+            allowed_scope, excluded_scope = server._launch_scope_inputs(body)
+            server_job_id = server._server_job_id()
+            confirmation, submitted_decision = server._server_confirmation(
+                body,
+                client_job_id=client_job_id,
+                server_job_id=server_job_id,
+                target=target,
+                allowed_scope=allowed_scope,
+                excluded_scope=excluded_scope,
+                engine="forge",
+                action="report.export",
+                dry_run=False,
+            )
+            decision, confirmation, context = server._prepare_launch_action(
+                target=target,
+                allowed_scope=allowed_scope,
+                excluded_scope=excluded_scope,
+                confirmation=confirmation,
+                job_id=server_job_id,
+                engine="forge",
+                action="report.export",
+                dry_run=False,
+                tenant_id=server.tenant_id,
+                engagement_id=str(report["engagement_id"]),
+                run_id=f"run-{uuid.uuid4().hex}",
+                operator_id=payload.username,
+                operator_role=payload.role.value,
+                safety_mode=SafetyMode.PASSIVE.value,
+                module_id=report_export_binding(
+                    str(report["report_id"]),
+                    str(report["artifact_sha256"]),
+                ),
+                prior_decision=submitted_decision,
+            )
+            del decision
+            assert confirmation is not None and context is not None
+            authorization = server._commit_dashboard_action_authorization(
+                context,
+                confirmation,
+                boundary="dashboard.report.export",
+            )
+            database_path = server._canonical_report_database(report_id.strip())
+            report_session, service = server._canonical_report_service(database_path)
+            try:
+                exported = service.export_html(
+                    report_id.strip(),
+                    operator_id=payload.username,
+                    authorization=authorization,
+                    request_id=client_job_id,
+                )
+            except CanonicalReportAuthorizationError:
+                raise HTTPException(
+                    status_code=403,
+                    detail={"reason_code": "canonical_report_export_not_authorized"},
+                ) from None
+            except (CanonicalReportError, CustodyError):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "canonical_report_export_failed"},
+                ) from None
+            finally:
+                report_session.close()
+            receipt = exported.receipt()
+            server.event_bus.emit_simple(
+                EventType.EXPORT_COMPLETED,
+                source="dashboard",
+                artifact_id=receipt["artifact_id"],
+                artifact_sha256=receipt["artifact_sha256"],
+                export_id=receipt["export_id"],
+                format="html",
+                report_id=receipt["report_id"],
+                report_version=receipt["report_version"],
+                status="completed",
+            )
+            _audit(
+                request,
+                "report.export",
+                object_id=str(receipt["export_id"]),
+                detail={
+                    "artifact_sha256": receipt["artifact_sha256"],
+                    "report_id": receipt["report_id"],
+                    "report_version": receipt["report_version"],
+                },
+                payload=payload,
+            )
+            return Response(
+                content=exported.content,
+                media_type="text/html",
+                headers={
+                    "Content-Disposition": (
+                        f'attachment; filename="forge-report-v{exported.report.version}.html"'
+                    ),
+                    "ETag": f'"{exported.report.artifact_sha256}"',
+                    "X-Forge-Export-ID": exported.export_id,
+                    "X-Forge-Report-ID": exported.report.report_id,
+                    "X-Forge-Report-Version": str(exported.report.version),
+                },
             )
 
         # ── Plugin inventory ──────────────────────────────────────────
@@ -6054,26 +6466,119 @@ class DashboardServer:
             framework: str | None = None,
             limit: int = Query(default=50, le=200),
         ):
-            """List all generated reports across all engagements.
-
-            Query params:
-              fmt:       filter by format — html | pdf | json
-              framework: filter by framework — webforge | netforge
-              limit:     max results (default 50, max 200)
-            """
+            """List tenant-bound locked HTML report versions."""
             _require_auth(request)
-            if framework is not None and framework not in {"webforge", "netforge"}:
+            if framework is not None and framework != "webforge":
                 raise HTTPException(status_code=400, detail="Unsupported report framework")
-            if fmt is not None and fmt not in {"html", "pdf", "json"}:
+            if fmt is not None and fmt != "html":
                 raise HTTPException(status_code=400, detail="Unsupported report format")
-            del limit
-            return JSONResponse(
-                {
-                    "status": "disabled",
-                    "reason_code": "report_artifact_tenant_binding_unavailable",
-                },
-                status_code=503,
+            reports = server._canonical_reports(limit=limit)
+            return {"reports": reports, "status": "ready", "total": len(reports)}
+
+        @app.post("/api/v1/reports")
+        async def api_report_create(request: Request):
+            """Freeze and render one existing HTML report from canonical state."""
+
+            payload = _require_auth(request, Role.OPERATOR)
+            try:
+                body = await request.json()
+            except Exception:
+                body = None
+            if not isinstance(body, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason_code": "canonical_report_request_invalid"},
+                )
+            forbidden = {
+                "artifact_id",
+                "finding_ids",
+                "membership",
+                "observation_ids",
+                "operator_id",
+                "source_ids",
+                "tenant_id",
+            }
+            if forbidden.intersection(body):
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason_code": "canonical_report_sources_are_server_derived"},
+                )
+            finding_id = body.get("finding_id")
+            if not isinstance(finding_id, str) or not finding_id.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail={"reason_code": "canonical_report_request_invalid"},
+                )
+            if body.get("format", "html") != "html":
+                raise HTTPException(status_code=400, detail="Unsupported report format")
+            try:
+                database_path = server._canonical_finding_database(
+                    finding_id.strip()
+                )
+                report_session, service = server._canonical_report_service(
+                    database_path
+                )
+                try:
+                    report = await service.create_html_report(
+                        finding_id.strip(),
+                        operator_id=payload.username,
+                    )
+                finally:
+                    report_session.close()
+            except CanonicalReportNotFound:
+                raise HTTPException(status_code=404, detail="Finding not found") from None
+            except CanonicalReportSourceIncomplete as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": exc.reason_code},
+                ) from None
+            except CanonicalReportConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": exc.reason_code},
+                ) from None
+            except CanonicalReportError as exc:
+                log.warning(
+                    "Canonical report generation failed reason_code=%s",
+                    exc.reason_code,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": exc.reason_code},
+                ) from None
+            except (CustodyError, DashboardArtifactError) as exc:
+                log.warning(
+                    "Canonical report boundary failed reason=%s detail=%s",
+                    type(exc).__name__,
+                    str(exc)[:200],
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "canonical_report_generation_failed"},
+                ) from None
+            projection = report.to_dict()
+            server.event_bus.emit_simple(
+                EventType.REPORT_UPDATED,
+                source="dashboard",
+                artifact_id=projection["artifact_id"],
+                artifact_sha256=projection["artifact_sha256"],
+                format="html",
+                report_id=projection["report_id"],
+                report_version=projection["version"],
+                status="locked",
             )
+            _audit(
+                request,
+                "report.lock",
+                object_id=str(projection["report_id"]),
+                detail={
+                    "artifact_sha256": projection["artifact_sha256"],
+                    "report_version": projection["version"],
+                    "source_digest": projection["source_digest"],
+                },
+                payload=payload,
+            )
+            return {"report": projection, "status": "locked"}
 
         # ── Verification queue ────────────────────────────────────────
 
@@ -7167,7 +7672,7 @@ class DashboardServer:
 
     def _with_scan_jobs_session(self, callback: Any) -> Any:
         """Run a short-lived scan job DB operation."""
-        session = create_db(self._scan_jobs_db_path)
+        session = open_existing_db(self._scan_jobs_db_path)
         try:
             return callback(session)
         finally:
@@ -8644,6 +9149,7 @@ class DashboardServer:
         run_truths: list[RunTruthReceipt],
         worker_id: str,
         actor: TransitionActor,
+        custody_root: Path | None = None,
     ) -> tuple[ObservationReceipt, dict[str, Any]]:
         """Atomically bind Task 102 custody and Task 103 acceptance material."""
 
@@ -8673,13 +9179,17 @@ class DashboardServer:
                 actor=actor,
             )
 
-        custody_root = self._scan_results_dir / _artifact_identifier(job_id)
-        _ensure_private_artifact_directory(custody_root)
-        session = create_db(self._scan_jobs_db_path)
+        selected_custody_root = (
+            _artifact_path(custody_root)
+            if custody_root is not None
+            else self._scan_results_dir / _artifact_identifier(job_id)
+        )
+        _ensure_private_artifact_directory(selected_custody_root)
+        session = open_existing_db(self._scan_jobs_db_path)
         try:
             evidence = CanonicalEvidenceService.from_authorization(
                 session,
-                custody_root / "evidence-custody",
+                selected_custody_root / "evidence-custody",
                 envelope,
                 attempt_id=str(attempt["id"]),
             )
@@ -8715,6 +9225,320 @@ class DashboardServer:
             actor=actor,
         )
         return receipt, delivery
+
+    def _reference_module_authorization(
+        self,
+        *,
+        job_id: str,
+        engine_decision_id: str,
+    ) -> ActionAuthorizationEnvelope:
+        """Load the exact consumed HeaderAudit child authority after exit."""
+
+        session = open_existing_db(self._scan_jobs_db_path)
+        try:
+            rows = session.execute(
+                sql_text(
+                    "SELECT d.envelope_json,c.boundary AS consumption_boundary,"
+                    "c.envelope_digest AS consumption_digest,"
+                    "x.boundary AS execution_boundary,"
+                    "x.envelope_digest AS execution_digest "
+                    "FROM authorization_decisions d "
+                    "JOIN authorization_consumptions c "
+                    "ON c.decision_id=d.decision_id "
+                    "JOIN authorization_execution_claims x "
+                    "ON x.decision_id=d.decision_id "
+                    "WHERE d.tenant_id=:tenant_id AND d.job_id=:job_id "
+                    "AND d.parent_decision_id=:parent_decision_id "
+                    "AND d.engine='webforge' "
+                    "AND d.action_kind='module.execute' "
+                    "AND d.module_id='header_audit' "
+                    "AND d.decision_outcome='allow'"
+                ),
+                {
+                    "tenant_id": self.tenant_id,
+                    "job_id": job_id,
+                    "parent_decision_id": engine_decision_id,
+                },
+            ).mappings().all()
+            session.rollback()
+        finally:
+            session.close()
+        if len(rows) != 1:
+            raise CanonicalEvidenceError(
+                "reference module authorization is unavailable or ambiguous"
+            )
+        row = rows[0]
+        try:
+            envelope = ActionAuthorizationEnvelope.from_value(
+                json.loads(str(row["envelope_json"]))
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise CanonicalEvidenceError(
+                "reference module authorization is invalid"
+            ) from None
+        if not all(
+            (
+                envelope.tenant_id == self.tenant_id,
+                envelope.job_id == job_id,
+                envelope.parent_decision_id == engine_decision_id,
+                envelope.engine == "webforge",
+                envelope.module_id == "header_audit",
+                envelope.action_kind == "module.execute",
+                envelope.decision_outcome == "allow",
+                row["consumption_boundary"] == "webforge.module",
+                row["execution_boundary"] == "webforge.module",
+                row["consumption_digest"] == envelope.binding_digest,
+                row["execution_digest"] == envelope.binding_digest,
+            )
+        ):
+            raise CanonicalEvidenceError(
+                "reference module authorization lineage is invalid"
+            )
+        return envelope
+
+    @staticmethod
+    def _reference_import_evidence(
+        projection: Mapping[str, Any],
+    ) -> Evidence:
+        """Rehydrate only verified redacted derivatives for parent custody."""
+
+        evidence_value = projection.get("evidence")
+        if not isinstance(evidence_value, Mapping):
+            raise CanonicalEvidenceError("reference finding evidence is unavailable")
+        observations = evidence_value.get("observations")
+        if not isinstance(observations, list) or len(observations) != 1:
+            raise CanonicalEvidenceError(
+                "reference finding must have one source observation"
+            )
+        observation = observations[0]
+        if not isinstance(observation, Mapping):
+            raise CanonicalEvidenceError("reference source observation is invalid")
+        artifacts = observation.get("artifacts")
+        if not isinstance(artifacts, list) or not artifacts:
+            raise CanonicalEvidenceError("reference source artifacts are unavailable")
+        request_raw: str | None = None
+        response_raw: str | None = None
+        structured: dict[str, Any] | None = None
+        seen_kinds: set[str] = set()
+        for artifact in artifacts:
+            if not isinstance(artifact, Mapping):
+                raise CanonicalEvidenceError("reference source artifact is invalid")
+            kind = str(artifact.get("capture_kind") or "")
+            derivative = artifact.get("derivative")
+            if kind in seen_kinds or not isinstance(derivative, str):
+                raise CanonicalEvidenceError(
+                    "reference source artifact set is ambiguous"
+                )
+            seen_kinds.add(kind)
+            if kind == "request":
+                request_raw = derivative
+            elif kind == "response":
+                response_raw = derivative
+            elif kind == "structured_proof":
+                try:
+                    decoded = json.loads(derivative)
+                except json.JSONDecodeError:
+                    raise CanonicalEvidenceError(
+                        "reference structured proof is invalid"
+                    ) from None
+                if not isinstance(decoded, dict):
+                    raise CanonicalEvidenceError(
+                        "reference structured proof is invalid"
+                    )
+                structured = decoded
+        if request_raw is None or response_raw is None or structured is None:
+            raise CanonicalEvidenceError(
+                "reference request, response, and proof are required"
+            )
+        if (
+            observation.get("check_id") != "Content-Security-Policy"
+            or observation.get("proof_type") != "passive"
+            or structured.get("check_id") != "Content-Security-Policy"
+            or structured.get("proof_policy") != "header-audit-csp-proof-v1"
+            or structured.get("proof_type") != "passive"
+        ):
+            raise CanonicalEvidenceError("reference CSP proof binding is invalid")
+        return Evidence(
+            request_raw=request_raw,
+            response_raw=response_raw,
+            extra=structured,
+        )
+
+    def _import_reference_slice_finding(
+        self,
+        *,
+        job: Mapping[str, Any],
+        attempt: Mapping[str, Any],
+        engine_envelope: ActionAuthorizationEnvelope,
+    ) -> dict[str, Any] | None:
+        """Import one child-staged CSP result into parent-owned canonical state."""
+
+        assignment_value = job.get("payload")
+        assignment = (
+            dict(assignment_value)
+            if isinstance(assignment_value, Mapping)
+            else {}
+        )
+        if assignment.get("reference_slice") != "header-audit-csp-v1":
+            return None
+        root = self._verified_canonical_result_root(
+            str(assignment.get("results_dir") or "")
+        )
+        databases = [
+            path
+            for path in self._canonical_database_paths(root)
+            if path.name == "webforge.db"
+        ]
+        if len(databases) != 1:
+            raise CanonicalEvidenceError(
+                "reference child canonical result is unavailable or ambiguous"
+            )
+        source_database = databases[0]
+        source_session = create_db(source_database)
+        try:
+            source_reader = CanonicalEvidenceReader(
+                source_session,
+                source_database.parent / "evidence-custody",
+                self.tenant_id,
+                audit_actor_id="dashboard-reference-import",
+            )
+            candidates = []
+            for projection in source_reader.list_finding_projections():
+                evidence_value = projection.get("evidence")
+                observations = (
+                    evidence_value.get("observations")
+                    if isinstance(evidence_value, Mapping)
+                    else None
+                )
+                if not isinstance(observations, list):
+                    continue
+                if any(
+                    isinstance(item, Mapping)
+                    and item.get("job_id") == job["id"]
+                    and item.get("check_id") == "Content-Security-Policy"
+                    and item.get("proof_type") == "passive"
+                    for item in observations
+                ):
+                    candidates.append(projection)
+            source_session.rollback()
+        finally:
+            source_session.close()
+        if not candidates:
+            # A corrected response has no unsupported finding to import.
+            return None
+        if len(candidates) != 1:
+            raise CanonicalEvidenceError(
+                "reference child produced an ambiguous CSP finding set"
+            )
+
+        central_custody = self._scan_jobs_db_path.parent / "evidence-custody"
+        _ensure_private_artifact_directory(central_custody)
+        central = open_existing_db(self._scan_jobs_db_path)
+        try:
+            existing = central.execute(
+                sql_text(
+                    "SELECT f.id AS finding_id,o.id AS observation_id "
+                    "FROM canonical_findings f "
+                    "JOIN canonical_finding_observations fo "
+                    "ON fo.tenant_id=f.tenant_id AND fo.finding_id=f.id "
+                    "JOIN canonical_observations o "
+                    "ON o.tenant_id=fo.tenant_id AND o.id=fo.observation_id "
+                    "JOIN canonical_module_versions mv "
+                    "ON mv.tenant_id=o.tenant_id AND mv.id=o.module_version_id "
+                    "WHERE f.tenant_id=:tenant_id AND o.job_id=:job_id "
+                    "AND o.attempt_id=:attempt_id "
+                    "AND o.check_id='Content-Security-Policy' "
+                    "AND o.proof_type='passive' "
+                    "AND mv.module_id='header_audit'"
+                ),
+                {
+                    "tenant_id": self.tenant_id,
+                    "job_id": str(job["id"]),
+                    "attempt_id": str(attempt["id"]),
+                },
+            ).mappings().all()
+            central.rollback()
+            if len(existing) > 1:
+                raise CanonicalEvidenceError(
+                    "reference attempt has duplicate canonical observations"
+                )
+            if existing:
+                existing_projection = CanonicalEvidenceReader(
+                    central,
+                    central_custody,
+                    self.tenant_id,
+                    audit_actor_id="dashboard-reference-import",
+                ).get_finding_projection(str(existing[0]["finding_id"]))
+                if existing_projection is None:
+                    raise CanonicalEvidenceError(
+                        "reference imported finding is unreadable"
+                    )
+                central.rollback()
+                return {
+                    "duplicate": True,
+                    "finding_id": str(existing[0]["finding_id"]),
+                    "observation_id": str(existing[0]["observation_id"]),
+                }
+
+            source = candidates[0]
+            module_envelope = self._reference_module_authorization(
+                job_id=str(job["id"]),
+                engine_decision_id=engine_envelope.decision_id,
+            )
+            imported = Finding(
+                title=str(source["title"]),
+                severity=Severity(str(source["severity"]).capitalize()),
+                target=str(source["target"]),
+                module="header_audit",
+                description=str(source["description"]),
+                reproduction_steps=[str(item) for item in source.get("reproduction_steps", [])],
+                remediation=str(source.get("remediation") or ""),
+                references=["CWE-1021", "OWASP A05:2021"],
+                evidence=self._reference_import_evidence(source),
+                cvss_v31_vector=(
+                    str(source["cvss_v31_vector"])
+                    if source.get("cvss_v31_vector")
+                    else None
+                ),
+                cvss_v40_vector=(
+                    str(source["cvss_v40_vector"])
+                    if source.get("cvss_v40_vector")
+                    else None
+                ),
+                mitre_attack=[str(item) for item in source.get("mitre_attack", [])],
+                url=str(source.get("url") or source["target"]),
+                confidence=str(source.get("confidence") or "UNVERIFIED"),
+                status="open",
+                proof_type="passive",
+                maturity=str(source.get("maturity") or "experimental"),
+                verification_state=str(
+                    source.get("verification_state") or "unknown"
+                ),
+            )
+            projection = CanonicalEvidenceService.from_authorization(
+                central,
+                central_custody,
+                module_envelope,
+                attempt_id=str(attempt["id"]),
+            ).persist_finding(imported)
+            observations = projection["evidence"]["observations"]
+            matched = [
+                item
+                for item in observations
+                if item.get("job_id") == job["id"]
+                and item.get("check_id") == "Content-Security-Policy"
+            ]
+            if len(matched) != 1:
+                raise CanonicalEvidenceError(
+                    "reference imported observation is ambiguous"
+                )
+            return {
+                "duplicate": False,
+                "finding_id": str(projection["id"]),
+                "observation_id": str(matched[0]["observation_id"]),
+            }
+        finally:
+            central.close()
 
     def _complete_agent_job(
         self,
@@ -9136,7 +9960,12 @@ class DashboardServer:
                 decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
             )
         intent = raw_intent.strip().lower()
-        if intent not in {"scan.start", "scan.launch", "finding.retest"}:
+        if intent not in {
+            "scan.start",
+            "scan.launch",
+            "finding.retest",
+            "report.export",
+        }:
             self._raise_scope_denial(
                 decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
             )
@@ -9260,7 +10089,7 @@ class DashboardServer:
                 actions.append(
                     (_web_target(target), "webforge", "scan", primary_scope)
                 )
-        else:
+        elif intent == "finding.retest":
             raw_finding_id = body.get("finding_id")
             if not isinstance(raw_finding_id, str) or not raw_finding_id.strip():
                 self._raise_scope_denial(
@@ -9279,6 +10108,18 @@ class DashboardServer:
                 )
             engine = self._retest_framework(module)
             actions.append((target, engine, "retest", primary_scope))
+        else:
+            raw_report_id = body.get("report_id")
+            if not isinstance(raw_report_id, str) or not raw_report_id.strip():
+                self._raise_scope_denial(
+                    decision_for_reason(ScopeReason.INVALID_CONFIRMATION)
+                )
+            try:
+                report = self._canonical_report_metadata(raw_report_id.strip())
+            except (CanonicalReportError, DashboardArtifactError):
+                raise HTTPException(status_code=404, detail="Report not found") from None
+            target = _required_target(report.get("target"))
+            actions.append((target, "forge", "report.export", primary_scope))
 
         decisions: list[ScopeDecision] = []
         confirmations: list[ActionConfirmation] = []
@@ -9415,6 +10256,13 @@ class DashboardServer:
     @staticmethod
     def _server_job_id() -> str:
         return f"job-{uuid.uuid4().hex}"
+
+    def _reference_slice_job_id(self, client_job_id: str) -> str:
+        """Derive one stable Task 103 identity from a server-issued correlation."""
+
+        correlation = self._client_job_id({"job_id": client_job_id})
+        material = f"{self.tenant_id}\x00header-audit-csp-v1\x00{correlation}"
+        return f"job-{uuid.uuid5(uuid.NAMESPACE_URL, material).hex}"
 
     @staticmethod
     def _confirmation_from_body(
@@ -9579,6 +10427,7 @@ class DashboardServer:
         actions: list[tuple[AuthorizationContext, ActionConfirmation]],
         *,
         job_record: dict[str, Any],
+        persist_legacy_projection: bool = True,
     ) -> list[ActionAuthorizationEnvelope]:
         """Atomically issue a launch batch and link its pending scan job."""
         if not actions:
@@ -9652,16 +10501,17 @@ class DashboardServer:
                 # The dashboard handoff still owns a Gate-0 compatibility job
                 # row; it has no module-version/asset graph yet.  Keep that
                 # exception explicit and fail closed on canonical adapters.
-                save_scan_job(
-                    session,
-                    persisted_job,
-                    commit=False,
-                    # The handoff has no complete canonical engagement /
-                    # module-version / asset graph.  Fail typed before
-                    # persisting an orphan job; Task 103 owns the durable
-                    # state-machine adapter.
-                    allow_legacy_compat=False,
-                )
+                if persist_legacy_projection:
+                    save_scan_job(
+                        session,
+                        persisted_job,
+                        commit=False,
+                        # The handoff has no complete canonical engagement /
+                        # module-version / asset graph. Fail typed before
+                        # persisting an orphan job; Task 103 owns the durable
+                        # state-machine adapter.
+                        allow_legacy_compat=False,
+                    )
                 session.commit()
                 return children
             except HTTPException:
@@ -9683,6 +10533,62 @@ class DashboardServer:
                         "Authorization handoff persistence failed; execution denied"
                     ),
                 ) from exc
+
+        return self._with_scan_jobs_session(_persist)
+
+    def _commit_dashboard_action_authorization(
+        self,
+        context: AuthorizationContext,
+        confirmation: ActionConfirmation,
+        *,
+        boundary: str,
+    ) -> ActionAuthorizationEnvelope:
+        """Issue and consume one non-scan dashboard action atomically."""
+
+        def _persist(session: Any) -> ActionAuthorizationEnvelope:
+            try:
+                issued = issue_authorization(
+                    session=session,
+                    context=context,
+                    confirmation=confirmation,
+                    commit=False,
+                )
+                if not issued.allowed:
+                    raise ValueError(issued.reason_code)
+                consumed = consume_authorization(
+                    session=session,
+                    envelope=issued.envelope,
+                    expected=context,
+                    boundary=boundary,
+                    commit=False,
+                )
+                if not consumed.allowed:
+                    raise ValueError(consumed.reason_code)
+                validated = validate_consumed_authorization(
+                    session=session,
+                    envelope=consumed.envelope,
+                    expected=context,
+                    boundary=boundary,
+                )
+                if not validated.allowed:
+                    raise ValueError(validated.reason_code)
+                session.commit()
+                return validated.envelope
+            except Exception as exc:
+                session.rollback()
+                record_authorization_denial(
+                    session=session,
+                    context=context,
+                    reason_code=AuthorizationReason.HANDOFF_PERSISTENCE_FAILED,
+                )
+                log.warning(
+                    "Dashboard action authorization failed reason=%s",
+                    type(exc).__name__,
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail={"reason_code": "action_authorization_failed"},
+                ) from None
 
         return self._with_scan_jobs_session(_persist)
 
@@ -9793,6 +10699,8 @@ class DashboardServer:
                 "FORGE_RUN_TRUTH_PUBLIC_KEY",
                 "FORGE_RUN_TRUTH_PRIVATE_KEY_FILE",
                 "FORGE_RUN_TRUTH_AUTHORITY_ID",
+                "FORGE_REFERENCE_TIMEOUT_SECONDS",
+                AUTHORIZATION_DB_PREINITIALIZED_ENV,
             },
         )
         env["FORGE_TENANT_ID"] = self.tenant_id
@@ -9803,6 +10711,7 @@ class DashboardServer:
             [authorization]
         )
         env[AUTHORIZATION_DB_ENV] = str(self._scan_jobs_db_path)
+        env[AUTHORIZATION_DB_PREINITIALIZED_ENV] = "1"
         env.update(authorization_runtime_environment(authorization))
         return env
 
@@ -9854,7 +10763,7 @@ class DashboardServer:
             matches: list[Path] = []
             for root in self._canonical_result_roots():
                 for database_path in self._canonical_database_paths(root):
-                    session = create_db(database_path)
+                    session = self._open_database_session(database_path)
                     try:
                         count = int(
                             session.execute(
@@ -9930,6 +10839,7 @@ class DashboardServer:
         control_file: Path,
         actor_id: str,
         actor_role: str,
+        reference_slice: str = "",
     ) -> dict[str, Any]:
         """Persist job, lease, and per-child launch intent before Popen."""
 
@@ -9965,6 +10875,7 @@ class DashboardServer:
                 framework: authorizations[framework].to_dict()
                 for framework in framework_order
             },
+            "reference_slice": reference_slice,
             "source": "dashboard",
         }
         job = service.create_job(
@@ -9973,7 +10884,11 @@ class DashboardServer:
             job_id=scan_id,
             engagement_id=primary.engagement_id,
             run_id=primary.run_id,
-            job_kind="dashboard_scan",
+            job_kind=(
+                "reference_header_audit"
+                if reference_slice == "header-audit-csp-v1"
+                else "dashboard_scan"
+            ),
             target=target,
             authorization_decision_id=primary.decision_id,
             authorization_action_id=primary.action_id,
@@ -10290,6 +11205,12 @@ class DashboardServer:
             "run_truths": [item.to_dict() for item in truth_receipts],
         }
         try:
+            if assignment.get("reference_slice") == "header-audit-csp-v1":
+                self._import_reference_slice_finding(
+                    job=job,
+                    attempt=attempt,
+                    engine_envelope=envelope,
+                )
             _receipt, _delivery = self._persist_custodied_job_result(
                 durable=service,
                 job_id=scan_id,
@@ -10303,6 +11224,12 @@ class DashboardServer:
                 run_truths=truth_receipts,
                 worker_id="dashboard",
                 actor=actor,
+                custody_root=(
+                    self._scan_jobs_db_path.parent
+                    if assignment.get("reference_slice")
+                    == "header-audit-csp-v1"
+                    else None
+                ),
             )
             current = service.get_job(scan_id, tenant_id=self.tenant_id) or job
             if str(current.get("state") or "") in {
@@ -10490,6 +11417,15 @@ class DashboardServer:
 
     def _load_scan_job(self, scan_id: str) -> dict[str, Any] | None:
         """Load a durable scan job row as a JSON-friendly dict."""
+        if self._job_state_service_path != str(self._scan_jobs_db_path):
+            return next(
+                (
+                    row
+                    for row in self._load_scan_jobs(limit=1000)
+                    if row.get("scan_id") == scan_id
+                ),
+                None,
+            )
         durable = self._durable_job_state().get_job(
             scan_id,
             tenant_id=self.tenant_id,
@@ -10532,6 +11468,7 @@ class DashboardServer:
                     "authorization_action_id": durable.get(
                         "authorization_action_id"
                     ),
+                    "lifecycle_authority": "task103",
                     "attempts": attempts,
                     "coverage": coverage,
                 }
@@ -10560,6 +11497,7 @@ class DashboardServer:
                 "authorization_state": job.authorization_state or "unknown_not_authorized",
                 "authorization_decision_id": job.authorization_decision_id,
                 "authorization_action_id": job.authorization_action_id,
+                "lifecycle_authority": "unverified_legacy",
             }
 
         try:
@@ -10683,6 +11621,7 @@ class DashboardServer:
             "truncated_work": _value("truncated_work", 0),
             "uncollected_work": _value("uncollected_work", 0),
             "lifecycle_authority": "task103",
+            "reference_slice": str(payload.get("reference_slice") or ""),
             "findings_count": {
                 "critical": 0,
                 "high": 0,
@@ -10994,19 +11933,71 @@ class DashboardServer:
         scan_id: str | None = None,
         limit: int = 200,
     ) -> list[dict[str, Any]]:
-        """Return only Task 103 rows through the descriptor-pinned reader."""
+        """Return Task 103 rows through the startup-pinned live authority."""
 
+        rows = self._load_scan_jobs(limit=limit)
         return [
             row
-            for row in self._load_scan_jobs_read_only(
-                scan_id=scan_id,
-                limit=limit,
-            )
+            for row in rows
             if row.get("lifecycle_authority") == "task103"
+            and (scan_id is None or row.get("scan_id") == scan_id)
         ]
 
     def _load_scan_jobs(self, limit: int = 200) -> list[dict[str, Any]]:
         """Load canonical Task 103 jobs, then conservative legacy history."""
+
+        if self._job_state_service_path != str(self._scan_jobs_db_path):
+            # Viewer/read adapters can be pointed at an already initialized
+            # owner-verified database by embedding callers and fixtures.  Read
+            # it without initializing, reconciling, or replacing the pinned
+            # lifecycle service; mutations still fail on authority mismatch.
+            if _artifact_lstat(self._scan_jobs_db_path) is None:
+                return []
+            session = open_existing_db(self._scan_jobs_db_path)
+            try:
+                snapshot_durable_rows = session.execute(
+                    sql_text(
+                        "SELECT * FROM durable_job_state_jobs "
+                        "WHERE tenant_id=:tenant_id "
+                        "ORDER BY created_at DESC LIMIT :limit"
+                    ),
+                    {
+                        "tenant_id": self.tenant_id,
+                        "limit": max(1, min(int(limit), 1000)),
+                    },
+                ).mappings().all()
+                durable_ids = {
+                    str(row["id"]) for row in snapshot_durable_rows
+                }
+                snapshot_legacy_rows = session.execute(
+                    sql_text(
+                        "SELECT * FROM scan_jobs WHERE tenant_id=:tenant_id "
+                        "ORDER BY created_at DESC LIMIT :limit"
+                    ),
+                    {
+                        "tenant_id": self.tenant_id,
+                        "limit": max(1, min(int(limit), 1000)),
+                    },
+                ).mappings().all()
+                session.rollback()
+            finally:
+                session.close()
+            rows = [
+                self._durable_scan_job_mapping(
+                    cast(Mapping[str, Any], row)
+                )
+                for row in snapshot_durable_rows
+            ]
+            rows.extend(
+                self._scan_job_mapping(cast(Mapping[str, Any], row))
+                for row in snapshot_legacy_rows
+                if str(row["id"]) not in durable_ids
+            )
+            return sorted(
+                rows,
+                key=lambda item: str(item.get("created_at") or ""),
+                reverse=True,
+            )[:limit]
 
         durable_rows = self._durable_job_state().list_jobs(
             tenant_id=self.tenant_id,
@@ -11021,7 +12012,25 @@ class DashboardServer:
             is not None
         ]
         known = {str(item.get("scan_id") or "") for item in rows}
-        for legacy in self._load_scan_jobs_read_only(limit=limit):
+        legacy_session = open_existing_db(self._scan_jobs_db_path)
+        try:
+            legacy_rows = legacy_session.execute(
+                sql_text(
+                    "SELECT * FROM scan_jobs WHERE tenant_id=:tenant_id "
+                    "ORDER BY created_at DESC LIMIT :limit"
+                ),
+                {
+                    "tenant_id": self.tenant_id,
+                    "limit": max(1, min(int(limit), 1000)),
+                },
+            ).mappings().all()
+            legacy_session.rollback()
+        finally:
+            legacy_session.close()
+        for legacy_row in legacy_rows:
+            legacy = self._scan_job_mapping(
+                cast(Mapping[str, Any], legacy_row)
+            )
             scan_id = str(legacy.get("scan_id") or "")
             if not scan_id or scan_id in known:
                 continue
@@ -11077,6 +12086,85 @@ class DashboardServer:
                 return self._public_finding(finding)
         return None
 
+    def _existing_dashboard_retest(
+        self,
+        finding_id: str,
+        idempotency_key: str,
+        *,
+        actor_id: str,
+    ) -> dict[str, Any] | None:
+        """Reopen one exact API retest without issuing work or trusting events."""
+
+        database_path = self._canonical_finding_database(finding_id)
+        session = self._open_database_session(database_path)
+        try:
+            row = session.execute(
+                sql_text(
+                    "SELECT r.id AS retest_id,r.new_job_id,ra.id AS attempt_id,"
+                    "ra.durable_attempt_id,ra.state,ra.verdict,ra.reason_code,"
+                    "p.observation_id,p.artifact_id "
+                    "FROM canonical_retests r "
+                    "JOIN canonical_retest_attempts ra "
+                    "ON ra.tenant_id=r.tenant_id AND ra.retest_id=r.id "
+                    "LEFT JOIN canonical_retest_proofs p "
+                    "ON p.tenant_id=ra.tenant_id AND p.id=ra.proof_id "
+                    "WHERE r.tenant_id=:tenant_id AND r.finding_id=:finding_id "
+                    "AND r.idempotency_key=:idempotency_key "
+                    "ORDER BY COALESCE(ra.finished_at,ra.started_at,ra.created_at) "
+                    "DESC,ra.id DESC LIMIT 1"
+                ),
+                {
+                    "tenant_id": self.tenant_id,
+                    "finding_id": finding_id,
+                    "idempotency_key": idempotency_key,
+                },
+            ).mappings().first()
+            if row is None:
+                session.rollback()
+                return None
+            reader = CanonicalEvidenceReader(
+                session,
+                database_path.parent / "evidence-custody",
+                self.tenant_id,
+                audit_actor_id=actor_id,
+            )
+            projection = reader.get_finding_projection(finding_id)
+            if (
+                projection is None
+                or projection.get("retest_id") != str(row["retest_id"])
+            ):
+                raise DashboardArtifactError(
+                    "canonical retest idempotency projection conflicts"
+                )
+            verdict = str(row["verdict"]) if row["verdict"] is not None else None
+            return {
+                "artifact_id": (
+                    str(row["artifact_id"])
+                    if row["artifact_id"] is not None
+                    else None
+                ),
+                "duplicate": True,
+                "durable_attempt_id": str(row["durable_attempt_id"]),
+                "finding_id": finding_id,
+                "job_id": str(row["new_job_id"]),
+                "observation_id": (
+                    str(row["observation_id"])
+                    if row["observation_id"] is not None
+                    else None
+                ),
+                "reason_code": str(row["reason_code"] or ""),
+                "retest_attempt_id": str(row["attempt_id"]),
+                "retest_id": str(row["retest_id"]),
+                "retest_verdict": verdict,
+                "schema_version": "forge-real-retest-v1",
+                "state": str(row["state"]),
+                "verdict_authority": (
+                    "canonical_retest_proof" if row["artifact_id"] else "task103_job_state"
+                ),
+            }
+        finally:
+            session.close()
+
     def _retest_framework(self, module: str) -> str:
         """Classify an existing module without a generic execution fallback."""
 
@@ -11095,32 +12183,126 @@ class DashboardServer:
         """Resolve the one verified canonical database that owns a finding."""
 
         matches: list[Path] = []
-        for root in self._canonical_result_roots():
-            for database_path in self._canonical_database_paths(root):
-                session = create_db(database_path)
-                try:
-                    count = int(
-                        session.execute(
-                            sql_text(
-                                "SELECT COUNT(*) FROM canonical_findings "
-                                "WHERE tenant_id=:tenant_id AND id=:finding_id"
-                            ),
-                            {
-                                "tenant_id": self.tenant_id,
-                                "finding_id": finding_id,
-                            },
-                        ).scalar_one()
-                    )
-                    session.rollback()
-                finally:
-                    session.close()
-                if count:
-                    matches.append(database_path)
+        for database_path in self._canonical_database_candidates():
+            session = self._open_database_session(database_path)
+            try:
+                count = int(
+                    session.execute(
+                        sql_text(
+                            "SELECT COUNT(*) FROM canonical_findings "
+                            "WHERE tenant_id=:tenant_id AND id=:finding_id"
+                        ),
+                        {
+                            "tenant_id": self.tenant_id,
+                            "finding_id": finding_id,
+                        },
+                    ).scalar_one()
+                )
+                session.rollback()
+            finally:
+                session.close()
+            if count:
+                matches.append(database_path)
         if len(matches) != 1:
             raise DashboardArtifactError(
                 "canonical finding source is unavailable or ambiguous"
             )
         return matches[0]
+
+    def _canonical_report_database(self, report_id: str) -> Path:
+        """Resolve the one tenant-bound canonical database owning a report."""
+
+        matches: list[Path] = []
+        for database_path in self._canonical_database_candidates():
+            session = self._open_database_session(database_path)
+            try:
+                count = int(
+                    session.execute(
+                        sql_text(
+                            "SELECT COUNT(*) FROM canonical_report_locks "
+                            "WHERE tenant_id=:tenant_id AND report_id=:report_id"
+                        ),
+                        {
+                            "tenant_id": self.tenant_id,
+                            "report_id": report_id,
+                        },
+                    ).scalar_one()
+                )
+                session.rollback()
+            finally:
+                session.close()
+            if count:
+                matches.append(database_path)
+        if len(matches) != 1:
+            raise DashboardArtifactError(
+                "canonical report source is unavailable or ambiguous"
+            )
+        return matches[0]
+
+    def _canonical_report_service(
+        self,
+        database_path: Path,
+    ) -> tuple[Any, CanonicalReportService]:
+        session = self._open_database_session(database_path)
+        service = CanonicalReportService(
+            session,
+            database_path.parent / "evidence-custody",
+            tenant_id=self.tenant_id,
+        )
+        return session, service
+
+    def _canonical_report_metadata(self, report_id: str) -> dict[str, Any]:
+        database_path = self._canonical_report_database(report_id)
+        session, service = self._canonical_report_service(database_path)
+        try:
+            return service.get_report(report_id).to_dict()
+        finally:
+            session.close()
+
+    def _canonical_reports(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Aggregate locked reports without allowing cross-store conflicts."""
+
+        by_id: dict[str, dict[str, Any]] = {}
+        for database_path in self._canonical_database_candidates():
+            session = self._open_database_session(database_path)
+            try:
+                count = int(
+                    session.execute(
+                        sql_text(
+                            "SELECT COUNT(*) FROM canonical_report_locks "
+                            "WHERE tenant_id=:tenant_id"
+                        ),
+                        {"tenant_id": self.tenant_id},
+                    ).scalar_one()
+                )
+                session.rollback()
+                if count == 0:
+                    continue
+                service = CanonicalReportService(
+                    session,
+                    database_path.parent / "evidence-custody",
+                    tenant_id=self.tenant_id,
+                )
+                reports = service.list_reports(limit=limit)
+            finally:
+                session.close()
+            for report in reports:
+                projection = report.to_dict()
+                report_id = str(projection["report_id"])
+                previous = by_id.get(report_id)
+                if previous is not None and previous != projection:
+                    raise DashboardArtifactError(
+                        "canonical report identity conflicts across stores"
+                    )
+                by_id[report_id] = projection
+        return sorted(
+            by_id.values(),
+            key=lambda item: (
+                str(item.get("locked_at") or ""),
+                str(item.get("report_id") or ""),
+            ),
+            reverse=True,
+        )[: max(1, min(int(limit), 200))]
 
     def _retest_session_reference(self, finding_id: str) -> str:
         """Load only the original opaque credential reference for authorization.
@@ -11132,7 +12314,7 @@ class DashboardServer:
         """
 
         database_path = self._canonical_finding_database(finding_id)
-        canonical_session = create_db(database_path)
+        canonical_session = self._open_database_session(database_path)
         try:
             row = canonical_session.execute(
                 sql_text(
@@ -11436,7 +12618,7 @@ class DashboardServer:
 
         jobs = {
             job.get("scan_id", ""): job
-            for job in self._load_scan_jobs_read_only(limit=max(limit, 200))
+            for job in self._load_scan_jobs(limit=max(limit, 200))
         }
         seen_ids = {record.get("scan_id", "") for record in history}
         for record in history:
@@ -11486,12 +12668,28 @@ class DashboardServer:
         forge_root = Path(__file__).parent.parent.parent
         for record in history:
             if record.get("status") == "completed":
-                record["findings_count"] = self._count_findings_for_scan(
-                    forge_root, record,
-                )
+                if (
+                    record.get("reference_slice")
+                    == "header-audit-csp-v1"
+                    or str(record.get("results_dir") or "").strip()
+                ):
+                    record["findings_count"] = self._count_findings_for_scan(
+                        forge_root,
+                        record,
+                    )
+                else:
+                    record["findings_count"] = {
+                        "critical": 0,
+                        "high": 0,
+                        "medium": 0,
+                        "low": 0,
+                        "total": 0,
+                    }
         return sorted(
             history,
-            key=lambda r: r.get("started_at") or r.get("created_at") or "",
+            key=lambda r: str(
+                r.get("started_at") or r.get("created_at") or ""
+            ),
             reverse=True,
         )[:limit]
 
@@ -11637,7 +12835,7 @@ class DashboardServer:
         root = self._job_bound_canonical_result_root(record)
         for database_path in self._canonical_database_paths(root):
             try:
-                session = create_db(database_path)
+                session = self._open_database_session(database_path)
                 try:
                     count = int(
                         session.execute(
@@ -11669,11 +12867,12 @@ class DashboardServer:
         scan_id = _artifact_identifier(scan_id)
         records = self._load_scan_history(limit=500)
         record = next((r for r in records if r.get("scan_id") == scan_id), None)
-        read_only_jobs = self._load_scan_jobs_read_only(
-            scan_id=scan_id,
-            limit=1,
-        )
-        job = read_only_jobs[0] if read_only_jobs else None
+        # The startup-pinned Task 103 service is already the lifecycle
+        # authority and these calls are read-only.  Reopening a path through
+        # the descriptor-stability projection can legitimately return no row
+        # while another process is committing WAL frames; that absence must
+        # never demote a live canonical job to an orphaned legacy row.
+        job = self._load_scan_job(scan_id)
         authoritative_status = (
             str(job.get("status"))
             if job is not None
@@ -11740,8 +12939,6 @@ class DashboardServer:
                 "actual_modules": [],
             }
 
-        forge_root = Path(__file__).parent.parent.parent
-        findings = self._findings_for_scan(forge_root, record)
         if job:
             record = {
                 **record,
@@ -11751,6 +12948,8 @@ class DashboardServer:
                 "error": job.get("error"),
                 "completed_at": job.get("completed_at"),
             }
+        forge_root = Path(__file__).parent.parent.parent
+        findings = self._findings_for_scan(forge_root, record)
         return {
             **record,
             "findings_count": self._count_findings(findings),
@@ -11767,8 +12966,7 @@ class DashboardServer:
             process_id = f"{scan_id}{suffix}"
             log_paths[process_id] = self._scan_logs_dir / f"{process_id}.log"
 
-        read_only_jobs = self._load_scan_jobs_read_only(scan_id=scan_id, limit=1)
-        job = read_only_jobs[0] if read_only_jobs else None
+        job = self._load_scan_job(scan_id)
         for process_id, raw_path in (job or {}).get("logs", {}).items():
             path = Path(str(raw_path))
             try:
@@ -11836,6 +13034,23 @@ class DashboardServer:
         del forge_root
         if record.get("authorization_state") != "allow":
             return []
+        if record.get("reference_slice") == "header-audit-csp-v1":
+            scan_id = str(record.get("scan_id") or "")
+            return [
+                self._public_finding(row)
+                for row in self._canonical_projection_rows(
+                    actor_id="dashboard-scan-history",
+                )
+                if any(
+                    isinstance(observation, Mapping)
+                    and observation.get("job_id") == scan_id
+                    for observation in (
+                        row.get("evidence", {}).get("observations", [])
+                        if isinstance(row.get("evidence"), Mapping)
+                        else []
+                    )
+                )
+            ]
         root = self._job_bound_canonical_result_root(record)
         return [
             self._public_finding(row)

@@ -137,7 +137,7 @@ _FORWARDED_VALUE_OPTIONS_BY_FRAMEWORK: dict[str, frozenset[str]] = {
             "--browser", "--login-url", "--login-script", "--auth-type",
             "--header-name", "--auth-state", "--api-schema",
             "--graphql-schema-url", "--profile", "--collab-domain",
-            "--dashboard-url", "--control-file",
+            "--dashboard-url", "--control-file", "--reference-slice",
         }
     ),
     "net": frozenset(

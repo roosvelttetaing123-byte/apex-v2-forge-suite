@@ -742,6 +742,34 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
               </p>
             </div>
 
+            {% if f.review %}
+            <div class="detail-block">
+              <strong>Persisted reviewer state</strong>
+              <p>Status: {{ f.review.status | e }}<br>
+                 Owner: {{ f.review.owner_operator_id | default('Unassigned', true) | e }}<br>
+                 Revision: {{ f.review.revision_id | e }} (v{{ f.review.version }})<br>
+                 Updated by: {{ f.review.updated_by_operator_id | e }}<br>
+                 Notes: {{ f.review.notes | e }}</p>
+            </div>
+            {% endif %}
+
+            {% if f.canonical_lineage %}
+            <div class="detail-block">
+              <strong>Locked canonical source lineage</strong>
+              <p>Report: {{ f.canonical_lineage.report_id | e }}
+                 v{{ f.canonical_lineage.report_version }}<br>
+                 Finding: {{ f.canonical_lineage.finding_id | e }}<br>
+                 Engagements: {{ f.canonical_lineage.engagement_ids | join(', ') | e }}<br>
+                 Jobs: {{ f.canonical_lineage.job_ids | join(', ') | e }}<br>
+                 Observations: {{ f.canonical_lineage.observation_ids | join(', ') | e }}<br>
+                 Artifacts: {{ f.canonical_lineage.artifact_ids | join(', ') | e }}<br>
+                 Retest: {{ f.canonical_lineage.retest_id | e }} /
+                 {{ f.canonical_lineage.retest_attempt_id | e }}<br>
+                 Reviewer revision: {{ f.canonical_lineage.review_revision_id | e }}<br>
+                 Source digest: {{ f.canonical_lineage.source_digest | e }}</p>
+            </div>
+            {% endif %}
+
             {% if f.references %}
             <div class="detail-block">
               <strong>References</strong>
@@ -1011,6 +1039,35 @@ def _build_html_inline(ctx: dict[str, Any]) -> str:
             )
             for artifact in f.get("evidence_artifacts", [])
         )
+        review = f.get("review") if isinstance(f.get("review"), dict) else {}
+        review_html = ""
+        if review:
+            review_html = (
+                "<br><strong>Persisted reviewer state:</strong> "
+                f"status={_escape(review.get('status', ''))}; "
+                f"owner={_escape(review.get('owner_operator_id') or 'Unassigned')}; "
+                f"revision={_escape(review.get('revision_id', ''))}; "
+                f"updated_by={_escape(review.get('updated_by_operator_id', ''))}; "
+                f"notes={_escape(review.get('notes', ''))}"
+            )
+        lineage = (
+            f.get("canonical_lineage")
+            if isinstance(f.get("canonical_lineage"), dict)
+            else {}
+        )
+        lineage_html = ""
+        if lineage:
+            lineage_html = (
+                "<br><strong>Locked canonical source lineage:</strong> "
+                + _escape(
+                    json.dumps(
+                        lineage,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=True,
+                    )
+                )
+            )
 
         rows_html += f"""
         <tr>
@@ -1032,6 +1089,8 @@ def _build_html_inline(ctx: dict[str, Any]) -> str:
           <strong>Remediation:</strong> {_escape(f.get('remediation',''))}<br>
           <strong>References:</strong> {refs}<br>
           <strong>MITRE ATT&CK:</strong> {mitre}
+          {review_html}
+          {lineage_html}
           {evidence_html}
         </td></tr>"""
 

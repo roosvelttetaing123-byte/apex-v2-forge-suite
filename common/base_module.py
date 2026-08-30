@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from types import FunctionType
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from common.dashboard.event_bus import EventBus
@@ -1147,14 +1148,35 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
             if canonical_path:
                 if self._canonical_evidence_service is None:
                     assert self.authorization_envelope is not None
+                    evidence_root_value = self.config.extra.get(
+                        "canonical_evidence_root"
+                    )
+                    evidence_root = (
+                        Path(str(evidence_root_value))
+                        if evidence_root_value
+                        else self.results_dir / "evidence-custody"
+                    )
+                    if not evidence_root.is_absolute():
+                        raise MissingCanonicalContextError(
+                            "canonical evidence root must be absolute"
+                        )
                     self._canonical_evidence_service = (
                         CanonicalEvidenceService.from_authorization(
                             self.db,
-                            self.results_dir / "evidence-custody",
+                            evidence_root,
                             self.authorization_envelope,
                             attempt_id=(
-                                os.environ.get(JOB_ATTEMPT_ID_ENV, "").strip()
-                                or None
+                                None
+                                if self.config.extra.get(
+                                    "reference_parent_import"
+                                )
+                                else (
+                                    os.environ.get(
+                                        JOB_ATTEMPT_ID_ENV,
+                                        "",
+                                    ).strip()
+                                    or None
+                                )
                             ),
                         )
                     )
@@ -1298,6 +1320,50 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
     ) -> Finding:
         """Create a new finding, add it, and return it."""
         evidence = evidence or Evidence()
+        reference_selected = True
+        if (
+            self.NAME == "header_audit"
+            and self.config.extra.get("reference_slice")
+            == "header-audit-csp-v1"
+        ):
+            request_state = self.config.extra.get("reference_request_state")
+            if not isinstance(request_state, Mapping):
+                raise ValueError("reference header request state is unavailable")
+            selected_target = str(target or self.config.target)
+            parsed = urlsplit(selected_target)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("reference header target is invalid")
+            route = parsed.path or "/"
+            request_target = route + (f"?{parsed.query}" if parsed.query else "")
+            if (
+                request_state.get("method") != "GET"
+                or request_state.get("request_count") != 1
+                or request_state.get("requested_url") != selected_target
+                or request_state.get("final_url") != selected_target
+                or request_state.get("failure_reason")
+            ):
+                raise ValueError("reference header request identity is incomplete")
+            header_name = str(evidence.extra.get("header") or "").strip()
+            reference_selected = header_name == "Content-Security-Policy"
+            if reference_selected:
+                evidence.request_raw = (
+                    f"GET {request_target} HTTP/1.1\r\n"
+                    f"Host: {parsed.netloc}\r\n"
+                )
+                evidence.screenshot_path = None
+                evidence.extra.update(
+                    {
+                        "check_id": header_name,
+                        "final_url": selected_target,
+                        "method": "GET",
+                        "proof_policy": "header-audit-csp-proof-v1",
+                        "proof_type": "passive",
+                        "response_status": int(request_state["response_status"]),
+                        "route": route,
+                    }
+                )
+                proof_type = "passive"
+                url = selected_target
         if verification is None or (isinstance(verification, dict) and not verification):
             verification = self._verification_from_evidence(evidence)
         elif not isinstance(verification, dict):
@@ -1341,7 +1407,12 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
             proof_type=proof_type,
             maturity=maturity,
         )
-        self.add_finding(f)
+        # The unchanged HeaderAudit implementation evaluates several header
+        # rules after its one GET.  Task 105 selects exactly the existing CSP
+        # rule at this adapter boundary; the other rule results are neither
+        # findings nor evidence for the reference slice.
+        if reference_selected:
+            self.add_finding(f)
         return f
 
     def auth_headers(
@@ -1608,6 +1679,12 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
 
         Returns path to PNG, or None if screenshot unavailable.
         """
+        if (
+            self.NAME == "header_audit"
+            and self.config.extra.get("reference_slice")
+            == "header-audit-csp-v1"
+        ):
+            return None
         try:
             from common.screenshot import capture
             return capture(
@@ -1633,8 +1710,28 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
             skipped = True
             skip_reason = denial_reason
         duration = time.monotonic() - start_time
+        errors: list[str] = []
+        if (
+            self.NAME == "header_audit"
+            and self.config.extra.get("reference_slice")
+            == "header-audit-csp-v1"
+        ):
+            request_state = self.config.extra.get("reference_request_state")
+            if isinstance(request_state, Mapping) and request_state.get(
+                "failure_reason"
+            ):
+                errors.append(str(request_state["failure_reason"]))
+        if denial_reason:
+            errors.append(denial_reason)
         if skipped:
             self._emit_event("module_skip", name=self.NAME, reason=skip_reason)
+        elif errors:
+            self._emit_event(
+                "module_fail",
+                name=self.NAME,
+                error=errors[0],
+                duration=duration,
+            )
         else:
             self._emit_event(
                 "module_complete", name=self.NAME,
@@ -1643,7 +1740,7 @@ class BaseModule(ABC, metaclass=_BaseModuleMeta):
         return ModuleResult(
             module_name=self.NAME,
             findings=self.findings,
-            errors=[denial_reason] if denial_reason else [],
+            errors=errors,
             duration_s=duration,
             skipped=skipped,
             skip_reason=skip_reason,

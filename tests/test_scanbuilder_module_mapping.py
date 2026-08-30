@@ -340,10 +340,10 @@ class TestScanBuilderModuleMapping(unittest.IsolatedAsyncioTestCase):
                         },
                     )
 
-            self.assertEqual(resp.status_code, 500, resp.text)
+            self.assertEqual(resp.status_code, 503, resp.text)
             self.assertEqual(
-                resp.json()["detail"],
-                "Authorization handoff persistence failed; execution denied",
+                resp.json()["detail"]["reason_code"],
+                "mutation_audit_unavailable",
             )
             self.assertFalse(history_path.exists())
             self.assertFalse(any(logs_dir.iterdir()))

@@ -53,6 +53,9 @@ EvidenceCustodyError = CustodyError
 _SAFE_FINDING_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _SAFE_SHA256_REFERENCE = re.compile(r"sha256:[0-9a-f]{64}")
 _SAFE_DEDUP_KEY = re.compile(r"finding-v[0-9]+:[0-9a-f]{64}")
+_SAFE_CANONICAL_REFERENCE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._:@/+-]{0,999}"
+)
 _RETEST_VERDICTS = frozenset(
     {
         "fixed",
@@ -112,6 +115,13 @@ _ORDINARY_FINDING_FIELDS = frozenset(
         "retest_state",
         "retest_status",
         "retest_verdict",
+        "review_notes",
+        "review_owner_operator_id",
+        "review_revision_id",
+        "review_status",
+        "review_updated_at",
+        "review_updated_by_operator_id",
+        "review_version",
         "service",
         "severity",
         "status",
@@ -201,6 +211,23 @@ def ordinary_evidence_projection(value: Any) -> dict[str, Any]:
             )
         return redact_text(item)
 
+    def _reference_value(
+        item: Any,
+        field_name: str,
+        *,
+        limit: int = 300,
+    ) -> str:
+        if (
+            not isinstance(item, str)
+            or not item
+            or len(item) > limit
+            or _SAFE_CANONICAL_REFERENCE.fullmatch(item) is None
+        ):
+            raise EvidenceCaptureError(
+                f"persisted evidence {field_name} is invalid"
+            )
+        return item
+
     def _digest_value(item: Any, field_name: str, *, optional: bool = False) -> str | None:
         if optional and item is None:
             return None
@@ -218,7 +245,10 @@ def ordinary_evidence_projection(value: Any) -> dict[str, Any]:
         return item
 
     _reject_forbidden(value)
-    finding_id = _text_value(value.get("finding_id"), "finding_id", limit=300)
+    finding_id = _reference_value(
+        value.get("finding_id"),
+        "finding_id",
+    )
     raw_observations = value.get("observations")
     if (
         not isinstance(raw_observations, list)
@@ -248,7 +278,7 @@ def ordinary_evidence_projection(value: Any) -> dict[str, Any]:
             raise EvidenceCaptureError(
                 "persisted evidence observation is invalid"
             )
-        observation_id = _text_value(
+        observation_id = _reference_value(
             raw_observation.get("observation_id"),
             "observation_id",
             limit=300,
@@ -266,7 +296,7 @@ def ordinary_evidence_projection(value: Any) -> dict[str, Any]:
                 )
             artifacts.append(
                 {
-                    "artifact_id": _text_value(
+                    "artifact_id": _reference_value(
                         raw_artifact.get("artifact_id"),
                         "artifact_id",
                         limit=300,
@@ -340,7 +370,17 @@ def ordinary_evidence_projection(value: Any) -> dict[str, Any]:
             observation[field_name] = (
                 None
                 if field_value is None
-                else _text_value(field_value, field_name, limit=1_000)
+                else (
+                    _reference_value(field_value, field_name, limit=1_000)
+                    if field_name
+                    in {
+                        "asset_id",
+                        "engagement_id",
+                        "job_id",
+                        "module_execution_id",
+                    }
+                    else _text_value(field_value, field_name, limit=1_000)
+                )
             )
         observations.append(observation)
     return {
@@ -384,6 +424,12 @@ def ordinary_finding_projection(value: Any) -> dict[str, Any]:
         "retest_state": 100,
         "retest_status": 100,
         "retest_verdict": 100,
+        "review_notes": 4_000,
+        "review_owner_operator_id": 300,
+        "review_revision_id": 300,
+        "review_status": 100,
+        "review_updated_at": 100,
+        "review_updated_by_operator_id": 300,
         "service": 500,
         "status": 100,
         "target": 2_000,
@@ -406,8 +452,19 @@ def ordinary_finding_projection(value: Any) -> dict[str, Any]:
         "cvss_v31_score",
         "cvss_v40_score",
         "vpr_score",
+        "review_version",
     }
     rendered: dict[str, Any] = {}
+    canonical_reference_fields = {
+        "id",
+        "retest_artifact_id",
+        "retest_attempt_id",
+        "retest_durable_attempt_id",
+        "retest_id",
+        "retest_job_id",
+        "retest_observation_id",
+        "review_revision_id",
+    }
     for key in sorted(_ORDINARY_FINDING_FIELDS):
         if key not in value or key in {"severity", "dedup_key"}:
             continue
@@ -419,6 +476,12 @@ def ordinary_finding_projection(value: Any) -> dict[str, Any]:
                 raise EvidenceCaptureError(
                     f"ordinary finding {key} is invalid"
                 )
+            elif key in canonical_reference_fields:
+                if _SAFE_CANONICAL_REFERENCE.fullmatch(item) is None:
+                    raise EvidenceCaptureError(
+                        f"ordinary finding {key} is invalid"
+                    )
+                rendered[key] = item
             else:
                 rendered[key] = redact_text(item)
         elif key in sequence_limits:

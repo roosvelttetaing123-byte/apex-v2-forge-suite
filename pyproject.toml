@@ -65,7 +65,7 @@ python = "3.13.9"
 node = "20.19.5"
 coverage_total = 35.0
 expected_collection_minimum = 3344
-expected_collection_sha256 = "bf8d5b2216c48b735b0606060d06f6d06bb24d0f81296d8135681f4fc1408281"
+expected_collection_sha256 = "f8bdd4449c90dba442e8d14b76fa7690ef9ad243f192f2df2139055a802d0c9e"
 allowed_skip_node_ids = [
   "tests/test_lab_integration_opt_in.py::test_opt_in_web_lab_is_reachable[dvwa-]",
   "tests/test_lab_integration_opt_in.py::test_opt_in_web_lab_is_reachable[webgoat-]",

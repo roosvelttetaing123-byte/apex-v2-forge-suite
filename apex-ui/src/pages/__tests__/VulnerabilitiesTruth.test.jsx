@@ -274,4 +274,106 @@ describe('Vulnerabilities visible truth contract', () => {
       expect(screen.getByText(/Workflow:/)).toHaveTextContent('False Positive');
     });
   });
+
+  it('ignores legacy localStorage workflow metadata and renders server reviewer truth', async () => {
+    localStorage.setItem('apex.vulnerability.workflow.v1', JSON.stringify({
+      'finding-visible-truth': {
+        owner: 'LOCAL_OWNER_CANARY',
+        queueNote: 'LOCAL_NOTE_CANARY',
+      },
+    }));
+    vi.stubGlobal('fetch', vi.fn(async () => response({
+      findings: [visibleFinding({
+        review_notes: 'Persisted reviewer note',
+        review_owner_operator_id: 'operator-server',
+        review_revision_id: 'review-revision-server',
+        review_updated_by_operator_id: 'operator-server',
+        review_version: 3,
+      })],
+    })));
+
+    render(<Vulnerabilities authToken="fixture" />);
+    fireEvent.click(await screen.findByText('Visible candidate signal'));
+
+    expect(await screen.findByDisplayValue('operator-server')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('v3')).toBeInTheDocument();
+    expect(screen.getByDisplayValue('Persisted reviewer note')).toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent('LOCAL_OWNER_CANARY');
+    expect(document.body).not.toHaveTextContent('LOCAL_NOTE_CANARY');
+  });
+
+  it('uses versioned reviewer status when the deduplicated finding summary drifts', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => response({
+      findings: [visibleFinding({
+        status: 'open',
+        review_status: 'false_positive',
+        review_version: 2,
+      })],
+    })));
+
+    render(<Vulnerabilities authToken="fixture" />);
+    expect(await screen.findByText('Visible candidate signal')).toBeInTheDocument();
+    expect(screen.getAllByText('False Positive').length).toBeGreaterThan(0);
+    expect(document.body).not.toHaveTextContent(/^Open$/);
+  });
+
+  it('sends expected reviewer version and waits for persistence before status changes', async () => {
+    let getReads = 0;
+    /** @type {(value: any) => void} */
+    let resolvePatch = () => {};
+    const patchResponse = new Promise(resolve => { resolvePatch = resolve; });
+    const fetchMock = vi.fn(async (url, options = {}) => {
+      if (options.method === 'PATCH') return patchResponse;
+      getReads += 1;
+      return response({
+        findings: [visibleFinding({
+          status: getReads === 1 ? 'accepted_risk' : 'in_progress',
+          review_status: getReads === 1 ? 'accepted_risk' : 'in_progress',
+          review_version: getReads === 1 ? 4 : 5,
+        })],
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<Vulnerabilities authToken="fixture" />);
+    fireEvent.click(await screen.findByText('Visible candidate signal'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'In Progress' }));
+    expect(screen.getAllByText('Accepted').length).toBeGreaterThan(0);
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/v1/findings/finding-visible-truth/status',
+        expect.objectContaining({
+          method: 'PATCH',
+          body: JSON.stringify({ expected_version: 4, status: 'In Progress' }),
+        }),
+      );
+    });
+
+    resolvePatch(response({ review: { version: 5 } }));
+    expect(await screen.findByDisplayValue('v5')).toBeInTheDocument();
+    expect(screen.getAllByText('In Progress').length).toBeGreaterThan(0);
+  });
+
+  it('surfaces deterministic reviewer conflicts and refreshes without optimistic state', async () => {
+    const fetchMock = vi.fn(async (_url, options = {}) => {
+      if (options.method === 'PATCH') {
+        return {
+          ok: false,
+          status: 409,
+          json: vi.fn().mockResolvedValue({
+            detail: { reason_code: 'finding_review_version_conflict' },
+          }),
+        };
+      }
+      return response({ findings: [visibleFinding({ review_version: 7 })] });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<Vulnerabilities authToken="fixture" />);
+    fireEvent.click(await screen.findByText('Visible candidate signal'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'In Progress' }));
+    expect(await screen.findByText(/Reviewer state changed in another session/)).toBeInTheDocument();
+    expect(screen.getAllByText('Accepted').length).toBeGreaterThan(0);
+    expect(screen.getByDisplayValue('v7')).toBeInTheDocument();
+  });
 });

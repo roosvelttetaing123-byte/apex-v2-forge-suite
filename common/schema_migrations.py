@@ -229,6 +229,10 @@ JOB_STATE_SCHEMA_VERSION = "forge-jobs-v1"
 # accepted canonical wire version.  The migration journal records the new
 # request/attempt/proof boundary independently.
 RETEST_SCHEMA_VERSION = "forge-retest-v1"
+# Task 105 completes one canonical operator workflow.  It extends the
+# accepted tables with normalized reviewer revisions, locked report sources,
+# and export receipts without changing the Task 101 wire version.
+REFERENCE_SLICE_SCHEMA_VERSION = "forge-reference-slice-v1"
 CURRENT_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
 JOURNAL_TABLE = "canonical_migration_journal"
 
@@ -5751,6 +5755,496 @@ def _apply_retest_downgrade(connection: Connection) -> None:
         connection.exec_driver_sql(statement)
 
 
+def _reference_slice_table_sql() -> tuple[str, ...]:
+    """Return Task 105 reviewer/report/export relationships and guards."""
+
+    return (
+        """
+        CREATE TABLE IF NOT EXISTS canonical_finding_review_revisions (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            finding_id TEXT NOT NULL,
+            schema_version TEXT NOT NULL CHECK(schema_version='forge-reference-slice-v1'),
+            version INTEGER NOT NULL CHECK(version >= 1),
+            status TEXT NOT NULL CHECK(status IN ('open','in_progress','remediated','accepted_risk','false_positive')),
+            owner_operator_id TEXT,
+            notes TEXT NOT NULL DEFAULT '' CHECK(length(notes) <= 4000),
+            actor_operator_id TEXT NOT NULL,
+            actor_role TEXT NOT NULL CHECK(actor_role IN ('operator','admin','system')),
+            created_at TEXT NOT NULL,
+            UNIQUE(tenant_id, id),
+            UNIQUE(tenant_id, finding_id, version),
+            FOREIGN KEY(tenant_id, finding_id) REFERENCES canonical_findings(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, owner_operator_id) REFERENCES canonical_operators(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, actor_operator_id) REFERENCES canonical_operators(tenant_id, id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_finding_review_current (
+            tenant_id TEXT NOT NULL,
+            finding_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            schema_version TEXT NOT NULL CHECK(schema_version='forge-reference-slice-v1'),
+            version INTEGER NOT NULL CHECK(version >= 1),
+            status TEXT NOT NULL CHECK(status IN ('open','in_progress','remediated','accepted_risk','false_positive')),
+            owner_operator_id TEXT,
+            notes TEXT NOT NULL DEFAULT '' CHECK(length(notes) <= 4000),
+            updated_by_operator_id TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(tenant_id, finding_id),
+            UNIQUE(tenant_id, revision_id),
+            FOREIGN KEY(tenant_id, finding_id) REFERENCES canonical_findings(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, revision_id) REFERENCES canonical_finding_review_revisions(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, owner_operator_id) REFERENCES canonical_operators(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, updated_by_operator_id) REFERENCES canonical_operators(tenant_id, id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_report_sources (
+            tenant_id TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+            schema_version TEXT NOT NULL CHECK(schema_version='forge-reference-slice-v1'),
+            engagement_id TEXT NOT NULL,
+            finding_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            observation_id TEXT NOT NULL,
+            artifact_id TEXT NOT NULL,
+            retest_id TEXT,
+            retest_attempt_id TEXT,
+            retest_proof_id TEXT,
+            review_revision_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(tenant_id, report_id, ordinal),
+            UNIQUE(tenant_id, report_id, observation_id, artifact_id),
+            CHECK(
+                (retest_id IS NULL AND retest_attempt_id IS NULL AND retest_proof_id IS NULL)
+                OR
+                (retest_id IS NOT NULL AND retest_attempt_id IS NOT NULL AND retest_proof_id IS NOT NULL)
+            ),
+            FOREIGN KEY(tenant_id, report_id) REFERENCES canonical_reports(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, engagement_id) REFERENCES canonical_engagements(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, finding_id) REFERENCES canonical_findings(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, job_id) REFERENCES canonical_jobs(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, observation_id) REFERENCES canonical_observations(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, artifact_id, observation_id) REFERENCES canonical_artifact_refs(tenant_id, id, observation_id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, retest_id) REFERENCES canonical_retests(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, retest_attempt_id) REFERENCES canonical_retest_attempts(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, retest_proof_id) REFERENCES canonical_retest_proofs(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, review_revision_id) REFERENCES canonical_finding_review_revisions(tenant_id, id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_report_locks (
+            tenant_id TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            schema_version TEXT NOT NULL CHECK(schema_version='forge-reference-slice-v1'),
+            engagement_id TEXT NOT NULL,
+            report_series_id TEXT NOT NULL CHECK(length(report_series_id) BETWEEN 1 AND 200),
+            source_digest TEXT NOT NULL CHECK(length(source_digest)=71 AND substr(source_digest,1,7)='sha256:'),
+            artifact_id TEXT NOT NULL,
+            artifact_observation_id TEXT NOT NULL,
+            artifact_manifest_digest TEXT NOT NULL CHECK(length(artifact_manifest_digest)=71 AND substr(artifact_manifest_digest,1,7)='sha256:'),
+            artifact_sha256 TEXT NOT NULL CHECK(length(artifact_sha256)=71 AND substr(artifact_sha256,1,7)='sha256:'),
+            artifact_size INTEGER NOT NULL CHECK(artifact_size >= 0),
+            media_type TEXT NOT NULL CHECK(media_type='text/html'),
+            redaction_state TEXT NOT NULL CHECK(redaction_state IN ('redacted','not_applicable')),
+            created_by_operator_id TEXT NOT NULL,
+            locked_at TEXT NOT NULL,
+            PRIMARY KEY(tenant_id, report_id),
+            UNIQUE(tenant_id, report_series_id, source_digest),
+            UNIQUE(tenant_id, artifact_id),
+            FOREIGN KEY(tenant_id, report_id) REFERENCES canonical_reports(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, engagement_id) REFERENCES canonical_engagements(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, artifact_id, artifact_observation_id) REFERENCES canonical_artifact_refs(tenant_id, id, observation_id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, created_by_operator_id) REFERENCES canonical_operators(tenant_id, id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_export_receipts (
+            tenant_id TEXT NOT NULL,
+            export_id TEXT NOT NULL,
+            schema_version TEXT NOT NULL CHECK(schema_version='forge-reference-slice-v1'),
+            engagement_id TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            report_version INTEGER NOT NULL CHECK(report_version >= 1),
+            report_artifact_id TEXT NOT NULL,
+            report_sha256 TEXT NOT NULL CHECK(length(report_sha256)=71 AND substr(report_sha256,1,7)='sha256:'),
+            operator_id TEXT NOT NULL,
+            authorization_decision_id TEXT NOT NULL,
+            authorization_action_id TEXT NOT NULL,
+            request_id TEXT NOT NULL CHECK(length(request_id) BETWEEN 1 AND 200),
+            exported_at TEXT NOT NULL,
+            format TEXT NOT NULL CHECK(format='html'),
+            outcome TEXT NOT NULL CHECK(outcome='completed'),
+            audit_event_id TEXT NOT NULL,
+            PRIMARY KEY(tenant_id, export_id),
+            UNIQUE(tenant_id, report_id, operator_id, request_id),
+            UNIQUE(tenant_id, authorization_decision_id, authorization_action_id),
+            FOREIGN KEY(tenant_id, export_id) REFERENCES canonical_exports(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, engagement_id) REFERENCES canonical_engagements(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, report_id) REFERENCES canonical_reports(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, report_artifact_id) REFERENCES canonical_artifact_refs(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, operator_id) REFERENCES canonical_operators(tenant_id, id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id, audit_event_id) REFERENCES canonical_events(tenant_id, id) ON DELETE RESTRICT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_canonical_review_current_owner ON canonical_finding_review_current(tenant_id, owner_operator_id, status)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_report_sources_finding ON canonical_report_sources(tenant_id, finding_id, report_id)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_report_locks_series ON canonical_report_locks(tenant_id, report_series_id, locked_at)",
+        "CREATE INDEX IF NOT EXISTS ix_canonical_export_receipts_report ON canonical_export_receipts(tenant_id, report_id, exported_at)",
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_review_revision_no_update
+        BEFORE UPDATE ON canonical_finding_review_revisions
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical review revisions are immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_review_revision_no_delete
+        BEFORE DELETE ON canonical_finding_review_revisions
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical review revisions are immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_review_current_insert_guard
+        BEFORE INSERT ON canonical_finding_review_current
+        WHEN NOT EXISTS (
+          SELECT 1 FROM canonical_finding_review_revisions r
+          WHERE r.tenant_id=NEW.tenant_id AND r.id=NEW.revision_id
+            AND r.finding_id=NEW.finding_id AND r.version=NEW.version
+            AND r.status=NEW.status
+            AND r.owner_operator_id IS NEW.owner_operator_id
+            AND r.notes=NEW.notes AND r.actor_operator_id=NEW.updated_by_operator_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical review current revision mismatch');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_review_current_update_guard
+        BEFORE UPDATE ON canonical_finding_review_current
+        WHEN NEW.tenant_id<>OLD.tenant_id OR NEW.finding_id<>OLD.finding_id
+          OR NEW.version<>OLD.version+1
+          OR NOT EXISTS (
+            SELECT 1 FROM canonical_finding_review_revisions r
+            WHERE r.tenant_id=NEW.tenant_id AND r.id=NEW.revision_id
+              AND r.finding_id=NEW.finding_id AND r.version=NEW.version
+              AND r.status=NEW.status
+              AND r.owner_operator_id IS NEW.owner_operator_id
+              AND r.notes=NEW.notes AND r.actor_operator_id=NEW.updated_by_operator_id
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical review compare-and-swap mismatch');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_review_current_no_delete
+        BEFORE DELETE ON canonical_finding_review_current
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical review current projection cannot be deleted');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_source_lineage_guard
+        BEFORE INSERT ON canonical_report_sources
+        WHEN NOT EXISTS (
+          SELECT 1 FROM canonical_observations o
+          WHERE o.tenant_id=NEW.tenant_id AND o.id=NEW.observation_id
+            AND o.engagement_id=NEW.engagement_id AND o.job_id=NEW.job_id
+        ) OR NOT EXISTS (
+          SELECT 1 FROM canonical_artifact_refs a
+          WHERE a.tenant_id=NEW.tenant_id AND a.id=NEW.artifact_id
+            AND a.observation_id=NEW.observation_id
+        ) OR NOT EXISTS (
+          SELECT 1 FROM canonical_finding_review_revisions rr
+          WHERE rr.tenant_id=NEW.tenant_id AND rr.id=NEW.review_revision_id
+            AND rr.finding_id=NEW.finding_id
+        ) OR NOT (
+          EXISTS (
+            SELECT 1 FROM canonical_finding_observations fo
+            WHERE fo.tenant_id=NEW.tenant_id AND fo.finding_id=NEW.finding_id
+              AND fo.observation_id=NEW.observation_id
+          ) OR (
+            NEW.retest_id IS NOT NULL AND EXISTS (
+              SELECT 1 FROM canonical_retests r
+              JOIN canonical_retest_attempts ra
+                ON ra.tenant_id=r.tenant_id AND ra.retest_id=r.id
+              JOIN canonical_retest_proofs rp
+                ON rp.tenant_id=ra.tenant_id AND rp.retest_attempt_id=ra.id
+              WHERE r.tenant_id=NEW.tenant_id AND r.id=NEW.retest_id
+                AND r.finding_id=NEW.finding_id
+                AND ra.id=NEW.retest_attempt_id AND rp.id=NEW.retest_proof_id
+                AND rp.observation_id=NEW.observation_id
+                AND rp.artifact_id=NEW.artifact_id
+            )
+          )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical report source lineage mismatch');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_source_insert_after_lock
+        BEFORE INSERT ON canonical_report_sources
+        WHEN EXISTS (
+          SELECT 1 FROM canonical_report_locks l
+          WHERE l.tenant_id=NEW.tenant_id AND l.report_id=NEW.report_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'locked report sources are immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_source_no_update
+        BEFORE UPDATE ON canonical_report_sources
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical report sources are immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_source_no_delete
+        BEFORE DELETE ON canonical_report_sources
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical report sources are immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_membership_insert_after_lock
+        BEFORE INSERT ON canonical_report_memberships
+        WHEN EXISTS (
+          SELECT 1 FROM canonical_report_locks l
+          WHERE l.tenant_id=NEW.tenant_id AND l.report_id=NEW.report_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'locked report membership is immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_membership_update_after_lock
+        BEFORE UPDATE ON canonical_report_memberships
+        WHEN EXISTS (
+          SELECT 1 FROM canonical_report_locks l
+          WHERE l.tenant_id=OLD.tenant_id AND l.report_id=OLD.report_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'locked report membership is immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_membership_delete_after_lock
+        BEFORE DELETE ON canonical_report_memberships
+        WHEN EXISTS (
+          SELECT 1 FROM canonical_report_locks l
+          WHERE l.tenant_id=OLD.tenant_id AND l.report_id=OLD.report_id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'locked report membership is immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_lock_insert_guard
+        BEFORE INSERT ON canonical_report_locks
+        WHEN NOT EXISTS (
+          SELECT 1 FROM canonical_reports r
+          WHERE r.tenant_id=NEW.tenant_id AND r.id=NEW.report_id
+            AND r.status='final' AND r.created_by=NEW.created_by_operator_id
+        ) OR NOT EXISTS (
+          SELECT 1 FROM canonical_report_sources s
+          WHERE s.tenant_id=NEW.tenant_id AND s.report_id=NEW.report_id
+            AND s.engagement_id=NEW.engagement_id
+        ) OR NOT EXISTS (
+          SELECT 1 FROM canonical_artifact_refs a
+          JOIN canonical_artifact_manifests m
+            ON m.tenant_id=a.tenant_id AND m.artifact_id=a.id
+          WHERE a.tenant_id=NEW.tenant_id AND a.id=NEW.artifact_id
+            AND a.observation_id=NEW.artifact_observation_id
+            AND a.manifest_digest=NEW.artifact_manifest_digest
+            AND m.manifest_digest=NEW.artifact_manifest_digest
+            AND m.derivative_sha256=NEW.artifact_sha256
+            AND m.derivative_size=NEW.artifact_size
+            AND a.media_type=NEW.media_type
+            AND a.redaction_state=NEW.redaction_state
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical report lock lineage mismatch');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_lock_no_update
+        BEFORE UPDATE ON canonical_report_locks
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical report locks are immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_lock_no_delete
+        BEFORE DELETE ON canonical_report_locks
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical report locks are immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_row_update_after_lock
+        BEFORE UPDATE ON canonical_reports
+        WHEN EXISTS (
+          SELECT 1 FROM canonical_report_locks l
+          WHERE l.tenant_id=OLD.tenant_id AND l.report_id=OLD.id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'locked report row is immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_row_delete_after_lock
+        BEFORE DELETE ON canonical_reports
+        WHEN EXISTS (
+          SELECT 1 FROM canonical_report_locks l
+          WHERE l.tenant_id=OLD.tenant_id AND l.report_id=OLD.id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'locked report row is immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_export_receipt_insert_guard
+        BEFORE INSERT ON canonical_export_receipts
+        WHEN NOT EXISTS (
+          SELECT 1 FROM canonical_exports e
+          JOIN canonical_reports r
+            ON r.tenant_id=e.tenant_id AND r.id=e.report_id
+          JOIN canonical_report_locks l
+            ON l.tenant_id=r.tenant_id AND l.report_id=r.id
+          JOIN canonical_events ev
+            ON ev.tenant_id=e.tenant_id AND ev.id=NEW.audit_event_id
+          WHERE e.tenant_id=NEW.tenant_id AND e.id=NEW.export_id
+            AND e.report_id=NEW.report_id AND e.status='completed'
+            AND e.format='html' AND r.version=NEW.report_version
+            AND l.engagement_id=NEW.engagement_id
+            AND l.artifact_id=NEW.report_artifact_id
+            AND l.artifact_sha256=NEW.report_sha256
+            AND ev.actor_id=NEW.operator_id
+            AND ev.event_type='report.export.completed'
+            AND EXISTS (
+              SELECT 1 FROM canonical_report_sources s
+              WHERE s.tenant_id=e.tenant_id AND s.report_id=e.report_id
+                AND s.finding_id=e.finding_id
+                AND s.observation_id=e.source_observation_id
+                AND s.job_id=ev.job_id
+            )
+        ) OR NOT EXISTS (
+          SELECT 1 FROM authorization_decisions d
+          JOIN authorization_consumptions c
+            ON c.decision_id=d.decision_id
+          WHERE d.decision_id=NEW.authorization_decision_id
+            AND d.tenant_id=NEW.tenant_id
+            AND d.engagement_id=NEW.engagement_id
+            AND d.action_id=NEW.authorization_action_id
+            AND d.operator_id=NEW.operator_id
+            AND d.operator_role IN ('operator','admin')
+            AND d.action_kind='report.export'
+            AND d.engine='forge'
+            AND d.decision_outcome='allow'
+            AND c.tenant_id=d.tenant_id
+            AND c.job_id=d.job_id
+            AND c.action_id=d.action_id
+            AND c.boundary='dashboard.report.export'
+            AND c.envelope_digest=d.binding_digest
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical export receipt lineage mismatch');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_export_receipt_no_update
+        BEFORE UPDATE ON canonical_export_receipts
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical export receipts are immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_export_receipt_no_delete
+        BEFORE DELETE ON canonical_export_receipts
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical export receipts are immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_export_event_no_update
+        BEFORE UPDATE ON canonical_events
+        WHEN OLD.event_type='report.export.completed'
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical report export audit is immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_report_export_event_no_delete
+        BEFORE DELETE ON canonical_events
+        WHEN OLD.event_type='report.export.completed'
+        BEGIN
+          SELECT RAISE(ABORT, 'canonical report export audit is immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_export_row_update_after_receipt
+        BEFORE UPDATE ON canonical_exports
+        WHEN EXISTS (
+          SELECT 1 FROM canonical_export_receipts er
+          WHERE er.tenant_id=OLD.tenant_id AND er.export_id=OLD.id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'receipted canonical export is immutable');
+        END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_export_row_delete_after_receipt
+        BEFORE DELETE ON canonical_exports
+        WHEN EXISTS (
+          SELECT 1 FROM canonical_export_receipts er
+          WHERE er.tenant_id=OLD.tenant_id AND er.export_id=OLD.id
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'receipted canonical export is immutable');
+        END
+        """,
+    )
+
+
+def _reference_slice_drop_sql() -> tuple[str, ...]:
+    return (
+        "DROP TRIGGER IF EXISTS canonical_export_row_delete_after_receipt",
+        "DROP TRIGGER IF EXISTS canonical_export_row_update_after_receipt",
+        "DROP TRIGGER IF EXISTS canonical_report_export_event_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_report_export_event_no_update",
+        "DROP TRIGGER IF EXISTS canonical_export_receipt_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_export_receipt_no_update",
+        "DROP TRIGGER IF EXISTS canonical_export_receipt_insert_guard",
+        "DROP TRIGGER IF EXISTS canonical_report_row_delete_after_lock",
+        "DROP TRIGGER IF EXISTS canonical_report_row_update_after_lock",
+        "DROP TRIGGER IF EXISTS canonical_report_lock_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_report_lock_no_update",
+        "DROP TRIGGER IF EXISTS canonical_report_lock_insert_guard",
+        "DROP TRIGGER IF EXISTS canonical_report_membership_delete_after_lock",
+        "DROP TRIGGER IF EXISTS canonical_report_membership_update_after_lock",
+        "DROP TRIGGER IF EXISTS canonical_report_membership_insert_after_lock",
+        "DROP TRIGGER IF EXISTS canonical_report_source_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_report_source_no_update",
+        "DROP TRIGGER IF EXISTS canonical_report_source_insert_after_lock",
+        "DROP TRIGGER IF EXISTS canonical_report_source_lineage_guard",
+        "DROP TRIGGER IF EXISTS canonical_review_current_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_review_current_update_guard",
+        "DROP TRIGGER IF EXISTS canonical_review_current_insert_guard",
+        "DROP TRIGGER IF EXISTS canonical_review_revision_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_review_revision_no_update",
+        "DROP TABLE IF EXISTS canonical_export_receipts",
+        "DROP TABLE IF EXISTS canonical_report_locks",
+        "DROP TABLE IF EXISTS canonical_report_sources",
+        "DROP TABLE IF EXISTS canonical_finding_review_current",
+        "DROP TABLE IF EXISTS canonical_finding_review_revisions",
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=CANONICAL_SCHEMA_VERSION,
@@ -5779,6 +6273,13 @@ MIGRATIONS: tuple[Migration, ...] = (
         upgrade_sql=_retest_table_sql(),
         downgrade_sql=_retest_drop_sql(),
         description="Task 104 evidence-backed real retest",
+    ),
+    Migration(
+        version=REFERENCE_SLICE_SCHEMA_VERSION,
+        order=105,
+        upgrade_sql=_reference_slice_table_sql(),
+        downgrade_sql=_reference_slice_drop_sql(),
+        description="Task 105 canonical reviewer and locked report workflow",
     ),
 )
 
@@ -5870,6 +6371,7 @@ class MigrationManager:
                 EVIDENCE_SCHEMA_VERSION,
                 JOB_STATE_SCHEMA_VERSION,
                 RETEST_SCHEMA_VERSION,
+                REFERENCE_SLICE_SCHEMA_VERSION,
             }:
                 version = CANONICAL_SCHEMA_VERSION
             else:
@@ -6066,6 +6568,41 @@ class MigrationManager:
                 connection.commit()
             keep = set(self.versions[: self.versions.index(target) + 1]) if target else set()
             removing = {str(row[0]) for row in rows} - keep
+            if REFERENCE_SLICE_SCHEMA_VERSION in removing:
+                reference_tables = (
+                    "canonical_finding_review_revisions",
+                    "canonical_finding_review_current",
+                    "canonical_report_sources",
+                    "canonical_report_locks",
+                    "canonical_export_receipts",
+                )
+                present_tables = {
+                    str(row[0])
+                    for row in connection.exec_driver_sql(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if not set(reference_tables) <= present_tables:
+                    if connection.in_transaction():
+                        connection.rollback()
+                    raise MigrationError(
+                        "reference-slice downgrade encountered incomplete state"
+                    )
+                retained_reference_history = any(
+                    int(
+                        connection.exec_driver_sql(
+                            f"SELECT COUNT(*) FROM {table}"
+                        ).scalar_one()
+                    )
+                    > 0
+                    for table in reference_tables
+                )
+                if connection.in_transaction():
+                    connection.rollback()
+                if retained_reference_history:
+                    raise MigrationError(
+                        "reference-slice downgrade would destroy retained history"
+                    )
             if RETEST_SCHEMA_VERSION in removing:
                 retest_tables = (
                     "canonical_retests",
@@ -6426,7 +6963,7 @@ def migration_versions() -> tuple[str, ...]:
 
 
 __all__ = [
-    "CANONICAL_MIGRATION_PREFIX", "CANONICAL_SCHEMA_VERSION", "CURRENT_SCHEMA_VERSION", "EVIDENCE_SCHEMA_VERSION", "JOB_STATE_SCHEMA_VERSION", "RETEST_SCHEMA_VERSION",
+    "CANONICAL_MIGRATION_PREFIX", "CANONICAL_SCHEMA_VERSION", "CURRENT_SCHEMA_VERSION", "EVIDENCE_SCHEMA_VERSION", "JOB_STATE_SCHEMA_VERSION", "REFERENCE_SLICE_SCHEMA_VERSION", "RETEST_SCHEMA_VERSION",
     "JOURNAL_TABLE", "MIGRATIONS", "Migration", "MigrationError", "MigrationInterruptedError",
     "MigrationManager", "UnsupportedMigrationError", "current_version", "downgrade", "migration_versions",
     "archive_legacy_records", "recover", "upgrade",

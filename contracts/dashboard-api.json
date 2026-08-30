@@ -1,6 +1,6 @@
 {
   "backend_source": "common/dashboard/server.py",
-  "backend_source_sha256": "6726c896c1f51252769b7cbe39d3d38c4cbe55beb7c157ea533bcbaa62a507c2",
+  "backend_source_sha256": "aa34bc2549c6e96d4b04aaa5b9df55f0d3c28b2a88b245056f69b182a4eb4e6b",
   "endpoints": {
     "actionConfirmations": {
       "method": "POST",
@@ -253,7 +253,15 @@
       "path": "/api/v1/reports"
     },
     {
+      "method": "POST",
+      "path": "/api/v1/reports"
+    },
+    {
       "method": "GET",
+      "path": "/api/v1/reports/download"
+    },
+    {
+      "method": "POST",
       "path": "/api/v1/reports/download"
     },
     {

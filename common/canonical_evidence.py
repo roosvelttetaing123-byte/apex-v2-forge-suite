@@ -293,6 +293,7 @@ class CanonicalEvidenceReader:
                 "JOIN canonical_module_versions mv ON mv.tenant_id=o.tenant_id AND mv.id=o.module_version_id "
                 "JOIN canonical_assets asset ON asset.tenant_id=o.tenant_id AND asset.id=o.asset_id "
                 "LEFT JOIN canonical_observation_artifacts oa ON oa.tenant_id=o.tenant_id AND oa.observation_id=o.id "
+                "AND oa.role<>'derivative' "
                 "LEFT JOIN canonical_artifact_refs a ON a.tenant_id=oa.tenant_id AND a.id=oa.artifact_id "
                 "LEFT JOIN canonical_artifact_manifests am ON am.tenant_id=a.tenant_id AND am.artifact_id=a.id "
                 "WHERE f.tenant_id=:tenant_id AND f.id=:finding_id "
@@ -622,6 +623,55 @@ class CanonicalEvidenceReader:
                     ),
                 }
             )
+        review_table = self.session.execute(
+            text(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='canonical_finding_review_current'"
+            )
+        ).first()
+        review = (
+            self.session.execute(
+                text(
+                    "SELECT revision_id,version,status,owner_operator_id,notes,"
+                    "updated_by_operator_id,updated_at "
+                    "FROM canonical_finding_review_current "
+                    "WHERE tenant_id=:tenant_id AND finding_id=:finding_id"
+                ),
+                {"tenant_id": self.tenant_id, "finding_id": finding_id},
+            ).mappings().first()
+            if review_table is not None
+            else None
+        )
+        if review is None:
+            projection.update(
+                {
+                    "review_notes": "",
+                    "review_owner_operator_id": None,
+                    "review_revision_id": None,
+                    "review_status": projection["status"],
+                    "review_updated_at": None,
+                    "review_updated_by_operator_id": None,
+                    "review_version": 0,
+                }
+            )
+        else:
+            projection.update(
+                {
+                    "review_notes": redact_text(str(review["notes"])),
+                    "review_owner_operator_id": (
+                        str(review["owner_operator_id"])
+                        if review["owner_operator_id"] is not None
+                        else None
+                    ),
+                    "review_revision_id": str(review["revision_id"]),
+                    "review_status": str(review["status"]),
+                    "review_updated_at": str(review["updated_at"]),
+                    "review_updated_by_operator_id": str(
+                        review["updated_by_operator_id"]
+                    ),
+                    "review_version": int(review["version"]),
+                }
+            )
         # Finding metadata is contract-bounded and redacted at persistence.
         # Apply the emergency redactor again to all presentation fields while
         # preserving custody IDs/digests already verified above.
@@ -637,6 +687,7 @@ class CanonicalEvidenceReader:
                 "retest_id",
                 "retest_job_id",
                 "retest_observation_id",
+                "review_revision_id",
             }:
                 continue
             projection[key] = redact_value(projection[key])
@@ -807,12 +858,29 @@ class CanonicalEvidenceService(CanonicalEvidenceReader):
             decision_reason=context.scope_reason,
             decided_at=context.decided_at,
         )
+        persisted_job = self.session.execute(
+            text(
+                "SELECT status,job_kind FROM canonical_jobs "
+                "WHERE tenant_id=:tenant_id AND id=:job_id"
+            ),
+            {"tenant_id": context.tenant_id, "job_id": context.job_id},
+        ).mappings().first()
+        if self.session.in_transaction():
+            self.session.rollback()
         job = Job(
             id=context.job_id,
             tenant_id=context.tenant_id,
             engagement_id=context.engagement_id,
-            job_kind=context.engine,
-            status=JobStatus.RUNNING,
+            job_kind=(
+                str(persisted_job["job_kind"])
+                if persisted_job is not None
+                else context.engine
+            ),
+            status=(
+                JobStatus(str(persisted_job["status"]))
+                if persisted_job is not None
+                else JobStatus.RUNNING
+            ),
         )
         action = Action(
             id=context.action_id,

@@ -57,6 +57,10 @@ class EventType(str, Enum):
     FINDING_NEW         = "finding_new"
     FINDING_UPDATED     = "finding_updated"
 
+    # ── Locked reports and exports ───────────────────────────────────
+    REPORT_UPDATED      = "report_updated"
+    EXPORT_COMPLETED    = "export_completed"
+
     # ── Network / HTTP metrics ────────────────────────────────────────
     REQUEST_SENT        = "request_sent"
     REQUEST_ERROR       = "request_error"

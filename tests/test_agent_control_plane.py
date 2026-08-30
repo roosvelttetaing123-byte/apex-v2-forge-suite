@@ -721,7 +721,10 @@ class TestFindingStatusPersistence(unittest.IsolatedAsyncioTestCase):
                 async with _make_async_client(app) as client:
                     resp = await client.patch(
                         f"/api/v1/findings/{canonical_id}/status",
-                        json={"status": "False Positive"},
+                        json={
+                            "expected_version": 0,
+                            "status": "False Positive",
+                        },
                     )
                 canonical_db = srv._canonical_database_paths(
                     srv._canonical_result_roots()[0]
@@ -730,8 +733,8 @@ class TestFindingStatusPersistence(unittest.IsolatedAsyncioTestCase):
                 try:
                     persisted_status = session.execute(
                         text(
-                            "SELECT status FROM canonical_findings "
-                            "WHERE tenant_id=:tenant_id AND id=:finding_id"
+                            "SELECT status FROM canonical_finding_review_current "
+                            "WHERE tenant_id=:tenant_id AND finding_id=:finding_id"
                         ),
                         {
                             "tenant_id": srv.tenant_id,
@@ -744,7 +747,8 @@ class TestFindingStatusPersistence(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resp.status_code, 200, resp.text)
         self.assertTrue(resp.json()["persisted"])
-        self.assertEqual(resp.json()["canonical_status"], "false_positive")
+        self.assertEqual(resp.json()["review"]["status"], "false_positive")
+        self.assertEqual(resp.json()["review"]["version"], 1)
         self.assertEqual(persisted_status, "false_positive")
 
 

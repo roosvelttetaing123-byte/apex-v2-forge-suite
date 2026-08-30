@@ -35,12 +35,16 @@ class ForgeSession:
         cookies: dict[str, str] | None = None,
         cookie_provenance: dict[str, dict[str, Any]] | None = None,
         outbound_policy: OutboundPolicy | None = None,
+        reference_slice: str = "",
+        reference_state: dict[str, Any] | None = None,
     ) -> None:
         self.rate = rate
         self.proxy = proxy
         self.timeout = float(timeout)
         self.verify_ssl = verify_ssl
         self.outbound_policy = outbound_policy
+        self.reference_slice = str(reference_slice or "")
+        self.reference_state = reference_state if reference_state is not None else {}
         self.base_headers: dict[str, str] = {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
             "Accept-Encoding": "gzip, deflate",  # avoid brotli — not natively decoded by aiohttp
@@ -104,12 +108,43 @@ class ForgeSession:
     ) -> PolicyResponse:
         """Execute a rate-limited request through the canonical policy client."""
         assert self._session, "Session not started — use async with ForgeSession()"
+        reference_csp = self.reference_slice == "header-audit-csp-v1"
+        if reference_csp:
+            if method.upper() != "GET" or self.request_count != 0:
+                self.reference_state["failure_reason"] = (
+                    "reference_slice_request_budget_exceeded"
+                )
+                raise RuntimeError("reference slice request budget exceeded")
+            kwargs["allow_redirects"] = False
+            retries = 1
+            self.reference_state.update(
+                {
+                    "failure_reason": "",
+                    "method": "GET",
+                    "requested_url": url,
+                }
+            )
         await self._rate_limit()
         kwargs.setdefault("allow_redirects", True)
         kwargs.setdefault("retries", max(0, retries - 1))
         kwargs.setdefault("timeout", self.timeout)
-        response = await self._session.request(method, url, **kwargs)
+        try:
+            response = await self._session.request(method, url, **kwargs)
+        except Exception as exc:
+            if reference_csp:
+                self.reference_state["failure_reason"] = (
+                    "reference_slice_transport_" + type(exc).__name__.lower()
+                )
+            raise
         self.request_count += 1
+        if reference_csp:
+            self.reference_state.update(
+                {
+                    "final_url": str(response.url),
+                    "request_count": self.request_count,
+                    "response_status": int(response.status),
+                }
+            )
         return response
 
     def update_headers(self, headers: dict[str, str]) -> None:
@@ -167,6 +202,12 @@ class ForgeSession:
         outbound_policy = config.extra.get("outbound_policy")
         if not isinstance(outbound_policy, OutboundPolicy):
             outbound_policy = None
+        reference_state = config.extra.setdefault("reference_request_state", {})
+        if not isinstance(reference_state, dict):
+            reference_state = {}
+            config.extra["reference_request_state"] = reference_state
+        if config.extra.get("reference_slice") == "header-audit-csp-v1":
+            timeout = int(config.extra.get("reference_timeout_seconds", timeout))
         return cls(
             rate=config.rate.requests_per_second,
             proxy=config.extra.get("proxy") or config.proxy,
@@ -179,6 +220,8 @@ class ForgeSession:
                 else {}
             ),
             outbound_policy=outbound_policy,
+            reference_slice=str(config.extra.get("reference_slice") or ""),
+            reference_state=reference_state,
         )
 
 
