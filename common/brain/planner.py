@@ -1,23 +1,23 @@
-"""AttackPlanner — AI-powered attack path planning and kill chain progression.
+"""AttackPlanner — inert legacy planning compatibility types and helpers.
 
-Wraps ForgeBrain to provide tactical attack planning:
-    - plan_next()           → next attack steps based on current intel
-    - adapt_to_failure()    → pivot strategy after a failed action
-    - adapt_to_discovery()  → react to new findings with follow-up actions
-    - autonomous_gate()     → decide if an action can auto-execute
+Public planning remains disabled until every proposal has canonical source
+lineage and durable plan/node custody:
+    - plan_next()           → fixed zero-progress plan with no actions
+    - adapt_to_failure()    → no alternatives
+    - adapt_to_discovery()  → no follow-up actions
+    - autonomous_gate()     → advisory-only compatibility gate (always false)
 
 Kill Chain Progression:
     RECON → INITIAL_ACCESS → EXECUTION → PERSISTENCE → PRIV_ESC →
     LATERAL → COLLECTION → EXFIL
 
-Graceful degradation: if brain is unavailable, wraps existing
-AttackChain with rule-based planning heuristics.
+Private rule helpers remain only for compatibility inspection; public methods
+do not call them or ForgeBrain.
 
 FOR AUTHORIZED PENETRATION TESTING AND RED TEAM OPERATIONS ONLY.
 """
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -25,11 +25,7 @@ from typing import Any
 from common.brain.brain import (
     ForgeBrain,
     PlannedAction,
-    Confidence,
-    RiskLevel,
 )
-
-log = logging.getLogger("forge.brain.planner")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -133,32 +129,10 @@ _SAFE_PHASES = frozenset({
 # ══════════════════════════════════════════════════════════════════════
 
 class AttackPlanner:
-    """AI-powered attack path planner.
+    """Inert compatibility facade for the legacy attack planner.
 
-    Uses ForgeBrain for intelligent attack planning with rule-based
-    fallback. Manages kill chain progression, action safety gates,
-    and adaptation to new findings or failures.
-
-    Usage::
-
-        brain = ForgeBrain()
-        planner = AttackPlanner(brain)
-
-        # Get next attack steps
-        plan = await planner.plan_next(intel, target_context, opsec_level="standard")
-        for action in plan.actions:
-            if action.auto_execute or operator_approves(action):
-                execute(action)
-
-        # React to failure
-        alternatives = await planner.adapt_to_failure(
-            failed_action, error_msg, current_intel
-        )
-
-        # React to new finding
-        follow_ups = await planner.adapt_to_discovery(
-            new_finding, existing_intel
-        )
+    Public planning and adaptation methods produce no proposal until they can
+    persist through the canonical Task 106 advisory plan/node boundary.
     """
 
     def __init__(self, brain: ForgeBrain | None = None) -> None:
@@ -179,7 +153,7 @@ class AttackPlanner:
         target_context: dict[str, Any],
         opsec_level: str = "standard",
     ) -> AttackPlan:
-        """Plan the next attack steps based on current intelligence.
+        """Return a fixed inert plan until canonical persistence is available.
 
         Args:
             intel:          All gathered intelligence (findings, creds, hosts).
@@ -187,24 +161,21 @@ class AttackPlanner:
             opsec_level:    "stealth", "standard", or "noisy".
 
         Returns:
-            AttackPlan with ordered actions and phase assessment.
+            A zero-progress advisory plan with no actions.
         """
-        # Assess current kill chain phase
-        phase = self._assess_phase(intel)
-
-        # Get planned actions from brain
-        actions = await self._brain.plan_next_attack(intel, target_context, opsec_level)
-
-        # Apply safety gates to each action
-        for action in actions:
-            action.auto_execute = self.autonomous_gate(action)
-            if not action.auto_execute:
-                action.requires_confirm = True
-
-        # Sort by priority
-        actions.sort(key=lambda a: a.priority)
-
-        return AttackPlan(phase=phase, actions=actions)
+        del intel, target_context, opsec_level
+        return AttackPlan(
+            phase=PhaseAssessment(
+                current_phase=KillChainPhase.RECON,
+                phase_complete=False,
+                next_phase=KillChainPhase.RECON,
+                completion_pct=0.0,
+                blockers=[
+                    "legacy planner disabled pending canonical persistence"
+                ],
+            ),
+            actions=[],
+        )
 
     async def adapt_to_failure(
         self,
@@ -212,7 +183,7 @@ class AttackPlanner:
         error: str,
         intel: dict[str, Any],
     ) -> list[PlannedAction]:
-        """Generate alternative actions after a failure.
+        """Reject legacy failure adaptation without canonical persistence.
 
         Args:
             failed_action: The action that failed.
@@ -220,145 +191,43 @@ class AttackPlanner:
             intel:         Current intelligence state.
 
         Returns:
-            List of alternative PlannedActions to try.
+            An empty list; this compatibility path cannot create plan nodes.
         """
-        if self._brain.available:
-            try:
-                prompt_data = {
-                    "task": "adapt_to_failure",
-                    "failed_action": {
-                        "module": failed_action.module,
-                        "framework": failed_action.framework,
-                        "target": failed_action.target,
-                        "phase": failed_action.phase,
-                    },
-                    "error": error[:500],
-                    "intel_summary": self._summarize_intel(intel),
-                }
-                import json
-                raw = await self._brain._call(
-                    json.dumps(prompt_data, indent=2, default=str),
-                    model=self._brain._fast_model,
-                    max_tokens=1500,
-                )
-                items = self._brain._parse_json_array(raw)
-                return [
-                    PlannedAction(
-                        priority=item.get("priority", 5),
-                        phase=item.get("phase", failed_action.phase),
-                        mitre=item.get("mitre", ""),
-                        framework=item.get("framework", failed_action.framework),
-                        module=item.get("module", ""),
-                        target=item.get("target", failed_action.target),
-                        rationale=item.get("rationale", ""),
-                        auto_execute=False,
-                        requires_confirm=True,
-                    )
-                    for item in items
-                ]
-            except Exception as exc:
-                log.warning("Brain adapt_to_failure failed: %s", exc)
-
-        # Rule-based fallback: suggest alternatives based on failure type
-        return self._rule_based_adapt_failure(failed_action, error)
+        del failed_action, error, intel
+        return []
 
     async def adapt_to_discovery(
         self,
         new_finding: dict[str, Any],
         existing_intel: dict[str, Any],
     ) -> list[PlannedAction]:
-        """React to a new finding with follow-up attack actions.
-
-        This is the engine behind cross-framework attack chains:
-        e.g., WebForge SQLi → NetForge credential spray.
+        """Reject legacy discovery adaptation without canonical persistence.
 
         Args:
             new_finding:    The newly discovered finding (as dict).
             existing_intel: Current intelligence state.
 
         Returns:
-            List of follow-up PlannedActions triggered by the finding.
+            An empty list; this compatibility path cannot create plan nodes.
         """
-        if self._brain.available:
-            try:
-                import json
-                prompt_data = {
-                    "task": "adapt_to_discovery",
-                    "new_finding": {
-                        "title": new_finding.get("title", ""),
-                        "severity": new_finding.get("severity", ""),
-                        "module": new_finding.get("module", ""),
-                        "target": new_finding.get("target", ""),
-                        "description": new_finding.get("description", "")[:300],
-                    },
-                    "intel_summary": self._summarize_intel(existing_intel),
-                    "instructions": (
-                        "Based on this new finding, what follow-up attack actions should we take? "
-                        "Consider cross-framework chains: "
-                        "SQLi creds → credential spray, SSRF → internal scan, "
-                        "host compromise → lateral movement, etc."
-                    ),
-                }
-                raw = await self._brain._call(
-                    json.dumps(prompt_data, indent=2, default=str),
-                    model=self._brain._fast_model,
-                    max_tokens=1500,
-                )
-                items = self._brain._parse_json_array(raw)
-                return [
-                    PlannedAction(
-                        priority=item.get("priority", 5),
-                        phase=item.get("phase", ""),
-                        mitre=item.get("mitre", ""),
-                        framework=item.get("framework", ""),
-                        module=item.get("module", ""),
-                        target=item.get("target", ""),
-                        rationale=item.get("rationale", ""),
-                        auto_execute=False,
-                        requires_confirm=True,
-                    )
-                    for item in items
-                ]
-            except Exception as exc:
-                log.warning("Brain adapt_to_discovery failed: %s", exc)
-
-        # Rule-based fallback
-        return self._rule_based_adapt_discovery(new_finding)
+        del new_finding, existing_intel
+        return []
 
     def autonomous_gate(self, action: PlannedAction) -> bool:
-        """Determine if an action should auto-execute without human approval.
+        """Return false because planner output is never action authority.
 
-        Safety rules:
-        - Safe modules (recon/passive) → auto-execute
-        - Dangerous modules (exploit/lateral) → always require confirm
-        - RECON phase → auto-execute
-        - Everything else → require confirm
+        Legacy module/phase classifications remain useful presentation
+        metadata, but even a passive proposal must resolve through the exact
+        capability registry, deterministic policy, existing operator approval,
+        and Task 103 job boundary.
 
         Args:
             action: The PlannedAction to evaluate.
 
         Returns:
-            True if safe to auto-execute.
+            Always false.
         """
-        module = action.module.lower()
-        phase = action.phase.upper()
-
-        # Always block dangerous modules
-        if module in _DANGEROUS_MODULES:
-            return False
-
-        # Always allow safe modules
-        if module in _SAFE_MODULES:
-            return True
-
-        # Allow auto-execute in safe phases
-        try:
-            if KillChainPhase(phase) in _SAFE_PHASES:
-                return True
-        except ValueError:
-            pass
-
-        # Default: require confirmation
+        del action
         return False
 
     # ── Phase Assessment ──────────────────────────────────────────────
@@ -698,14 +567,14 @@ class TestAttackPlanner:
         planner = AttackPlanner()
         assert planner.brain is not None
 
-    def test_autonomous_gate_safe_module(self) -> None:
+    def test_autonomous_gate_passive_module_is_still_advisory(self) -> None:
         planner = AttackPlanner()
         action = PlannedAction(
             priority=1, phase="RECON", mitre="TA0043/T1595",
             framework="netforge", module="port_scanner",
             target="10.0.0.1", rationale="Recon scan",
         )
-        assert planner.autonomous_gate(action) is True
+        assert planner.autonomous_gate(action) is False
 
     def test_autonomous_gate_dangerous_module(self) -> None:
         planner = AttackPlanner()
@@ -845,8 +714,8 @@ class TestAttackPlanner:
             ],
         )
         assert plan.total_actions == 2
-        assert plan.auto_executable == 1
-        assert plan.requires_confirm == 1
+        assert plan.auto_executable == 0
+        assert plan.requires_confirm == 2
 
     def test_phase_complete_recon_no_creds(self) -> None:
         """RECON phase_complete is False when no credentials obtained yet."""
@@ -905,12 +774,41 @@ class TestAttackPlanner:
         assert _PHASE_ORDER[KillChainPhase.RECON] < _PHASE_ORDER[KillChainPhase.INITIAL_ACCESS]
         assert _PHASE_ORDER[KillChainPhase.LATERAL] < _PHASE_ORDER[KillChainPhase.EXFIL]
 
-    def test_plan_next_sync(self) -> None:
-        """Test plan_next() runs with rule-based fallback."""
+    def test_legacy_public_planner_paths_are_disabled(self) -> None:
+        """Legacy planning cannot call a model or create an in-memory plan."""
         import asyncio
-        planner = AttackPlanner()
-        intel: dict[str, Any] = {"findings": [], "credentials": []}
+
+        class ForbiddenBrain:
+            async def plan_next_attack(self, *_args: Any, **_kwargs: Any) -> Any:
+                raise AssertionError("legacy planner called ForgeBrain")
+
+        planner = AttackPlanner(ForbiddenBrain())  # type: ignore[arg-type]
+        intel: dict[str, Any] = {
+            "findings": [{"title": "caller claim"}],
+            "credentials": [{"id": "caller-credential"}],
+            "shells": [{"target": "caller-shell"}],
+            "persistence": [{"target": "caller-persistence"}],
+            "lateral_moves": [{"target": "caller-lateral"}],
+        }
         context = {"target": "https://example.com"}
         plan = asyncio.run(planner.plan_next(intel, context))
         assert isinstance(plan, AttackPlan)
         assert plan.phase.current_phase == KillChainPhase.RECON
+        assert plan.phase.next_phase == KillChainPhase.RECON
+        assert plan.phase.phase_complete is False
+        assert plan.phase.completion_pct == 0.0
+        assert plan.phase.blockers == [
+            "legacy planner disabled pending canonical persistence"
+        ]
+        assert plan.actions == []
+        failed = PlannedAction(
+            priority=1,
+            phase="EXECUTION",
+            mitre="TA0002",
+            framework="webforge",
+            module="fixture",
+            target="https://example.com",
+            rationale="caller claim",
+        )
+        assert asyncio.run(planner.adapt_to_failure(failed, "failure", intel)) == []
+        assert asyncio.run(planner.adapt_to_discovery({}, intel)) == []

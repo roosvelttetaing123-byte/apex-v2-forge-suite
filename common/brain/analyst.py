@@ -3,8 +3,8 @@
 Wraps ForgeBrain to provide finding-level analysis:
     - analyze()              → AnalysisResult for a single finding
     - bulk_analyze()         → batch analysis (token-efficient)
-    - enrich_finding()       → mutate finding with brain verdict
-    - filter_false_positives()→ remove FPs based on confidence
+    - enrich_finding()       → compatibility no-op; verdict stays advisory
+    - filter_false_positives()→ analyze without removing canonical findings
     - detect_false_negatives()→ identify likely missed vulns
 
 Graceful degradation: if brain is unavailable, falls back to
@@ -31,6 +31,7 @@ from common.brain.brain import (
     Verdict,
     Confidence,
 )
+from common.redaction import redact_text
 
 log = logging.getLogger("forge.brain.analyst")
 
@@ -125,7 +126,11 @@ class FindingAnalyst:
                 if isinstance(result, asyncio.CancelledError):
                     raise result
                 if isinstance(result, BaseException):
-                    log.warning("Bulk analysis failed for finding %d: %s", i + j, result)
+                    log.warning(
+                        "Bulk analysis failed for finding %d: %s",
+                        i + j,
+                        redact_text(str(result)),
+                    )
                     finding = batch[j]
                     fid = (
                         finding.get("id", f"unknown-{i+j}")
@@ -136,7 +141,7 @@ class FindingAnalyst:
                         finding_id=fid,
                         verdict=Verdict.NEEDS_VERIFICATION,
                         confidence=Confidence.LOW,
-                        reasoning=f"Analysis failed: {result}",
+                        reasoning="Advisory analysis failed.",
                     ))
                 else:
                     results.append(result)
@@ -148,41 +153,16 @@ class FindingAnalyst:
         finding: Any,
         analysis: AnalysisResult,
     ) -> Any:
-        """Mutate a Finding object with brain analysis results.
-
-        Adds brain verdict, adjusted severity, and confidence to the
-        finding's tags and evidence.extra.
+        """Return the finding unchanged; analysis is an advisory projection.
 
         Args:
             finding:  Finding object (with .tags, .evidence.extra, .severity).
             analysis: AnalysisResult from analyze().
 
         Returns:
-            The mutated Finding (same object).
+            The original finding (same object), with no canonical mutation.
         """
-        # Add brain tags
-        finding.tags = getattr(finding, "tags", []) or []
-        finding.tags.append(f"brain:verdict:{analysis.verdict.value}")
-        finding.tags.append(f"brain:confidence:{analysis.confidence.value}")
-
-        if analysis.verdict == Verdict.FALSE_POSITIVE:
-            finding.tags.append("brain:fp")
-
-        # Add to evidence.extra
-        if hasattr(finding, "evidence") and hasattr(finding.evidence, "extra"):
-            finding.evidence.extra = finding.evidence.extra or {}
-            finding.evidence.extra["brain_verdict"] = analysis.verdict.value
-            finding.evidence.extra["brain_confidence"] = analysis.confidence.value
-            finding.evidence.extra["brain_reasoning"] = analysis.reasoning
-            if analysis.action:
-                finding.evidence.extra["brain_action"] = analysis.action
-
-        # Severity adjustment
-        if analysis.severity_adjustment == "upgrade":
-            _upgrade_severity(finding)
-        elif analysis.severity_adjustment == "downgrade":
-            _downgrade_severity(finding)
-
+        del analysis
         return finding
 
     async def filter_false_positives(
@@ -190,7 +170,7 @@ class FindingAnalyst:
         findings: list[Any],
         min_confidence: str = "MEDIUM",
     ) -> list[Any]:
-        """Filter out false positive findings based on brain analysis.
+        """Analyze findings without allowing the model to remove canonical rows.
 
         Args:
             findings:       List of Finding objects or dicts.
@@ -198,7 +178,7 @@ class FindingAnalyst:
                            brain verdict of FALSE_POSITIVE are removed.
 
         Returns:
-            Filtered list of findings (FPs removed).
+            The original list. Advisory verdicts are not finding authority.
         """
         min_conf = Confidence(min_confidence)
         results = await self.bulk_analyze(findings)
@@ -212,20 +192,15 @@ class FindingAnalyst:
                     else getattr(finding, "id", "?")
                 )
                 log.info(
-                    "FP filtered: %s (confidence=%s, reason=%s)",
+                    "Advisory FP suggestion retained canonically: %s (confidence=%s, reason=%s)",
                     fid, analysis.confidence.value, analysis.reasoning[:80],
                 )
-                continue
-
-            # Keep if confidence meets minimum
-            conf_order = {Confidence.HIGH: 3, Confidence.MEDIUM: 2, Confidence.LOW: 1}
-            if conf_order.get(analysis.confidence, 0) >= conf_order.get(min_conf, 0):
-                filtered.append(finding)
-            else:
+            elif analysis.confidence == Confidence.LOW:
                 log.info(
-                    "Low-confidence finding suppressed: %s (%s < %s)",
+                    "Low-confidence advisory retained canonically: %s (%s < %s)",
                     analysis.finding_id, analysis.confidence.value, min_conf.value,
                 )
+            filtered.append(finding)
 
         return filtered
 
@@ -441,8 +416,8 @@ class TestFindingAnalyst:
         assert result.finding_id == "test-1"
         assert result.verdict in (Verdict.TRUE_POSITIVE, Verdict.NEEDS_VERIFICATION)
 
-    def test_filter_suppresses_low_confidence(self) -> None:
-        """filter_false_positives must suppress findings below min_confidence."""
+    def test_filter_retains_low_confidence_as_canonical_truth(self) -> None:
+        """Advisory confidence cannot remove a canonical finding."""
         import asyncio
         analyst = FindingAnalyst()
         finding = {
@@ -455,7 +430,7 @@ class TestFindingAnalyst:
         result = asyncio.run(
             analyst.filter_false_positives([finding], min_confidence="MEDIUM")
         )
-        assert len(result) == 0
+        assert result == [finding]
 
     def test_filter_keeps_high_confidence(self) -> None:
         """filter_false_positives must keep findings at or above min_confidence."""
@@ -473,10 +448,9 @@ class TestFindingAnalyst:
         )
         assert len(result) == 1
 
-    def test_enrich_finding(self) -> None:
-        """Test that enrich_finding adds brain metadata."""
+    def test_enrich_finding_is_read_only(self) -> None:
+        """Model output cannot mutate finding tags, evidence, or severity."""
         from common.finding import Finding, Severity
-        from common.evidence import Evidence
 
         analyst = FindingAnalyst()
         finding = Finding(
@@ -495,9 +469,12 @@ class TestFindingAnalyst:
             confidence=Confidence.HIGH,
             reasoning="Strong evidence",
         )
+        original_tags = list(finding.tags)
+        original_severity = finding.severity
         enriched = analyst.enrich_finding(finding, analysis)
-        assert "brain:verdict:TRUE_POSITIVE" in enriched.tags
-        assert "brain:confidence:HIGH" in enriched.tags
+        assert enriched is finding
+        assert enriched.tags == original_tags
+        assert enriched.severity == original_severity
 
     def test_severity_upgrade(self) -> None:
         from common.finding import Severity

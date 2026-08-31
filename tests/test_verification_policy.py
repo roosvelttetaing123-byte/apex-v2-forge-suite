@@ -658,7 +658,7 @@ def test_autonomous_placeholder_serializes_simulation_not_execution() -> None:
     assert "executed" not in str(engine._chain_log[0]).lower()
 
 
-def test_attack_narrative_uses_verification_state_not_result_wording() -> None:
+def test_attack_narrative_rejects_caller_verification_and_result_wording() -> None:
     from common.brain.narrator import ReportNarrator
 
     narrative = ReportNarrator()._template_attack_narrative(
@@ -682,17 +682,21 @@ def test_attack_narrative_uses_verification_state_not_result_wording() -> None:
         ]
     )
 
-    assert "**1** action(s) produced verified outcomes" in narrative
+    assert "Advisory projection only" in narrative
+    assert "does not assert" in narrative
+    assert "Recorded advisory entries: **2**" in narrative
+    assert "produced verified outcomes" not in narrative
     assert "successfully exploited according to process log" not in narrative
     assert "documented proof policy satisfied" not in narrative
-    assert narrative.count("Observation detail withheld") == 2
-    assert "verification_state=candidate" in narrative
-    assert "proof_type=active" in narrative
+    assert narrative.count("Observation detail withheld") == 1
+    assert "verification_state=candidate" not in narrative
+    assert "verification_state=verified" not in narrative
+    assert "proof_type=active" not in narrative
 
 
-def test_event_and_api_adapters_preserve_truth_fields() -> None:
+def test_event_and_api_adapters_reject_unresolved_finding_truth() -> None:
     from common.dashboard.event_bus import Event, EventBus, EventType
-    from common.dashboard.server import DashboardServer
+    from common.dashboard.server import DashboardArtifactError, DashboardServer
     from common.dashboard.state_store import StateStore
 
     bus = EventBus()
@@ -714,16 +718,8 @@ def test_event_and_api_adapters_preserve_truth_fields() -> None:
             },
         )
     )
-    event_row = store.findings[0].to_dict()
-    assert event_row["verification_state"] == "candidate"
-    assert event_row["proof_type"] == "version_correlation"
-    assert event_row["maturity"] == "experimental"
-
-    public_row = DashboardServer(auth=False)._public_finding(event_row)
-    assert public_row["verification_state"] == "candidate"
-    assert public_row["proof_type"] == "version_correlation"
-    assert public_row["maturity"] == "experimental"
-    assert "verification" not in public_row
+    assert store.findings == []
+    assert store.timeline == []
 
     fabricated = Event(
         event_type=EventType.FINDING_NEW,
@@ -740,9 +736,8 @@ def test_event_and_api_adapters_preserve_truth_fields() -> None:
             "maturity": "verified",
         },
     )
-    public_event = DashboardServer(auth=False)._public_event(fabricated)
-    assert public_event["data"]["status"] == "open"
-    assert public_event["data"]["verification_state"] == "candidate"
+    with pytest.raises(DashboardArtifactError, match="canonical snapshot refresh"):
+        DashboardServer(auth=False)._public_event(fabricated)
 
 
 def test_legacy_persisted_finding_migrates_to_unknown_unverified(tmp_path) -> None:

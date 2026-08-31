@@ -443,8 +443,6 @@ class ReportEngine:
         try:
             from common.brain.narrator import ReportNarrator
             narrator = ReportNarrator()
-            if not narrator.brain.available:
-                return _default_exec_summary(self.findings, self.config)
             summary = await narrator.executive_summary(
                 findings=self.findings,
                 engagement=self.config.engagement,
@@ -474,35 +472,14 @@ def _vpr_label(cvss: float) -> str:
 # ── Default executive summary (when AI is unavailable) ────────────────────────
 
 def _default_exec_summary(findings: list[dict], config: ReportConfig) -> str:
-    """Generate a template-driven executive summary."""
-    severity_counts: dict[str, int] = {
-        "Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Informational": 0
-    }
-    for f in findings:
-        sev = f.get("severity", "Informational")
-        severity_counts[sev] = severity_counts.get(sev, 0) + 1
+    """Return a non-authoritative notice for generic report inputs."""
 
-    crit = severity_counts.get("Critical", 0)
-    high = severity_counts.get("High", 0)
-    total = len(findings)
+    from common.brain.truth_boundary import advisory_report_projection
 
-    risk_level = (
-        "CRITICAL" if crit > 0 else
-        "HIGH"     if high > 0 else
-        "MEDIUM"   if severity_counts.get("Medium", 0) > 0 else
-        "LOW"
-    )
-
-    return (
-        f"A penetration test was conducted against {config.target or 'the target environment'} "
-        f"as part of engagement '{config.engagement}'. "
-        f"The assessment identified {total} finding(s) across multiple risk categories, "
-        f"including {crit} critical and {high} high severity issue(s). "
-        f"The overall risk posture of the target is assessed as {risk_level}. "
-        f"Immediate remediation is recommended for all Critical and High severity findings "
-        f"to reduce the risk of unauthorized access and data compromise. "
-        f"Full technical details, reproduction steps, and remediation guidance are provided "
-        f"in the findings section of this report."
+    del config
+    return advisory_report_projection(
+        projection_kind="executive_summary",
+        entry_count=len(findings),
     )
 
 
@@ -1180,8 +1157,10 @@ class TestReportEngine:
     def test_default_exec_summary(self) -> None:
         config = ReportConfig(engagement="Test", target="example.com")
         summary = _default_exec_summary(self._sample_findings(), config)
-        assert "example.com" in summary
-        assert "CRITICAL" in summary
+        assert "Advisory projection only" in summary
+        assert "not published as execution" in summary
+        assert "example.com" not in summary
+        assert "CRITICAL" not in summary
 
     def test_generate_html(self) -> None:
         import asyncio, tempfile

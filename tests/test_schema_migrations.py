@@ -1251,6 +1251,40 @@ def test_target_v1_ignores_stray_partial_v2_tables_for_legacy_finding(
         session.close()
 
 
+_LEGACY_GATE0_MISMATCH_CASES = (
+    "job_state",
+    "job_decision",
+    "job_action",
+    "target",
+    "module",
+    "engine",
+    "module_set_mismatch",
+    "consumption_decision",
+    "consumption_tenant",
+    "consumption_job",
+    "consumption_action",
+    "consumption_digest",
+    "consumption_boundary",
+    "consumption_empty_boundary",
+    "consumption_result",
+    "consumption_before_issued",
+    "consumption_after_expiry",
+    "claim_decision",
+    "claim_tenant",
+    "claim_job",
+    "claim_action",
+    "claim_digest",
+    "claim_boundary",
+    "claim_empty_boundary",
+    "claim_before_consumption",
+    "claim_after_expiry",
+    "missing_consumption",
+    "missing_claim",
+    "duplicate_consumption",
+    "duplicate_claim",
+)
+
+
 def test_legacy_gate0_records_migrate_to_unknown_reduced_claims(tmp_path: Path) -> None:
     session = create_db(tmp_path / "legacy.db")
     try:
@@ -1366,195 +1400,6 @@ def test_legacy_gate0_records_migrate_to_unknown_reduced_claims(tmp_path: Path) 
         ).scalar_one() == "completed"
     finally:
         module_set_session.close()
-
-    for mutation in (
-        "job_state",
-        "job_decision",
-        "job_action",
-        "target",
-        "module",
-        "engine",
-        "module_set_mismatch",
-        "consumption_decision",
-        "consumption_tenant",
-        "consumption_job",
-        "consumption_action",
-        "consumption_digest",
-        "consumption_boundary",
-        "consumption_empty_boundary",
-        "consumption_result",
-        "consumption_before_issued",
-        "consumption_after_expiry",
-        "claim_decision",
-        "claim_tenant",
-        "claim_job",
-        "claim_action",
-        "claim_digest",
-        "claim_boundary",
-        "claim_empty_boundary",
-        "claim_before_consumption",
-        "claim_after_expiry",
-        "missing_consumption",
-        "missing_claim",
-        "duplicate_consumption",
-        "duplicate_claim",
-    ):
-        mismatch_session = create_db(tmp_path / f"legacy-mismatch-{mutation}.db")
-        try:
-            module_set_case = mutation == "module_set_mismatch"
-            model, _envelope = _valid_legacy_authorization_model(
-                module_id=(
-                    module_set_binding(["module-a", "module-b"])
-                    if module_set_case
-                    else "module-a"
-                )
-            )
-            consumption, claim = _legacy_execution_records(model)
-            job_values: dict[str, object] = {
-                "id": "legacy-job",
-                "tenant_id": "legacy-tenant",
-                "target": "fixture",
-                "frameworks": json.dumps(["fixture"]),
-                "modules": json.dumps(
-                    ["module-a", "module-b"] if module_set_case else ["module-a"]
-                ),
-                "status": "completed",
-                "authorization_state": "allow",
-                "authorization_decision_id": model.decision_id,
-                "authorization_action_id": model.action_id,
-            }
-            if mutation == "job_state":
-                job_values["authorization_state"] = "unknown_not_authorized"
-            elif mutation == "job_decision":
-                job_values["authorization_decision_id"] = "other-decision"
-            elif mutation == "job_action":
-                job_values["authorization_action_id"] = "other-action"
-            elif mutation == "target":
-                job_values["target"] = "different.example"
-            elif mutation == "module":
-                job_values["modules"] = json.dumps(["module-b"])
-            elif mutation == "engine":
-                job_values["frameworks"] = json.dumps(["other-engine"])
-            elif mutation == "module_set_mismatch":
-                job_values["modules"] = json.dumps(["module-a", "module-c"])
-            elif mutation == "consumption_decision":
-                consumption.decision_id = "other-decision"
-            elif mutation == "consumption_tenant":
-                consumption.tenant_id = "other-tenant"
-            elif mutation == "consumption_job":
-                consumption.job_id = "other-job"
-            elif mutation == "consumption_action":
-                consumption.action_id = "other-action"
-            elif mutation == "consumption_digest":
-                consumption.envelope_digest = "sha256:" + "0" * 64
-            elif mutation == "consumption_boundary":
-                consumption.boundary = "other.boundary"
-            elif mutation == "consumption_empty_boundary":
-                consumption.boundary = ""
-            elif mutation == "consumption_result":
-                consumption.result_id = "other-result"
-            elif mutation == "consumption_before_issued":
-                consumption.consumed_at = model.issued_at - timedelta(seconds=1)
-            elif mutation == "consumption_after_expiry":
-                consumption.consumed_at = model.expires_at + timedelta(seconds=1)
-                claim.claimed_at = consumption.consumed_at
-            elif mutation == "claim_decision":
-                claim.decision_id = "other-decision"
-            elif mutation == "claim_tenant":
-                claim.tenant_id = "other-tenant"
-            elif mutation == "claim_job":
-                claim.job_id = "other-job"
-            elif mutation == "claim_action":
-                claim.action_id = "other-action"
-            elif mutation == "claim_digest":
-                claim.envelope_digest = "sha256:" + "0" * 64
-            elif mutation == "claim_boundary":
-                claim.boundary = "other.boundary"
-            elif mutation == "claim_empty_boundary":
-                claim.boundary = ""
-            elif mutation == "claim_before_consumption":
-                consumption.consumed_at = model.issued_at + timedelta(seconds=1)
-                claim.claimed_at = model.issued_at
-            elif mutation == "claim_after_expiry":
-                claim.claimed_at = model.expires_at + timedelta(seconds=1)
-
-            mismatch_session.add(model)
-            if mutation != "missing_consumption":
-                mismatch_session.add(consumption)
-            if mutation != "missing_claim":
-                mismatch_session.add(claim)
-            mismatch_session.add(ScanJobModel(**job_values))
-            mismatch_session.commit()
-            if mutation in {"duplicate_consumption", "duplicate_claim"}:
-                if mutation == "duplicate_consumption":
-                    table = "authorization_consumptions"
-                    duplicate_id = "consume-legacy-duplicate"
-                    columns = (
-                        "sequence INTEGER PRIMARY KEY,consumption_id VARCHAR(64) NOT NULL,"
-                        "decision_id VARCHAR(64) NOT NULL,tenant_id VARCHAR(100) NOT NULL,"
-                        "job_id VARCHAR(160) NOT NULL,action_id VARCHAR(64) NOT NULL,"
-                        "boundary VARCHAR(160) NOT NULL,result_id VARCHAR(160) NOT NULL,"
-                        "envelope_digest VARCHAR(80) NOT NULL,consumed_at DATETIME NOT NULL"
-                    )
-                else:
-                    table = "authorization_execution_claims"
-                    duplicate_id = "execute-legacy-duplicate"
-                    columns = (
-                        "sequence INTEGER PRIMARY KEY,claim_id VARCHAR(64) NOT NULL,"
-                        "decision_id VARCHAR(64) NOT NULL,tenant_id VARCHAR(100) NOT NULL,"
-                        "job_id VARCHAR(160) NOT NULL,action_id VARCHAR(64) NOT NULL,"
-                        "boundary VARCHAR(160) NOT NULL,envelope_digest VARCHAR(80) NOT NULL,"
-                        "claimed_at DATETIME NOT NULL"
-                    )
-                source = f"{table}_source"
-                mismatch_session.execute(
-                    text(f"DROP TRIGGER IF EXISTS {table}_no_update")
-                )
-                mismatch_session.execute(
-                    text(f"DROP TRIGGER IF EXISTS {table}_no_delete")
-                )
-                mismatch_session.execute(text(f"ALTER TABLE {table} RENAME TO {source}"))
-                mismatch_session.execute(text(f"CREATE TABLE {table} ({columns})"))
-                mismatch_session.execute(text(f"INSERT INTO {table} SELECT * FROM {source}"))
-                mismatch_session.execute(
-                    text(
-                            f"INSERT INTO {table} SELECT NULL,:duplicate_id,"
-                        + ",".join(
-                            column
-                            for column in (
-                                "decision_id",
-                                "tenant_id",
-                                "job_id",
-                                "action_id",
-                                "boundary",
-                                *(
-                                    ("result_id",)
-                                    if mutation == "duplicate_consumption"
-                                    else ()
-                                ),
-                                "envelope_digest",
-                                "consumed_at"
-                                if mutation == "duplicate_consumption"
-                                else "claimed_at",
-                            )
-                        )
-                        + f" FROM {source} LIMIT 1"
-                    ),
-                    {"duplicate_id": duplicate_id},
-                )
-                mismatch_session.execute(text(f"DROP TABLE {source}"))
-                mismatch_session.commit()
-            manager = MigrationManager(mismatch_session.get_bind())
-            manager.downgrade()
-            manager.upgrade()
-            assert mismatch_session.execute(
-                text("SELECT status FROM canonical_jobs WHERE id LIKE 'legacy-job-%'")
-            ).scalar_one() == "unknown_not_authorized"
-            assert mismatch_session.execute(
-                text("SELECT status FROM canonical_observations")
-            ).scalar_one() == "not_authorized"
-        finally:
-            mismatch_session.close()
 
     archive_session = create_db(tmp_path / "finding-archive-only.db")
     try:
@@ -1694,6 +1539,169 @@ def test_legacy_gate0_records_migrate_to_unknown_reduced_claims(tmp_path: Path) 
         ).scalar_one() == "triaged-link-mismatch"
     finally:
         archive_session.close()
+
+
+@pytest.mark.parametrize("mutation", _LEGACY_GATE0_MISMATCH_CASES)
+def test_legacy_gate0_authorization_mismatch_reduces_claims(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    mismatch_session = create_db(tmp_path / f"legacy-mismatch-{mutation}.db")
+    try:
+        module_set_case = mutation == "module_set_mismatch"
+        model, _envelope = _valid_legacy_authorization_model(
+            module_id=(
+                module_set_binding(["module-a", "module-b"])
+                if module_set_case
+                else "module-a"
+            )
+        )
+        consumption, claim = _legacy_execution_records(model)
+        job_values: dict[str, object] = {
+            "id": "legacy-job",
+            "tenant_id": "legacy-tenant",
+            "target": "fixture",
+            "frameworks": json.dumps(["fixture"]),
+            "modules": json.dumps(
+                ["module-a", "module-b"] if module_set_case else ["module-a"]
+            ),
+            "status": "completed",
+            "authorization_state": "allow",
+            "authorization_decision_id": model.decision_id,
+            "authorization_action_id": model.action_id,
+        }
+        if mutation == "job_state":
+            job_values["authorization_state"] = "unknown_not_authorized"
+        elif mutation == "job_decision":
+            job_values["authorization_decision_id"] = "other-decision"
+        elif mutation == "job_action":
+            job_values["authorization_action_id"] = "other-action"
+        elif mutation == "target":
+            job_values["target"] = "different.example"
+        elif mutation == "module":
+            job_values["modules"] = json.dumps(["module-b"])
+        elif mutation == "engine":
+            job_values["frameworks"] = json.dumps(["other-engine"])
+        elif mutation == "module_set_mismatch":
+            job_values["modules"] = json.dumps(["module-a", "module-c"])
+        elif mutation == "consumption_decision":
+            consumption.decision_id = "other-decision"
+        elif mutation == "consumption_tenant":
+            consumption.tenant_id = "other-tenant"
+        elif mutation == "consumption_job":
+            consumption.job_id = "other-job"
+        elif mutation == "consumption_action":
+            consumption.action_id = "other-action"
+        elif mutation == "consumption_digest":
+            consumption.envelope_digest = "sha256:" + "0" * 64
+        elif mutation == "consumption_boundary":
+            consumption.boundary = "other.boundary"
+        elif mutation == "consumption_empty_boundary":
+            consumption.boundary = ""
+        elif mutation == "consumption_result":
+            consumption.result_id = "other-result"
+        elif mutation == "consumption_before_issued":
+            consumption.consumed_at = model.issued_at - timedelta(seconds=1)
+        elif mutation == "consumption_after_expiry":
+            consumption.consumed_at = model.expires_at + timedelta(seconds=1)
+            claim.claimed_at = consumption.consumed_at
+        elif mutation == "claim_decision":
+            claim.decision_id = "other-decision"
+        elif mutation == "claim_tenant":
+            claim.tenant_id = "other-tenant"
+        elif mutation == "claim_job":
+            claim.job_id = "other-job"
+        elif mutation == "claim_action":
+            claim.action_id = "other-action"
+        elif mutation == "claim_digest":
+            claim.envelope_digest = "sha256:" + "0" * 64
+        elif mutation == "claim_boundary":
+            claim.boundary = "other.boundary"
+        elif mutation == "claim_empty_boundary":
+            claim.boundary = ""
+        elif mutation == "claim_before_consumption":
+            consumption.consumed_at = model.issued_at + timedelta(seconds=1)
+            claim.claimed_at = model.issued_at
+        elif mutation == "claim_after_expiry":
+            claim.claimed_at = model.expires_at + timedelta(seconds=1)
+
+        mismatch_session.add(model)
+        if mutation != "missing_consumption":
+            mismatch_session.add(consumption)
+        if mutation != "missing_claim":
+            mismatch_session.add(claim)
+        mismatch_session.add(ScanJobModel(**job_values))
+        mismatch_session.commit()
+        if mutation in {"duplicate_consumption", "duplicate_claim"}:
+            if mutation == "duplicate_consumption":
+                table = "authorization_consumptions"
+                duplicate_id = "consume-legacy-duplicate"
+                columns = (
+                    "sequence INTEGER PRIMARY KEY,consumption_id VARCHAR(64) NOT NULL,"
+                    "decision_id VARCHAR(64) NOT NULL,tenant_id VARCHAR(100) NOT NULL,"
+                    "job_id VARCHAR(160) NOT NULL,action_id VARCHAR(64) NOT NULL,"
+                    "boundary VARCHAR(160) NOT NULL,result_id VARCHAR(160) NOT NULL,"
+                    "envelope_digest VARCHAR(80) NOT NULL,consumed_at DATETIME NOT NULL"
+                )
+            else:
+                table = "authorization_execution_claims"
+                duplicate_id = "execute-legacy-duplicate"
+                columns = (
+                    "sequence INTEGER PRIMARY KEY,claim_id VARCHAR(64) NOT NULL,"
+                    "decision_id VARCHAR(64) NOT NULL,tenant_id VARCHAR(100) NOT NULL,"
+                    "job_id VARCHAR(160) NOT NULL,action_id VARCHAR(64) NOT NULL,"
+                    "boundary VARCHAR(160) NOT NULL,envelope_digest VARCHAR(80) NOT NULL,"
+                    "claimed_at DATETIME NOT NULL"
+                )
+            source = f"{table}_source"
+            mismatch_session.execute(
+                text(f"DROP TRIGGER IF EXISTS {table}_no_update")
+            )
+            mismatch_session.execute(
+                text(f"DROP TRIGGER IF EXISTS {table}_no_delete")
+            )
+            mismatch_session.execute(text(f"ALTER TABLE {table} RENAME TO {source}"))
+            mismatch_session.execute(text(f"CREATE TABLE {table} ({columns})"))
+            mismatch_session.execute(text(f"INSERT INTO {table} SELECT * FROM {source}"))
+            mismatch_session.execute(
+                text(
+                    f"INSERT INTO {table} SELECT NULL,:duplicate_id,"
+                    + ",".join(
+                        column
+                        for column in (
+                            "decision_id",
+                            "tenant_id",
+                            "job_id",
+                            "action_id",
+                            "boundary",
+                            *(
+                                ("result_id",)
+                                if mutation == "duplicate_consumption"
+                                else ()
+                            ),
+                            "envelope_digest",
+                            "consumed_at"
+                            if mutation == "duplicate_consumption"
+                            else "claimed_at",
+                        )
+                    )
+                    + f" FROM {source} LIMIT 1"
+                ),
+                {"duplicate_id": duplicate_id},
+            )
+            mismatch_session.execute(text(f"DROP TABLE {source}"))
+            mismatch_session.commit()
+        manager = MigrationManager(mismatch_session.get_bind())
+        manager.downgrade()
+        manager.upgrade()
+        assert mismatch_session.execute(
+            text("SELECT status FROM canonical_jobs WHERE id LIKE 'legacy-job-%'")
+        ).scalar_one() == "unknown_not_authorized"
+        assert mismatch_session.execute(
+            text("SELECT status FROM canonical_observations")
+        ).scalar_one() == "not_authorized"
+    finally:
+        mismatch_session.close()
 
 
 def test_legacy_secret_bearing_keys_are_opaque_in_canonical_archive(tmp_path: Path) -> None:

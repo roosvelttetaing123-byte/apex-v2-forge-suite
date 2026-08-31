@@ -243,7 +243,7 @@ def test_database_canonicalises_nested_verification_confidence(tmp_path: Path) -
 
 
 @pytest.mark.parametrize("value", INVALID_CONFIDENCE)
-def test_dashboard_snapshot_normalises_invalid_confidence(value: object) -> None:
+def test_dashboard_snapshot_rejects_unresolved_confidence(value: object) -> None:
     bus = EventBus(run_id="confidence-fixture")
     store = StateStore(bus, framework="webforge", target="https://fixture.invalid")
     data = _finding_dict("dashboard-finding")
@@ -252,11 +252,11 @@ def test_dashboard_snapshot_normalises_invalid_confidence(value: object) -> None
 
     store._on_finding(Event(EventType.FINDING_NEW, data=data, source="fixture_module"))
 
-    assert store.findings_snapshot()[0]["confidence"] == "UNVERIFIED"
-    assert store.snapshot()["findings"][0]["confidence"] == "UNVERIFIED"
+    assert store.findings_snapshot() == []
+    assert store.snapshot()["findings"] == []
 
 
-def test_dashboard_uses_nested_confidence_only_when_top_level_is_absent() -> None:
+def test_dashboard_rejects_unresolved_nested_confidence() -> None:
     bus = EventBus(run_id="confidence-fixture")
     store = StateStore(bus, framework="webforge", target="https://fixture.invalid")
     nested = _finding_dict("dashboard-nested")
@@ -268,8 +268,7 @@ def test_dashboard_uses_nested_confidence_only_when_top_level_is_absent() -> Non
     store._on_finding(Event(EventType.FINDING_NEW, data=nested, source="fixture_module"))
     store._on_finding(Event(EventType.FINDING_NEW, data=explicit_null, source="fixture_module"))
 
-    assert store.findings_snapshot()[0]["confidence"] == "HIGH"
-    assert store.findings_snapshot()[1]["confidence"] == "UNVERIFIED"
+    assert store.findings_snapshot() == []
 
 
 @pytest.mark.parametrize("value", INVALID_CONFIDENCE)

@@ -1,15 +1,15 @@
-"""AutonomousEngine — Fully autonomous VAPT mode for Forge Suite.
+"""AutonomousEngine — advisory compatibility mode for Forge Suite.
 
-Runs complete security assessments without human interaction:
-    - run_engagement()         → full VAPT engagement from RECON to REPORT
-    - Autonomous phase progression (RECON → SCAN → EXPLOIT → POST → REPORT)
-    - auto_confirm gates: safe actions auto-execute, risky ones queue
+Builds inert engagement simulations without production action authority:
+    - run_engagement()         → advisory flow from RECON to REPORT
+    - Advisory phase progression (RECON → SCAN → EXPLOIT → POST → REPORT)
+    - Unpersisted proposals are suppressed before review/execution queues
     - Stop conditions: domain compromise, time limit, finding count
-    - Brain-driven module selection: smart module ordering
-    - FN sweep after each phase
+    - Brain ordering cannot create action or completion authority
+    - FN suggestions are suppressed without canonical plan custody
     - Engagement report at completion
 
-Graceful degradation: works without brain (sequential module execution).
+Graceful degradation: works without brain (advisory module ordering only).
 
 FOR AUTHORIZED PENETRATION TESTING AND RED TEAM OPERATIONS ONLY.
 """
@@ -21,7 +21,9 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
+
+from common.redaction import redact_text
 
 log = logging.getLogger("forge.brain.autonomous")
 
@@ -55,6 +57,10 @@ class _EngagementBusChainAdapter:
     def __init__(self, engagement_bus: Any) -> None:
         self._handlers: dict[str, list[Any]] = {}
         self._engagement_bus = engagement_bus
+        self._tenant_id = str(getattr(engagement_bus, "_tenant_id", ""))
+        self._engagement_id = str(
+            getattr(engagement_bus, "_engagement_id", "")
+        )
         self.emitted: list[dict[str, Any]] = []
         engagement_bus.subscribe(self._on_finding)
 
@@ -68,6 +74,9 @@ class _EngagementBusChainAdapter:
         if str(finding.get("verification_state") or "").lower() != "verified":
             return
         payload = dict(finding)
+        payload["tenant_id"] = self._tenant_id
+        payload["engagement_id"] = self._engagement_id
+        payload["finding_id"] = str(finding.get("id") or "")
         payload.setdefault("type", _infer_chain_finding_type(finding))
         payload.setdefault("target", finding.get("target") or finding.get("url") or "")
         payload.setdefault("framework", framework)
@@ -75,7 +84,9 @@ class _EngagementBusChainAdapter:
             try:
                 handler(payload)
             except Exception as exc:
-                log.debug("Chain adapter handler failed: %s", exc)
+                log.debug(
+                    "Chain adapter handler failed: %s", redact_text(str(exc))
+                )
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -91,6 +102,7 @@ class EngagementPhase(str, Enum):
     POST     = "POST"
     REPORT   = "REPORT"
     COMPLETE = "COMPLETE"
+    ADVISORY_COMPLETE = "ADVISORY_COMPLETE"
     ABORTED  = "ABORTED"
 
 
@@ -104,6 +116,7 @@ class OpsecLevel(str, Enum):
 class StopReason(str, Enum):
     """Reasons the engagement stopped."""
     COMPLETED        = "completed"
+    ADVISORY_COMPLETE = "advisory_complete"
     DOMAIN_COMPROMISED = "domain_compromised"
     CRITICAL_FOUND   = "critical_found"
     TIME_LIMIT       = "time_limit"
@@ -289,12 +302,11 @@ _PHASE_MODULES: dict[str, dict[str, list[str]]] = {
 # ══════════════════════════════════════════════════════════════════════
 
 class AutonomousEngine:
-    """Fully autonomous VAPT engine.
+    """Advisory engagement simulator retained for compatibility.
 
-    Runs complete security assessments without human prompts. Uses
-    ForgeBrain for intelligent module selection and AttackPlanner for
-    kill chain progression. Falls back to sequential execution when
-    brain is unavailable.
+    ForgeBrain may order and explain proposals, but this class never approves,
+    dispatches, or counts a production action.  Real work must enter through
+    the Task 106 canonical truth boundary.
 
     Usage::
 
@@ -329,6 +341,7 @@ class AutonomousEngine:
         narrator: Any | None = None,
         analyst: Any | None = None,
         event_bus: Any | None = None,
+        advisory_sink: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         """Initialize the autonomous engine.
 
@@ -346,6 +359,7 @@ class AutonomousEngine:
         self._narrator = narrator
         self._analyst = analyst
         self._event_bus = event_bus
+        self._advisory_sink = advisory_sink
 
         # State
         self._progress = EngagementProgress()
@@ -357,9 +371,7 @@ class AutonomousEngine:
         self._aborted = False
         self._start_time = 0.0
 
-        # Subscribe to bus so findings_count stays current
-        if engagement_bus:
-            engagement_bus.subscribe(self._on_finding_published)
+        # Legacy finding events are not subscribed as progress authority.
 
     @property
     def progress(self) -> EngagementProgress:
@@ -381,16 +393,17 @@ class AutonomousEngine:
         log.warning("Autonomous engagement abort requested")
 
     def _on_finding_published(self, framework: str, finding: dict[str, Any]) -> None:
-        """Increment findings_count when the bus receives a new finding."""
-        self._progress.findings_count += 1
+        """Ignore event counters; this class has no canonical evidence reader."""
+        del framework, finding
 
     async def run_engagement(
         self, config: EngagementConfig
     ) -> EngagementReport:
-        """Run a full autonomous VAPT engagement.
+        """Run an inert advisory engagement simulation.
 
-        Progresses through RECON → SCAN → EXPLOIT → POST → REPORT
-        phases, using brain-driven module selection when available.
+        Progresses through advisory RECON → SCAN → EXPLOIT → POST → REPORT
+        labels, using brain-driven ordering when available.  It creates no job
+        and invokes no module.
 
         Args:
             config: Engagement configuration.
@@ -408,7 +421,7 @@ class AutonomousEngine:
         self._chain_log = []
         self._review_queue = []
 
-        stop_reason = StopReason.COMPLETED
+        stop_reason = StopReason.ADVISORY_COMPLETE
 
         log.info(
             "Autonomous engagement started: %s → %s (frameworks=%s, opsec=%s)",
@@ -475,15 +488,9 @@ class AutonomousEngine:
 
                     # Auto-confirm gate
                     if not self._should_auto_execute(mod, phase.value, config):
-                        self._review_queue.append({
-                            "framework": fw,
-                            "module": mod,
-                            "phase": phase.value,
-                            "target": config.target,
-                            "reason": "Requires operator confirmation",
-                        })
                         log.info(
-                            "Queued for review: %s/%s (phase=%s)",
+                            "Proposal suppressed pending canonical persistence: "
+                            "%s/%s (phase=%s)",
                             fw, mod, phase.value,
                         )
                         continue
@@ -513,10 +520,10 @@ class AutonomousEngine:
                 }
 
         except Exception as exc:
-            log.error("Autonomous engagement error: %s", exc)
+            log.error("Advisory engagement error: %s", redact_text(str(exc)))
             stop_reason = StopReason.ERROR
             report_content = {
-                "executive_summary": f"Engagement aborted due to error: {exc}",
+                "executive_summary": "Advisory engagement stopped due to an internal error.",
                 "attack_narrative": "",
                 "remediation_roadmap": "",
                 "risk_scenario": "",
@@ -526,9 +533,15 @@ class AutonomousEngine:
         ended_at = datetime.now(timezone.utc).isoformat()
         elapsed = time.monotonic() - self._start_time
         self._progress.elapsed_seconds = elapsed
-        self._progress.percent_complete = 100.0
+        # This percentage describes advisory-workflow progress only.  It must
+        # never become a canonical executed-work completion claim.
+        self._progress.percent_complete = min(
+            float(self._progress.percent_complete), 99.0
+        )
         self._progress.phase = (
-            EngagementPhase.ABORTED if self._aborted else EngagementPhase.COMPLETE
+            EngagementPhase.ADVISORY_COMPLETE
+            if stop_reason is StopReason.ADVISORY_COMPLETE and not self._aborted
+            else EngagementPhase.ABORTED
         )
         self._running = False
 
@@ -536,12 +549,12 @@ class AutonomousEngine:
         findings_summary = self._build_findings_summary()
 
         log.info(
-            "Autonomous engagement complete: %s (reason=%s, findings=%d, elapsed=%.0fs)",
+            "Advisory engagement finished: %s (reason=%s, findings=%d, elapsed=%.0fs)",
             engagement_id, stop_reason.value,
             self._progress.findings_count, elapsed,
         )
 
-        self._emit_progress("engagement_complete", {
+        self._emit_progress("engagement_advisory_complete", {
             "engagement_id": engagement_id,
             "stop_reason": stop_reason.value,
             "findings_count": self._progress.findings_count,
@@ -570,14 +583,21 @@ class AutonomousEngine:
         """Attach the ChainEngine to the autonomous engagement bus when possible."""
         if not self._eng_bus or self._chain_engine:
             return
+        if self._advisory_sink is None:
+            log.info(
+                "ChainEngine remains disabled: canonical advisory sink unavailable"
+            )
+            return
         try:
             from common.attack_chains import ChainEngine
-            auto_trigger = config.auto_confirm_safe and config.opsec_level == OpsecLevel.NOISY
+            # Legacy flags and OpSec labels cannot activate chain dispatch.
+            auto_trigger = False
             self._chain_adapter = _EngagementBusChainAdapter(self._eng_bus)
             self._chain_engine = ChainEngine(
                 bus=self._chain_adapter,
                 auto_trigger=auto_trigger,
                 opsec_level=config.opsec_level.value.upper(),
+                advisory_sink=self._advisory_sink,
             )
             self._chain_engine.register_all()
             log.info(
@@ -599,27 +619,6 @@ class AutonomousEngine:
         if self._progress.findings_count >= config.max_findings:
             log.info("Finding limit reached (%d)", self._progress.findings_count)
             return StopReason.FINDING_LIMIT
-
-        # Check for domain compromise and critical findings (single intel fetch)
-        if self._eng_bus:
-            intel = self._eng_bus.get_intel()
-            has_domain_admin = any(
-                "domain admin" in (f.get("title") or "").lower()
-                or "dcsync" in (f.get("title") or "").lower()
-                or "golden ticket" in (f.get("title") or "").lower()
-                for f in intel.findings
-            )
-            if has_domain_admin:
-                log.info("Domain compromise detected — engagement objective achieved")
-                return StopReason.DOMAIN_COMPROMISED
-
-            if config.stop_on_critical:
-                crits = intel.severity_counts.get("Critical", 0)
-                if crits > 0 and self._progress.phase in (
-                    EngagementPhase.EXPLOIT, EngagementPhase.POST
-                ):
-                    log.info("Critical finding detected in exploit phase — stopping")
-                    return StopReason.CRITICAL_FOUND
 
         return None
 
@@ -707,7 +706,7 @@ class AutonomousEngine:
     def _should_auto_execute(
         self, module: str, phase: str, config: EngagementConfig
     ) -> bool:
-        """Determine if a module should auto-execute.
+        """Return false because this advisory flow has no approval authority.
 
         Args:
             module: Module name.
@@ -715,30 +714,9 @@ class AutonomousEngine:
             config: Engagement config.
 
         Returns:
-            True if the module can execute without human approval.
+            Always false.
         """
-        if not config.auto_confirm_safe:
-            return False
-
-        if module in _ALWAYS_CONFIRM:
-            return False
-
-        if module in _SAFE_MODULES:
-            return True
-
-        if phase == "RECON":
-            return True
-
-        # In standard opsec, allow scanning modules
-        if config.opsec_level in (OpsecLevel.STANDARD, OpsecLevel.NOISY):
-            if phase == "SCAN":
-                return True
-
-        # In noisy mode, allow exploitation too
-        if config.opsec_level == OpsecLevel.NOISY:
-            if phase == "EXPLOIT" and module not in _ALWAYS_CONFIRM:
-                return True
-
+        del module, phase, config
         return False
 
     async def _execute_module(
@@ -808,25 +786,25 @@ class AutonomousEngine:
                     await self._execute_module("auto", hint.suggested_module, config)
                     self._progress.modules_simulated += 1
                 else:
-                    self._review_queue.append({
-                        "framework": "auto",
-                        "module": hint.suggested_module,
-                        "phase": phase,
-                        "target": config.target,
-                        "reason": f"FN sweep: {hint.likely_vuln} — {hint.reason}",
-                        "fn_hint": True,
-                    })
+                    log.info(
+                        "FN proposal suppressed pending canonical persistence: %s",
+                        hint.suggested_module,
+                    )
 
         except Exception as exc:
-            log.warning("FN sweep failed for phase %s: %s", phase, exc)
+            log.warning(
+                "FN sweep failed for phase %s: %s",
+                phase,
+                redact_text(str(exc)),
+            )
 
     async def _generate_report(
         self, config: EngagementConfig
     ) -> dict[str, str]:
         """Generate engagement report using the narrator."""
-        findings = []
-        if self._eng_bus:
-            findings = self._eng_bus.get_all_findings()
+        # This compatibility class has no canonical evidence reader.  Legacy
+        # bus rows therefore cannot enter report truth.
+        findings: list[dict[str, Any]] = []
 
         result: dict[str, str] = {
             "executive_summary": "",
@@ -842,32 +820,40 @@ class AutonomousEngine:
                     engagement=f"Autonomous Assessment — {config.target}",
                 )
             except Exception as exc:
-                log.warning("Report executive_summary failed: %s", exc)
+                log.warning(
+                    "Report executive_summary failed: %s", redact_text(str(exc))
+                )
 
             try:
                 result["attack_narrative"] = await self._narrator.attack_narrative(
                     self._chain_log,
                 )
             except Exception as exc:
-                log.warning("Report attack_narrative failed: %s", exc)
+                log.warning(
+                    "Report attack_narrative failed: %s", redact_text(str(exc))
+                )
 
             try:
                 result["remediation_roadmap"] = await self._narrator.remediation_roadmap(
                     findings,
                 )
             except Exception as exc:
-                log.warning("Report remediation_roadmap failed: %s", exc)
+                log.warning(
+                    "Report remediation_roadmap failed: %s", redact_text(str(exc))
+                )
 
             try:
                 result["risk_scenario"] = await self._narrator.risk_scenario(
                     findings,
                 )
             except Exception as exc:
-                log.warning("Report risk_scenario failed: %s", exc)
+                log.warning(
+                    "Report risk_scenario failed: %s", redact_text(str(exc))
+                )
         else:
             # Basic fallback report
             result["executive_summary"] = (
-                f"# Autonomous Assessment — {config.target}\n\n"
+                f"# Advisory Assessment — {config.target}\n\n"
                 f"**Findings:** {len(findings)}\n"
                 f"**Duration:** {self._progress.elapsed_seconds:.0f}s\n"
                 f"**Frameworks:** {', '.join(config.frameworks)}\n"
@@ -885,18 +871,14 @@ class AutonomousEngine:
             }
 
         intel = self._eng_bus.get_intel()
-        findings = intel.findings
-
-        by_framework: dict[str, int] = {}
-        for f in findings:
-            fw = f.get("framework", "unknown")
-            by_framework[fw] = by_framework.get(fw, 0) + 1
 
         return {
-            "total": len(findings),
-            "by_severity": intel.severity_counts,
-            "by_framework": by_framework,
-            "credentials_found": len(intel.credentials),
+            "total": 0,
+            "by_severity": {},
+            "by_framework": {},
+            "credentials_found": 0,
+            "advisory_observations": len(intel.findings),
+            "protected_credential_references": len(intel.credentials),
             "chains_triggered": self._progress.chains_triggered,
             "review_queue_size": len(self._review_queue),
         }
@@ -957,7 +939,7 @@ class TestAutonomousEngine:
     def test_should_auto_execute_safe(self) -> None:
         engine = AutonomousEngine()
         config = EngagementConfig(target="test")
-        assert engine._should_auto_execute("port_scanner", "RECON", config) is True
+        assert engine._should_auto_execute("port_scanner", "RECON", config) is False
 
     def test_should_auto_execute_dangerous(self) -> None:
         engine = AutonomousEngine()
@@ -969,14 +951,14 @@ class TestAutonomousEngine:
         config = EngagementConfig(
             target="test", opsec_level=OpsecLevel.STANDARD
         )
-        assert engine._should_auto_execute("sqli_scanner", "SCAN", config) is True
+        assert engine._should_auto_execute("sqli_scanner", "SCAN", config) is False
 
     def test_should_auto_execute_exploit_noisy(self) -> None:
         engine = AutonomousEngine()
         config = EngagementConfig(
             target="test", opsec_level=OpsecLevel.NOISY
         )
-        assert engine._should_auto_execute("credential_spray", "EXPLOIT", config) is True
+        assert engine._should_auto_execute("credential_spray", "EXPLOIT", config) is False
 
     def test_should_auto_execute_exploit_stealth(self) -> None:
         engine = AutonomousEngine()
@@ -1042,7 +1024,8 @@ class TestAutonomousEngine:
         )
         report = asyncio.run(engine.run_engagement(config))
         assert report.engagement_id
-        assert report.stop_reason in (StopReason.COMPLETED, StopReason.TIME_LIMIT)
+        assert report.stop_reason in (StopReason.ADVISORY_COMPLETE, StopReason.TIME_LIMIT)
+        assert report.progress["percent_complete"] < 100.0
         assert report.duration_seconds > 0
 
     def test_stop_conditions_time_limit(self) -> None:
@@ -1068,13 +1051,21 @@ class TestAutonomousEngine:
         # Should return default order without brain
         assert modules[0]["module"] == "port_scanner"
 
-    def test_on_finding_published_increments_count(self) -> None:
+    def test_on_finding_published_requires_canonical_verified_evidence(self) -> None:
         engine = AutonomousEngine()
         assert engine._progress.findings_count == 0
         engine._on_finding_published("webforge", {"title": "test"})
-        assert engine._progress.findings_count == 1
-        engine._on_finding_published("netforge", {"title": "test2"})
-        assert engine._progress.findings_count == 2
+        assert engine._progress.findings_count == 0
+        engine._on_finding_published(
+            "netforge",
+            {
+                "title": "test2",
+                "verification_state": "verified",
+                "observation_id": "observation-fixture",
+                "evidence_ref": "sha256:" + "a" * 64,
+            },
+        )
+        assert engine._progress.findings_count == 0
 
     def test_adcs_esc_modules_in_phase(self) -> None:
         engine = AutonomousEngine()
@@ -1102,8 +1093,8 @@ class TestAutonomousEngine:
         module_names = [m["module"] for m in modules]
         assert "jailbreak_exploit" in module_names
 
-    def test_check_stop_conditions_single_intel_fetch(self) -> None:
-        """Domain compromise and critical check reuse the same intel object."""
+    def test_check_stop_conditions_ignores_legacy_finding_claims(self) -> None:
+        """Legacy bus rows cannot claim compromise or stop canonical work."""
         from unittest.mock import MagicMock
         engine = AutonomousEngine()
         engine._start_time = time.monotonic()
@@ -1115,6 +1106,5 @@ class TestAutonomousEngine:
         engine._eng_bus = mock_bus
         config = EngagementConfig(target="test")
         reason = engine._check_stop_conditions(config)
-        assert reason == StopReason.DOMAIN_COMPROMISED
-        # Should only have been called once despite two checks
-        assert mock_bus.get_intel.call_count == 1
+        assert reason is None
+        assert mock_bus.get_intel.call_count == 0

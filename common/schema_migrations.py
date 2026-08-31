@@ -233,6 +233,9 @@ RETEST_SCHEMA_VERSION = "forge-retest-v1"
 # accepted tables with normalized reviewer revisions, locked report sources,
 # and export receipts without changing the Task 101 wire version.
 REFERENCE_SLICE_SCHEMA_VERSION = "forge-reference-slice-v1"
+# Task 106 adds an advisory planning and action-truth boundary.  It is an
+# additive control-plane schema and does not change the Task 101 wire version.
+BRAIN_TRUTH_SCHEMA_VERSION = "forge-brain-truth-v1"
 CURRENT_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
 JOURNAL_TABLE = "canonical_migration_journal"
 
@@ -6245,6 +6248,380 @@ def _reference_slice_drop_sql() -> tuple[str, ...]:
     )
 
 
+def _brain_truth_table_sql() -> tuple[str, ...]:
+    """Add tenant-bound advisory plans without creating execution authority."""
+
+    return (
+        """
+        CREATE TABLE IF NOT EXISTS canonical_advisory_capability_snapshots (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            registry_version TEXT NOT NULL,
+            registry_digest TEXT NOT NULL CHECK(registry_digest GLOB 'sha256:*'),
+            entries_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(tenant_id,id),
+            UNIQUE(tenant_id,registry_version,registry_digest),
+            FOREIGN KEY(tenant_id) REFERENCES canonical_tenants(id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_advisory_plans (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            engagement_id TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK(revision >= 1),
+            supersedes_plan_id TEXT,
+            source_observation_id TEXT,
+            source_finding_id TEXT,
+            target_digest TEXT NOT NULL CHECK(target_digest GLOB 'sha256:*'),
+            target_display TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            model_version TEXT NOT NULL,
+            planner_id TEXT NOT NULL,
+            planner_version TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('advisory','simulation')),
+            created_at TEXT NOT NULL,
+            revised_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(tenant_id,id),
+            UNIQUE(tenant_id,engagement_id,id),
+            FOREIGN KEY(tenant_id,engagement_id)
+                REFERENCES canonical_engagements(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,source_observation_id)
+                REFERENCES canonical_observations(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,source_finding_id)
+                REFERENCES canonical_findings(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,supersedes_plan_id)
+                REFERENCES canonical_advisory_plans(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_advisory_nodes (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            engagement_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            capability_snapshot_id TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            requested_capability_id TEXT NOT NULL,
+            requested_capability_version TEXT NOT NULL,
+            resolved_capability_id TEXT,
+            resolved_capability_version TEXT,
+            resolution_reason TEXT NOT NULL,
+            target_digest TEXT NOT NULL CHECK(target_digest GLOB 'sha256:*'),
+            target_display TEXT NOT NULL,
+            input_kind TEXT NOT NULL,
+            parameter_digest TEXT NOT NULL CHECK(parameter_digest GLOB 'sha256:*'),
+            parameters_json TEXT NOT NULL,
+            preconditions_json TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN (
+                'advisory','simulation','rejected','awaiting_approval',
+                'approved','job_created','terminal'
+            )),
+            policy_decision TEXT NOT NULL CHECK(policy_decision IN (
+                'missing','allow','deny','not_authorized'
+            )),
+            policy_reason TEXT NOT NULL,
+            policy_id TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            policy_digest TEXT NOT NULL CHECK(policy_digest GLOB 'sha256:*'),
+            approval_reference TEXT,
+            scope_decision_id TEXT,
+            action_id TEXT,
+            job_id TEXT,
+            attempt_id TEXT,
+            module_version_id TEXT,
+            asset_id TEXT,
+            idempotency_key TEXT NOT NULL,
+            request_digest TEXT NOT NULL CHECK(request_digest GLOB 'sha256:*'),
+            created_at TEXT NOT NULL,
+            revised_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(tenant_id,id),
+            UNIQUE(tenant_id,engagement_id,id),
+            UNIQUE(tenant_id,engagement_id,plan_id,id),
+            UNIQUE(tenant_id,idempotency_key),
+            FOREIGN KEY(tenant_id,engagement_id,plan_id)
+                REFERENCES canonical_advisory_plans(tenant_id,engagement_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,capability_snapshot_id)
+                REFERENCES canonical_advisory_capability_snapshots(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES canonical_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,scope_decision_id)
+                REFERENCES canonical_scope_decisions(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,action_id)
+                REFERENCES canonical_actions(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,module_version_id)
+                REFERENCES canonical_module_versions(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,asset_id)
+                REFERENCES canonical_assets(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_advisory_action_intents (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            engagement_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            job_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            approval_decision_id TEXT NOT NULL,
+            operator_id TEXT NOT NULL,
+            operator_role TEXT NOT NULL,
+            request_digest TEXT NOT NULL CHECK(request_digest GLOB 'sha256:*'),
+            parameter_digest TEXT NOT NULL CHECK(parameter_digest GLOB 'sha256:*'),
+            envelope_digest TEXT NOT NULL CHECK(envelope_digest GLOB 'sha256:*'),
+            boundary TEXT NOT NULL,
+            nonce TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'prepared','consumed','job_created','rejected'
+            )),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(tenant_id,id),
+            UNIQUE(tenant_id,node_id),
+            UNIQUE(tenant_id,idempotency_key),
+            FOREIGN KEY(tenant_id,engagement_id,node_id)
+                REFERENCES canonical_advisory_nodes(tenant_id,engagement_id,id) ON DELETE RESTRICT
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS canonical_advisory_outcomes (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            engagement_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            action_id TEXT,
+            job_id TEXT,
+            attempt_id TEXT,
+            outcome TEXT NOT NULL CHECK(outcome IN (
+                'advisory','simulation','success','failed','partial','canceled',
+                'timeout','unauthorized','unsupported','inconclusive'
+            )),
+            job_state TEXT NOT NULL,
+            terminal_reason TEXT NOT NULL,
+            signed_outcome_ref TEXT,
+            evidence_refs_json TEXT NOT NULL,
+            classification_source TEXT NOT NULL,
+            recorded_at TEXT NOT NULL,
+            UNIQUE(tenant_id,id),
+            UNIQUE(tenant_id,node_id,id),
+            FOREIGN KEY(tenant_id,engagement_id,node_id)
+                REFERENCES canonical_advisory_nodes(tenant_id,engagement_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,job_id)
+                REFERENCES canonical_jobs(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,action_id)
+                REFERENCES canonical_actions(tenant_id,id) ON DELETE RESTRICT,
+            FOREIGN KEY(tenant_id,attempt_id)
+                REFERENCES durable_job_state_attempts(tenant_id,id) ON DELETE RESTRICT
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_advisory_nodes_plan ON canonical_advisory_nodes(tenant_id,engagement_id,plan_id)",
+        "CREATE INDEX IF NOT EXISTS ix_advisory_nodes_job ON canonical_advisory_nodes(tenant_id,job_id)",
+        "CREATE INDEX IF NOT EXISTS ix_advisory_outcomes_node ON canonical_advisory_outcomes(tenant_id,node_id,recorded_at)",
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_snapshot_no_update
+        BEFORE UPDATE ON canonical_advisory_capability_snapshots
+        BEGIN SELECT RAISE(ABORT,'advisory capability snapshot is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_snapshot_no_delete
+        BEFORE DELETE ON canonical_advisory_capability_snapshots
+        BEGIN SELECT RAISE(ABORT,'advisory capability snapshot is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_plan_no_update
+        BEFORE UPDATE ON canonical_advisory_plans
+        BEGIN SELECT RAISE(ABORT,'advisory plan revision is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_plan_no_delete
+        BEFORE DELETE ON canonical_advisory_plans
+        BEGIN SELECT RAISE(ABORT,'advisory plan revision is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_node_identity_guard
+        BEFORE UPDATE ON canonical_advisory_nodes
+        WHEN NEW.tenant_id != OLD.tenant_id
+          OR NEW.engagement_id != OLD.engagement_id
+          OR NEW.plan_id != OLD.plan_id
+          OR NEW.capability_snapshot_id != OLD.capability_snapshot_id
+          OR NEW.requested_capability_id != OLD.requested_capability_id
+          OR NEW.requested_capability_version != OLD.requested_capability_version
+          OR NEW.resolved_capability_id IS NOT OLD.resolved_capability_id
+          OR NEW.resolved_capability_version IS NOT OLD.resolved_capability_version
+          OR NEW.resolution_reason != OLD.resolution_reason
+          OR NEW.target_digest != OLD.target_digest
+          OR NEW.target_display != OLD.target_display
+          OR NEW.input_kind != OLD.input_kind
+          OR NEW.parameter_digest != OLD.parameter_digest
+          OR NEW.parameters_json != OLD.parameters_json
+          OR NEW.preconditions_json != OLD.preconditions_json
+          OR NEW.rationale != OLD.rationale
+          OR NEW.idempotency_key != OLD.idempotency_key
+          OR NEW.request_digest != OLD.request_digest
+          OR NEW.created_at != OLD.created_at
+        BEGIN SELECT RAISE(ABORT,'advisory node identity is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_node_no_delete
+        BEFORE DELETE ON canonical_advisory_nodes
+        BEGIN SELECT RAISE(ABORT,'advisory node is retained'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_node_authority_guard
+        BEFORE UPDATE ON canonical_advisory_nodes
+        WHEN (OLD.approval_reference IS NOT NULL AND (
+                NEW.approval_reference IS NOT OLD.approval_reference
+             OR NEW.policy_decision != OLD.policy_decision
+             OR NEW.policy_reason != OLD.policy_reason
+             OR NEW.policy_id != OLD.policy_id
+             OR NEW.policy_version != OLD.policy_version
+             OR NEW.policy_digest != OLD.policy_digest
+        )) OR (OLD.scope_decision_id IS NOT NULL
+             AND NEW.scope_decision_id IS NOT OLD.scope_decision_id)
+          OR (OLD.action_id IS NOT NULL AND NEW.action_id IS NOT OLD.action_id)
+          OR (OLD.job_id IS NOT NULL AND NEW.job_id IS NOT OLD.job_id)
+          OR (OLD.attempt_id IS NOT NULL AND NEW.attempt_id IS NOT OLD.attempt_id)
+          OR (OLD.module_version_id IS NOT NULL
+             AND NEW.module_version_id IS NOT OLD.module_version_id)
+          OR (OLD.asset_id IS NOT NULL AND NEW.asset_id IS NOT OLD.asset_id)
+        BEGIN SELECT RAISE(ABORT,'advisory node authority binding is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_intent_identity_guard
+        BEFORE UPDATE ON canonical_advisory_action_intents
+        WHEN NEW.tenant_id != OLD.tenant_id
+          OR NEW.engagement_id != OLD.engagement_id
+          OR NEW.node_id != OLD.node_id
+          OR NEW.action_id != OLD.action_id
+          OR NEW.job_id != OLD.job_id
+          OR NEW.run_id != OLD.run_id
+          OR NEW.approval_decision_id != OLD.approval_decision_id
+          OR NEW.operator_id != OLD.operator_id
+          OR NEW.operator_role != OLD.operator_role
+          OR NEW.request_digest != OLD.request_digest
+          OR NEW.parameter_digest != OLD.parameter_digest
+          OR NEW.envelope_digest != OLD.envelope_digest
+          OR NEW.boundary != OLD.boundary
+          OR NEW.nonce != OLD.nonce
+          OR NEW.idempotency_key != OLD.idempotency_key
+          OR NEW.expires_at != OLD.expires_at
+          OR NEW.created_at != OLD.created_at
+        BEGIN SELECT RAISE(ABORT,'advisory action intent identity is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_intent_authorization_guard
+        BEFORE INSERT ON canonical_advisory_action_intents
+        WHEN NOT EXISTS (
+          SELECT 1 FROM authorization_decisions d
+          WHERE d.tenant_id=NEW.tenant_id
+            AND d.job_id=NEW.job_id
+            AND d.decision_id=NEW.approval_decision_id
+            AND d.action_id=NEW.action_id
+            AND d.operator_id=NEW.operator_id
+            AND d.operator_role=NEW.operator_role
+            AND d.binding_digest=NEW.envelope_digest
+            AND d.decision_outcome='allow'
+        )
+        BEGIN SELECT RAISE(ABORT,'advisory action intent authorization mismatch'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_intent_transition_guard
+        BEFORE UPDATE OF status ON canonical_advisory_action_intents
+        WHEN NEW.status != OLD.status AND NOT (
+          (OLD.status='prepared' AND NEW.status IN ('consumed','rejected'))
+          OR (OLD.status='consumed' AND NEW.status='job_created')
+        )
+        BEGIN SELECT RAISE(ABORT,'invalid advisory action intent transition'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_intent_consumption_guard
+        BEFORE UPDATE OF status ON canonical_advisory_action_intents
+        WHEN NEW.status IN ('consumed','job_created') AND NOT EXISTS (
+          SELECT 1 FROM authorization_consumptions c
+          WHERE c.tenant_id=NEW.tenant_id
+            AND c.job_id=NEW.job_id
+            AND c.decision_id=NEW.approval_decision_id
+            AND c.action_id=NEW.action_id
+            AND c.boundary=NEW.boundary
+            AND c.envelope_digest=NEW.envelope_digest
+        )
+        BEGIN SELECT RAISE(ABORT,'advisory action intent is not consumed'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_intent_job_guard
+        BEFORE UPDATE OF status ON canonical_advisory_action_intents
+        WHEN NEW.status='job_created' AND (
+          NOT EXISTS (
+            SELECT 1 FROM canonical_jobs j
+            WHERE j.tenant_id=NEW.tenant_id
+              AND j.engagement_id=NEW.engagement_id
+              AND j.id=NEW.job_id
+          ) OR NOT EXISTS (
+            SELECT 1 FROM canonical_actions a
+            WHERE a.tenant_id=NEW.tenant_id
+              AND a.engagement_id=NEW.engagement_id
+              AND a.job_id=NEW.job_id
+              AND a.id=NEW.action_id
+          )
+        )
+        BEGIN SELECT RAISE(ABORT,'advisory action intent lacks canonical job/action'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_intent_no_delete
+        BEFORE DELETE ON canonical_advisory_action_intents
+        BEGIN SELECT RAISE(ABORT,'advisory action intent is retained'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_outcome_no_update
+        BEFORE UPDATE ON canonical_advisory_outcomes
+        BEGIN SELECT RAISE(ABORT,'advisory outcome is immutable'); END
+        """,
+        """
+        CREATE TRIGGER IF NOT EXISTS canonical_advisory_outcome_no_delete
+        BEFORE DELETE ON canonical_advisory_outcomes
+        BEGIN SELECT RAISE(ABORT,'advisory outcome is immutable'); END
+        """,
+    )
+
+
+def _brain_truth_drop_sql() -> tuple[str, ...]:
+    return (
+        "DROP TRIGGER IF EXISTS canonical_advisory_outcome_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_advisory_outcome_no_update",
+        "DROP TRIGGER IF EXISTS canonical_advisory_intent_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_advisory_intent_job_guard",
+        "DROP TRIGGER IF EXISTS canonical_advisory_intent_consumption_guard",
+        "DROP TRIGGER IF EXISTS canonical_advisory_intent_transition_guard",
+        "DROP TRIGGER IF EXISTS canonical_advisory_intent_authorization_guard",
+        "DROP TRIGGER IF EXISTS canonical_advisory_intent_identity_guard",
+        "DROP TRIGGER IF EXISTS canonical_advisory_node_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_advisory_node_authority_guard",
+        "DROP TRIGGER IF EXISTS canonical_advisory_node_identity_guard",
+        "DROP TRIGGER IF EXISTS canonical_advisory_plan_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_advisory_plan_no_update",
+        "DROP TRIGGER IF EXISTS canonical_advisory_snapshot_no_delete",
+        "DROP TRIGGER IF EXISTS canonical_advisory_snapshot_no_update",
+        "DROP TABLE IF EXISTS canonical_advisory_outcomes",
+        "DROP TABLE IF EXISTS canonical_advisory_action_intents",
+        "DROP TABLE IF EXISTS canonical_advisory_nodes",
+        "DROP TABLE IF EXISTS canonical_advisory_plans",
+        "DROP TABLE IF EXISTS canonical_advisory_capability_snapshots",
+    )
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         version=CANONICAL_SCHEMA_VERSION,
@@ -6280,6 +6657,13 @@ MIGRATIONS: tuple[Migration, ...] = (
         upgrade_sql=_reference_slice_table_sql(),
         downgrade_sql=_reference_slice_drop_sql(),
         description="Task 105 canonical reviewer and locked report workflow",
+    ),
+    Migration(
+        version=BRAIN_TRUTH_SCHEMA_VERSION,
+        order=106,
+        upgrade_sql=_brain_truth_table_sql(),
+        downgrade_sql=_brain_truth_drop_sql(),
+        description="Task 106 ForgeBrain advisory and chain truth boundary",
     ),
 )
 
@@ -6372,6 +6756,7 @@ class MigrationManager:
                 JOB_STATE_SCHEMA_VERSION,
                 RETEST_SCHEMA_VERSION,
                 REFERENCE_SLICE_SCHEMA_VERSION,
+                BRAIN_TRUTH_SCHEMA_VERSION,
             }:
                 version = CANONICAL_SCHEMA_VERSION
             else:
@@ -6568,6 +6953,41 @@ class MigrationManager:
                 connection.commit()
             keep = set(self.versions[: self.versions.index(target) + 1]) if target else set()
             removing = {str(row[0]) for row in rows} - keep
+            if BRAIN_TRUTH_SCHEMA_VERSION in removing:
+                brain_truth_tables = (
+                    "canonical_advisory_capability_snapshots",
+                    "canonical_advisory_plans",
+                    "canonical_advisory_nodes",
+                    "canonical_advisory_action_intents",
+                    "canonical_advisory_outcomes",
+                )
+                present_tables = {
+                    str(row[0])
+                    for row in connection.exec_driver_sql(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+                if not set(brain_truth_tables) <= present_tables:
+                    if connection.in_transaction():
+                        connection.rollback()
+                    raise MigrationError(
+                        "brain-truth downgrade encountered incomplete state"
+                    )
+                retained_brain_truth = any(
+                    int(
+                        connection.exec_driver_sql(
+                            f"SELECT COUNT(*) FROM {table}"
+                        ).scalar_one()
+                    )
+                    > 0
+                    for table in brain_truth_tables
+                )
+                if connection.in_transaction():
+                    connection.rollback()
+                if retained_brain_truth:
+                    raise MigrationError(
+                        "brain-truth downgrade would destroy retained history"
+                    )
             if REFERENCE_SLICE_SCHEMA_VERSION in removing:
                 reference_tables = (
                     "canonical_finding_review_revisions",
@@ -6963,7 +7383,7 @@ def migration_versions() -> tuple[str, ...]:
 
 
 __all__ = [
-    "CANONICAL_MIGRATION_PREFIX", "CANONICAL_SCHEMA_VERSION", "CURRENT_SCHEMA_VERSION", "EVIDENCE_SCHEMA_VERSION", "JOB_STATE_SCHEMA_VERSION", "REFERENCE_SLICE_SCHEMA_VERSION", "RETEST_SCHEMA_VERSION",
+    "BRAIN_TRUTH_SCHEMA_VERSION", "CANONICAL_MIGRATION_PREFIX", "CANONICAL_SCHEMA_VERSION", "CURRENT_SCHEMA_VERSION", "EVIDENCE_SCHEMA_VERSION", "JOB_STATE_SCHEMA_VERSION", "REFERENCE_SLICE_SCHEMA_VERSION", "RETEST_SCHEMA_VERSION",
     "JOURNAL_TABLE", "MIGRATIONS", "Migration", "MigrationError", "MigrationInterruptedError",
     "MigrationManager", "UnsupportedMigrationError", "current_version", "downgrade", "migration_versions",
     "archive_legacy_records", "recover", "upgrade",

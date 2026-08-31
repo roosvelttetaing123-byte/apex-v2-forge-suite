@@ -57,7 +57,7 @@ try:
 except ImportError:
     HAS_RICH = False
 
-from common.dashboard.event_bus import Event, EventBus, EventType
+from common.dashboard.event_bus import EventBus, EventType
 from common.dashboard.state_store import StateStore
 from common.dashboard.metrics import sparkline as _sparkline_text
 
@@ -161,27 +161,9 @@ class WarRoomTUI:
         self._flash_messages: list[tuple[float, str]] = []
         self._key_thread: threading.Thread | None = None
 
-        # Subscribe for flash notifications on critical events
-        self.event_bus.subscribe(EventType.FINDING_NEW, self._on_finding_flash)
-        self.event_bus.subscribe(EventType.SHELL_SESSION, self._on_shell_flash)
-        self.event_bus.subscribe(EventType.TARGET_PWNED, self._on_pwned_flash)
-        self.event_bus.subscribe(EventType.CREDENTIAL_FOUND, self._on_cred_flash)
-
-    # ── Flash notification handlers ───────────────────────────────────
-
-    def _on_finding_flash(self, event: Event) -> None:
-        sev = event.data.get("severity", "Info")
-        if sev in ("Critical", "High"):
-            self._flash(f"🚨 {sev.upper()}: {event.data.get('title', 'Finding')}")
-
-    def _on_shell_flash(self, event: Event) -> None:
-        self._flash(f"💀 SHELL OBTAINED: {event.data.get('target', '?')}")
-
-    def _on_pwned_flash(self, event: Event) -> None:
-        self._flash(f"🏴 TARGET PWNED: {event.data.get('target', '?')}")
-
-    def _on_cred_flash(self, event: Event) -> None:
-        self._flash(f"🔑 CREDENTIAL: {event.data.get('account', '?')}")
+        # Raw events are invalidations, not notification authority. The TUI
+        # renders only its bounded StateStore snapshot and never flashes
+        # caller-selected finding, credential, compromise, or session claims.
 
     def _flash(self, msg: str) -> None:
         """Add a flash message that expires after 5 seconds."""

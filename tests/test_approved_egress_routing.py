@@ -53,6 +53,24 @@ from tests.test_outbound_policy import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _freeze_default_route_wall_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep route TTL fixtures deterministic in slow full-suite runs."""
+
+    test_now = datetime.now(timezone.utc).replace(microsecond=0)
+    test_clock = _policy.__globals__["_TEST_CLOCK"]
+    monkeypatch.setitem(globals(), "NOW", test_now)
+    monkeypatch.setitem(_policy.__globals__, "NOW", test_now)
+    monkeypatch.setitem(test_clock, "now", test_now)
+    monkeypatch.setattr(
+        outbound_policy_module,
+        "_system_utc_now",
+        lambda: test_clock["now"],
+    )
+
+
 def _route(**overrides: object) -> ApprovedEgressRoute:
     values: dict[str, object] = {
         "schema_version": "forge-approved-egress-route-v1",

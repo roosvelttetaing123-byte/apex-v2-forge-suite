@@ -24,6 +24,11 @@ from common.action_authorization import (
     compute_envelope_digest,
     issue_authorization,
 )
+from common.brain.truth_boundary import (
+    SUPPORTED_CAPABILITY_ID,
+    SUPPORTED_CAPABILITY_VERSION,
+    SUPPORTED_IMPLEMENTATION,
+)
 from common.confirm_gate import ActionConfirmation
 from common.dashboard.auth import Role, TokenPayload, issue_identity_token, validate_token
 from common.dashboard.event_bus import (
@@ -36,6 +41,8 @@ from common.dashboard.event_bus import (
 )
 from common.dashboard.state_store import CredentialEntry, FindingEntry
 from common.db import create_db, get_authorization_decision
+from common.scope import canonical_target
+from common.version import VERSION
 
 
 TARGET = "http://127.0.0.1:8080/fixture"
@@ -44,8 +51,104 @@ STATE_CHANGING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
+_TASK106_TENANT = "tenant-task106"
+_TASK106_ENGAGEMENT = "engagement-task106"
+_TASK106_RUN = "run-task106"
+_TASK106_PLAN = "plan-task106"
+_TASK106_NODE = "node-task106"
+_TASK106_ACTION = "action-task106"
+_TASK106_JOB = "job-task106"
+_TASK106_ATTEMPT = "attempt-task106"
+_TASK106_SIGNED_REF = "run-truth:task106"
 
-def test_public_finding_events_preserve_all_seven_retest_verdicts_exactly() -> None:
+
+def _task106_lineage(
+    *,
+    observation_id: str = "observation-task106",
+    finding_id: str = "finding-task106",
+    evidence_ref: str = "artifact:task106",
+) -> dict[str, str]:
+    return {
+        "plan_id": _TASK106_PLAN,
+        "node_id": _TASK106_NODE,
+        "action_id": _TASK106_ACTION,
+        "job_id": _TASK106_JOB,
+        "attempt_id": _TASK106_ATTEMPT,
+        "capability_id": SUPPORTED_CAPABILITY_ID,
+        "capability_version": SUPPORTED_CAPABILITY_VERSION,
+        "module_id": SUPPORTED_IMPLEMENTATION,
+        "runtime_module_version": VERSION,
+        "target_digest": canonical_target(TARGET),
+        "observation_id": observation_id,
+        "observation_status": "observed",
+        "finding_id": finding_id,
+        "finding_status": "open",
+        "finding_title": "Canonical CSP finding",
+        "finding_severity": "medium",
+        "finding_description": "Persisted canonical CSP fixture.",
+        "finding_created_at": "2026-08-31T00:00:00Z",
+        "verification_state": "candidate",
+        "proof_type": "passive",
+        "confidence": "HIGH",
+        "maturity": "experimental",
+        "evidence_ref": evidence_ref,
+    }
+
+
+def _task106_truth(
+    *lineage: dict[str, str],
+) -> dict[str, object]:
+    bindings = lineage or (_task106_lineage(),)
+    evidence_refs = tuple(
+        sorted({binding["evidence_ref"] for binding in bindings})
+    )
+    return {
+        "tenant_id": _TASK106_TENANT,
+        "engagement_id": _TASK106_ENGAGEMENT,
+        "run_id": _TASK106_RUN,
+        "canonical_plan_id": _TASK106_PLAN,
+        "canonical_node_id": _TASK106_NODE,
+        "canonical_action_id": _TASK106_ACTION,
+        "canonical_job_id": _TASK106_JOB,
+        "canonical_attempt_id": _TASK106_ATTEMPT,
+        "canonical_capability_id": SUPPORTED_CAPABILITY_ID,
+        "canonical_capability_version": SUPPORTED_CAPABILITY_VERSION,
+        "canonical_module_id": SUPPORTED_IMPLEMENTATION,
+        "canonical_runtime_module_version": VERSION,
+        "canonical_target": canonical_target(TARGET),
+        "canonical_target_display": TARGET,
+        "canonical_lineage": tuple(bindings),
+        "canonical_outcome": "success",
+        "signed_outcome_ref": _TASK106_SIGNED_REF,
+        "evidence_refs": evidence_refs,
+    }
+
+
+def _task106_event_data(**updates: object) -> dict[str, object]:
+    data: dict[str, object] = {
+        "tenant_id": _TASK106_TENANT,
+        "engagement_id": _TASK106_ENGAGEMENT,
+        "run_id": _TASK106_RUN,
+        "canonical_plan_id": _TASK106_PLAN,
+        "canonical_node_id": _TASK106_NODE,
+        "canonical_action_id": _TASK106_ACTION,
+        "canonical_job_id": _TASK106_JOB,
+        "canonical_attempt_id": _TASK106_ATTEMPT,
+        "canonical_capability_id": SUPPORTED_CAPABILITY_ID,
+        "canonical_capability_version": SUPPORTED_CAPABILITY_VERSION,
+        "canonical_module_id": SUPPORTED_IMPLEMENTATION,
+        "canonical_runtime_module_version": VERSION,
+        "canonical_target": canonical_target(TARGET),
+        "target": TARGET,
+        "canonical_outcome": "success",
+        "signed_outcome_ref": _TASK106_SIGNED_REF,
+        "evidence_refs": ("artifact:task106",),
+    }
+    data.update(updates)
+    return data
+
+
+def test_public_finding_events_require_canonical_snapshot_refresh() -> None:
     from common.dashboard.server import DashboardArtifactError, DashboardServer
 
     server = object.__new__(DashboardServer)
@@ -58,7 +161,6 @@ def test_public_finding_events_preserve_all_seven_retest_verdicts_exactly() -> N
         "not_authorized",
         "unsupported",
     }
-    projected = set()
     for verdict in verdicts:
         event = Event(
             event_type=EventType.FINDING_UPDATED,
@@ -74,48 +176,11 @@ def test_public_finding_events_preserve_all_seven_retest_verdicts_exactly() -> N
                 "retest_verdict": verdict,
             },
         )
-        payload = server._public_event(event)
-        assert payload["data"]["finding_id"] == "finding-task104"
-        assert payload["data"]["retest_state"] == "terminal"
-        assert payload["data"]["retest_status"] == verdict
-        projected.add(payload["data"]["retest_verdict"])
-    assert projected == verdicts
-
-    with pytest.raises(
-        DashboardArtifactError,
-        match="retest event verdict is invalid",
-    ):
-        server._public_event(
-            Event(
-                event_type=EventType.FINDING_UPDATED,
-                source="task104-fixture",
-                data={
-                    "finding_id": "finding-task104",
-                    "action": "retest",
-                    "retest_state": "terminal",
-                    "retest_status": "invented",
-                    "retest_verdict": "invented",
-                },
-            )
-        )
-
-    with pytest.raises(
-        DashboardArtifactError,
-        match="mixes lifecycle and verdict truth",
-    ):
-        server._public_event(
-            Event(
-                event_type=EventType.FINDING_UPDATED,
-                source="task104-fixture",
-                data={
-                    "finding_id": "finding-task104",
-                    "action": "retest",
-                    "retest_state": "running",
-                    "retest_status": "fixed",
-                    "retest_verdict": "fixed",
-                },
-            )
-        )
+        with pytest.raises(
+            DashboardArtifactError,
+            match="canonical snapshot refresh",
+        ):
+            server._public_event(event)
 
 
 def _async_test(
@@ -780,7 +845,12 @@ async def test_public_bootstrap_allowlist_reaches_no_dashboard_or_host_mutation(
     assert [response.status_code for response in responses] == [401, 200, 503, 503, 503, 200]
     rendered = "".join(response.text for response in responses) + json.dumps(audits)
     assert canary not in rendered
-    assert server.state_store.snapshot() == before
+    after = server.state_store.snapshot()
+    # Elapsed time is a live rendering field, not dashboard mutation. Keep the
+    # assertion byte-exact for every authoritative/projected field and every
+    # other metric while normalizing only that monotonic clock derivative.
+    before["metrics"]["elapsed"] = after["metrics"]["elapsed"]
+    assert after == before
     emit.assert_not_called()
     emit_simple.assert_not_called()
     inventory.assert_not_called()
@@ -2222,16 +2292,23 @@ def test_public_state_snapshot_ignores_transient_findings_and_omits_secrets() ->
     assert canary not in rendered
     assert viewer["findings"] == []
     assert operator["findings"] == []
+    assert viewer["findings_count"] == 0
+    assert operator["findings_count"] == 0
     assert viewer["credentials"] == []
     assert "secret" not in operator["credentials"][0]
 
 
-def test_state_store_rejects_explicit_cross_tenant_events() -> None:
+def test_state_store_rejects_cross_tenant_and_unresolved_finding_events() -> None:
     from common.dashboard.event_bus import EventBus
     from common.dashboard.state_store import StateStore
 
     bus = EventBus(run_id="tenant-run")
-    store = StateStore(bus, tenant_id="tenant-a")
+    store = StateStore(
+        bus,
+        tenant_id="tenant-a",
+        engagement_id="engagement-a",
+        run_id="tenant-run",
+    )
     bus.start()
     try:
         bus.emit(Event(
@@ -2249,17 +2326,587 @@ def test_state_store_rejects_explicit_cross_tenant_events() -> None:
             source="fixture",
             data={
                 "tenant_id": "tenant-a",
+                "engagement_id": "engagement-a",
+                "run_id": "tenant-run",
                 "id": "same-tenant",
                 "title": "fixture",
                 "severity": "Low",
             },
         ))
+    finally:
+        bus.stop()
+    assert store.findings == []
+    assert store.timeline == []
+
+
+def test_state_store_rejects_cross_tenant_credential_and_chain_events() -> None:
+    from common.dashboard.event_bus import EventBus
+    from common.dashboard.state_store import StateStore
+
+    bus = EventBus(run_id="tenant-credential-chain")
+    store = StateStore(
+        bus,
+        tenant_id="tenant-a",
+        engagement_id="engagement-a",
+        run_id="tenant-credential-chain",
+    )
+    bus.start()
+    try:
+        bus.emit(Event(
+            event_type=EventType.CREDENTIAL_FOUND,
+            source="fixture",
+            data={
+                "tenant_id": "tenant-b",
+                "id": "credential-cross-tenant",
+                "credential_reference": "cred:fixture:opaque",
+            },
+        ))
+        bus.emit(Event(
+            event_type=EventType.CHAIN_ACTION_NEW,
+            source="fixture",
+            data={
+                "tenant_id": "tenant-b",
+                "chain_type": "cross-tenant",
+                "target_module": "header_audit",
+            },
+        ))
+        bus.emit(Event(
+            event_type=EventType.CREDENTIAL_FOUND,
+            source="fixture",
+            data={
+                "tenant_id": "tenant-a",
+                "engagement_id": "engagement-a",
+                "run_id": "tenant-credential-chain",
+                "id": "credential-same-tenant",
+                "credential_reference": "cred:fixture:opaque",
+            },
+        ))
         deadline = time.monotonic() + 1.0
-        while len(store.findings) < 1 and time.monotonic() < deadline:
+        while len(store.credentials) < 1 and time.monotonic() < deadline:
             time.sleep(0.01)
     finally:
         bus.stop()
-    assert [finding.id for finding in store.findings] == ["same-tenant"]
+    assert [credential.id for credential in store.credentials] == [
+        "credential-same-tenant"
+    ]
+    assert store.chain_actions == []
+
+
+def test_state_store_binds_two_tenants_and_engagements_fail_closed() -> None:
+    from common.dashboard.event_bus import EventBus
+    from common.dashboard.state_store import StateStore
+
+    bus = EventBus(run_id="run-shared")
+    store_a = StateStore(
+        bus,
+        tenant_id="tenant-a",
+        engagement_id="engagement-a",
+        run_id="run-shared",
+    )
+    store_b = StateStore(
+        bus,
+        tenant_id="tenant-b",
+        engagement_id="engagement-b",
+        run_id="run-shared",
+    )
+    bus.start()
+    try:
+        for tenant, engagement, name in (
+            ("tenant-a", "engagement-a", "module-a"),
+            ("tenant-b", "engagement-b", "module-b"),
+        ):
+            bus.emit(Event(
+                event_type=EventType.MODULE_START,
+                source="fixture",
+                run_id="run-shared",
+                data={
+                    "tenant_id": tenant,
+                    "engagement_id": engagement,
+                    "run_id": "run-shared",
+                    "name": name,
+                },
+            ))
+        # Missing tenant, cross-engagement, and missing engagement context
+        # must not be projected into either tenant's dashboard.
+        for data in (
+            {"engagement_id": "engagement-a", "name": "missing-tenant"},
+            {
+                "tenant_id": "tenant-a",
+                "engagement_id": "engagement-b",
+                "name": "cross-engagement",
+            },
+            {"tenant_id": "tenant-a", "name": "missing-engagement"},
+            {
+                "tenant_id": "tenant-a",
+                "engagement_id": "engagement-a",
+                "run_id": "run-other",
+                "name": "cross-run",
+            },
+        ):
+            bus.emit(Event(
+                event_type=EventType.MODULE_START,
+                source="fixture",
+                run_id="run-shared",
+                data=data,
+            ))
+        deadline = time.monotonic() + 1.0
+        while (
+            ("module-a" not in store_a.modules or "module-b" not in store_b.modules)
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+    finally:
+        bus.stop()
+
+    assert set(store_a.modules) == {"module-a"}
+    assert set(store_b.modules) == {"module-b"}
+
+
+def test_strict_tenant_requires_engagement_before_projection() -> None:
+    from common.dashboard.event_bus import EventBus
+    from common.dashboard.state_store import StateStore
+
+    bus = EventBus(run_id="run-before-start")
+    store = StateStore(bus, tenant_id="tenant-a", run_id="run-before-start")
+    bus.start()
+    try:
+        # Matching tenant alone is not enough to project an orphan event.
+        bus.emit(Event(
+            event_type=EventType.FINDING_NEW,
+            source="fixture",
+            run_id="run-before-start",
+            data={
+                "tenant_id": "tenant-a",
+                "id": "orphan-finding",
+                "title": "must not project",
+            },
+        ))
+        bus.emit(Event(
+            event_type=EventType.SCAN_START,
+            source="fixture",
+            run_id="run-before-start",
+            data={
+                "tenant_id": "tenant-a",
+                "engagement_id": "engagement-a",
+                "run_id": "run-before-start",
+                "modules": [],
+            },
+        ))
+        bus.emit(Event(
+            event_type=EventType.MODULE_START,
+            source="fixture",
+            run_id="run-before-start",
+            data={
+                "tenant_id": "tenant-a",
+                "engagement_id": "engagement-a",
+                "run_id": "run-before-start",
+                "name": "bound-module",
+            },
+        ))
+        deadline = time.monotonic() + 1.0
+        while "bound-module" not in store.modules and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        bus.stop()
+
+    assert [finding.id for finding in store.findings] == []
+    assert set(store.modules) == {"bound-module"}
+    assert store.engagement_id == "engagement-a"
+
+
+def test_state_store_default_fixture_compatibility_is_narrow() -> None:
+    from common.dashboard.event_bus import EventBus
+    from common.dashboard.state_store import StateStore
+
+    # Existing single-tenant in-process fixtures may omit identity metadata
+    # only for the default tenant while no engagement is active.
+    bus = EventBus(run_id="legacy-run")
+    store = StateStore(bus, tenant_id="default", run_id="legacy-run")
+    store._on_module_start(Event(EventType.MODULE_START, {"name": "legacy"}))
+    assert set(store.modules) == {"legacy"}
+
+
+def test_transient_scan_and_phase_completion_stay_inconclusive() -> None:
+    from common.dashboard.event_bus import EventBus
+    from common.dashboard.state_store import StateStore
+
+    store = StateStore(EventBus(run_id="task106-transient"), target="fixture.invalid")
+    store._on_phase_start(Event(
+        EventType.PHASE_START,
+        {"number": 1, "name": "Recon", "modules": ["header_audit"]},
+    ))
+    store._on_scan_complete(Event(
+        EventType.SCAN_COMPLETE,
+        {"status": "success", "completed": True},
+    ))
+    store._on_phase_complete(Event(
+        EventType.PHASE_COMPLETE,
+        {"number": 1, "duration": 2.0, "completed": True},
+    ))
+
+    assert store.scan_status == "inconclusive"
+    assert store.phases[1].status == "advisory"
+    assert store.kill_chain.completion_pct() == 0.0
+
+
+def test_canonical_scan_and_phase_completion_requires_success_evidence() -> None:
+    from common.dashboard.event_bus import EventBus
+    from common.dashboard.state_store import StateStore
+
+    truth = _task106_truth()
+    store = StateStore(
+        EventBus(run_id=_TASK106_RUN),
+        target=TARGET,
+        canonical_truth_resolver=lambda _value: truth,
+    )
+    store._on_scan_start(Event(
+        EventType.SCAN_START,
+        {
+            "target": TARGET,
+            "modules": [SUPPORTED_IMPLEMENTATION],
+        },
+        source="task106-fixture",
+    ))
+    store._on_phase_start(Event(
+        EventType.PHASE_START,
+        {
+            "number": 1,
+            "name": "Recon",
+            "modules": [SUPPORTED_IMPLEMENTATION],
+        },
+    ))
+    store._on_module_start(Event(
+        EventType.MODULE_START,
+        {"name": SUPPORTED_IMPLEMENTATION, "phase": 1},
+        source=SUPPORTED_IMPLEMENTATION,
+    ))
+    store._on_module_complete(Event(
+        EventType.MODULE_COMPLETE,
+        _task106_event_data(name=SUPPORTED_IMPLEMENTATION),
+        source=SUPPORTED_IMPLEMENTATION,
+    ))
+    store._on_phase_complete(Event(
+        EventType.PHASE_COMPLETE,
+        _task106_event_data(number=1, duration=2.0),
+        source=SUPPORTED_IMPLEMENTATION,
+    ))
+    store._on_scan_complete(Event(
+        EventType.SCAN_COMPLETE,
+        _task106_event_data(),
+        source=SUPPORTED_IMPLEMENTATION,
+    ))
+
+    assert store.scan_status == "completed"
+    assert store.phases[1].status == "complete"
+    assert store.modules[SUPPORTED_IMPLEMENTATION].status == "complete"
+    assert store.kill_chain.completion_pct() == 100.0
+
+
+def test_canonical_finding_rejects_cross_paired_observation_lineage() -> None:
+    from common.dashboard.event_bus import EventBus
+    from common.dashboard.state_store import StateStore
+
+    first = _task106_lineage(
+        observation_id="observation-first",
+        finding_id="finding-first",
+        evidence_ref="artifact:first",
+    )
+    second = _task106_lineage(
+        observation_id="observation-second",
+        finding_id="finding-second",
+        evidence_ref="artifact:second",
+    )
+    truth = _task106_truth(first, second)
+    evidence_refs = tuple(truth["evidence_refs"])
+    store = StateStore(
+        EventBus(run_id=_TASK106_RUN),
+        target=TARGET,
+        canonical_truth_resolver=lambda _value: truth,
+    )
+    store._on_module_start(Event(
+        EventType.MODULE_START,
+        {"name": SUPPORTED_IMPLEMENTATION},
+        source=SUPPORTED_IMPLEMENTATION,
+    ))
+
+    cross_paired = _task106_event_data(
+        id="finding-first",
+        finding_id="finding-first",
+        canonical_finding_id="finding-first",
+        observation_id="observation-second",
+        canonical_observation_id="observation-second",
+        module=SUPPORTED_IMPLEMENTATION,
+        title="Cross-paired finding",
+        severity="High",
+        evidence_refs=evidence_refs,
+    )
+    store._on_finding(Event(
+        EventType.FINDING_NEW,
+        cross_paired,
+        source=SUPPORTED_IMPLEMENTATION,
+    ))
+    assert sum(store.kill_chain.phase_findings.values()) == 0
+    assert store.modules[SUPPORTED_IMPLEMENTATION].findings_count == 0
+    assert store.findings == []
+
+    exact = _task106_event_data(
+        id="finding-first",
+        finding_id="finding-first",
+        canonical_finding_id="finding-first",
+        observation_id="observation-first",
+        canonical_observation_id="observation-first",
+        module=SUPPORTED_IMPLEMENTATION,
+        title="Exact canonical finding",
+        severity="High",
+        evidence_refs=evidence_refs,
+    )
+    store._on_finding(Event(
+        EventType.FINDING_NEW,
+        exact,
+        source=SUPPORTED_IMPLEMENTATION,
+    ))
+
+    assert sum(store.kill_chain.phase_findings.values()) == 0
+    assert store.modules[SUPPORTED_IMPLEMENTATION].findings_count == 0
+    assert [item.id for item in store.findings] == ["finding-first"]
+    assert store.findings[0].title == "Canonical CSP finding"
+    assert store.findings[0].severity == "Medium"
+    assert store.findings[0].verification_state == "candidate"
+
+
+def test_dashboard_server_scopes_local_events_aborts_and_fences_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from common.dashboard.event_bus import EventBus
+    from common.dashboard.server import DashboardServer
+    from common.brain.engagement_bus import EngagementBus
+
+    monkeypatch.setenv("FORGE_TENANT_ID", "tenant-a")
+    monkeypatch.setenv("FORGE_DASHBOARD_STATE_DIR", str(tmp_path / "state"))
+    bus = EventBus(run_id="transport-run-must-not-win")
+    server = DashboardServer(event_bus=bus)
+    bus.start()
+    try:
+        server._emit_scoped_event(
+            EventType.SCAN_START,
+            source="dashboard",
+            engagement_id="engagement-a",
+            run_id="run-a",
+            target="fixture.invalid",
+            modules=["header_audit"],
+        )
+        server._emit_scoped_event(
+            EventType.MODULE_START,
+            source="header_audit",
+            engagement_id="engagement-a",
+            run_id="run-a",
+            name="header_audit",
+            phase=1,
+        )
+        engagement_bus = EngagementBus(
+            db_path=":memory:",
+            tenant_id="tenant-a",
+            engagement_id="engagement-a",
+            run_id="run-a",
+            event_bus=bus,
+        )
+        asyncio.run(
+            engagement_bus.publish(
+                "webforge",
+                {
+                    "id": "finding-scoped-event",
+                    "title": "Scoped event fixture",
+                    "severity": "Low",
+                    "target": "fixture.invalid",
+                },
+            )
+        )
+        engagement_bus.close()
+        server._active_scans = {
+            "scan-a_web": {
+                "engagement_id": "engagement-a",
+                "run_id": "run-a",
+            }
+        }
+        server._emit_scoped_scan_aborts(
+            ["scan-a_web"],
+            reason="fixture_cancel",
+        )
+        deadline = time.monotonic() + 1.0
+        while (
+            server.state_store.scan_status != "canceled"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+        assert server.state_store.tenant_id == "tenant-a"
+        assert server.state_store.engagement_id == "engagement-a"
+        assert server.state_store.run_id == "run-a"
+        assert set(server.state_store.modules) == {"header_audit"}
+        assert server.state_store.findings == []
+        assert server.state_store.scan_status == "canceled"
+        scoped = bus.get_history(limit=3)
+        assert all(item.data["tenant_id"] == "tenant-a" for item in scoped)
+        assert all(item.data["engagement_id"] == "engagement-a" for item in scoped)
+        assert all(item.run_id == "run-a" for item in scoped)
+
+        server.state_store.stop()
+        server._emit_scoped_event(
+            EventType.MODULE_START,
+            source="late-module",
+            engagement_id="engagement-a",
+            run_id="run-a",
+            name="must-not-project",
+            phase=2,
+        )
+        time.sleep(0.05)
+        assert set(server.state_store.modules) == {"header_audit"}
+    finally:
+        server.state_store.stop()
+        bus.stop()
+
+
+def test_state_store_stop_fences_inflight_timer_rescheduling() -> None:
+    from common.dashboard.event_bus import EventBus
+    from common.dashboard.state_store import StateBackend, StateStore
+
+    class CountingBackend(StateBackend):
+        name = "counting"
+
+        def __init__(self) -> None:
+            self.saves = 0
+
+        def save(self, run_id: str, snapshot: dict[str, Any]) -> None:
+            del run_id, snapshot
+            self.saves += 1
+
+    backend = CountingBackend()
+    store = StateStore(EventBus(), backend=backend)
+    assert store._persist_timer is not None
+    store.stop()
+    assert backend.saves == 1
+    assert store._persist_timer is None
+    store._persist_and_reschedule()
+    assert backend.saves == 1
+    assert store._persist_timer is None
+
+
+def test_monitor_wait_handles_late_registration_and_global_cancel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from common.dashboard.server import DashboardServer
+
+    monkeypatch.setenv("FORGE_DASHBOARD_STATE_DIR", str(tmp_path / "state"))
+    server = DashboardServer()
+
+    class StoppedProcess:
+        @staticmethod
+        def poll() -> int:
+            return 0
+
+    ready = threading.Event()
+    info: dict[str, Any] = {
+        "proc": StoppedProcess(),
+        "monitor_ready": ready,
+        "status": "running",
+    }
+    server._active_scans = {"scan-a_web": info}
+    observed: list[bool] = []
+    waiter = threading.Thread(
+        target=lambda: observed.append(
+            server._wait_for_scan_monitors("scan-a", timeout_seconds=1.0)
+        )
+    )
+    waiter.start()
+    time.sleep(0.02)
+    monitor = threading.Thread(target=lambda: None)
+    info["monitor_thread"] = monitor
+    monitor.start()
+    ready.set()
+    waiter.join(timeout=1.0)
+    assert observed == [True]
+
+    cancel_budgets: list[float] = []
+
+    class FixtureService:
+        @staticmethod
+        def get_job(job_id: str, **_kwargs: Any) -> dict[str, str] | None:
+            return {"id": job_id} if job_id in {"scan-a", "scan-b"} else None
+
+        @staticmethod
+        def cancel_job(job_id: str, **_kwargs: Any) -> dict[str, str]:
+            cancel_budgets.append(float(_kwargs["sla_seconds"]))
+            # Consume enough of the shared deadline to prove that the next
+            # scan receives the residual budget rather than a fresh 5s SLA.
+            time.sleep(0.8)
+            return {"id": job_id, "state": "canceled"}
+
+    server._active_scans["scan-b_web"] = {"status": "running"}
+    monkeypatch.setattr(server, "_durable_job_state", lambda: FixtureService())
+    monkeypatch.setattr(server, "_sync_scan_job_from_active", lambda _scan_id: None)
+    with patch.object(
+        server,
+        "_wait_for_scan_monitors",
+        return_value=True,
+    ) as wait_for_monitors:
+        assert server._terminate_active_scans("aborted") == [
+            "scan-a_web",
+            "scan-b_web",
+        ]
+    assert wait_for_monitors.call_count == 2
+    assert len(cancel_budgets) == 2
+    assert 0.0 < cancel_budgets[1] < cancel_budgets[0] <= 5.0
+
+
+@_async_test
+async def test_websocket_suppresses_raw_authority_sensitive_events() -> None:
+    from common.dashboard.server import DashboardServer
+
+    server = DashboardServer(auth=True)
+    operator = _FakeWebSocket()
+    operator_payload = validate_token(issue_identity_token("operator", Role.OPERATOR))
+    assert operator_payload is not None
+    server._ws_clients[operator] = operator_payload
+
+    with patch.object(
+        server,
+        "_public_event",
+        side_effect=AssertionError("raw authority event reached serializer"),
+    ):
+        for event_type in (
+            EventType.SCAN_START,
+            EventType.SCAN_COMPLETE,
+            EventType.PHASE_START,
+            EventType.PHASE_COMPLETE,
+            EventType.MODULE_START,
+            EventType.MODULE_PROGRESS,
+            EventType.MODULE_COMPLETE,
+            EventType.MODULE_FAIL,
+            EventType.MODULE_SKIP,
+            EventType.REQUEST_SENT,
+            EventType.REQUEST_ERROR,
+            EventType.WAF_BLOCK,
+            EventType.RATE_LIMIT_HIT,
+            EventType.TARGET_DISCOVERED,
+            EventType.TARGET_PWNED,
+            EventType.SHELL_SESSION,
+            EventType.FINDING_NEW,
+            EventType.FINDING_UPDATED,
+            EventType.BRAIN_VERDICT,
+            EventType.CHAIN_ACTION_NEW,
+        ):
+            await server._broadcast_event(Event(
+                event_type=event_type,
+                source="untrusted-terminal-fixture",
+                data={"tenant_id": server.tenant_id},
+            ))
+
+    assert operator.sent_text == []
+    assert operator.sent_json == []
 
 
 @_async_test
@@ -2317,10 +2964,7 @@ async def test_websocket_event_tenant_filter_and_canary_redaction() -> None:
             "maturity": "verified",
         },
     ))
-    public_finding = json.loads(operator.sent_text[-1])["data"]
-    assert public_finding["status"] == "open"
-    assert public_finding["verification_state"] != "verified"
-    assert public_finding["maturity"] == "experimental"
+    assert len(operator.sent_text) == before
 
     await server._handle_ws_command({"action": "get_findings", "limit": 201}, operator)
     assert operator.sent_json[-1]["reason_code"] == "websocket_limit_invalid"

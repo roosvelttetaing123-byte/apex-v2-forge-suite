@@ -1,6 +1,6 @@
-"""In-memory state aggregator for the War Room dashboard.
+"""Rebuildable in-memory projection for the War Room dashboard.
 
-StateStore is the single source of truth that dashboards render from.
+Canonical jobs/findings/evidence remain the source of truth.
 It subscribes to EventBus events, aggregates them into structured state,
 and provides thread-safe snapshots for the TUI and web dashboard.
 
@@ -18,11 +18,12 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from common.dashboard.event_bus import Event, EventBus, EventType
 from common.dashboard.kill_chain import KillChainState
 from common.dashboard.metrics import MetricsCollector, MetricsSnapshot
+from common.brain.truth_boundary import canonical_target
 
 log = logging.getLogger("forge.dashboard.state")
 
@@ -236,6 +237,7 @@ class ChainActionEntry:
     target: str = ""
     rationale: str = ""
     auto_execute: bool = False
+    execution_state: str = "advisory"
     timestamp: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -248,6 +250,7 @@ class ChainActionEntry:
             "target": self.target,
             "rationale": self.rationale,
             "auto_execute": self.auto_execute,
+            "execution_state": self.execution_state,
             "timestamp": self.timestamp,
         }
 
@@ -315,24 +318,29 @@ class TargetStatus:
 
 @dataclass
 class CredentialEntry:
-    """A discovered credential."""
+    """A protected credential reference or explicit purge marker."""
     id:            str = field(default_factory=lambda: str(uuid.uuid4())[:8])
     cred_type:     str = ""    # PLAINTEXT, NTLM_HASH, KERB_TICKET, API_KEY, SSH_KEY, JWT
     account:       str = ""
-    secret:        str = ""
+    credential_reference: str = ""
+    credential_state: str = "purged_legacy"
+    secret: str = field(default="", repr=False, compare=False)
     target:        str = ""
     discovered_by: str = ""
     timestamp:     str = ""
 
+    def __post_init__(self) -> None:
+        # Compatibility callers may still pass ``secret``; discard it before
+        # the value can enter state, snapshots, UI, reports, or exports.
+        self.secret = ""
+
     def to_dict(self, mask: bool = True) -> dict[str, Any]:
-        secret_display = self.secret
-        if mask and len(self.secret) > 8:
-            secret_display = self.secret[:4] + "…" + self.secret[-4:]
-        elif mask and self.secret:
-            secret_display = "●" * len(self.secret)
+        del mask
         return {
             "id": self.id, "cred_type": self.cred_type,
-            "account": self.account, "secret": secret_display,
+            "account": self.account,
+            "credential_reference": self.credential_reference,
+            "credential_state": self.credential_state,
             "target": self.target, "discovered_by": self.discovered_by,
             "timestamp": self.timestamp,
         }
@@ -381,13 +389,25 @@ class StateStore:
         backend_kind: str = "",
         redis_url: str = "",
         tenant_id: str = "default",
+        engagement_id: str = "",
+        strict_event_scope: bool | None = None,
+        canonical_truth_resolver: (
+            Callable[[Mapping[str, Any]], Mapping[str, Any] | None] | None
+        ) = None,
     ) -> None:
         self._bus = event_bus
         self.framework = framework
         self.run_id = run_id
         self.target = target
         self._db = persist_db
-        self.tenant_id = tenant_id
+        self.tenant_id = _validated_state_tenant_id(tenant_id)
+        self.engagement_id = engagement_id.strip() if isinstance(engagement_id, str) else ""
+        self._strict_event_scope = (
+            self.tenant_id != "default"
+            if strict_event_scope is None
+            else bool(strict_event_scope)
+        )
+        self._canonical_truth_resolver = canonical_truth_resolver
         if backend is not None:
             self._backend = backend
         elif backend_kind:
@@ -395,13 +415,17 @@ class StateStore:
                 backend_kind,
                 db_session=persist_db,
                 redis_url=redis_url,
-                tenant_id=tenant_id,
+                tenant_id=self.tenant_id,
             )
         elif persist_db:
-            self._backend = SQLiteStateBackend(persist_db, tenant_id=tenant_id)
+            self._backend = SQLiteStateBackend(persist_db, tenant_id=self.tenant_id)
         else:
             self._backend = StateBackend()
         self._lock = threading.RLock()
+        self._closed = False
+        self._subscriptions: list[
+            tuple[EventType, Callable[[Event], None]]
+        ] = []
 
         # ── State containers ──
         self.findings:    list[FindingEntry] = []
@@ -420,7 +444,7 @@ class StateStore:
         self.scan_status: str = "initializing"
         self.scan_start:  float = 0.0
         self.scan_mode:   str = ""
-        self.engagement:  str = ""
+        self.engagement:  str = self.engagement_id
         self.tester:      str = ""
 
         # Subscribe to all events
@@ -431,41 +455,316 @@ class StateStore:
         if self._backend.name != "memory":
             self._schedule_persist()
 
+    def set_canonical_truth_resolver(
+        self,
+        resolver: Callable[[Mapping[str, Any]], Mapping[str, Any] | None],
+    ) -> None:
+        self._canonical_truth_resolver = resolver
+
+    def enforce_strict_event_scope(self) -> None:
+        """Require exact tenant/engagement/run context for future events."""
+        with self._lock:
+            self._strict_event_scope = True
+
+    def _canonical_truth(
+        self, value: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        if self._canonical_truth_resolver is None:
+            return None
+        try:
+            truth = self._canonical_truth_resolver(value)
+        except Exception:
+            return None
+        return truth if isinstance(truth, Mapping) else None
+
+    @staticmethod
+    def _canonical_success(value: Mapping[str, Any]) -> bool:
+        """Return whether persisted job/evidence truth authorizes completion."""
+        truth = value
+        evidence_refs = truth.get("evidence_refs") or ()
+        lineage = truth.get("canonical_lineage") or ()
+        signed_ref = str(truth.get("signed_outcome_ref") or "")
+        return (
+            bool(truth.get("canonical_action_id"))
+            and bool(truth.get("canonical_job_id"))
+            and bool(truth.get("canonical_attempt_id"))
+            and str(truth.get("canonical_outcome") or "").lower() == "success"
+            and signed_ref.startswith("run-truth:")
+            and isinstance(evidence_refs, (list, tuple))
+            and bool(evidence_refs)
+            and all(
+                isinstance(ref, str)
+                and ref.startswith(("artifact:", "sha256:"))
+                for ref in evidence_refs
+            )
+            and isinstance(lineage, (list, tuple))
+            and bool(lineage)
+            and all(isinstance(item, Mapping) for item in lineage)
+        )
+
+    def _canonical_truth_matches_event(
+        self,
+        value: Mapping[str, Any],
+        truth: Mapping[str, Any] | None,
+        *,
+        module_id: str,
+        target: str,
+        observation_id: str = "",
+        finding_id: str = "",
+    ) -> bool:
+        """Bind a successful projection to the event's full canonical identity."""
+
+        if truth is None or not self._canonical_success(truth):
+            return False
+
+        def exact_aliases(
+            names: tuple[str, ...], expected: str, *, required: bool
+        ) -> bool:
+            present = [value.get(name) for name in names if name in value]
+            if any(not str(item or "").strip() for item in present):
+                return False
+            supplied = {str(item).strip() for item in present}
+            if required and not supplied:
+                return False
+            return not supplied or supplied == {expected}
+
+        identity_groups = (
+            (("tenant_id",), str(truth.get("tenant_id") or ""), True),
+            (("engagement_id",), str(truth.get("engagement_id") or ""), True),
+            (("run_id",), str(truth.get("run_id") or ""), True),
+            (
+                ("canonical_plan_id", "plan_id"),
+                str(truth.get("canonical_plan_id") or ""),
+                bool(truth.get("canonical_plan_id")),
+            ),
+            (
+                ("canonical_node_id", "node_id"),
+                str(truth.get("canonical_node_id") or ""),
+                bool(truth.get("canonical_node_id")),
+            ),
+            (
+                ("canonical_action_id", "action_id"),
+                str(truth.get("canonical_action_id") or ""),
+                True,
+            ),
+            (
+                ("canonical_job_id", "job_id"),
+                str(truth.get("canonical_job_id") or ""),
+                True,
+            ),
+            (
+                ("canonical_attempt_id", "attempt_id"),
+                str(truth.get("canonical_attempt_id") or ""),
+                True,
+            ),
+        )
+        if any(
+            not expected or not exact_aliases(names, expected, required=required)
+            for names, expected, required in identity_groups
+        ):
+            return False
+
+        expected_capability = str(truth.get("canonical_capability_id") or "")
+        expected_version = str(truth.get("canonical_capability_version") or "")
+        expected_module = str(truth.get("canonical_module_id") or "")
+        expected_runtime_version = str(
+            truth.get("canonical_runtime_module_version") or ""
+        )
+        if (
+            not module_id
+            or module_id != expected_module
+            or not exact_aliases(
+                ("canonical_module_id", "module_id", "module"),
+                expected_module,
+                required=False,
+            )
+            or not exact_aliases(
+                ("canonical_capability_id", "capability_id"),
+                expected_capability,
+                required=True,
+            )
+            or not exact_aliases(
+                (
+                    "canonical_capability_version",
+                    "capability_version",
+                    "canonical_module_version",
+                    "module_version",
+                ),
+                expected_version,
+                required=True,
+            )
+            or not exact_aliases(
+                ("canonical_runtime_module_version", "runtime_module_version"),
+                expected_runtime_version,
+                required=True,
+            )
+        ):
+            return False
+
+        supplied_target = str(value.get("target") or "").strip()
+        expected_target = str(truth.get("canonical_target") or "")
+        if not supplied_target or supplied_target != str(target or "").strip():
+            return False
+        try:
+            event_target = canonical_target(supplied_target)
+        except (TypeError, ValueError):
+            return False
+        if not expected_target or event_target != expected_target:
+            return False
+        if not exact_aliases(
+            ("canonical_target", "target_digest"), expected_target, required=False
+        ):
+            return False
+
+        if not exact_aliases(
+            ("canonical_outcome", "outcome"), "success", required=False
+        ):
+            return False
+        signed_ref = str(truth.get("signed_outcome_ref") or "")
+        if not exact_aliases(("signed_outcome_ref",), signed_ref, required=False):
+            return False
+        supplied_refs = value.get("evidence_refs")
+        if supplied_refs is not None:
+            if not isinstance(supplied_refs, (list, tuple)):
+                return False
+            if tuple(sorted(str(ref) for ref in supplied_refs)) != tuple(
+                sorted(str(ref) for ref in truth.get("evidence_refs") or ())
+            ):
+                return False
+
+        if observation_id and not exact_aliases(
+            ("canonical_observation_id", "observation_id"),
+            observation_id,
+            required=True,
+        ):
+            return False
+        if finding_id and not exact_aliases(
+            ("canonical_finding_id", "finding_id", "id"),
+            finding_id,
+            required=True,
+        ):
+            return False
+
+        expected_action = str(truth.get("canonical_action_id") or "")
+        expected_job = str(truth.get("canonical_job_id") or "")
+        expected_attempt = str(truth.get("canonical_attempt_id") or "")
+        expected_plan = str(truth.get("canonical_plan_id") or "")
+        expected_node = str(truth.get("canonical_node_id") or "")
+        for raw in truth.get("canonical_lineage") or ():
+            binding = dict(raw)
+            if (
+                str(binding.get("plan_id") or "") != expected_plan
+                or str(binding.get("node_id") or "") != expected_node
+                or str(binding.get("action_id") or "") != expected_action
+                or str(binding.get("job_id") or "") != expected_job
+                or str(binding.get("attempt_id") or "") != expected_attempt
+                or str(binding.get("capability_id") or "") != expected_capability
+                or str(binding.get("capability_version") or "") != expected_version
+                or str(binding.get("module_id") or "") != expected_module
+                or str(binding.get("target_digest") or "") != expected_target
+                or (observation_id and str(binding.get("observation_id") or "") != observation_id)
+                or (finding_id and str(binding.get("finding_id") or "") != finding_id)
+                or str(binding.get("evidence_ref") or "")
+                not in {str(ref) for ref in truth.get("evidence_refs") or ()}
+            ):
+                continue
+            return True
+        return False
+
+    def _event_scope_allowed(self, event: Event) -> bool:
+        """Check event identity before projecting it into dashboard state.
+
+        DashboardServer enables strict scope even for its historical default
+        tenant. Direct in-process fixtures may retain legacy omitted-context
+        behavior only when strict scope is not requested and no engagement is
+        active. Tenant-bound stores and every active engagement require exact
+        event data bindings.
+        """
+        data = event.data
+        event_tenant = data.get("tenant_id")
+        strict_scope = self._strict_event_scope
+        if strict_scope:
+            if event_tenant != self.tenant_id:
+                return False
+        elif event_tenant is not None and event_tenant != self.tenant_id:
+            return False
+
+        expected_engagement = self.engagement_id or self.engagement
+        event_engagement = data.get("engagement_id")
+        if strict_scope and not expected_engagement:
+            # A scoped tenant cannot accept an orphan projection. The only
+            # event allowed to establish the first engagement is a fully
+            # bound scan start; every other event must wait for that context.
+            if event.event_type is not EventType.SCAN_START:
+                return False
+            if not isinstance(event_engagement, str) or not event_engagement.strip():
+                return False
+        if expected_engagement and event_engagement != expected_engagement:
+            return False
+
+        # EventBus stamps the top-level run_id; remote/canonical adapters may
+        # also retain it in data. Require it whenever a tenant or engagement
+        # binding makes this a production-scoped projection. Default-only
+        # fixtures with no active engagement retain their legacy behavior.
+        expected_run = self.run_id
+        strict_run = strict_scope or bool(expected_engagement)
+        if strict_run and expected_run:
+            # Reject disagreement between the Event envelope and any copied
+            # run binding in data; preferring one would permit cross-run data
+            # to ride on an otherwise valid envelope.
+            if event.run_id and event.run_id != expected_run:
+                return False
+            if data.get("run_id") is not None and data.get("run_id") != expected_run:
+                return False
+            if not event.run_id and data.get("run_id") is None:
+                return False
+        if strict_run and expected_engagement and not isinstance(event_engagement, str):
+            return False
+        return True
+
     def _subscribe(self) -> None:
         """Register handlers for all event types."""
         def guarded(handler: Callable[[Event], None]) -> Callable[[Event], None]:
             def receive(event: Event) -> None:
-                event_tenant = event.data.get("tenant_id")
-                if event_tenant is not None and (
-                    not isinstance(event_tenant, str)
-                    or event_tenant != self.tenant_id
-                ):
-                    return
-                handler(event)
+                # Hold the re-entrant state lock across admission and handler
+                # execution so stop() fences an already-dispatched callback.
+                with self._lock:
+                    if self._closed or not self._event_scope_allowed(event):
+                        return
+                    handler(event)
 
             return receive
 
-        self._bus.subscribe(EventType.SCAN_START, guarded(self._on_scan_start))
-        self._bus.subscribe(EventType.SCAN_COMPLETE, guarded(self._on_scan_complete))
-        self._bus.subscribe(EventType.SCAN_INTERRUPTED, guarded(self._on_scan_interrupted))
-        self._bus.subscribe(EventType.PHASE_START, guarded(self._on_phase_start))
-        self._bus.subscribe(EventType.PHASE_COMPLETE, guarded(self._on_phase_complete))
-        self._bus.subscribe(EventType.MODULE_START, guarded(self._on_module_start))
-        self._bus.subscribe(EventType.MODULE_PROGRESS, guarded(self._on_module_progress))
-        self._bus.subscribe(EventType.MODULE_COMPLETE, guarded(self._on_module_complete))
-        self._bus.subscribe(EventType.MODULE_FAIL, guarded(self._on_module_fail))
-        self._bus.subscribe(EventType.MODULE_SKIP, guarded(self._on_module_skip))
-        self._bus.subscribe(EventType.FINDING_NEW, guarded(self._on_finding))
-        self._bus.subscribe(EventType.REQUEST_SENT, guarded(self._on_request))
-        self._bus.subscribe(EventType.REQUEST_ERROR, guarded(self._on_request_error))
-        self._bus.subscribe(EventType.WAF_BLOCK, guarded(self._on_waf_block))
-        self._bus.subscribe(EventType.RATE_LIMIT_HIT, guarded(self._on_rate_limit))
-        self._bus.subscribe(EventType.CREDENTIAL_FOUND, guarded(self._on_credential))
-        self._bus.subscribe(EventType.TARGET_DISCOVERED, guarded(self._on_target_discovered))
-        self._bus.subscribe(EventType.TARGET_PWNED, guarded(self._on_target_pwned))
-        self._bus.subscribe(EventType.SHELL_SESSION, guarded(self._on_shell_session))
-        self._bus.subscribe(EventType.BRAIN_VERDICT, guarded(self._on_brain_verdict))
-        self._bus.subscribe(EventType.CHAIN_ACTION_NEW, guarded(self._on_chain_action))
+        def subscribe(
+            event_type: EventType,
+            handler: Callable[[Event], None],
+        ) -> None:
+            callback = guarded(handler)
+            self._bus.subscribe(event_type, callback)
+            self._subscriptions.append((event_type, callback))
+
+        subscribe(EventType.SCAN_START, self._on_scan_start)
+        subscribe(EventType.SCAN_COMPLETE, self._on_scan_complete)
+        subscribe(EventType.SCAN_INTERRUPTED, self._on_scan_interrupted)
+        subscribe(EventType.SCAN_ABORTED, self._on_scan_aborted)
+        subscribe(EventType.PHASE_START, self._on_phase_start)
+        subscribe(EventType.PHASE_COMPLETE, self._on_phase_complete)
+        subscribe(EventType.MODULE_START, self._on_module_start)
+        subscribe(EventType.MODULE_PROGRESS, self._on_module_progress)
+        subscribe(EventType.MODULE_COMPLETE, self._on_module_complete)
+        subscribe(EventType.MODULE_FAIL, self._on_module_fail)
+        subscribe(EventType.MODULE_SKIP, self._on_module_skip)
+        subscribe(EventType.FINDING_NEW, self._on_finding)
+        subscribe(EventType.REQUEST_SENT, self._on_request)
+        subscribe(EventType.REQUEST_ERROR, self._on_request_error)
+        subscribe(EventType.WAF_BLOCK, self._on_waf_block)
+        subscribe(EventType.RATE_LIMIT_HIT, self._on_rate_limit)
+        subscribe(EventType.CREDENTIAL_FOUND, self._on_credential)
+        subscribe(EventType.TARGET_DISCOVERED, self._on_target_discovered)
+        subscribe(EventType.TARGET_PWNED, self._on_target_pwned)
+        subscribe(EventType.SHELL_SESSION, self._on_shell_session)
+        subscribe(EventType.BRAIN_VERDICT, self._on_brain_verdict)
+        subscribe(EventType.CHAIN_ACTION_NEW, self._on_chain_action)
 
     # ── Event handlers ────────────────────────────────────────────────
 
@@ -484,10 +783,14 @@ class StateStore:
             self.kill_chain = KillChainState()
             self.metrics = MetricsCollector()
 
-            self.scan_status = "running"
+            self.scan_status = "advisory"
             self.scan_start = time.monotonic()
             self.scan_mode = event.data.get("mode", "")
-            self.engagement = event.data.get("engagement", "")
+            self.engagement = event.data.get(
+                "engagement_id", event.data.get("engagement", self.engagement)
+            )
+            if not self.engagement_id and isinstance(self.engagement, str):
+                self.engagement_id = self.engagement.strip()
             self.tester = event.data.get("tester", "")
             self.run_id = event.data.get("run_id", self.run_id)
             self.target = event.data.get("target", self.target)
@@ -495,17 +798,62 @@ class StateStore:
             if module_names:
                 self.kill_chain.set_module_totals(module_names)
                 self.metrics.set_total_modules(len(module_names))
-            self._add_timeline("scan_start", "Assessment started", event.source)
+            self._add_timeline(
+                "scan_start_advisory",
+                "Assessment start notification received",
+                event.source,
+            )
 
     def _on_scan_complete(self, event: Event) -> None:
         with self._lock:
-            self.scan_status = "completed"
-            self._add_timeline("scan_complete", "Assessment completed", event.source)
+            truth = self._canonical_truth(event.data)
+            valid_truth = self._canonical_truth_matches_event(
+                event.data,
+                truth,
+                module_id=str(
+                    event.data.get("canonical_module_id")
+                    or event.data.get("module_id")
+                    or event.data.get("module")
+                ),
+                target=str(event.data.get("target") or ""),
+            )
+            all_modules_complete = bool(self.modules) and all(
+                module.status == "complete" for module in self.modules.values()
+            )
+            if valid_truth and all_modules_complete:
+                if self.scan_status == "completed":
+                    return
+                self.scan_status = "completed"
+                self._add_timeline("scan_complete", "Assessment completed", event.source)
+            elif self.scan_status != "completed":
+                self.scan_status = "inconclusive"
+                self._add_timeline(
+                    "scan_complete_advisory",
+                    "Assessment completion is advisory pending canonical evidence",
+                    event.source,
+                )
 
     def _on_scan_interrupted(self, event: Event) -> None:
         with self._lock:
             self.scan_status = "interrupted"
             self._add_timeline("scan_interrupted", "Assessment interrupted", event.source)
+
+    def _on_scan_aborted(self, event: Event) -> None:
+        with self._lock:
+            durable_status = str(event.data.get("status") or "").strip().lower()
+            projected_status = (
+                "canceled" if durable_status == "canceled" else "aborted"
+            )
+            if self.scan_status == projected_status:
+                return
+            self.scan_status = projected_status
+            self._add_timeline(
+                "scan_aborted",
+                "Assessment canceled"
+                if self.scan_status == "canceled"
+                else "Assessment aborted",
+                event.source,
+            )
 
     def _on_phase_start(self, event: Event) -> None:
         with self._lock:
@@ -513,255 +861,387 @@ class StateStore:
             name = event.data.get("name", f"Phase {num}")
             modules = event.data.get("modules", [])
             self.phases[num] = PhaseStatus(
-                number=num, name=name, status="running", modules=modules,
+                number=num, name=name, status="advisory", modules=modules,
             )
-            self._add_timeline("phase_start", f"Phase {num}: {name}", event.source)
+            self._add_timeline(
+                "phase_start_advisory",
+                f"Phase {num} notification: {name}",
+                event.source,
+            )
 
     def _on_phase_complete(self, event: Event) -> None:
         with self._lock:
             num = event.data.get("number", 0)
             if num in self.phases:
-                self.phases[num].status = "complete"
+                truth = self._canonical_truth(event.data)
+                valid_truth = self._canonical_truth_matches_event(
+                    event.data,
+                    truth,
+                    module_id=str(
+                        event.data.get("canonical_module_id")
+                        or event.data.get("module_id")
+                        or event.data.get("module")
+                    ),
+                    target=str(event.data.get("target") or ""),
+                )
+                phase_modules = tuple(self.phases[num].modules)
+                phase_complete = bool(phase_modules) and all(
+                    module_id in self.modules
+                    and self.modules[module_id].status == "complete"
+                    for module_id in phase_modules
+                )
+                if valid_truth and phase_complete:
+                    if self.phases[num].status == "complete":
+                        return
+                    self.phases[num].status = "complete"
+                elif self.phases[num].status != "complete":
+                    self.phases[num].status = "advisory"
                 self.phases[num].duration = event.data.get("duration", 0.0)
 
     def _on_module_start(self, event: Event) -> None:
         name = event.data.get("name", event.source)
         with self._lock:
             self.modules[name] = ModuleStatus(
-                name=name, status="running",
+                name=name, status="advisory",
                 start_time=time.monotonic(),
                 phase=event.data.get("phase", 0),
             )
-            self.kill_chain.record_module_start(name)
-            self.metrics.record_module_start()
 
     def _on_module_progress(self, event: Event) -> None:
         name = event.data.get("name", event.source)
         with self._lock:
             if name in self.modules:
-                self.modules[name].progress_pct = event.data.get("progress", 0.0)
+                self.modules[name].progress_pct = min(
+                    float(event.data.get("progress", 0.0)), 99.0
+                )
 
     def _on_module_complete(self, event: Event) -> None:
         name = event.data.get("name", event.source)
         with self._lock:
             if name in self.modules:
                 mod = self.modules[name]
-                mod.status = "complete"
-                mod.progress_pct = 100.0
+                truth = self._canonical_truth(event.data)
+                evidence_refs = (truth or {}).get("evidence_refs") or ()
+                if not isinstance(evidence_refs, (list, tuple)):
+                    evidence_refs = ()
+                valid_truth = self._canonical_truth_matches_event(
+                    event.data,
+                    truth,
+                    module_id=str(name),
+                    target=str(event.data.get("target") or ""),
+                )
+                if not valid_truth and mod.status == "complete":
+                    return
+                counted = (
+                    self.kill_chain.record_module_complete(
+                        name,
+                        canonical_job_id=str(
+                            (truth or {}).get("canonical_job_id") or ""
+                        ),
+                        outcome=str((truth or {}).get("canonical_outcome") or ""),
+                        evidence_refs=tuple(str(ref) for ref in evidence_refs),
+                    )
+                    if valid_truth
+                    else False
+                )
+                if valid_truth and not counted and mod.status == "complete":
+                    return
+                mod.status = "complete" if valid_truth else "advisory"
+                mod.progress_pct = (
+                    100.0 if valid_truth else min(mod.progress_pct, 99.0)
+                )
                 mod.end_time = time.monotonic()
                 mod.duration = mod.end_time - mod.start_time
-                mod.findings_count = event.data.get("findings_count", mod.findings_count)
-                self.kill_chain.record_module_complete(name)
-                self.metrics.record_module_complete(mod.duration)
+                if counted:
+                    mod.findings_count = len(
+                        {
+                            str(item.get("finding_id") or "")
+                            for item in (truth or {}).get("canonical_lineage") or ()
+                            if isinstance(item, Mapping)
+                            and str(item.get("finding_id") or "")
+                        }
+                    )
+                    self.metrics.record_module_complete(mod.duration)
 
     def _on_module_fail(self, event: Event) -> None:
         name = event.data.get("name", event.source)
         with self._lock:
             if name in self.modules:
-                self.modules[name].status = "failed"
-                self.modules[name].error = event.data.get("error", "unknown")
+                if self.modules[name].status == "complete":
+                    return
+                self.modules[name].status = "advisory"
+                self.modules[name].error = (
+                    "failure notification pending canonical job state"
+                )
             else:
                 self.modules[name] = ModuleStatus(
-                    name=name, status="failed",
-                    error=event.data.get("error", "unknown"),
+                    name=name,
+                    status="advisory",
+                    error="failure notification pending canonical job state",
                 )
-            self.metrics.record_module_fail()
-            self._add_timeline(
-                "module_fail", f"Module failed: {name} — {event.data.get('error', '')}",
-                event.source,
-            )
 
     def _on_module_skip(self, event: Event) -> None:
         name = event.data.get("name", event.source)
         with self._lock:
+            if name in self.modules and self.modules[name].status == "complete":
+                return
             self.modules[name] = ModuleStatus(
-                name=name, status="skipped",
-                error=event.data.get("reason", ""),
+                name=name,
+                status="advisory",
+                error="skip notification pending canonical job state",
             )
 
     def _on_finding(self, event: Event) -> None:
         from common.confidence_policy import normalise_finding
 
-        # Normalize the mutable event payload before constructing state.  The
-        # same Event instance is subsequently observed by the dashboard's
-        # wildcard/WebSocket subscriber, so publication and the StateStore
-        # snapshot share one authoritative set of truth fields instead of
-        # independently serializing attacker-supplied claims.
+        binding_fields = {
+            key: event.data[key]
+            for key in (
+                "tenant_id",
+                "engagement_id",
+                "run_id",
+                "canonical_plan_id",
+                "canonical_node_id",
+                "canonical_action_id",
+                "canonical_job_id",
+                "canonical_attempt_id",
+                "canonical_capability_id",
+                "canonical_capability_version",
+                "canonical_module_id",
+                "canonical_module_version",
+                "canonical_runtime_module_version",
+                "canonical_target",
+                "canonical_observation_id",
+                "canonical_finding_id",
+                "action_id",
+                "job_id",
+                "attempt_id",
+                "plan_id",
+                "node_id",
+                "capability_id",
+                "capability_version",
+                "module_id",
+                "module_version",
+                "runtime_module_version",
+                "target_digest",
+                "observation_id",
+                "finding_id",
+                "canonical_outcome",
+                "outcome",
+                "signed_outcome_ref",
+                "evidence_refs",
+            )
+            if key in event.data
+        }
         d = normalise_finding(dict(event.data))
-        event.data.clear()
-        event.data.update(d)
-        entry = FindingEntry(
-            id=d.get("id", str(uuid.uuid4())[:8]),
-            title=d.get("title", "Untitled"),
-            severity=d.get("severity", "Informational"),
-            module=d.get("module", event.source),
-            target=d.get("target", self.target),
-            cvss_score=d.get("cvss_score"),
-            timestamp=event.timestamp,
-            url=d.get("url", ""),
-            port=d.get("port"),
-            service=d.get("service", ""),
-            description=d.get("description", ""),
-            mitre=d.get("mitre_attack", []),
-            evidence=d.get("evidence", {}),
-            confidence=d.get("confidence", "UNVERIFIED"),
-            status=d.get("status", "open"),
-            vpr_score=d.get("vpr_score"),
-            vpr_priority=d.get("vpr_priority", ""),
-            verification=d.get("verification", {}),
-            verification_state=d.get("verification_state", "unknown"),
-            proof_type=d.get("proof_type", "unknown"),
-            maturity=d.get("maturity", "experimental"),
-        )
+        d.update(binding_fields)
         with self._lock:
+            truth = self._canonical_truth(d)
+            mod_name = str(d.get("module") or "")
+            observation_id = str(d.get("observation_id") or "")
+            finding_id = str(d.get("finding_id") or d.get("id") or "")
+            if not (
+                bool(observation_id)
+                and bool(finding_id)
+                and self._canonical_truth_matches_event(
+                    d,
+                    truth,
+                    module_id=str(mod_name),
+                    target=str(d.get("target") or ""),
+                    observation_id=observation_id,
+                    finding_id=finding_id,
+                )
+            ):
+                return
+            finding_bindings = [
+                dict(item)
+                for item in (truth or {}).get("canonical_lineage") or ()
+                if isinstance(item, Mapping)
+                and str(item.get("observation_id") or "") == observation_id
+                and str(item.get("finding_id") or "") == finding_id
+                and str(item.get("verification_state") or "")
+                in {"candidate", "verified"}
+            ]
+            if not finding_bindings:
+                return
+            binding = finding_bindings[0]
+            immutable_fields = (
+                "finding_title",
+                "finding_severity",
+                "finding_description",
+                "finding_created_at",
+                "finding_status",
+                "verification_state",
+                "proof_type",
+                "confidence",
+                "maturity",
+            )
+            if any(
+                str(item.get(field) or "") != str(binding.get(field) or "")
+                for item in finding_bindings
+                for field in immutable_fields
+            ):
+                return
+            finding_evidence_refs = tuple(
+                sorted(
+                    {
+                        str(item.get("evidence_ref") or "")
+                        for item in finding_bindings
+                        if str(item.get("evidence_ref") or "")
+                    }
+                )
+            )
+            if not finding_evidence_refs:
+                return
+            severity_value = str(binding.get("finding_severity") or "").lower()
+            severity = (
+                severity_value.capitalize()
+                if severity_value
+                in {"critical", "high", "medium", "low", "informational"}
+                else "Informational"
+            )
+            target_display = str((truth or {}).get("canonical_target_display") or "")
+            if not target_display:
+                return
+            entry = FindingEntry(
+                id=finding_id,
+                title=str(binding.get("finding_title") or "Canonical finding"),
+                severity=severity,
+                module=str((truth or {}).get("canonical_module_id") or ""),
+                target=target_display,
+                cvss_score=None,
+                timestamp=str(binding.get("finding_created_at") or event.timestamp),
+                url="",
+                port=None,
+                service="",
+                description=str(binding.get("finding_description") or ""),
+                mitre=[],
+                evidence={
+                    "state": "persisted",
+                    "artifact_refs": list(finding_evidence_refs),
+                },
+                confidence=str(binding.get("confidence") or "UNVERIFIED"),
+                status=str(binding.get("finding_status") or "open"),
+                vpr_score=None,
+                vpr_priority="",
+                verification={
+                    "source": "canonical_run_truth",
+                    "signed_outcome_ref": str(
+                        (truth or {}).get("signed_outcome_ref") or ""
+                    ),
+                },
+                verification_state=str(
+                    binding.get("verification_state") or "candidate"
+                ),
+                proof_type=str(binding.get("proof_type") or "passive"),
+                maturity=str(binding.get("maturity") or "stable"),
+            )
+            event.data.clear()
+            event.data.update(
+                {
+                    **binding_fields,
+                    "id": entry.id,
+                    "finding_id": entry.id,
+                    "title": entry.title,
+                    "severity": entry.severity,
+                    "module": entry.module,
+                    "target": entry.target,
+                    "status": entry.status,
+                    "verification_state": entry.verification_state,
+                    "proof_type": entry.proof_type,
+                    "maturity": entry.maturity,
+                    "evidence_refs": finding_evidence_refs,
+                }
+            )
+            if any(existing.id == entry.id for existing in self.findings):
+                return
             self.findings.append(entry)
+            counted = self.kill_chain.record_finding(
+                mod_name,
+                verification_state=entry.verification_state,
+                observation_id=str(d.get("observation_id") or ""),
+                evidence_refs=finding_evidence_refs,
+            )
             # Update module finding count
-            mod_name = d.get("module", event.source)
-            if mod_name in self.modules:
+            if counted and mod_name in self.modules:
                 self.modules[mod_name].findings_count += 1
             # Update phase finding count
-            for phase in self.phases.values():
-                if mod_name in phase.modules:
-                    phase.findings += 1
-                    break
+            if counted:
+                for phase in self.phases.values():
+                    if mod_name in phase.modules:
+                        phase.findings += 1
+                        break
             # Update target finding count
-            target = d.get("target", self.target)
-            if target in self.targets:
+            target = entry.target
+            if counted and target in self.targets:
                 self.targets[target].findings += 1
-            # Update kill chain
-            self.kill_chain.record_finding(mod_name)
-            self.metrics.record_finding()
+            if counted:
+                self.metrics.record_finding()
             # Timeline
-            sev = d.get("severity", "Info")
+            sev = entry.severity
             self._add_timeline(
                 f"finding_{sev.lower()}",
-                f"[{sev.upper()}] {d.get('title', 'Finding')}",
+                f"[{sev.upper()}] {entry.title}",
                 mod_name,
             )
 
     def _on_request(self, event: Event) -> None:
-        self.metrics.record_request(
-            bytes_out=event.data.get("bytes_out", 0),
-            bytes_in=event.data.get("bytes_in", 0),
-        )
+        del event
 
     def _on_request_error(self, event: Event) -> None:
-        self.metrics.record_error()
+        del event
 
     def _on_waf_block(self, event: Event) -> None:
-        self.metrics.record_waf_block()
+        del event
 
     def _on_rate_limit(self, event: Event) -> None:
-        self.metrics.record_rate_limit()
+        del event
 
     def _on_credential(self, event: Event) -> None:
         d = event.data
+        reference = str(d.get("credential_reference") or "")
+        if reference and not reference.startswith("cred:"):
+            reference = ""
         entry = CredentialEntry(
-            cred_type=d.get("type", "UNKNOWN"),
-            account=d.get("account", ""),
-            secret=d.get("secret", ""),
-            target=d.get("target", ""),
+            id=str(d.get("id") or str(uuid.uuid4())[:8]),
+            cred_type=d.get("type", "REFERENCE"),
+            account="",
+            credential_reference=reference,
+            credential_state=(
+                "protected_reference" if reference else "purged_legacy"
+            ),
+            target="",
             discovered_by=d.get("module", event.source),
             timestamp=event.timestamp,
         )
         with self._lock:
             self.credentials.append(entry)
-            # Update target creds count
-            target = d.get("target", "")
-            if target in self.targets:
-                self.targets[target].creds_count += 1
             self._add_timeline(
                 "credential",
-                f"Credential found: {d.get('type', '')} {d.get('account', '')}",
+                f"Credential boundary record: {entry.credential_state}",
                 event.source,
             )
 
     def _on_target_discovered(self, event: Event) -> None:
-        target = event.data.get("target", "")
-        with self._lock:
-            if target and target not in self.targets:
-                self.targets[target] = TargetStatus(
-                    target=target,
-                    services=event.data.get("services", []),
-                )
+        del event
 
     def _on_target_pwned(self, event: Event) -> None:
-        target = event.data.get("target", "")
-        with self._lock:
-            if target in self.targets:
-                self.targets[target].pwned = True
-                self.targets[target].access_level = event.data.get("access_level", "user")
-            self._add_timeline(
-                "target_pwned",
-                f"Target compromised: {target} ({event.data.get('access_level', '')})",
-                event.source,
-            )
+        """Ignore raw compromise events until a typed canonical proof exists."""
+
+        del event
+        return
 
     def _on_shell_session(self, event: Event) -> None:
-        d = event.data
-        with self._lock:
-            session = ShellSession(
-                session_id=len(self.sessions) + 1,
-                target=d.get("target", ""),
-                shell_type=d.get("shell_type", "CMD"),
-                access_level=d.get("access_level", "user"),
-                established=event.timestamp,
-                module=event.source,
-            )
-            self.sessions.append(session)
-            # Mark target as having shell
-            target = d.get("target", "")
-            if target in self.targets:
-                self.targets[target].shell = True
-                self.targets[target].pwned = True
+        """Ignore raw shell events until a typed canonical session proof exists."""
+
+        del event
+        return
 
     def _on_brain_verdict(self, event: Event) -> None:
-        d = event.data
-        finding_id = d.get("finding_id", "")
-        finding_title = d.get("finding", "")
-        if not finding_title and finding_id:
-            with self._lock:
-                match = next((f for f in self.findings if f.id == finding_id), None)
-                finding_title = match.title if match else finding_id
-        entry = BrainVerdictEntry(
-            finding_id=finding_id,
-            finding=finding_title,
-            verdict=d.get("verdict", "LIKELY"),
-            confidence=d.get("confidence", "UNVERIFIED"),
-            reasoning=d.get("reasoning", d.get("reason", "")),
-            severity_adjustment=d.get("severity_adjustment", ""),
-            timestamp=event.timestamp,
-        )
-        with self._lock:
-            self.brain_verdicts.append(entry)
-            self.brain_verdicts = self.brain_verdicts[-100:]
-            self._add_timeline(
-                "brain_verdict",
-                f"Brain verdict: {entry.verdict} for {entry.finding}",
-                event.source,
-            )
+        del event
 
     def _on_chain_action(self, event: Event) -> None:
-        d = event.data
-        entry = ChainActionEntry(
-            chain_type=d.get("chain_type", d.get("phase", "planner_action")),
-            source_finding=d.get("source_finding", ""),
-            source_framework=d.get("source_framework", d.get("framework", "")),
-            target_framework=d.get("target_framework", d.get("framework", "")),
-            target_module=d.get("target_module", d.get("module", "")),
-            target=d.get("target", ""),
-            rationale=d.get("rationale", ""),
-            auto_execute=bool(d.get("auto_execute", False)),
-            timestamp=event.timestamp,
-        )
-        with self._lock:
-            self.chain_actions.append(entry)
-            self.chain_actions = self.chain_actions[-200:]
-            self._add_timeline(
-                "chain_action",
-                f"Chain action: {entry.target_framework}/{entry.target_module}",
-                event.source,
-            )
+        del event
 
     # ── Timeline ──────────────────────────────────────────────────────
 
@@ -789,6 +1269,7 @@ class StateStore:
             return {
                 "framework":   self.framework,
                 "tenant_id":   self.tenant_id,
+                "engagement_id": self.engagement_id,
                 "run_id":      self.run_id,
                 "target":      self.target,
                 "scan_status": self.scan_status,
@@ -827,19 +1308,29 @@ class StateStore:
 
     def _schedule_persist(self) -> None:
         """Schedule periodic state persistence to SQLite."""
-        if self._backend.name == "memory":
-            return
-        self._persist_timer = threading.Timer(5.0, self._persist_and_reschedule)
-        self._persist_timer.daemon = True
-        self._persist_timer.start()
+        with self._lock:
+            if self._closed or self._backend.name == "memory":
+                return
+            timer = threading.Timer(5.0, self._persist_and_reschedule)
+            timer.daemon = True
+            self._persist_timer = timer
+            timer.start()
 
     def _persist_and_reschedule(self) -> None:
         """Persist current state and schedule the next persistence."""
+        with self._lock:
+            if self._closed:
+                return
         try:
             self._persist_state()
         except Exception as exc:
             log.debug("State persistence failed: %s", exc)
-        if self.scan_status == "running":
+        with self._lock:
+            reschedule = not self._closed and self.scan_status in {
+                "running",
+                "advisory",
+            }
+        if reschedule:
             self._schedule_persist()
 
     def _persist_state(self) -> None:
@@ -885,6 +1376,9 @@ class StateStore:
                 persist_db=db_session,
                 backend=backend,
                 tenant_id=tenant_id,
+                engagement_id=str(
+                    data.get("engagement_id") or data.get("engagement") or ""
+                ),
             )
             # Restore findings through the same truth normalizer used for live events.
             from common.confidence_policy import normalise_finding
@@ -915,9 +1409,19 @@ class StateStore:
             return None
 
     def stop(self) -> None:
-        """Stop persistence timer and flush final state."""
-        if self._persist_timer:
-            self._persist_timer.cancel()
+        """Fence event/timer activity, then flush one final projection."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            timer = self._persist_timer
+            self._persist_timer = None
+            subscriptions = list(self._subscriptions)
+            self._subscriptions.clear()
+        if timer is not None:
+            timer.cancel()
+        for event_type, callback in subscriptions:
+            self._bus.unsubscribe(event_type, callback)
         self._persist_state()
 
 
@@ -943,9 +1447,7 @@ class TestStateStore:
         _time.sleep(0.3)
         bus.stop()
 
-        assert len(store.findings) == 1
-        assert store.findings[0].title == "SQLi"
-        assert store.findings[0].severity == "High"
+        assert store.findings == []
 
     def test_module_lifecycle(self) -> None:
         bus = EventBus()
@@ -960,7 +1462,9 @@ class TestStateStore:
         bus.stop()
 
         assert "port_scanner" in store.modules
-        assert store.modules["port_scanner"].status == "complete"
+        assert store.modules["port_scanner"].status == "advisory"
+        assert store.modules["port_scanner"].progress_pct < 100.0
+        assert store.modules["port_scanner"].findings_count == 0
 
     def test_credential_event(self) -> None:
         bus = EventBus()
@@ -1012,6 +1516,4 @@ class TestStateStore:
         _time.sleep(0.3)
         bus.stop()
 
-        assert "10.0.0.5" in store.targets
-        assert store.targets["10.0.0.5"].pwned is True
-        assert store.targets["10.0.0.5"].access_level == "root"
+        assert store.targets == {}

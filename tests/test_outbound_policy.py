@@ -58,6 +58,7 @@ from common.outbound_policy import (
 
 
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
+_TEST_CLOCK = {"now": NOW}
 TARGET = "https://127.0.0.1:8443/start"
 ALLOWED_SCOPE = ["127.0.0.1/32", "https://127.0.0.1:8443"]
 
@@ -66,10 +67,11 @@ ALLOWED_SCOPE = ["127.0.0.1/32", "https://127.0.0.1:8443"]
 def _default_trusted_test_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     test_now = datetime.now(timezone.utc).replace(microsecond=0)
     monkeypatch.setitem(globals(), "NOW", test_now)
+    monkeypatch.setitem(_TEST_CLOCK, "now", test_now)
     monkeypatch.setattr(
         outbound_policy_module,
         "_system_utc_now",
-        lambda: test_now,
+        lambda: _TEST_CLOCK["now"],
     )
 
 
@@ -940,6 +942,7 @@ def _policy(
     **outbound_overrides: Any,
 ) -> tuple[OutboundPolicy, Any]:
     validation_now = outbound_overrides.pop("now", NOW)
+    _TEST_CLOCK["now"] = validation_now
     runtime_id = outbound_overrides.pop("runtime_id", None)
     authorize_insecure_tls = bool(
         outbound_overrides.pop("authorize_insecure_tls", False)
@@ -1004,7 +1007,8 @@ def _policy(
             insecure_tls_expected=insecure_expected,
             **outbound_overrides,
         )
-        return OutboundPolicy(outbound, runtime_id=runtime_id), session
+        policy = OutboundPolicy(outbound, runtime_id=runtime_id)
+        return policy, session
     except BaseException:
         session.close()
         raise

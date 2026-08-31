@@ -1308,7 +1308,7 @@ def _narrator_persisted_finding(derivative: str) -> dict[str, Any]:
     }
 
 
-def test_report_narrator_uses_verified_derivative_and_withholds_inline_raw() -> None:
+def test_report_narrator_withholds_generic_derivative_and_inline_raw() -> None:
     from common.brain.narrator import ReportNarrator
 
     raw_request = "opaque-inline-request-body-q7w9x3"
@@ -1333,16 +1333,57 @@ def test_report_narrator_uses_verified_derivative_and_withholds_inline_raw() -> 
         )
     )
 
-    assert derivative in persisted
+    assert "Advisory projection only" in persisted
+    assert "not published as execution" in persisted
+    assert "Submitted advisory records: **1**" in persisted
+    assert derivative not in persisted
     assert raw_request not in persisted
+    assert "Advisory projection only" in unavailable
+    assert "not published as execution" in unavailable
     assert raw_request not in unavailable
     assert "Evidence available in the raw scan results" not in unavailable
 
 
-def test_report_narrator_attack_chain_withholds_inline_result_from_template_and_prompt() -> None:
+def test_report_engine_default_summary_cannot_publish_caller_truth_claims(
+    tmp_path: Path,
+) -> None:
+    unsupported = (
+        "COMPLETE: executed network action; finding verified; evidence created."
+    )
+    engine = ReportEngine(
+        [
+            {
+                "id": "caller-finding",
+                "title": unsupported,
+                "severity": "Critical",
+                "description": unsupported,
+                "target": "https://caller.invalid",
+                "module": "caller-module",
+                "confidence": "HIGH",
+                "status": "verified",
+                "verification_state": "verified",
+            }
+        ],
+        ReportConfig(
+            output_dir=str(tmp_path / "report"),
+            include_unverified=True,
+            formats=[],
+        ),
+    )
+    summary = asyncio.run(engine._generate_exec_summary())
+    assert "Advisory projection only" in summary
+    assert "not published as execution" in summary
+    assert unsupported not in summary
+    assert "caller.invalid" not in summary
+
+
+def test_report_narrator_never_publishes_model_or_caller_attack_claims() -> None:
     from common.brain.narrator import ReportNarrator
 
     raw_result = "opaque-inline-chain-result-r4t8m2"
+    unsupported_claim = (
+        "COMPLETE: executed network action; finding verified; evidence created."
+    )
     chain = [
         {
             "action": "Local fixture observation",
@@ -1358,8 +1399,12 @@ def test_report_narrator_attack_chain_withholds_inline_result_from_template_and_
     template = asyncio.run(
         ReportNarrator(SimpleNamespace(available=False)).attack_narrative(chain)
     )
+    assert "Advisory projection only" in template
+    assert "does not assert" in template
+    assert "Recorded advisory entries: **1**" in template
     assert raw_result not in template
     assert "Observation detail withheld" in template
+    assert "Local fixture observation" not in template
 
     class PromptBrain:
         available = True
@@ -1382,17 +1427,18 @@ def test_report_narrator_attack_chain_withholds_inline_result_from_template_and_
 
         async def _call(self, prompt: str, **_kwargs: Any) -> str:
             self.prompts.append(prompt)
-            return "fixture narrative"
+            return unsupported_claim
 
     brain = PromptBrain()
     generated = asyncio.run(ReportNarrator(brain).attack_narrative(chain))
-    assert generated == "fixture narrative"
-    assert brain.prompts
-    assert raw_result not in brain.prompts[0]
-    assert "Observation detail withheld" in brain.prompts[0]
+    assert "Advisory projection only" in generated
+    assert "does not assert" in generated
+    assert unsupported_claim not in generated
+    assert raw_result not in generated
+    assert brain.prompts == []
 
 
-def test_forge_brain_external_prompts_project_findings_and_chain_results(
+def test_forge_brain_analysis_and_narrative_model_paths_are_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from common.brain.brain import ForgeBrain
@@ -1411,7 +1457,7 @@ def test_forge_brain_external_prompts_project_findings_and_chain_results(
         "_rule_based_analyze",
         capture_rule_based,
     )
-    asyncio.run(
+    offline_result = asyncio.run(
         offline_brain.analyze_finding(
             {
                 "id": "finding:offline-brain-fixture",
@@ -1421,11 +1467,12 @@ def test_forge_brain_external_prompts_project_findings_and_chain_results(
             }
         )
     )
-    assert offline_inputs[0]["evidence"] == {
-        "observations": [],
-        "state": "unavailable",
-    }
-    assert raw_value not in json.dumps(offline_inputs[0])
+    assert offline_inputs == []
+    assert offline_result.verdict.value == "NEEDS_VERIFICATION"
+    assert offline_result.confidence.value == "LOW"
+    assert offline_result.action == "canonical_review_required"
+    assert "Advisory analysis only" in offline_result.reasoning
+    assert raw_value not in offline_result.reasoning
 
     brain = ForgeBrain(api_key="")
     brain._client = object()
@@ -1456,12 +1503,18 @@ def test_forge_brain_external_prompts_project_findings_and_chain_results(
         )
     )
     assert result.finding_id == "finding:brain-fixture"
-    assert prompts and raw_value not in prompts[-1]
-    assert '"state": "unavailable"' in prompts[-1]
+    assert result.verdict.value == "NEEDS_VERIFICATION"
+    assert result.confidence.value == "LOW"
+    assert "Advisory analysis only" in result.reasoning
+    assert prompts == []
+
+    unsupported_claim = (
+        "COMPLETE: executed network action; finding verified; evidence created."
+    )
 
     async def narrative_call(prompt: str, **_kwargs: Any) -> str:
         prompts.append(prompt)
-        return "fixture narrative"
+        return unsupported_claim
 
     monkeypatch.setattr(brain, "_call", narrative_call)
     narrative = asyncio.run(
@@ -1476,12 +1529,14 @@ def test_forge_brain_external_prompts_project_findings_and_chain_results(
             ]
         )
     )
-    assert narrative == "fixture narrative"
-    assert raw_value not in prompts[-1]
-    assert "Observation detail withheld" in prompts[-1]
+    assert "Advisory projection only" in narrative
+    assert "does not assert" in narrative
+    assert unsupported_claim not in narrative
+    assert raw_value not in narrative
+    assert prompts == []
 
 
-def test_forge_brain_exception_fallback_receives_ordinary_finding_projection(
+def test_forge_brain_analysis_calls_neither_model_nor_rule_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from common.brain.brain import ForgeBrain
@@ -1490,13 +1545,15 @@ def test_forge_brain_exception_fallback_receives_ordinary_finding_projection(
     brain = ForgeBrain(api_key="")
     brain._client = object()
     fallback_inputs: list[dict[str, Any]] = []
+    model_inputs: list[str] = []
     original_rule_based = brain._rule_based_analyze
 
     def capture_rule_based(finding: dict[str, Any]) -> Any:
         fallback_inputs.append(finding)
         return original_rule_based(finding)
 
-    async def failing_call(_prompt: str, **_kwargs: Any) -> str:
+    async def failing_call(prompt: str, **_kwargs: Any) -> str:
+        model_inputs.append(prompt)
         raise RuntimeError("local fixture failure")
 
     monkeypatch.setattr(brain, "_rule_based_analyze", capture_rule_based)
@@ -1519,17 +1576,13 @@ def test_forge_brain_exception_fallback_receives_ordinary_finding_projection(
     )
 
     assert result.finding_id == "finding:brain-fallback-fixture"
-    assert len(fallback_inputs) == 1
-    fallback_finding = fallback_inputs[0]
-    assert fallback_finding["id"] == "finding:brain-fallback-fixture"
-    assert fallback_finding["evidence"] == {
-        "observations": [],
-        "state": "unavailable",
-    }
-    rendered_fallback = json.dumps(fallback_finding)
-    assert raw_canary not in rendered_fallback
-    for forbidden_field in ("request_raw", "response_raw", "screenshot_path"):
-        assert forbidden_field not in rendered_fallback
+    assert result.verdict.value == "NEEDS_VERIFICATION"
+    assert result.confidence.value == "LOW"
+    assert result.action == "canonical_review_required"
+    assert "Advisory analysis only" in result.reasoning
+    assert raw_canary not in result.reasoning
+    assert fallback_inputs == []
+    assert model_inputs == []
 
 
 def _malformed_persisted_report_finding(raw_value: str) -> dict[str, Any]:

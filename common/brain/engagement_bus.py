@@ -11,7 +11,7 @@ can publish findings, any can subscribe, and the bus handles:
     - get_intel()                    → full EngagementIntelligence for the planner
     - Cross-framework chain triggers → SQLi→cred spray, SSRF→internal scan, etc.
     - Brain integration              → auto-analyze each published finding
-    - Planner integration            → trigger plan_next() after N findings
+    - Planner compatibility          → inert until canonical plan/node custody
     - EventBus integration           → emit FINDING_NEW, BRAIN_VERDICT, CHAIN_ACTION
 
 Graceful degradation: works without brain (no analysis), without event bus
@@ -22,6 +22,8 @@ FOR AUTHORIZED PENETRATION TESTING AND RED TEAM OPERATIONS ONLY.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import inspect
 import json
 import logging
 import os
@@ -29,6 +31,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -36,7 +39,15 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine
 
 from common.confidence_policy import normalise_finding
+from common.brain.truth_boundary import project_model_input
+from common.credential_boundary import CredentialReference
 from common.evidence import ordinary_finding_projection
+from common.redaction import (
+    is_sensitive_identifier,
+    redact_text,
+    redact_value,
+    redacted_json_dumps,
+)
 
 log = logging.getLogger("forge.brain.engagement_bus")
 
@@ -113,6 +124,10 @@ class EngagementIntelligence:
 FindingSubscriber = Callable[[str, dict[str, Any]], None]
 # Async subscriber: called with (framework: str, finding: dict)
 AsyncFindingSubscriber = Callable[[str, dict[str, Any]], Coroutine[Any, Any, None]]
+# The sink owns canonical advisory persistence and its validation boundary.
+# EngagementBus only supplies a bounded, tenant-scoped record; it never creates
+# jobs or interprets advisory data as execution authority.
+CanonicalAdvisorySink = Callable[[Mapping[str, Any]], Any]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -122,6 +137,8 @@ AsyncFindingSubscriber = Callable[[str, dict[str, Any]], Coroutine[Any, Any, Non
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS findings (
     id          TEXT PRIMARY KEY,
+    tenant_id   TEXT NOT NULL DEFAULT 'default',
+    engagement_id TEXT NOT NULL DEFAULT 'default-engagement',
     framework   TEXT NOT NULL,
     title       TEXT NOT NULL,
     severity    TEXT NOT NULL DEFAULT 'Informational',
@@ -154,6 +171,8 @@ CREATE TABLE IF NOT EXISTS credentials (
 
 CREATE TABLE IF NOT EXISTS chain_actions (
     id              TEXT PRIMARY KEY,
+    tenant_id       TEXT NOT NULL DEFAULT 'default',
+    engagement_id   TEXT NOT NULL DEFAULT 'default-engagement',
     chain_type      TEXT NOT NULL,
     source_finding  TEXT NOT NULL,
     source_framework TEXT NOT NULL,
@@ -170,7 +189,42 @@ CREATE INDEX IF NOT EXISTS idx_findings_framework ON findings(framework);
 CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(severity);
 CREATE INDEX IF NOT EXISTS idx_credentials_framework ON credentials(framework);
 CREATE INDEX IF NOT EXISTS idx_chain_source ON chain_actions(source_finding);
+
+CREATE TABLE IF NOT EXISTS credential_refs (
+    id                   TEXT PRIMARY KEY,
+    tenant_id            TEXT NOT NULL,
+    engagement_id        TEXT NOT NULL,
+    framework            TEXT NOT NULL,
+    credential_reference TEXT,
+    credential_state     TEXT NOT NULL CHECK(
+        credential_state IN ('protected_reference','purged_legacy')
+    ),
+    migrated_at          TEXT NOT NULL,
+    migration_reason     TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    UNIQUE(tenant_id, engagement_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_credential_refs_scope
+ON credential_refs(tenant_id, engagement_id, created_at);
+
+CREATE TABLE IF NOT EXISTS engagement_migration_journal (
+    version      TEXT PRIMARY KEY,
+    state        TEXT NOT NULL CHECK(state IN ('applying','applied','failed')),
+    started_at   TEXT NOT NULL,
+    completed_at TEXT,
+    detail       TEXT NOT NULL
+);
 """
+
+_CREDENTIAL_MIGRATION_VERSION = "forgebrain-credential-boundary-v1"
+
+
+def _scope_id(value: str, field_name: str) -> str:
+    rendered = str(value or "").strip()
+    if not rendered or len(rendered) > 200 or any(c.isspace() for c in rendered):
+        raise ValueError(f"invalid {field_name}")
+    return rendered
 
 
 class _FindingStore:
@@ -179,20 +233,222 @@ class _FindingStore:
     Thread-safe via a dedicated connection per instance with WAL mode.
     """
 
-    def __init__(self, db_path: str = "engagement.db") -> None:
+    def __init__(
+        self,
+        db_path: str = ":memory:",
+        *,
+        tenant_id: str = "default",
+        engagement_id: str = "default-engagement",
+    ) -> None:
         self._db_path = db_path
+        self._tenant_id = _scope_id(tenant_id, "tenant_id")
+        self._engagement_id = _scope_id(engagement_id, "engagement_id")
         self._lock = threading.Lock()
         self._conn: sqlite3.Connection | None = None
         self._init_db()
 
     def _init_db(self) -> None:
         """Initialize the SQLite database and schema."""
+        if self._db_path != ":memory:":
+            artifact = Path(os.path.abspath(self._db_path))
+            if (
+                artifact.parent.resolve() != artifact.parent
+                or artifact.is_symlink()
+                or (artifact.exists() and not artifact.is_file())
+            ):
+                raise ValueError("EngagementBus database path is unsafe")
+            self._db_path = os.fspath(artifact)
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._migrate_legacy_credentials()
+        if self._db_path != ":memory:":
+            for artifact in (
+                Path(self._db_path),
+                Path(self._db_path + "-wal"),
+                Path(self._db_path + "-shm"),
+            ):
+                if artifact.exists():
+                    artifact.chmod(0o600)
         log.debug("EngagementBus SQLite store initialized: %s", self._db_path)
+
+    def _ensure_scope_columns(self) -> bool:
+        legacy_scope_added = False
+        for table in ("findings", "chain_actions"):
+            columns = {
+                str(row[1])
+                for row in self._connection.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+            if "tenant_id" not in columns:
+                legacy_scope_added = True
+                self._connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'"
+                )
+            if "engagement_id" not in columns:
+                legacy_scope_added = True
+                self._connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN engagement_id TEXT NOT NULL DEFAULT 'default-engagement'"
+                )
+        return legacy_scope_added
+
+    @staticmethod
+    def _protected_reference(value: Any) -> str:
+        rendered = str(value or "").strip()
+        if is_sensitive_identifier(rendered):
+            return ""
+        try:
+            reference = CredentialReference.parse(rendered)
+        except ValueError:
+            return ""
+        return reference.value
+
+    def _migrate_legacy_credentials(self) -> None:
+        """Purge legacy secret columns into safe reference/purge markers.
+
+        The journal's applying marker is committed first.  A process stop in
+        the migration transaction leaves the old rows intact and the next
+        initialization replays the same idempotent transformation.
+        """
+
+        prior_journal = self._connection.execute(
+            "SELECT state FROM engagement_migration_journal WHERE version=?",
+            (_CREDENTIAL_MIGRATION_VERSION,),
+        ).fetchone()
+        legacy_scope_added = self._ensure_scope_columns()
+        quarantine_legacy_scope = (
+            legacy_scope_added
+            or prior_journal is None
+            or str(prior_journal[0]) != "applied"
+        )
+        stamp = datetime.now(timezone.utc).isoformat()
+        self._connection.execute(
+            """
+            INSERT INTO engagement_migration_journal(
+                version,state,started_at,completed_at,detail
+            ) VALUES(?, 'applying', ?, NULL, ?)
+            ON CONFLICT(version) DO UPDATE SET
+                state=CASE
+                    WHEN engagement_migration_journal.state='applied' THEN 'applied'
+                    ELSE 'applying'
+                END,
+                started_at=CASE
+                    WHEN engagement_migration_journal.state='applied'
+                    THEN engagement_migration_journal.started_at ELSE excluded.started_at END,
+                detail=excluded.detail
+            """,
+            (
+                _CREDENTIAL_MIGRATION_VERSION,
+                stamp,
+                json.dumps({"secret_restore": False}, sort_keys=True),
+            ),
+        )
+        self._connection.commit()
+        try:
+            self._connection.execute("BEGIN IMMEDIATE")
+            if quarantine_legacy_scope:
+                self._connection.execute(
+                    "UPDATE findings SET tenant_id='legacy-unattributed', engagement_id='legacy-unattributed'"
+                )
+                self._connection.execute(
+                    "UPDATE chain_actions SET tenant_id='legacy-unattributed', engagement_id='legacy-unattributed'"
+                )
+            rows = self._connection.execute(
+                "SELECT id,framework,data_json,created_at FROM credentials"
+            ).fetchall()
+            for row in rows:
+                reference = ""
+                try:
+                    extra = json.loads(str(row[2] or "{}"))
+                except (TypeError, json.JSONDecodeError):
+                    extra = {}
+                if isinstance(extra, dict):
+                    reference = self._protected_reference(
+                        extra.get("credential_reference")
+                    )
+                state = "protected_reference" if reference else "purged_legacy"
+                reason = (
+                    "validated protected reference retained"
+                    if reference
+                    else (
+                        "legacy plaintext purged without secret-derived fingerprint "
+                        "or tenant attribution"
+                    )
+                )
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO credential_refs(
+                        id,tenant_id,engagement_id,framework,
+                        credential_reference,credential_state,migrated_at,
+                        migration_reason,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        str(row[0]),
+                        "legacy-unattributed",
+                        "legacy-unattributed",
+                        str(row[1]),
+                        reference or None,
+                        state,
+                        stamp,
+                        reason,
+                        str(row[3] or stamp),
+                    ),
+                )
+                marker = self._connection.execute(
+                    """
+                    SELECT tenant_id,engagement_id,framework,
+                           credential_reference,credential_state
+                    FROM credential_refs WHERE id=?
+                    """,
+                    (str(row[0]),),
+                ).fetchone()
+                expected_marker = (
+                    "legacy-unattributed",
+                    "legacy-unattributed",
+                    str(row[1]),
+                    reference or None,
+                    state,
+                )
+                if marker is None or tuple(marker) != expected_marker:
+                    raise RuntimeError("legacy credential marker conflict")
+            self._connection.execute(
+                """
+                UPDATE credentials
+                SET host='',service='',username='',password='',hash_value='',
+                    hash_type='',domain='',source='',data_json='{}'
+                """
+            )
+            self._connection.execute(
+                "UPDATE chain_actions SET auto_execute=0,executed=0"
+            )
+            self._connection.execute(
+                """
+                UPDATE engagement_migration_journal
+                SET state='applied',completed_at=?,detail=? WHERE version=?
+                """,
+                (
+                    stamp,
+                    json.dumps(
+                        {"rows": len(rows), "secret_restore": False},
+                        sort_keys=True,
+                    ),
+                    _CREDENTIAL_MIGRATION_VERSION,
+                ),
+            )
+            self._connection.execute("COMMIT")
+        except BaseException:
+            self._connection.execute("ROLLBACK")
+            raise
+        # Remove the ordinary SQLite remnants that a file/WAL backup could
+        # otherwise retain after an UPDATE.  Tests use only synthetic rows.
+        if self._db_path != ":memory:":
+            self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._connection.execute("VACUUM")
+            self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     @property
     def _connection(self) -> sqlite3.Connection:
@@ -203,32 +459,88 @@ class _FindingStore:
 
     def store_finding(self, framework: str, finding: dict[str, Any]) -> str:
         """Store a finding and return its ID."""
-        finding_id = finding.get("id") or str(uuid.uuid4())
+        finding_id, _created = self.store_finding_once(framework, finding)
+        return finding_id
+
+    def store_finding_once(
+        self, framework: str, finding: dict[str, Any]
+    ) -> tuple[str, bool]:
+        """Store one scoped identity and report whether it was newly created."""
+        candidate_id = str(finding.get("id") or "").strip()
+        finding_id = (
+            candidate_id
+            if candidate_id
+            and len(candidate_id) <= 200
+            and not any(char.isspace() for char in candidate_id)
+            and not is_sensitive_identifier(candidate_id)
+            else str(uuid.uuid4())
+        )
         data = {k: v for k, v in finding.items()
                 if k not in ("id", "framework", "title", "severity", "target",
                              "module", "description", "remediation", "confidence")}
 
+        safe_data = redacted_json_dumps(
+            data, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        safe_title = redact_text(str(finding.get("title", "")))[:1000]
+        safe_severity = str(finding.get("severity", "Informational"))[:100]
+        safe_target = redact_text(str(finding.get("target", "")))[:2000]
+        safe_module = str(finding.get("module", ""))[:200]
+        safe_description = redact_text(str(finding.get("description", "")))[:8000]
+        safe_remediation = redact_text(str(finding.get("remediation", "")))[:8000]
+        safe_confidence = str(finding.get("confidence", "MEDIUM"))[:100]
         with self._lock:
+            existing = self._connection.execute(
+                """
+                SELECT tenant_id,engagement_id,framework,title,severity,target,
+                       module,description,remediation,confidence,data_json
+                FROM findings WHERE id=?
+                """,
+                (finding_id,),
+            ).fetchone()
+            expected = (
+                self._tenant_id,
+                self._engagement_id,
+                framework,
+                safe_title,
+                safe_severity,
+                safe_target,
+                safe_module,
+                safe_description,
+                safe_remediation,
+                safe_confidence,
+                safe_data,
+            )
+            if existing is not None and tuple(existing) != expected:
+                raise ValueError("finding idempotency conflict")
             self._connection.execute(
-                """INSERT OR REPLACE INTO findings
-                   (id, framework, title, severity, target, module,
+                """INSERT INTO findings
+                   (id, tenant_id, engagement_id, framework, title, severity, target, module,
                     description, remediation, confidence, data_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     framework=excluded.framework,title=excluded.title,
+                     severity=excluded.severity,target=excluded.target,
+                     module=excluded.module,description=excluded.description,
+                     remediation=excluded.remediation,confidence=excluded.confidence,
+                     data_json=excluded.data_json""",
                 (
                     finding_id,
+                    self._tenant_id,
+                    self._engagement_id,
                     framework,
-                    finding.get("title", ""),
-                    finding.get("severity", "Informational"),
-                    finding.get("target", ""),
-                    finding.get("module", ""),
-                    finding.get("description", ""),
-                    finding.get("remediation", ""),
-                    finding.get("confidence", "MEDIUM"),
-                    json.dumps(data, default=str),
+                    safe_title,
+                    safe_severity,
+                    safe_target,
+                    safe_module,
+                    safe_description,
+                    safe_remediation,
+                    safe_confidence,
+                    safe_data,
                 ),
             )
             self._connection.commit()
-        return finding_id
+        return finding_id, existing is None
 
     def update_brain_verdict(
         self, finding_id: str, verdict: str, confidence: str, reasoning: str
@@ -237,72 +549,110 @@ class _FindingStore:
         with self._lock:
             self._connection.execute(
                 """UPDATE findings SET brain_verdict=?, brain_confidence=?,
-                   brain_reasoning=? WHERE id=?""",
-                (verdict, confidence, reasoning, finding_id),
+                   brain_reasoning=? WHERE id=? AND tenant_id=? AND engagement_id=?""",
+                (
+                    str(verdict)[:100],
+                    str(confidence)[:100],
+                    redact_text(str(reasoning))[:4000],
+                    finding_id,
+                    self._tenant_id,
+                    self._engagement_id,
+                ),
             )
             self._connection.commit()
 
     def store_credential(self, framework: str, cred: dict[str, Any]) -> str:
-        """Store a credential and return its ID."""
-        cred_id = cred.get("id") or str(uuid.uuid4())
-        data = {k: v for k, v in cred.items()
-                if k not in ("id", "framework", "host", "service", "username",
-                             "password", "hash_value", "hash_type", "domain", "source")}
-
+        """Store only an opaque reference or an explicit purge marker."""
+        cred_id = str(uuid.uuid4())
+        reference = self._protected_reference(cred.get("credential_reference"))
+        state = "protected_reference" if reference else "purged_legacy"
+        reason = (
+            "validated protected reference retained"
+            if reference
+            else "raw credential rejected and purged at EngagementBus boundary"
+        )
+        stamp = datetime.now(timezone.utc).isoformat()
         with self._lock:
             self._connection.execute(
-                """INSERT OR REPLACE INTO credentials
-                   (id, framework, host, service, username, password,
-                    hash_value, hash_type, domain, source, data_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT INTO credential_refs(
+                   id,tenant_id,engagement_id,framework,credential_reference,
+                   credential_state,migrated_at,migration_reason,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
                 (
                     cred_id,
+                    self._tenant_id,
+                    self._engagement_id,
                     framework,
-                    cred.get("host", ""),
-                    cred.get("service", ""),
-                    cred.get("username", ""),
-                    cred.get("password", ""),
-                    cred.get("hash_value", cred.get("hash", "")),
-                    cred.get("hash_type", ""),
-                    cred.get("domain", ""),
-                    cred.get("source", ""),
-                    json.dumps(data, default=str),
+                    reference or None,
+                    state,
+                    stamp,
+                    reason,
+                    stamp,
                 ),
             )
             self._connection.commit()
         return cred_id
 
-    def store_chain_action(self, action: ChainAction) -> str:
-        """Store a chain action."""
-        action_id = str(uuid.uuid4())
+    def store_chain_action(self, action: ChainAction) -> tuple[str, bool]:
+        """Store an advisory chain suggestion without execution authority."""
+        identity = {
+            "tenant_id": self._tenant_id,
+            "engagement_id": self._engagement_id,
+            "chain_type": action.chain_type.value,
+            "source_finding": action.source_finding,
+            "source_framework": action.source_framework,
+            "target_framework": action.target_framework,
+            "target_module": action.target_module,
+            "target": redact_text(str(action.target))[:2000],
+        }
+        action_id = "chain-action-" + hashlib.sha256(
+            json.dumps(
+                identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+        ).hexdigest()[:32]
         with self._lock:
+            existing = self._connection.execute(
+                """
+                SELECT tenant_id,engagement_id,chain_type,source_finding,
+                       source_framework,target_framework,target_module,target
+                FROM chain_actions WHERE id=?
+                """,
+                (action_id,),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != tuple(identity.values()):
+                    raise ValueError("chain advisory identity conflict")
+                return action_id, False
             self._connection.execute(
                 """INSERT INTO chain_actions
-                   (id, chain_type, source_finding, source_framework,
+                   (id, tenant_id, engagement_id, chain_type, source_finding, source_framework,
                     target_framework, target_module, target, rationale,
                     auto_execute, triggered_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     action_id,
+                    self._tenant_id,
+                    self._engagement_id,
                     action.chain_type.value,
                     action.source_finding,
                     action.source_framework,
                     action.target_framework,
                     action.target_module,
-                    action.target,
-                    action.rationale,
-                    1 if action.auto_execute else 0,
+                    redact_text(str(action.target))[:2000],
+                    redact_text(str(action.rationale))[:4000],
+                    0,
                     action.triggered_at,
                 ),
             )
             self._connection.commit()
-        return action_id
+        return action_id, True
 
     def get_all_findings(self) -> list[dict[str, Any]]:
         """Get all findings across all frameworks."""
         with self._lock:
             cursor = self._connection.execute(
-                "SELECT * FROM findings ORDER BY created_at DESC"
+                "SELECT * FROM findings WHERE tenant_id=? AND engagement_id=? ORDER BY created_at DESC",
+                (self._tenant_id, self._engagement_id),
             )
             cols = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
@@ -312,8 +662,8 @@ class _FindingStore:
         """Get findings for a specific framework."""
         with self._lock:
             cursor = self._connection.execute(
-                "SELECT * FROM findings WHERE framework=? ORDER BY created_at DESC",
-                (framework,),
+                "SELECT * FROM findings WHERE tenant_id=? AND engagement_id=? AND framework=? ORDER BY created_at DESC",
+                (self._tenant_id, self._engagement_id, framework),
             )
             cols = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
@@ -323,7 +673,13 @@ class _FindingStore:
         """Get all credentials across all frameworks."""
         with self._lock:
             cursor = self._connection.execute(
-                "SELECT * FROM credentials ORDER BY created_at DESC"
+                """SELECT id,tenant_id,engagement_id,framework,
+                          credential_reference,credential_state,migrated_at,
+                          migration_reason,created_at
+                   FROM credential_refs
+                   WHERE tenant_id=? AND engagement_id=?
+                   ORDER BY created_at DESC""",
+                (self._tenant_id, self._engagement_id),
             )
             cols = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
@@ -334,12 +690,13 @@ class _FindingStore:
         with self._lock:
             if executed is None:
                 cursor = self._connection.execute(
-                    "SELECT * FROM chain_actions ORDER BY triggered_at DESC"
+                    "SELECT * FROM chain_actions WHERE tenant_id=? AND engagement_id=? ORDER BY triggered_at DESC",
+                    (self._tenant_id, self._engagement_id),
                 )
             else:
                 cursor = self._connection.execute(
-                    "SELECT * FROM chain_actions WHERE executed=? ORDER BY triggered_at DESC",
-                    (1 if executed else 0,),
+                    "SELECT * FROM chain_actions WHERE tenant_id=? AND engagement_id=? AND executed=? ORDER BY triggered_at DESC",
+                    (self._tenant_id, self._engagement_id, 1 if executed else 0),
                 )
             cols = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
@@ -348,14 +705,18 @@ class _FindingStore:
     def count_findings(self) -> int:
         """Return total finding count."""
         with self._lock:
-            cursor = self._connection.execute("SELECT COUNT(*) FROM findings")
+            cursor = self._connection.execute(
+                "SELECT COUNT(*) FROM findings WHERE tenant_id=? AND engagement_id=?",
+                (self._tenant_id, self._engagement_id),
+            )
             return cursor.fetchone()[0]
 
     def severity_counts(self) -> dict[str, int]:
         """Return findings grouped by severity."""
         with self._lock:
             cursor = self._connection.execute(
-                "SELECT severity, COUNT(*) FROM findings GROUP BY severity"
+                "SELECT severity, COUNT(*) FROM findings WHERE tenant_id=? AND engagement_id=? GROUP BY severity",
+                (self._tenant_id, self._engagement_id),
             )
             return dict(cursor.fetchall())
 
@@ -365,14 +726,38 @@ class _FindingStore:
             self._conn.close()
             self._conn = None
 
+    def safe_backup(self, destination: str | Path) -> Path:
+        """Create an owner-private backup after replaying the purge boundary."""
+
+        target = Path(os.path.abspath(os.fspath(destination)))
+        if (
+            target.parent.resolve() != target.parent
+            or target.is_symlink()
+            or (target.exists() and not target.is_file())
+        ):
+            raise ValueError("legacy backup destination is unsafe")
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with self._lock:
+            self._migrate_legacy_credentials()
+            backup = sqlite3.connect(target)
+            try:
+                self._connection.backup(backup)
+            finally:
+                backup.close()
+        target.chmod(0o600)
+        return target
+
     @staticmethod
     def _row_to_dict(cols: list[str], row: tuple) -> dict[str, Any]:
         """Convert a sqlite row to dict, unpacking data_json."""
         d = dict(zip(cols, row))
         if "data_json" in d:
             try:
-                extra = json.loads(d.pop("data_json"))
-                d.update(extra)
+                extra = redact_value(json.loads(d.pop("data_json")))
+                if isinstance(extra, dict):
+                    for key, value in extra.items():
+                        if key not in d:
+                            d[key] = value
             except (json.JSONDecodeError, TypeError):
                 d.pop("data_json", None)
         return d
@@ -578,29 +963,69 @@ class EngagementBus:
     def __init__(
         self,
         db_path: str | None = None,
+        tenant_id: str = "default",
+        engagement_id: str = "default-engagement",
+        run_id: str = "",
         brain: Any | None = None,
         planner: Any | None = None,
         event_bus: Any | None = None,
+        canonical_advisory_sink: CanonicalAdvisorySink | None = None,
         plan_trigger_threshold: int = 5,
     ) -> None:
         """Initialize the engagement bus.
 
         Args:
-            db_path:    Path to SQLite database. Default: engagement.db
-                        in current directory.
+            db_path:    Explicit legacy compatibility database path. Without
+                        one, the advisory bus is memory-only and cannot leave
+                        an ordinary side database in the working directory.
+            run_id:     Exact canonical run binding required for dashboard
+                        event projection. Events are suppressed when absent.
             brain:      ForgeBrain instance for auto-analysis.
-            planner:    AttackPlanner instance for auto-planning.
+            planner:    Legacy AttackPlanner compatibility instance; it is not
+                        invoked by finding input or the inert auto-plan hook.
             event_bus:  Dashboard EventBus for real-time push.
-            plan_trigger_threshold: Trigger plan_next() after this many
-                                    new findings since last plan.
+            canonical_advisory_sink: Callable receiving one canonical advisory
+                                    record.  A chain is projected to the
+                                    legacy store/event only after this sink
+                                    explicitly accepts it and returns a
+                                    canonical advisory/node object or mapping
+                                    with a safe non-empty ``id``.
+            plan_trigger_threshold: Retained advisory-notification threshold;
+                                    it never invokes the planner.
         """
         self._db_path: str = db_path or os.environ.get(
-            "FORGE_ENGAGEMENT_DB", "engagement.db"
-        ) or "engagement.db"
-        self._store = _FindingStore(self._db_path)
+            "FORGE_ENGAGEMENT_DB", ""
+        ) or ":memory:"
+        self._tenant_id = _scope_id(tenant_id, "tenant_id")
+        self._engagement_id = _scope_id(engagement_id, "engagement_id")
+        requested_run = str(
+            run_id or getattr(event_bus, "run_id", "") or ""
+        ).strip()
+        self._run_id = (
+            _scope_id(requested_run, "run_id") if requested_run else ""
+        )
+        if brain is not None and (
+            str(getattr(brain, "_tenant_id", self._tenant_id)) != self._tenant_id
+            or str(getattr(brain, "_engagement_id", self._engagement_id))
+            != self._engagement_id
+        ):
+            raise ValueError("ForgeBrain scope does not match EngagementBus")
+        planner_brain = getattr(planner, "brain", None)
+        if planner_brain is not None and (
+            str(getattr(planner_brain, "_tenant_id", "")) != self._tenant_id
+            or str(getattr(planner_brain, "_engagement_id", ""))
+            != self._engagement_id
+        ):
+            raise ValueError("planner scope does not match EngagementBus")
+        self._store = _FindingStore(
+            self._db_path,
+            tenant_id=self._tenant_id,
+            engagement_id=self._engagement_id,
+        )
         self._brain = brain
         self._planner = planner
         self._event_bus = event_bus
+        self._canonical_advisory_sink = canonical_advisory_sink
         self._plan_threshold = plan_trigger_threshold
 
         # Subscriber lists
@@ -634,6 +1059,24 @@ class EngagementBus:
         with cls._instance_lock:
             if cls._instance is None:
                 cls._instance = cls(**kwargs)
+            else:
+                requested_tenant = str(
+                    kwargs.get("tenant_id", cls._instance._tenant_id)
+                )
+                requested_engagement = str(
+                    kwargs.get("engagement_id", cls._instance._engagement_id)
+                )
+                requested_run = str(
+                    kwargs.get("run_id")
+                    or getattr(kwargs.get("event_bus"), "run_id", "")
+                    or cls._instance._run_id
+                )
+                if (
+                    requested_tenant != cls._instance._tenant_id
+                    or requested_engagement != cls._instance._engagement_id
+                    or requested_run != cls._instance._run_id
+                ):
+                    raise ValueError("EngagementBus singleton scope mismatch")
             return cls._instance
 
     @classmethod
@@ -648,10 +1091,22 @@ class EngagementBus:
 
     def set_brain(self, brain: Any) -> None:
         """Set or replace the ForgeBrain instance."""
+        if (
+            str(getattr(brain, "_tenant_id", "")) != self._tenant_id
+            or str(getattr(brain, "_engagement_id", "")) != self._engagement_id
+        ):
+            raise ValueError("ForgeBrain scope does not match EngagementBus")
         self._brain = brain
 
     def set_planner(self, planner: Any) -> None:
         """Set or replace the AttackPlanner instance."""
+        planner_brain = getattr(planner, "brain", None)
+        if planner_brain is None or (
+            str(getattr(planner_brain, "_tenant_id", "")) != self._tenant_id
+            or str(getattr(planner_brain, "_engagement_id", ""))
+            != self._engagement_id
+        ):
+            raise ValueError("planner scope does not match EngagementBus")
         self._planner = planner
 
     @property
@@ -659,8 +1114,15 @@ class EngagementBus:
         """Return the attached planner for read-only integration consumers."""
         return self._planner
 
-    def set_event_bus(self, event_bus: Any) -> None:
-        """Set or replace the dashboard EventBus."""
+    def set_event_bus(self, event_bus: Any, *, run_id: str = "") -> None:
+        """Set the dashboard EventBus only with an exact stable run binding."""
+        requested_run = str(run_id or getattr(event_bus, "run_id", "") or "").strip()
+        if not requested_run:
+            raise ValueError("EngagementBus event run binding is required")
+        requested_run = _scope_id(requested_run, "run_id")
+        if self._run_id and requested_run != self._run_id:
+            raise ValueError("EngagementBus event run binding mismatch")
+        self._run_id = requested_run
         self._event_bus = event_bus
 
     # ── Publishing ────────────────────────────────────────────────────
@@ -669,8 +1131,8 @@ class EngagementBus:
         """Publish a finding from any framework.
 
         Projects to the ordinary persisted-evidence boundary, stores in SQLite,
-        notifies subscribers, detects chains, and optionally triggers brain
-        analysis and planner.
+        notifies subscribers, and detects canonically persisted chain advice.
+        Finding input never invokes brain analysis or planning.
 
         Args:
             framework: Source framework (netforge/webforge/adforge/aiforge).
@@ -679,7 +1141,12 @@ class EngagementBus:
         Returns:
             The finding ID.
         """
-        normalized = normalise_finding(dict(finding))
+        # Keep the producer's canonical lineage fields beside the ordinary
+        # projection.  ordinary_finding_projection intentionally strips
+        # adapter-only fields, while the chain sink requires a canonical
+        # finding or observation identity.
+        source_payload = dict(finding)
+        normalized = normalise_finding(source_payload)
         projected = ordinary_finding_projection(normalized)
         verification = normalized.get("verification")
         if isinstance(verification, dict):
@@ -691,8 +1158,13 @@ class EngagementBus:
         finding = normalise_finding(projected)
 
         # Store
-        finding_id = self._store.store_finding(framework, finding)
+        finding_id, finding_created = self._store.store_finding_once(
+            framework, finding
+        )
         finding["id"] = finding_id
+
+        if not finding_created:
+            return finding_id
 
         with self._lock:
             self._total_published += 1
@@ -713,6 +1185,8 @@ class EngagementBus:
             "title": finding.get("title", ""),
             "severity": finding.get("severity", ""),
             "target": finding.get("target", ""),
+            "tenant_id": self._tenant_id,
+            "engagement_id": self._engagement_id,
         })
 
         # Notify sync subscribers (lists already captured under lock above)
@@ -721,18 +1195,29 @@ class EngagementBus:
             try:
                 sync_cb(framework, finding)
             except Exception as exc:
-                log.error("Sync subscriber error: %s", exc)
+                log.error("Sync subscriber error: %s", redact_text(str(exc)))
 
         for async_cb in async_subs:
             try:
                 await async_cb(framework, finding)
             except Exception as exc:
-                log.error("Async subscriber error: %s", exc)
+                log.error("Async subscriber error: %s", redact_text(str(exc)))
 
         # Detect and trigger chains
         chains = _detect_chains(framework, finding)
         for chain in chains:
-            self._store.store_chain_action(chain)
+            canonical_result = await self._persist_canonical_chain_advisory(
+                chain,
+                source_payload,
+            )
+            if canonical_result is None:
+                # Missing/rejected canonical persistence is a hard stop for
+                # this chain.  No compatibility row or chain event may imply
+                # that an advisory was accepted.
+                continue
+            _chain_id, created = self._store.store_chain_action(chain)
+            if not created:
+                continue
             self._total_chains_triggered += 1
             log.info(
                 "Chain triggered: %s → %s/%s (from %s)",
@@ -747,79 +1232,277 @@ class EngagementBus:
                 "target_framework": chain.target_framework,
                 "target_module": chain.target_module,
                 "rationale": chain.rationale,
+                "auto_execute": False,
+                "execution_state": "advisory",
+                "canonical_advisory_id": canonical_result,
+                "tenant_id": self._tenant_id,
+                "engagement_id": self._engagement_id,
             })
 
-        # Brain analysis (async, fire-and-forget)
-        if self._brain and getattr(self._brain, "available", False):
-            asyncio.ensure_future(self._analyze_with_brain(finding_id, finding))
-
-        # Auto-trigger planner after N findings
+        # Finding/event input cannot schedule a model request or planner.  An
+        # operator may explicitly request advisory analysis through a caller
+        # that applies the model projection and canonical tenant context.
         if (
             self._planner
             and self._findings_since_plan >= self._plan_threshold
         ):
-            asyncio.ensure_future(self._auto_plan())
-            self._findings_since_plan = 0
+            log.info(
+                "Planner advisory threshold reached; explicit analysis required"
+            )
 
         return finding_id
+
+    @staticmethod
+    def _canonical_source_ids(
+        finding: dict[str, Any],
+    ) -> tuple[str, str, str]:
+        """Extract one source identity for canonical sink validation.
+
+        Compatibility findings commonly use ``id`` for a local/legacy row.
+        Explicit canonical lineage fields (or persisted canonical evidence)
+        take precedence; a safe producer id is passed to the injected
+        canonical sink for authoritative existence/tenant validation.  The
+        returned source kind is ``finding`` or ``observation`` and is empty
+        when no safe identity is available.
+        """
+
+        def safe(value: Any) -> str:
+            rendered = str(value or "").strip()
+            if (
+                not rendered
+                or len(rendered) > 200
+                or any(character.isspace() for character in rendered)
+                or is_sensitive_identifier(rendered)
+            ):
+                return ""
+            return rendered
+
+        def first(mapping: Any, names: tuple[str, ...]) -> str:
+            if not isinstance(mapping, Mapping):
+                return ""
+            for name in names:
+                value = safe(mapping.get(name))
+                if value:
+                    return value
+            return ""
+
+        canonical_lineage = finding.get("canonical_lineage")
+        canonical_finding = first(
+            finding,
+            ("canonical_finding_id", "source_finding_id", "finding_id"),
+        ) or first(
+            canonical_lineage,
+            ("finding_id", "canonical_finding_id", "source_finding_id"),
+        )
+        canonical_finding = canonical_finding or safe(finding.get("id"))
+        canonical_observation = first(
+            finding,
+            (
+                "canonical_observation_id",
+                "source_observation_id",
+                "observation_id",
+            ),
+        ) or first(
+            canonical_lineage,
+            (
+                "observation_id",
+                "canonical_observation_id",
+                "source_observation_id",
+            ),
+        )
+
+        evidence = finding.get("evidence")
+        if isinstance(evidence, Mapping) and evidence.get("state") == "persisted":
+            canonical_finding = canonical_finding or safe(evidence.get("finding_id"))
+            observations = evidence.get("observations")
+            if isinstance(observations, list) and observations:
+                first_observation = observations[0]
+                canonical_observation = canonical_observation or first(
+                    first_observation,
+                    ("observation_id", "canonical_observation_id"),
+                )
+
+        # Canonical advisory plans accept exactly one source kind.  Prefer the
+        # finding identity when both are present and retain the observation as
+        # descriptive metadata below.
+        if canonical_finding:
+            return canonical_finding, canonical_observation, "finding"
+        if canonical_observation:
+            return "", canonical_observation, "observation"
+        return "", "", ""
+
+    def _canonical_chain_record(
+        self,
+        chain: ChainAction,
+        source_payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        source_finding, source_observation, source_kind = self._canonical_source_ids(
+            source_payload
+        )
+        if not source_kind:
+            return None
+        target = redact_text(str(chain.target or ""))[:2_000]
+        # The canonical advisory service accepts exactly one source lineage
+        # kind.  Keep the non-selected identity only in descriptive metadata.
+        selected_finding = source_finding if source_kind == "finding" else ""
+        selected_observation = (
+            source_observation if source_kind == "observation" else ""
+        )
+        identity = {
+            "tenant_id": self._tenant_id,
+            "engagement_id": self._engagement_id,
+            "source_finding_id": selected_finding,
+            "source_observation_id": selected_observation,
+            "chain_type": chain.chain_type.value,
+            "source_framework": chain.source_framework,
+            "target_framework": chain.target_framework,
+            "target_module": chain.target_module,
+            "target": target,
+        }
+        idempotency_key = "chain-advisory-" + hashlib.sha256(
+            json.dumps(
+                identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("utf-8")
+        ).hexdigest()[:32]
+        # Keep both the canonical-service fields and an explicit metadata
+        # envelope so downstream adapters cannot confuse source and target
+        # framework/module values.
+        return {
+            **identity,
+            "source_kind": source_kind,
+            "framework": chain.target_framework,
+            "module": chain.target_module,
+            "capability_id": f"{chain.target_framework}:{chain.target_module}",
+            "capability_version": str(
+                source_payload.get("capability_version") or ""
+            )[:100],
+            "next_module": chain.target_module,
+            "description": redact_text(str(chain.rationale or ""))[:4_000],
+            "idempotency_key": idempotency_key,
+            "metadata": {
+                "tenant_id": self._tenant_id,
+                "engagement_id": self._engagement_id,
+                "source_finding_id": source_finding,
+                "source_observation_id": source_observation,
+                "source_framework": chain.source_framework,
+                "target_framework": chain.target_framework,
+                "target_module": chain.target_module,
+                "target": target,
+                "idempotency_key": idempotency_key,
+                "advisory": True,
+            },
+        }
+
+    @staticmethod
+    def _sink_result_id(result: Any) -> str:
+        if isinstance(result, Mapping):
+            value = result.get("id") or result.get("advisory_id")
+        else:
+            value = getattr(result, "id", "")
+        rendered = str(value or "").strip()
+        return (
+            rendered[:200]
+            if rendered
+            and len(rendered) <= 200
+            and not any(c.isspace() for c in rendered)
+            and not is_sensitive_identifier(rendered)
+            else ""
+        )
+
+    @classmethod
+    def _sink_accepted(cls, result: Any) -> bool:
+        """Require explicit success and reject negative status projections."""
+        if result is None:
+            return False
+        if isinstance(result, bool):
+            return result
+        if isinstance(result, Mapping):
+            if "accepted" in result:
+                return result["accepted"] is True
+            status = str(result.get("state") or result.get("status") or "").lower()
+            return status not in {"rejected", "denied", "failed"}
+        status = str(
+            getattr(result, "state", "") or getattr(result, "status", "")
+        ).lower()
+        return status not in {"rejected", "denied", "failed"}
+
+    async def _persist_canonical_chain_advisory(
+        self,
+        chain: ChainAction,
+        source_payload: dict[str, Any],
+    ) -> str | None:
+        """Persist canonical advisory state before legacy chain projection/event."""
+        sink = self._canonical_advisory_sink
+        if sink is None:
+            log.warning(
+                "Canonical advisory sink unavailable; suppressing chain %s",
+                chain.chain_type.value,
+            )
+            return None
+        record = self._canonical_chain_record(chain, source_payload)
+        if record is None:
+            log.warning(
+                "Canonical source lineage unavailable; suppressing chain %s",
+                chain.chain_type.value,
+            )
+            return None
+        try:
+            result = sink(record)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            log.warning(
+                "Canonical advisory sink rejected chain %s: %s",
+                chain.chain_type.value,
+                redact_text(str(exc)),
+            )
+            return None
+        if not self._sink_accepted(result):
+            log.warning(
+                "Canonical advisory sink rejected chain %s",
+                chain.chain_type.value,
+            )
+            return None
+        result_id = self._sink_result_id(result)
+        if not result_id:
+            log.warning(
+                "Canonical advisory sink returned no advisory identity for %s",
+                chain.chain_type.value,
+            )
+            return None
+        return result_id
 
     async def publish_credential(
         self, framework: str, cred: dict[str, Any]
     ) -> str:
-        """Publish a credential from any framework.
+        """Publish only a protected reference or a non-secret purge marker.
 
         Args:
             framework: Source framework.
-            cred:      Credential dict (host, service, username, password/hash).
+            cred:      Mapping containing an opaque ``credential_reference``.
+                       Raw secret fields are discarded and never persisted.
 
         Returns:
             The credential ID.
         """
         cred_id = self._store.store_credential(framework, cred)
-        log.debug(
-            "Credential published: %s [%s] %s@%s",
-            cred_id, framework,
-            cred.get("username", "?"), cred.get("host", "?"),
+        stored = next(
+            (item for item in self._store.get_all_credentials() if item["id"] == cred_id),
+            {"credential_state": "purged_legacy", "credential_reference": None},
         )
+        log.debug("Credential boundary record published: %s [%s]", cred_id, framework)
 
         self._emit_event("credential_found", {
             "id": cred_id,
             "framework": framework,
-            "host": cred.get("host", ""),
-            "username": cred.get("username", ""),
-            "service": cred.get("service", ""),
+            "credential_reference": stored.get("credential_reference"),
+            "credential_state": stored.get("credential_state"),
+            "tenant_id": self._tenant_id,
+            "engagement_id": self._engagement_id,
         })
-
-        # Domain credential → trigger lateral movement chain
-        if cred.get("domain"):
-            chain = ChainAction(
-                chain_type=ChainType.DOMAIN_CREDS_TO_LATERAL,
-                source_finding=cred_id,
-                source_framework=framework,
-                target_framework="netforge",
-                target_module="lateral_smb",
-                target=cred.get("host", ""),
-                rationale=(
-                    f"Domain credential ({cred.get('username', '?')}@{cred.get('domain')}) "
-                    "obtained → lateral movement via SMB/WMI/WinRM."
-                ),
-            )
-            self._store.store_chain_action(chain)
-            with self._lock:
-                self._total_chains_triggered += 1
-            log.info(
-                "Chain triggered: %s (domain cred: %s@%s)",
-                chain.chain_type.value,
-                cred.get("username", "?"), cred.get("domain"),
-            )
-            self._emit_event("chain_action_new", {
-                "chain_type": chain.chain_type.value,
-                "source_finding": cred_id,
-                "source_framework": framework,
-                "target_framework": chain.target_framework,
-                "target_module": chain.target_module,
-                "rationale": chain.rationale,
-            })
 
         return cred_id
 
@@ -856,7 +1539,9 @@ class EngagementBus:
             data = session
 
         meta = data.get("export_metadata", {})
-        target_summary: str = meta.get("target_summary", "") or engagement_name or "imported session"
+        target_summary = redact_text(
+            str(meta.get("target_summary", "") or engagement_name or "imported session")
+        )[:2000]
 
         findings_loaded = 0
         credentials_loaded = 0
@@ -874,42 +1559,70 @@ class EngagementBus:
             await self.publish_credential(framework, dict(cred))
             credentials_loaded += 1
 
-        # 3. Seed ForgeBrain memory with rich engagement context
+        # 3. Seed only the allowlisted, tenant-scoped model projection.  Raw
+        # payload/evasion/error/session structures never enter memory.
         if self._brain and hasattr(self._brain, "memory"):
             mem = self._brain.memory
 
-            if tc := data.get("target_context"):
-                mem.add("target_context", "import", {"target": target_summary, **tc})
+            if data.get("target_context"):
+                mem.add(
+                    "target_context",
+                    "import",
+                    project_model_input(
+                        {"target": target_summary, "event_type": "target_context"},
+                        tenant_id=self._tenant_id,
+                        engagement_id=self._engagement_id,
+                    ),
+                )
                 brain_events += 1
 
             for lesson in data.get("lessons_learned", []):
-                applicable = lesson.get("applicable_to", ["manual"])
-                mem.add("lesson", applicable[0] if applicable else "manual", lesson)
+                mem.add(
+                    "lesson",
+                    "import",
+                    project_model_input(
+                        {
+                            "event_type": "lesson",
+                            "title": lesson.get("title") or lesson.get("name") or "imported lesson",
+                            "description": lesson.get("description") or lesson.get("lesson") or "",
+                        },
+                        tenant_id=self._tenant_id,
+                        engagement_id=self._engagement_id,
+                    ),
+                )
                 brain_events += 1
 
             for fn in data.get("false_negatives_detected", []):
-                mem.add("fn_hint", "import", fn)
-                brain_events += 1
-
-            for ev in data.get("evasion_techniques", []):
-                mem.add("evasion", "import", ev)
-                brain_events += 1
-
-            for pl in data.get("payloads_library", []):
-                mem.add("payload", "import", pl)
-                brain_events += 1
-
-            for es in data.get("error_signatures", []):
-                mem.add("error_sig", "import", es)
+                mem.add(
+                    "fn_hint",
+                    "import",
+                    project_model_input(
+                        {
+                            "event_type": "fn_hint",
+                            "title": fn.get("title") or fn.get("likely_vuln") or "false-negative hint",
+                            "reason_code": fn.get("reason_code") or "imported_hint",
+                        },
+                        tenant_id=self._tenant_id,
+                        engagement_id=self._engagement_id,
+                    ),
+                )
                 brain_events += 1
 
             for ac in data.get("attack_chains", []):
-                mem.add("attack_chain", "import", {
-                    "chain_type": ac.get("chain_type"),
-                    "impact": ac.get("impact"),
-                    "rationale": ac.get("rationale"),
-                    "steps": len(ac.get("steps", [])),
-                })
+                mem.add(
+                    "attack_chain",
+                    "import",
+                    project_model_input(
+                        {
+                            "event_type": "attack_chain",
+                            "title": ac.get("chain_type") or "advisory chain",
+                            "rationale": ac.get("rationale") or "",
+                            "status": "advisory",
+                        },
+                        tenant_id=self._tenant_id,
+                        engagement_id=self._engagement_id,
+                    ),
+                )
                 brain_events += 1
 
         log.info(
@@ -1057,8 +1770,19 @@ class EngagementBus:
         """Emit an event to the dashboard EventBus if attached."""
         if not self._event_bus:
             return
+        if not self._run_id:
+            log.warning(
+                "EngagementBus event suppressed: canonical run binding unavailable"
+            )
+            return
         try:
             from common.dashboard.event_bus import Event, EventType
+            projected = redact_value(dict(data))
+            if not isinstance(projected, dict):
+                projected = {}
+            projected["tenant_id"] = self._tenant_id
+            projected["engagement_id"] = self._engagement_id
+            projected["run_id"] = self._run_id
             # Map string to EventType enum
             type_map = {
                 "finding_new": EventType.FINDING_NEW,
@@ -1070,14 +1794,16 @@ class EngagementBus:
             if etype:
                 self._event_bus.emit(Event(
                     event_type=etype,
-                    data=data,
+                    data=projected,
                     source="engagement_bus",
+                    run_id=self._run_id,
                 ))
             else:
                 self._event_bus.emit(Event(
                     event_type=EventType.STATE_SNAPSHOT,
-                    data={"sub_type": event_type_str, **data},
+                    data={"sub_type": event_type_str, **projected},
                     source="engagement_bus",
+                    run_id=self._run_id,
                 ))
         except Exception as exc:
             log.debug("EventBus emit failed (non-critical): %s", exc)
@@ -1090,51 +1816,41 @@ class EngagementBus:
             brain = self._brain
             if brain is None:
                 return
-            result = await brain.analyze_finding(finding)
+            del finding
+            projected_verdict = "NEEDS_VERIFICATION"
+            projected_confidence = "LOW"
+            safe_reasoning = (
+                "Advisory analysis only; canonical observation, finding, proof, "
+                "and evidence lineage are required."
+            )
             self._store.update_brain_verdict(
                 finding_id,
-                result.verdict.value,
-                result.confidence.value,
-                result.reasoning,
+                projected_verdict,
+                projected_confidence,
+                safe_reasoning,
             )
             log.debug(
                 "Brain verdict for %s: %s (%s)",
-                finding_id, result.verdict.value, result.confidence.value,
+                finding_id, projected_verdict, projected_confidence,
             )
             self._emit_event("brain_verdict", {
                 "finding_id": finding_id,
-                "verdict": result.verdict.value,
-                "confidence": result.confidence.value,
-                "reasoning": result.reasoning[:200],
+                "verdict": projected_verdict,
+                "confidence": projected_confidence,
+                "reasoning": safe_reasoning[:200],
+                "tenant_id": self._tenant_id,
+                "engagement_id": self._engagement_id,
             })
         except Exception as exc:
-            log.warning("Brain analysis failed for %s: %s", finding_id, exc)
+            log.warning(
+                "Brain analysis failed for %s: %s",
+                finding_id,
+                redact_text(str(exc)),
+            )
 
     async def _auto_plan(self) -> None:
-        """Auto-trigger the planner after N new findings."""
-        if not self._planner:
-            return
-        try:
-            intel = self.get_intel()
-            plan = await self._planner.plan_next(
-                intel.to_dict(),
-                target_context={},
-            )
-            for action in plan.actions:
-                log.info(
-                    "Planner suggests: [%s] %s/%s → %s",
-                    action.phase, action.framework, action.module, action.target,
-                )
-                self._emit_event("chain_action_new", {
-                    "phase": action.phase,
-                    "framework": action.framework,
-                    "module": action.module,
-                    "target": action.target,
-                    "rationale": action.rationale,
-                    "auto_execute": action.auto_execute,
-                })
-        except Exception as exc:
-            log.warning("Auto-plan failed: %s", exc)
+        """Remain inert until planner output has canonical plan/node custody."""
+        return
 
     def close(self) -> None:
         """Close the engagement bus and its store."""
@@ -1155,33 +1871,45 @@ class TestEngagementBus:
         return EngagementBus(db_path=tmp_path)
 
     def test_store_and_retrieve_finding(self) -> None:
+        """Store findings while the legacy auto-plan hook remains inert."""
+        calls = 0
+
+        class RecordingPlanner:
+            async def plan_next(self, *_args: Any, **_kwargs: Any) -> Any:
+                nonlocal calls
+                calls += 1
+                return type("EmptyPlan", (), {"actions": []})()
+
         bus = self._make_bus()
-        store = bus._store
-        fid = store.store_finding("webforge", {
-            "id": "test-1",
-            "title": "SQLi in login",
-            "severity": "Critical",
-            "target": "https://example.com",
-            "module": "sqli_scanner",
-        })
-        assert fid == "test-1"
-        findings = store.get_all_findings()
-        assert len(findings) >= 1
-        assert findings[0]["title"] == "SQLi in login"
-        bus.close()
+        bus._planner = RecordingPlanner()
+        try:
+            asyncio.run(bus._auto_plan())
+            assert calls == 0
+            store = bus._store
+            fid = store.store_finding("webforge", {
+                "id": "test-1",
+                "title": "SQLi in login",
+                "severity": "Critical",
+                "target": "https://example.com",
+                "module": "sqli_scanner",
+            })
+            assert fid == "test-1"
+            findings = store.get_all_findings()
+            assert len(findings) >= 1
+            assert findings[0]["title"] == "SQLi in login"
+        finally:
+            bus.close()
 
     def test_store_and_retrieve_credential(self) -> None:
         bus = self._make_bus()
         store = bus._store
         cid = store.store_credential("netforge", {
-            "host": "10.0.0.1",
-            "service": "ssh",
-            "username": "admin",
-            "password": "hunter2",
+            "credential_reference": "cred:fixture:opaque-reference",
         })
         creds = store.get_all_credentials()
         assert len(creds) >= 1
-        assert creds[0]["username"] == "admin"
+        assert creds[0]["credential_state"] == "protected_reference"
+        assert creds[0]["credential_reference"] == "cred:fixture:opaque-reference"
         bus.close()
 
     def test_severity_counts(self) -> None:
@@ -1261,7 +1989,7 @@ class TestEngagementBus:
         types = [c.chain_type for c in chains]
         assert ChainType.ZEROLOGON_TO_DOMAIN_COMPROMISE in types
 
-    def test_publish_credential_domain_triggers_chain(self) -> None:
+    def test_publish_raw_domain_credential_is_purged_and_does_not_chain(self) -> None:
         import asyncio
         bus = self._make_bus()
         cred = {
@@ -1272,8 +2000,8 @@ class TestEngagementBus:
         }
         asyncio.run(bus.publish_credential("adforge", cred))
         chains = bus.get_chain_actions()
-        chain_types = [c["chain_type"] for c in chains]
-        assert ChainType.DOMAIN_CREDS_TO_LATERAL.value in chain_types
+        assert chains == []
+        assert bus.get_credentials()[0]["credential_state"] == "purged_legacy"
         bus.close()
 
     def test_publish_credential_no_domain_no_chain(self) -> None:
@@ -1337,6 +2065,7 @@ class TestEngagementBus:
         intel = bus.get_intel()
         assert intel.total_findings == 2
         assert len(intel.credentials) == 1
+        assert intel.credentials[0]["credential_state"] == "purged_legacy"
         assert len(intel.shells) >= 1  # RCE finding classified as shell
         assert "webforge" in intel.frameworks_active
         bus.close()

@@ -969,6 +969,17 @@
       "test_name": "hashlib"
     },
     {
+      "confidence": "MEDIUM",
+      "filename": "common/brain/truth_boundary.py",
+      "fingerprint": "ee5a868c0674124a1a2db604bccc86b58e5068e200bc5382538c72ab7212e900",
+      "issue": "Possible SQL injection vector through string-based query construction.",
+      "occurrence": 1,
+      "severity": "MEDIUM",
+      "source_sha256": "104fd50c832179434d2ba9709d04d04969ee8b8aef91c2eadf36e86e5666dec2",
+      "test_id": "B608",
+      "test_name": "hardcoded_sql_expressions"
+    },
+    {
       "confidence": "HIGH",
       "filename": "common/base_module.py",
       "fingerprint": "eeb709d9251e1b472e60befd5df19e8c48a2884b13cce23b5b6d3d73eb621944",

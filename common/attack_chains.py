@@ -14,10 +14,13 @@ FOR AUTHORIZED PENETRATION TESTING AND RED TEAM OPERATIONS ONLY.
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable
+
+from common.redaction import redact_value
 
 log = logging.getLogger("forge.attack_chains")
 
@@ -33,6 +36,7 @@ class ChainState(Enum):
     COMPLETED   = "COMPLETED"    # Module succeeded, next-hops queued
     FAILED      = "FAILED"       # All modules (primary + fallbacks) errored
     BLOCKED     = "BLOCKED"      # Prerequisites not satisfied
+    ADVISORY    = "ADVISORY"     # Persisted suggestion; no action was executed
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -904,12 +908,12 @@ _CHAIN_DEFINITIONS: list[ChainTrigger] = [
 # ══════════════════════════════════════════════════════════════════════
 
 class ChainEngine:
-    """Multi-hop, scored, stateful attack chain orchestrator.
+    """Multi-hop, scored advisory chain projector.
 
     Sprint 2 capabilities:
-      - State machine per chain (PENDING/IN_PROGRESS/COMPLETED/FAILED/BLOCKED)
-      - Multi-hop continuation: after chain A completes, fires B, C, ...
-      - Failure adaptation: tries primary module, then fallback_modules in order
+      - Advisory state per chain with no module-dispatch authority
+      - Multi-hop/branch metadata retained for later canonical planning
+      - Primary/fallback module names retained as untrusted suggestions
       - Conditional branching: result payload selects downstream chain branch
       - Priority scheduling: highest impact x probability x stealth chains fire first
       - DAG enforcement: prerequisites must be COMPLETED before a chain runs
@@ -932,6 +936,7 @@ class ChainEngine:
         opsec_level: str = "STANDARD",
         module_registry: dict[str, Any] | None = None,
         max_hop_depth: int = 8,
+        advisory_sink: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         self._bus = bus or _SimpleEventBus()
         self._auto_trigger = auto_trigger
@@ -945,6 +950,8 @@ class ChainEngine:
             c.chain_id: c for c in _CHAIN_DEFINITIONS
         }
         self._max_hop_depth = max_hop_depth
+        self._advisory_sink = advisory_sink
+        self._advisory_identities: set[str] = set()
         # Track active hop paths to detect cycles at runtime
         self._active_hops: set[str] = set()
         # Custom chains registered via register_chain (separate from built-ins)
@@ -1046,22 +1053,6 @@ class ChainEngine:
         if not self._opsec_allows(chain):
             return
 
-        if not self._prerequisites_met(chain):
-            self._transition(chain.chain_id, ChainState.BLOCKED)
-            log.debug(
-                "Chain %s BLOCKED — prerequisites unmet: %s",
-                chain.chain_id, chain.prerequisites,
-            )
-            return
-
-        # Cycle detection: if this chain is already in the active hop stack, bail
-        if chain.chain_id in self._active_hops:
-            log.warning(
-                "Chain %s SKIPPED — cycle detected in hop path: %s",
-                chain.chain_id, self._active_hops,
-            )
-            return
-
         # Depth guard: count _hop_depth in payload to prevent infinite recursion
         hop_depth = int(payload.get("_hop_depth", 0))
         if hop_depth >= self._max_hop_depth:
@@ -1071,6 +1062,24 @@ class ChainEngine:
             )
             return
 
+        source_event_id = str(payload.get("source_event_id") or "")
+        if not source_event_id:
+            import hashlib
+            import json
+
+            source_event_id = "chain-event-" + hashlib.sha256(
+                json.dumps(
+                    redact_value(payload),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                ).encode("utf-8")
+            ).hexdigest()[:32]
+        advisory_identity = f"{chain.chain_id}:{source_event_id}"
+        if advisory_identity in self._advisory_identities:
+            return
+
+        prerequisites_met = self._prerequisites_met(chain)
         record: dict[str, Any] = {
             "chain_id":       chain.chain_id,
             "chain_name":     chain.name,
@@ -1080,33 +1089,71 @@ class ChainEngine:
             "mitre_tactics":  chain.mitre_tactics,
             "opsec_level":    chain.opsec_level,
             "priority_score": chain.priority_score,
-            "payload":        payload,
+            "source_event_id": source_event_id,
+            "source_observation_id": str(payload.get("observation_id") or ""),
+            "source_finding_id": str(payload.get("finding_id") or ""),
+            "tenant_id": str(payload.get("tenant_id") or ""),
+            "engagement_id": str(payload.get("engagement_id") or ""),
+            "target": str(redact_value(payload.get("target") or payload.get("url") or "")),
             "auto_executed":  False,
-            "state":          ChainState.PENDING.value,
+            "executed_module": "",
+            "execution_state": "advisory",
+            "legacy_auto_execute_hint": bool(chain.auto_execute),
+            "legacy_auto_trigger_value": bool(self._auto_trigger),
+            "auto_trigger_ignored": True,
+            "prerequisites_met": prerequisites_met,
+            "advisory_next_chains": list(chain.next_chains),
+            "advisory_branch_candidates": dict(chain.branch_conditions),
+            "state":          ChainState.ADVISORY.value,
             "hop_depth":      hop_depth,
         }
 
-        if self._auto_trigger and chain.auto_execute:
-            self._transition(chain.chain_id, ChainState.IN_PROGRESS)
-            self._active_hops.add(chain.chain_id)
-            try:
-                success = self._execute_with_fallback(chain, payload, record)
-                if success:
-                    self._transition(chain.chain_id, ChainState.COMPLETED)
-                    self._continue_hop(chain, payload, hop_depth)
-                    self._evaluate_branch(chain, payload, hop_depth)
-                else:
-                    self._transition(chain.chain_id, ChainState.FAILED)
-            finally:
-                self._active_hops.discard(chain.chain_id)
-        else:
-            log.info(
-                "Chain suggestion: %s → %s (auto=%s, opsec=%s, score=%.2f)",
-                chain.name, chain.next_module,
-                chain.auto_execute, chain.opsec_level, chain.priority_score,
+        # Task 106: definitions, noisy mode, and legacy ``auto_execute`` are
+        # metadata only.  No chain event can call a module or schedule work.
+        if self._advisory_sink is None:
+            log.warning(
+                "Chain advisory %s blocked: canonical persistence unavailable",
+                chain.chain_id,
             )
+            self._transition(chain.chain_id, ChainState.BLOCKED)
+            return
+        try:
+            persisted = self._advisory_sink(dict(record))
+        except Exception as exc:
+            # Persistence failure cannot fall back to execution.
+            log.warning(
+                "Chain advisory sink rejected %s (%s)",
+                chain.chain_id,
+                type(exc).__name__,
+            )
+            self._transition(chain.chain_id, ChainState.BLOCKED)
+            return
+        if isinstance(persisted, Mapping):
+            canonical_id = str(persisted.get("id") or "")
+            canonical_state = str(persisted.get("state") or "")
+            accepted = persisted.get("accepted") is True
+        else:
+            canonical_id = str(getattr(persisted, "id", "") or "")
+            canonical_state = str(getattr(persisted, "state", "") or "")
+            resolution = getattr(persisted, "resolution", None)
+            accepted = bool(getattr(resolution, "supported", False))
+        if (
+            not accepted
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:@+\-]{0,199}", canonical_id)
+            is None
+            or canonical_state not in {"advisory", "simulation"}
+        ):
+            log.warning(
+                "Chain advisory %s blocked: canonical node rejected",
+                chain.chain_id,
+            )
+            self._transition(chain.chain_id, ChainState.BLOCKED)
+            return
+        record["canonical_advisory_id"] = canonical_id
+        record["canonical_advisory_state"] = canonical_state
 
-        record["state"] = self._chain_states[chain.chain_id].value
+        self._transition(chain.chain_id, ChainState.ADVISORY)
+        self._advisory_identities.add(advisory_identity)
         self._triggered.append(record)
 
         try:
@@ -1120,55 +1167,15 @@ class ChainEngine:
         payload: dict[str, Any],
         record: dict[str, Any],
     ) -> bool:
-        """Try next_module then iterate through fallback_modules on failure.
+        """Compatibility shim that can no longer dispatch a module.
 
-        Handles both sync and async module methods (run_chain / run_for_target).
-        Returns True if any module succeeded, False when all exhausted.
+        Callers must resolve the advisory node through the canonical Task 106
+        policy/approval/job service.  Returning false is fail-closed and does
+        not mark the chain failed or complete.
         """
-        import asyncio
-        import inspect
-
-        async def _resolve_awaitable(awaitable: Awaitable[Any]) -> Any:
-            return await awaitable
-
-        candidates = [chain.next_module] + list(chain.fallback_modules)
-        for module_name in candidates:
-            module = self._modules.get(module_name)
-            if not module:
-                log.debug(
-                    "Chain %s: module %r not in registry — skipping",
-                    chain.chain_id, module_name,
-                )
-                continue
-            try:
-                log.info("Firing chain: %s → %s", chain.name, module_name)
-                result = None
-                if hasattr(module, "run_chain"):
-                    result = module.run_chain(payload)
-                elif hasattr(module, "run_for_target"):
-                    target = payload.get("url") or payload.get("target", "")
-                    result = module.run_for_target(target)
-                # If the module returned a coroutine, schedule it properly
-                if inspect.isawaitable(result):
-                    try:
-                        loop = asyncio.get_running_loop()
-                    except RuntimeError:
-                        # No running loop — run synchronously as last resort
-                        asyncio.run(_resolve_awaitable(result))
-                    else:
-                        loop.create_task(_resolve_awaitable(result))
-                record["auto_executed"] = True
-                record["executed_module"] = module_name
-                return True
-            except Exception as exc:
-                log.warning(
-                    "Chain %s: module %r failed (%s) — trying next fallback",
-                    chain.chain_id, module_name, exc,
-                )
-        log.error(
-            "Chain %s: all modules exhausted — primary=%r fallbacks=%r",
-            chain.chain_id, chain.next_module, chain.fallback_modules,
-        )
+        record["auto_executed"] = False
+        record["executed_module"] = ""
+        record["execution_state"] = "advisory"
         return False
 
     def _continue_hop(
@@ -1293,13 +1300,13 @@ def list_all_chains() -> str:
     """Return a formatted priority-ranked table of all attack chains."""
     chains = sorted(_CHAIN_DEFINITIONS, key=lambda c: c.priority_score, reverse=True)
     lines = [
-        "  Forge Suite v5 APEX — Attack Chain Engine v2 (Sprint 2)",
+        "  Forge Suite v5 APEX — Advisory Attack Chain Catalog",
         "  " + "-" * 75,
-        f"  {'SCORE':>6}  {'OPSEC':8}  {'MODE':6}  Chain",
+        f"  {'SCORE':>6}  {'OPSEC':8}  {'HINT':6}  Chain",
         "  " + "-" * 75,
     ]
     for c in chains:
-        auto  = "AUTO  " if c.auto_execute else "MANUAL"
+        auto  = "LEGACY" if c.auto_execute else "REVIEW"
         score = f"{c.priority_score:6.2f}"
         lines.append(f"  {score}  [{c.opsec_level:8}]  [{auto}]  {c.name}")
         if c.next_chains:

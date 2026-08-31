@@ -1491,8 +1491,10 @@ async def _run_scan_impl(
     cfg.extra["cred_engine"] = cred_engine
 
     # ── Attack Chain Engine (Red Team, graceful if unavailable) ───────
-    AttackChain = _import_attack_chain()
-    attack_chain = AttackChain(cred_engine=cred_engine) if (args.red_team and AttackChain and cred_engine) else None
+    # The legacy NetForge chain has no canonical Task 106 plan/node sink.
+    # Keep it disabled even in red-team mode; ordinary findings cannot become
+    # compromise state, credential reuse, or an execution-looking queue.
+    attack_chain = None
     cfg.extra["attack_chain"] = attack_chain
 
     # ── Transport Manager for credentialed scanning (v5.1) ───────────

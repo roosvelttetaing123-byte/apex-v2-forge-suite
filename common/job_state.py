@@ -1065,7 +1065,9 @@ class JobStateService:
                 # SQLAlchemy's SQLite DateTime adapter strips the offset from
                 # values that were validated as UTC before persistence.
                 expires = expires.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) >= expires.astimezone(timezone.utc):
+            if datetime.fromtimestamp(
+                self.clock(), timezone.utc
+            ) >= expires.astimezone(timezone.utc):
                 return False
         except (TypeError, ValueError):
             return False

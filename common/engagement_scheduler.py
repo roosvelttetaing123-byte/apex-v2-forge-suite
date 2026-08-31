@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -30,6 +31,8 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Coroutine
+
+from common.redaction import redact_text, redact_value
 
 log = logging.getLogger("forge.engagement_scheduler")
 
@@ -196,7 +199,7 @@ class EngagementRun:
             "run_id": self.run_id, "started_at": self.started_at,
             "completed_at": self.completed_at, "status": self.status,
             "findings": self.findings, "duration": round(self.duration, 1),
-            "error": self.error,
+            "error": redact_text(str(self.error))[:2000],
         }
 
 
@@ -451,10 +454,22 @@ class EngagementScheduler:
                 "runs": [r.to_dict() for r in self._runs],
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
-            with open(self._history_file, "w") as f:
-                json.dump(data, f, indent=2)
+            safe_data = redact_value(data)
+            descriptor = os.open(
+                self._history_file,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600,
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                    descriptor = -1
+                    json.dump(safe_data, stream, indent=2)
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
         except Exception as exc:
-            log.debug("History save failed: %s", exc)
+            log.debug("History save failed: %s", redact_text(str(exc)))
 
     def _emit_event(self, event_type: str, **data: Any) -> None:
         """Emit event to dashboard."""

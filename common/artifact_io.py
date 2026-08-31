@@ -96,6 +96,7 @@ def open_private_directory(
     directory: str | os.PathLike[str],
     *,
     create: bool = True,
+    tighten: bool = True,
 ) -> int:
     """Open a no-follow directory chain, privately creating missing components.
 
@@ -104,6 +105,10 @@ def open_private_directory(
     created by this boundary are tightened through their descriptors to
     ``0700`` independently of the process umask.
     """
+    if create and not tighten:
+        raise ArtifactBoundaryError(
+            "directory creation requires namespace tightening"
+        )
     candidate = absolute_lexical_path(directory)
     descriptor = -1
     try:
@@ -112,7 +117,8 @@ def open_private_directory(
             raise ArtifactBoundaryError("artifact directory is unavailable")
         descriptor = os.open(anchor, _DIRECTORY_FLAGS)
         for component in candidate.parts[1:]:
-            _tighten_owner_primary_group_directory(descriptor)
+            if tighten:
+                _tighten_owner_primary_group_directory(descriptor)
             created = False
             try:
                 metadata = os.stat(
@@ -192,9 +198,27 @@ def ensure_private_directory(directory: str | os.PathLike[str]) -> None:
         _safe_close(descriptor)
 
 
+def validate_private_directory_readonly(
+    directory: str | os.PathLike[str],
+) -> None:
+    """Validate an existing private directory chain without changing it."""
+
+    descriptor = -1
+    try:
+        descriptor = open_private_directory(
+            directory,
+            create=False,
+            tighten=False,
+        )
+    finally:
+        _safe_close(descriptor)
+
+
 def directory_descriptor_matches(
     descriptor: int,
     directory: str | os.PathLike[str],
+    *,
+    readonly: bool = False,
 ) -> bool:
     """Return whether a lexical directory still names the pinned descriptor.
 
@@ -205,7 +229,15 @@ def directory_descriptor_matches(
     """
     comparison_descriptor = -1
     try:
-        comparison_descriptor = open_private_directory(directory, create=False)
+        comparison_descriptor = (
+            open_private_directory(
+                directory,
+                create=False,
+                tighten=False,
+            )
+            if readonly
+            else open_private_directory(directory, create=False)
+        )
         pinned = os.fstat(descriptor)
         current = os.fstat(comparison_descriptor)
         return (
@@ -769,7 +801,11 @@ def _open_verified_regular_file_for_read_pinned(
     parent_descriptor = -1
     descriptor = -1
     try:
-        parent_descriptor = open_private_directory(candidate.parent, create=False)
+        parent_descriptor = open_private_directory(
+            candidate.parent,
+            create=False,
+            tighten=False,
+        )
         before = os.stat(
             candidate.name,
             dir_fd=parent_descriptor,
@@ -809,6 +845,7 @@ def _open_verified_regular_file_for_read_pinned(
         if not directory_descriptor_matches(
             parent_descriptor,
             candidate.parent,
+            readonly=True,
         ):
             raise ArtifactBoundaryError("artifact directory changed during read")
         result_descriptor = descriptor
@@ -927,6 +964,7 @@ def read_verified_regular_file(
         ) or not directory_descriptor_matches(
             parent_descriptor,
             candidate.parent,
+            readonly=True,
         ):
             raise ArtifactBoundaryError("artifact changed during read")
         result = bytes(payload)

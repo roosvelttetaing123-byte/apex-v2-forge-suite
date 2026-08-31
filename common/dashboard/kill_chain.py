@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any
+from typing import Any, Mapping
 
 log = logging.getLogger("forge.dashboard.killchain")
 
@@ -339,25 +339,71 @@ class KillChainState:
     active_phase: KillChainPhase | None = None
     highest_phase_reached: KillChainPhase = KillChainPhase.RECONNAISSANCE
     compromise_achieved: bool = False
+    _finding_identities: set[str] = field(default_factory=set, repr=False)
+    _completion_identities: set[str] = field(default_factory=set, repr=False)
 
-    def record_finding(self, module_name: str) -> None:
-        """Record a finding and update the kill chain state."""
+    def record_finding(
+        self,
+        module_name: str,
+        *,
+        verification_state: str = "unknown",
+        observation_id: str = "",
+        evidence_refs: list[str] | tuple[str, ...] = (),
+    ) -> bool:
+        """Record only a canonical verified finding with evidence lineage."""
+        if (
+            str(verification_state).lower() != "verified"
+            or not str(observation_id)
+            or not tuple(evidence_refs)
+        ):
+            return False
+        identity = "\x1f".join(
+            (str(observation_id), module_name, *sorted(str(ref) for ref in evidence_refs))
+        )
+        if identity in self._finding_identities:
+            return False
+        self._finding_identities.add(identity)
         phase = ALL_KILL_CHAIN.get(module_name, KillChainPhase.RECONNAISSANCE)
         self.phase_findings[phase] = self.phase_findings.get(phase, 0) + 1
         if phase.value > self.highest_phase_reached.value:
             self.highest_phase_reached = phase
         if phase == KillChainPhase.ACTIONS_ON_OBJECTIVE:
             self.compromise_achieved = True
+        return True
 
     def record_module_start(self, module_name: str) -> None:
         """Track which kill chain phase is currently active."""
         phase = ALL_KILL_CHAIN.get(module_name, KillChainPhase.RECONNAISSANCE)
         self.active_phase = phase
 
-    def record_module_complete(self, module_name: str) -> None:
-        """Track module completion per phase."""
+    def record_module_complete(
+        self,
+        module_name: str,
+        *,
+        canonical_job_id: str = "",
+        outcome: str = "",
+        evidence_refs: list[str] | tuple[str, ...] = (),
+    ) -> bool:
+        """Track only signed/evidenced canonical success, never an event claim."""
+        if (
+            not str(canonical_job_id)
+            or str(outcome).lower() != "success"
+            or not tuple(evidence_refs)
+        ):
+            return False
+        identity = "\x1f".join(
+            (
+                str(canonical_job_id),
+                module_name,
+                *sorted(str(ref) for ref in evidence_refs),
+            )
+        )
+        if identity in self._completion_identities:
+            return False
+        self._completion_identities.add(identity)
         phase = ALL_KILL_CHAIN.get(module_name, KillChainPhase.RECONNAISSANCE)
         self.phase_modules_run[phase] = self.phase_modules_run.get(phase, 0) + 1
+        return True
 
     def set_module_totals(self, module_names: list[str]) -> None:
         """Calculate total modules per kill chain phase."""
@@ -399,6 +445,7 @@ class KillChainState:
             "highest_reached": self.highest_phase_reached.value,
             "overall_completion": round(self.completion_pct(), 1),
             "compromise_achieved": self.compromise_achieved,
+            "truth_source": "canonical_job_outcome_and_evidence",
         }
 
     def render_ascii(self, width: int = 70) -> str:
@@ -500,11 +547,20 @@ OWASP_LLM_TOP_10_2025 = {
 }
 
 
-def calculate_owasp_coverage(completed_modules: list[str]) -> dict[str, dict[str, Any]]:
-    """Calculate OWASP Top 10 coverage from completed modules.
+def calculate_owasp_coverage(
+    canonical_outcomes: list[Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Calculate OWASP coverage only from evidenced canonical success rows.
 
     Returns dict mapping OWASP ID → {name, covered, modules}.
     """
+    completed_modules = [
+        str(item.get("module") or "")
+        for item in canonical_outcomes
+        if str(item.get("outcome") or "").lower() == "success"
+        and bool(item.get("canonical_job_id"))
+        and bool(item.get("evidence_refs"))
+    ]
     coverage: dict[str, dict[str, Any]] = {}
     for owasp_id, name in OWASP_TOP_10_2021.items():
         matching = [
@@ -529,19 +585,34 @@ class TestKillChain:
 
     def test_kill_chain_state_finding(self) -> None:
         state = KillChainState()
-        state.record_finding("sqli_scanner")
+        state.record_finding(
+            "sqli_scanner",
+            verification_state="verified",
+            observation_id="observation-fixture",
+            evidence_refs=("artifact:fixture",),
+        )
         assert state.phase_findings[KillChainPhase.EXPLOITATION] == 1
         assert state.highest_phase_reached == KillChainPhase.EXPLOITATION
 
     def test_kill_chain_compromise(self) -> None:
         state = KillChainState()
-        state.record_finding("dcsync")
+        state.record_finding(
+            "dcsync",
+            verification_state="verified",
+            observation_id="observation-fixture",
+            evidence_refs=("artifact:fixture",),
+        )
         assert state.compromise_achieved is True
 
     def test_completion_pct(self) -> None:
         state = KillChainState()
         state.set_module_totals(["sqli_scanner", "xss_scanner"])
-        state.record_module_complete("sqli_scanner")
+        state.record_module_complete(
+            "sqli_scanner",
+            canonical_job_id="job-fixture",
+            outcome="success",
+            evidence_refs=("artifact:fixture",),
+        )
         assert state.completion_pct() == 50.0
 
     def test_ascii_render(self) -> None:
@@ -552,14 +623,32 @@ class TestKillChain:
         assert "Exploit" in output
 
     def test_owasp_coverage(self) -> None:
-        coverage = calculate_owasp_coverage(["sqli_scanner", "xss_scanner"])
+        coverage = calculate_owasp_coverage([
+            {
+                "module": "sqli_scanner",
+                "outcome": "success",
+                "canonical_job_id": "job-sqli",
+                "evidence_refs": ["artifact:sqli"],
+            },
+            {
+                "module": "xss_scanner",
+                "outcome": "success",
+                "canonical_job_id": "job-xss",
+                "evidence_refs": ["artifact:xss"],
+            },
+        ])
         assert coverage["A03"]["covered"] is True
         assert coverage["A03"]["depth"] == 2
         assert coverage["A01"]["covered"] is False
 
     def test_serialization(self) -> None:
         state = KillChainState()
-        state.record_finding("sqli_scanner")
+        state.record_finding(
+            "sqli_scanner",
+            verification_state="verified",
+            observation_id="observation-fixture",
+            evidence_refs=("artifact:fixture",),
+        )
         d = state.to_dict()
         assert "phases" in d
         assert len(d["phases"]) == 7

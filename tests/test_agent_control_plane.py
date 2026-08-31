@@ -753,7 +753,7 @@ class TestFindingStatusPersistence(unittest.IsolatedAsyncioTestCase):
 
 
 class TestBrainAndChainDashboardEvents(unittest.TestCase):
-    def test_state_store_tracks_brain_verdict_and_chain_action(self):
+    def test_state_store_suppresses_raw_brain_verdict_and_chain_action(self):
         from common.dashboard.event_bus import EventBus, EventType
         from common.dashboard.state_store import StateStore
 
@@ -795,21 +795,28 @@ class TestBrainAndChainDashboardEvents(unittest.TestCase):
         bus.stop()
 
         snap = store.snapshot()
-        self.assertEqual(snap["brain_verdicts"][0]["finding"], "SQL Injection")
-        self.assertEqual(snap["brain_verdicts"][0]["confidence"], "HIGH")
-        self.assertEqual(snap["chain_actions"][0]["target_module"], "cred_spray")
-        self.assertTrue(
-            any(item["type"] == "chain_action" for item in snap["timeline"])
+        self.assertEqual(snap["findings"], [])
+        self.assertEqual(snap["brain_verdicts"], [])
+        self.assertEqual(snap["chain_actions"], [])
+        self.assertFalse(
+            any(
+                item["type"] in {"brain_verdict", "chain_action"}
+                for item in snap["timeline"]
+            )
         )
 
-    def test_engagement_bus_emits_first_class_brain_and_chain_events(self):
+    def test_engagement_bus_blocks_automatic_brain_and_unpersisted_chain_events(self):
         from common.brain.engagement_bus import EngagementBus
         from common.dashboard.event_bus import EventBus, EventType
 
         class RuleBrain:
             available = True
 
+            def __init__(self):
+                self.calls = 0
+
             async def analyze_finding(self, finding):
+                self.calls += 1
                 class Result:
                     class Value:
                         def __init__(self, value):
@@ -822,13 +829,17 @@ class TestBrainAndChainDashboardEvents(unittest.TestCase):
                 return Result()
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            events = EventBus()
+            events = EventBus(run_id="run-agent-control-fixture")
             seen = []
-            events.subscribe(None, lambda event: seen.append(event.event_type))
+            events.subscribe(
+                None, lambda event: seen.append((event.event_type, event.data))
+            )
             events.start()
+            brain = RuleBrain()
             bus = EngagementBus(
                 db_path=str(Path(tmpdir) / "engagement.db"),
-                brain=RuleBrain(),
+                run_id="run-agent-control-fixture",
+                brain=brain,
                 event_bus=events,
             )
             try:
@@ -848,13 +859,17 @@ class TestBrainAndChainDashboardEvents(unittest.TestCase):
                 asyncio.run(publish_and_wait())
                 import time as _time
                 _time.sleep(0.3)
+                chain_actions = bus.get_chain_actions()
             finally:
                 bus.close()
                 events.stop()
 
-        self.assertIn(EventType.FINDING_NEW, seen)
-        self.assertIn(EventType.CHAIN_ACTION_NEW, seen)
-        self.assertIn(EventType.BRAIN_VERDICT, seen)
+        event_types = [event_type for event_type, _data in seen]
+        self.assertIn(EventType.FINDING_NEW, event_types)
+        self.assertNotIn(EventType.CHAIN_ACTION_NEW, event_types)
+        self.assertNotIn(EventType.BRAIN_VERDICT, event_types)
+        self.assertEqual(brain.calls, 0)
+        self.assertEqual(chain_actions, [])
 
 
 if __name__ == "__main__":

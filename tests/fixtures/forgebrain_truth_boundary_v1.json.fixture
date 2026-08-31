@@ -1,0 +1,71 @@
+{
+  "schema_version": "forge-brain-truth-v1",
+  "registry": {
+    "registry_version": "forge-capability-registry-v1",
+    "registry_digest": "sha256:5bf53e70c11a44032bd9d319cefce5b93afb8a4fe11a3829558660577a3d6292",
+    "supported": {
+      "id": "webforge:header_audit",
+      "version": "1.0.0",
+      "engine": "webforge",
+      "input_kind": "url",
+      "safety": "passive",
+      "maturity": "experimental",
+      "implementation": "header_audit",
+      "reference_slice": "header-audit-csp-v1",
+      "source_digest": "sha256:5c2a0887403fbd0959ccd9e2a08cc9b5ac6d355305cb9511478f241509daad84"
+    },
+    "versionless": {"id": "webforge:xss_scanner", "engine": "webforge", "maturity": "experimental"},
+    "disabled": {"id": "webforge:disabled_fixture", "version": "1.0.0", "engine": "webforge", "maturity": "disabled"},
+    "wrong_engine": {"id": "webforge:header_audit", "version": "1.0.0", "engine": "netforge"},
+    "wrong_input": {"id": "webforge:header_audit", "version": "1.0.0", "input_kind": "host"}
+  },
+  "policy": {
+    "allowed": {"safety": "passive", "parameters": {}, "target": "https://fixture.example"},
+    "denied_active": {"safety": "active"},
+    "denied_extra_module": {"modules": ["header_audit", "xss_scanner"]},
+    "denied_credentials": {"credential_reference": "cred:fixture:synthetic"},
+    "out_of_scope": {"target": "https://outside.example"}
+  },
+  "approval": {
+    "operator": "operator-fixture",
+    "tenant": "tenant-a",
+    "engagement": "engagement-a",
+    "action": "action-fixture",
+    "job": "job-fixture",
+    "nonce": "approval-nonce-fixture"
+  },
+  "approval_negative_cases": [
+    "missing_approval",
+    "stale_approval",
+    "replayed_approval",
+    "wrong_target",
+    "wrong_job",
+    "wrong_operator",
+    "cross_tenant"
+  ],
+  "event_cases": [
+    "duplicate_model_response",
+    "duplicate_chain_event",
+    "restart_before_action_creation",
+    "restart_after_action_creation"
+  ],
+  "secret_surfaces": [
+    "model_request",
+    "memory",
+    "cache_key",
+    "cache_value",
+    "log",
+    "event",
+    "sqlite",
+    "audit",
+    "report",
+    "export",
+    "backup",
+    "temporary_file"
+  ],
+  "outcomes": ["advisory", "simulation", "success", "failed", "partial", "canceled", "timeout", "unauthorized", "unsupported", "inconclusive"],
+  "secrets": {"canary": "TASK106-SYNTHETIC-CREDENTIAL-CANARY", "reference": "cred:fixture:opaque"},
+  "tenants": ["tenant-a", "tenant-b"],
+  "restart": ["before_intent", "after_intent_before_consume", "after_consume_before_job", "after_job_before_link", "after_link"],
+  "migration": {"version": "forge-brain-truth-v1", "reversible": true, "plaintext_restore": false}
+}

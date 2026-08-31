@@ -1,14 +1,10 @@
-"""ReportNarrator — AI-powered report narrative generation.
+"""ReportNarrator — bounded advisory report projections.
 
-Wraps ForgeBrain to produce human-readable security assessment narratives:
-    - executive_summary()       → C-suite-ready engagement overview
-    - attack_narrative()        → step-by-step "what happened" red team story
-    - remediation_roadmap()     → prioritized fix list with effort estimates
-    - finding_description()     → AI-enhanced per-finding description
-    - risk_scenario()           → "what an attacker could do in 30 minutes"
+Generic caller/model records cannot establish report facts. Compatibility APIs
+return explicit non-authoritative notices until supplied through a canonical
+plan/action/job/outcome/observation/artifact projection.
 
-Graceful degradation: if brain is unavailable, all methods fall back to
-template-based summaries. No API key? Still works — just less eloquent.
+Model availability never changes that postcondition.
 
 FOR AUTHORIZED PENETRATION TESTING AND RED TEAM OPERATIONS ONLY.
 """
@@ -16,7 +12,6 @@ from __future__ import annotations
 
 import json
 import logging
-import textwrap
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
@@ -29,10 +24,14 @@ from common.brain.brain import (
     _ordinary_label,
     _ordinary_memory_metadata,
 )
+from common.brain.truth_boundary import (
+    advisory_narrative_projection,
+    advisory_report_projection,
+)
 from common.evidence import (
-    ordinary_evidence_artifacts,
     ordinary_finding_projection,
 )
+from common.redaction import redact_text
 
 log = logging.getLogger("forge.brain.narrator")
 
@@ -262,14 +261,6 @@ class ReportNarrator:
         target = _ordinary_label(target, limit=2_000)
         engagement = _ordinary_label(engagement, limit=500)
         scope = _ordinary_label(scope, limit=2_000)
-        if self._brain.available:
-            try:
-                return await self._ai_executive_summary(
-                    findings, target, engagement, scope
-                )
-            except Exception as exc:
-                log.warning("AI executive_summary failed, using template: %s", exc)
-
         return self._template_executive_summary(findings, target, engagement, scope)
 
     async def attack_narrative(
@@ -293,12 +284,7 @@ class ReportNarrator:
             Attack narrative as formatted markdown string.
         """
         truthful_chain_log = _ordinary_chain_log(chain_log)
-        if self._brain.available:
-            try:
-                return await self._ai_attack_narrative(truthful_chain_log, memory)
-            except Exception as exc:
-                log.warning("AI attack_narrative failed, using template: %s", exc)
-
+        del memory
         return self._template_attack_narrative(truthful_chain_log)
 
     async def remediation_roadmap(
@@ -317,12 +303,6 @@ class ReportNarrator:
             Remediation roadmap as formatted markdown string.
         """
         findings = _ordinary_findings(findings)
-        if self._brain.available:
-            try:
-                return await self._ai_remediation_roadmap(findings)
-            except Exception as exc:
-                log.warning("AI remediation_roadmap failed, using template: %s", exc)
-
         return self._template_remediation_roadmap(findings)
 
     async def finding_description(
@@ -350,13 +330,7 @@ class ReportNarrator:
             Enhanced description as a string.
         """
         finding = ordinary_finding_projection(finding)
-        context = _ordinary_finding_context(context)
-        if self._brain.available:
-            try:
-                return await self._ai_finding_description(finding, context)
-            except Exception as exc:
-                log.warning("AI finding_description failed, using template: %s", exc)
-
+        del context
         return self._template_finding_description(
             finding, cvss_v4=cvss_v4, epss_score=epss_score, kev_status=kev_status
         )
@@ -378,12 +352,6 @@ class ReportNarrator:
             Risk scenario narrative as formatted markdown string.
         """
         findings = _ordinary_findings(findings)
-        if self._brain.available:
-            try:
-                return await self._ai_risk_scenario(findings)
-            except Exception as exc:
-                log.warning("AI risk_scenario failed, using template: %s", exc)
-
         return self._template_risk_scenario(findings)
 
     # ══════════════════════════════════════════════════════════════════
@@ -432,16 +400,10 @@ class ReportNarrator:
             ),
         }, indent=2, default=str)
 
-        return await self._brain._call(
-            prompt,
-            model=self._brain._model,
-            max_tokens=2500,
-            system=(
-                "You are a senior security consultant writing an executive summary "
-                "for a penetration test report. Your audience is C-suite leadership "
-                "who may not have technical backgrounds. Write professionally, "
-                "clearly, and focus on business impact. Use markdown formatting."
-            ),
+        del prompt
+        return advisory_report_projection(
+            projection_kind="executive_summary",
+            entry_count=len(findings),
         )
 
     async def _ai_attack_narrative(
@@ -482,18 +444,8 @@ class ReportNarrator:
             ),
         }, indent=2, default=str)
 
-        return await self._brain._call(
-            prompt,
-            model=self._brain._model,
-            max_tokens=4000,
-            system=(
-                "You are an expert red team operator writing the attack narrative "
-                "section of a penetration test report. Write technically accurate "
-                "but engaging prose. Tell the story of the engagement — each step "
-                "should flow naturally into the next. Use markdown. Respond in "
-                "prose, not JSON."
-            ),
-        )
+        del prompt
+        return advisory_narrative_projection(chain_log)
 
     async def _ai_remediation_roadmap(
         self,
@@ -528,16 +480,10 @@ class ReportNarrator:
             ),
         }, indent=2, default=str)
 
-        return await self._brain._call(
-            prompt,
-            model=self._brain._model,
-            max_tokens=3000,
-            system=(
-                "You are a security consultant creating a remediation roadmap. "
-                "Be specific, practical, and estimate effort realistically. "
-                "Use markdown formatting with tables. Respond in prose/tables, "
-                "not JSON."
-            ),
+        del prompt
+        return advisory_report_projection(
+            projection_kind="remediation_roadmap",
+            entry_count=len(findings),
         )
 
     async def _ai_finding_description(
@@ -580,16 +526,10 @@ class ReportNarrator:
             ),
         }, indent=2, default=str)
 
-        return await self._brain._call(
-            prompt,
-            model=self._brain._fast_model,
-            max_tokens=1500,
-            system=(
-                "You are a security analyst writing a detailed finding description "
-                "for a penetration test report. Be technically precise, include "
-                "specific remediation steps, and explain business impact. "
-                "Respond in markdown prose."
-            ),
+        del prompt
+        return advisory_report_projection(
+            projection_kind="finding_description",
+            entry_count=1 if finding else 0,
         )
 
     async def _ai_risk_scenario(
@@ -624,16 +564,10 @@ class ReportNarrator:
             ),
         }, indent=2, default=str)
 
-        return await self._brain._call(
-            prompt,
-            model=self._brain._model,
-            max_tokens=2000,
-            system=(
-                "You are a threat intelligence analyst writing a realistic attack "
-                "scenario for executive leadership. Chain discovered vulnerabilities "
-                "into a plausible, concrete attack narrative. Focus on business "
-                "impact and urgency. Respond in markdown."
-            ),
+        del prompt
+        return advisory_report_projection(
+            projection_kind="risk_scenario",
+            entry_count=len(findings),
         )
 
     # ══════════════════════════════════════════════════════════════════
@@ -649,96 +583,10 @@ class ReportNarrator:
     ) -> str:
         """Template-based executive summary when brain is unavailable."""
         findings = _ordinary_findings(findings)
-        sev = Counter(f.get("severity", "Informational") for f in findings)
-        crit = sev.get("Critical", 0)
-        high = sev.get("High", 0)
-        med  = sev.get("Medium", 0)
-        low  = sev.get("Low", 0)
-        info = sev.get("Informational", 0)
-
-        # Risk rating
-        if crit > 0:
-            risk = "CRITICAL"
-            risk_desc = (
-                "The assessment identified critical vulnerabilities that pose an "
-                "immediate risk to the organization. These issues could allow an "
-                "attacker to gain unauthorized access to sensitive systems and data."
-            )
-        elif high > 0:
-            risk = "HIGH"
-            risk_desc = (
-                "The assessment identified high-severity vulnerabilities that "
-                "require prompt remediation. These issues could be exploited by "
-                "a skilled attacker to compromise key systems."
-            )
-        elif med > 0:
-            risk = "MEDIUM"
-            risk_desc = (
-                "The assessment identified moderate-risk vulnerabilities. While "
-                "not immediately exploitable in isolation, these issues could be "
-                "chained together or exploited under certain conditions."
-            )
-        else:
-            risk = "LOW"
-            risk_desc = (
-                "The assessment identified only low-severity or informational "
-                "findings. The target demonstrates a strong security posture "
-                "with no critical weaknesses identified."
-            )
-
-        # Top findings
-        sorted_f = _sort_by_severity(findings)
-        top_section = ""
-        if sorted_f:
-            top_items = []
-            for f in sorted_f[:5]:
-                title = f.get("title", "Unknown Finding")
-                sev_str = f.get("severity", "Informational")
-                desc = (f.get("description") or "No description available.")[:200]
-                top_items.append(
-                    f"- **{title}** ({sev_str}): {desc}"
-                )
-            top_section = "\n".join(top_items)
-
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-        return textwrap.dedent(f"""\
-            # Executive Summary — {engagement}
-
-            **Date:** {now}
-            **Target:** {target}
-            {f"**Scope:** {scope}" if scope else ""}
-            **Overall Risk Rating:** **{risk}**
-
-            ## Overview
-
-            {risk_desc}
-
-            A total of **{len(findings)}** findings were identified during this assessment:
-
-            | Severity | Count |
-            |----------|-------|
-            | Critical | {crit} |
-            | High | {high} |
-            | Medium | {med} |
-            | Low | {low} |
-            | Informational | {info} |
-
-            ## Key Findings
-
-            {top_section or "No findings to report."}
-
-            ## Recommendations
-
-            {"**Immediate Action Required:** Critical vulnerabilities must be remediated within 24 hours. These represent active risk to the organization." if crit > 0 else ""}
-            {"**Priority Remediation:** High-severity findings should be addressed within 7 business days." if high > 0 else ""}
-            {"**Scheduled Remediation:** Medium-severity findings should be included in the next development sprint." if med > 0 else ""}
-
-            A detailed remediation roadmap is provided in the full report.
-
-            ---
-            *Generated by ForgeBrain (template mode)*
-        """)
+        return advisory_report_projection(
+            projection_kind="executive_summary",
+            entry_count=len(findings),
+        )
 
     def _template_attack_narrative(
         self,
@@ -746,77 +594,7 @@ class ReportNarrator:
     ) -> str:
         """Template-based attack narrative when brain is unavailable."""
         chain_log = _ordinary_chain_log(chain_log)
-        if not chain_log:
-            return (
-                "# Attack Narrative\n\n"
-                "No attack chain log was recorded during this engagement.\n\n"
-                "---\n*Generated by ForgeBrain (template mode)*\n"
-            )
-
-        sections: list[str] = ["# Attack Narrative\n"]
-
-        # Group by phase if available
-        phases: dict[str, list[dict[str, Any]]] = {}
-        for step in chain_log:
-            phase = step.get("phase", step.get("mitre", "Execution"))
-            phases.setdefault(phase, []).append(step)
-
-        step_num = 0
-        for phase, steps in phases.items():
-            sections.append(f"\n## Phase: {phase}\n")
-
-            for step in steps:
-                step_num += 1
-                action   = step.get("action", "Unknown action")
-                target   = step.get("target", "unknown target")
-                result   = step.get("result", "")
-                fw       = step.get("framework", "")
-                ts       = step.get("timestamp", "")
-                verification_state = step.get("verification_state") or "unknown"
-                proof_type = step.get("proof_type") or "unknown"
-                maturity = step.get("maturity") or "experimental"
-
-                # MITRE fallback: check mitre field, then module name lookup
-                mitre = step.get("mitre", "")
-                if not mitre:
-                    mod = step.get("module", "")
-                    mitre = _MODULE_MITRE.get(mod, "")
-
-                fw_tag    = f" [{fw}]" if fw else ""
-                mitre_tag = f" (ATT&CK: {mitre})" if mitre else ""
-                ts_tag    = f" *{ts}*" if ts else ""
-
-                sections.append(
-                    f"**Step {step_num}:** {action} against `{target}`"
-                    f"{fw_tag}{mitre_tag}\n"
-                )
-                if result:
-                    sections.append(f"> Observation: {result}\n")
-                sections.append(
-                    f"> Truth: verification_state={verification_state}; "
-                    f"proof_type={proof_type}; maturity={maturity}\n"
-                )
-                if ts_tag:
-                    sections.append(f"{ts_tag}\n")
-
-        # Chain summary
-        total_actions = len(chain_log)
-        frameworks_used = set(s.get("framework", "") for s in chain_log) - {""}
-        verified_actions = sum(
-            1 for s in chain_log
-            if str(s.get("verification_state") or "").lower() == "verified"
-        )
-
-        sections.append(
-            f"\n## Summary\n\n"
-            f"The engagement comprised **{total_actions}** discrete actions "
-            f"across **{len(frameworks_used) or 1}** framework(s)"
-            f"{' (' + ', '.join(sorted(frameworks_used)) + ')' if frameworks_used else ''}. "
-            f"**{verified_actions}** action(s) produced verified outcomes.\n"
-        )
-
-        sections.append("\n---\n*Generated by ForgeBrain (template mode)*\n")
-        return "\n".join(sections)
+        return advisory_narrative_projection(chain_log)
 
     def _template_remediation_roadmap(
         self,
@@ -824,84 +602,10 @@ class ReportNarrator:
     ) -> str:
         """Template-based remediation roadmap when brain is unavailable."""
         findings = _ordinary_findings(findings)
-        if not findings:
-            return (
-                "# Remediation Roadmap\n\n"
-                "No findings to remediate.\n\n"
-                "---\n*Generated by ForgeBrain (template mode)*\n"
-            )
-
-        sorted_f = _sort_by_severity(findings)
-
-        # Tier assignments
-        tiers: dict[str, list[dict[str, Any]]] = {
-            "🔴 Immediate (within 24 hours)":  [],
-            "🟠 Short-Term (within 7 days)":   [],
-            "🟡 Medium-Term (within 30 days)": [],
-            "🟢 Long-Term (within 90 days)":   [],
-        }
-
-        tier_keys = list(tiers.keys())
-        for f in sorted_f:
-            sev = f.get("severity", "Informational")
-            if sev == "Critical":
-                tiers[tier_keys[0]].append(f)
-            elif sev == "High":
-                tiers[tier_keys[1]].append(f)
-            elif sev == "Medium":
-                tiers[tier_keys[2]].append(f)
-            else:
-                tiers[tier_keys[3]].append(f)
-
-        sections: list[str] = ["# Remediation Roadmap\n"]
-        total_effort_min = 0.0
-        total_effort_max = 0.0
-
-        for tier_name, tier_findings in tiers.items():
-            if not tier_findings:
-                continue
-
-            sections.append(f"\n## {tier_name}\n")
-            sections.append("| # | Finding | Effort | Fix |")
-            sections.append("|---|---------|--------|-----|")
-
-            for i, f in enumerate(tier_findings, 1):
-                title = f.get("title", "Unknown")
-                effort, fix = self._lookup_effort(f)
-                rem = f.get("remediation", "")
-                fix_text = rem[:80] if rem else fix
-
-                sections.append(f"| {i} | {title} | {effort} | {fix_text} |")
-
-                # Parse effort for totals
-                lo, hi = self._parse_effort_hours(effort)
-                total_effort_min += lo
-                total_effort_max += hi
-
-            sections.append("")
-
-        sections.append(
-            f"\n## Estimated Total Effort\n\n"
-            f"**{total_effort_min:.0f}–{total_effort_max:.0f} engineering hours** "
-            f"across {len(findings)} finding(s).\n"
+        return advisory_report_projection(
+            projection_kind="remediation_roadmap",
+            entry_count=len(findings),
         )
-
-        # Quick wins
-        quick_wins = [
-            f for f in sorted_f
-            if f.get("severity") in ("Critical", "High")
-            and self._parse_effort_hours(self._lookup_effort(f)[0])[1] <= 4
-        ]
-        if quick_wins:
-            sections.append("\n## Quick Wins (High Impact, Low Effort)\n")
-            for f in quick_wins[:5]:
-                title = f.get("title", "Unknown")
-                effort, _ = self._lookup_effort(f)
-                sections.append(f"- **{title}** — {effort}")
-            sections.append("")
-
-        sections.append("\n---\n*Generated by ForgeBrain (template mode)*\n")
-        return "\n".join(sections)
 
     def _template_finding_description(
         self,
@@ -912,76 +616,10 @@ class ReportNarrator:
     ) -> str:
         """Template-based finding description when brain is unavailable."""
         finding = ordinary_finding_projection(finding)
-        title       = finding.get("title", "Unknown Finding")
-        severity    = finding.get("severity", "Informational")
-        target      = finding.get("target", "")
-        module      = finding.get("module", "")
-        description = finding.get("description", "")
-        remediation = finding.get("remediation", "")
-        evidence    = finding.get("evidence", {})
-        references  = finding.get("references", [])
-
-        # CVSS / EPSS / KEV — prefer explicit params, fall back to finding fields
-        cvss_str  = cvss_v4 or finding.get("cvss_v4", "")
-        epss_val  = epss_score if epss_score is not None else finding.get("epss_score")
-        kev       = kev_status or bool(finding.get("kev_status", False))
-
-        epss_flag    = f"  ⚠ EPSS {epss_val:.0%} — high exploitation probability" if epss_val and epss_val > 0.5 else ""
-        kev_str      = "Yes — CISA Known Exploited Vulnerability (immediate remediation required)" if kev else "No"
-        cvss_display = cvss_str if cvss_str else "Not scored"
-
-        # Only verified, redacted derivatives may enter ordinary narrative text.
-        evidence_items: list[str] = []
-        for artifact in ordinary_evidence_artifacts(evidence):
-            derivative = str(artifact.get("derivative") or "")[:500]
-            derivative = derivative.replace("```", "` ` `")
-            kind = str(artifact.get("capture_kind") or "evidence").replace(
-                "_", " "
-            ).title()
-            if derivative:
-                evidence_items.append(
-                    f"**{kind} derivative:**\n```\n{derivative}\n```"
-                )
-            else:
-                evidence_items.append(
-                    f"**{kind} derivative:** content-free verified receipt "
-                    f"(`{artifact.get('derivative_sha256')}`)."
-                )
-        evidence_text = "\n\n".join(evidence_items)
-
-        # Build references section
-        ref_text = ""
-        if references:
-            ref_text = "\n**References:**\n" + "\n".join(f"- {r}" for r in references)
-
-        _, fix = self._lookup_effort(finding)
-
-        return textwrap.dedent(f"""\
-            ## {title}
-
-            **Severity:** {severity}
-            **CVSS v4.0:** {cvss_display}
-            **EPSS:** {f"{epss_val:.2f}" if epss_val is not None else "N/A"}{epss_flag}
-            **KEV:** {kev_str}
-            **Target:** {target}
-            **Detected by:** {module}
-
-            ### Description
-
-            {description or "This vulnerability was detected during automated scanning."}
-
-            ### Evidence
-            {evidence_text or "No verified evidence derivative is available for ordinary presentation."}
-
-            ### Business Impact
-
-            {"This is a critical/high-severity issue that could allow an attacker to compromise the target system, access sensitive data, or execute arbitrary code." if severity in ("Critical", "High") else "This issue represents a moderate security weakness that should be addressed as part of regular security maintenance."}
-
-            ### Remediation
-
-            {remediation or fix or "Refer to vendor documentation for specific remediation guidance."}
-            {ref_text}
-        """)
+        return advisory_report_projection(
+            projection_kind="finding_description",
+            entry_count=1 if finding else 0,
+        )
 
     def _template_risk_scenario(
         self,
@@ -989,131 +627,10 @@ class ReportNarrator:
     ) -> str:
         """Template-based risk scenario when brain is unavailable."""
         findings = _ordinary_findings(findings)
-        sorted_f = _sort_by_severity(findings)
-        crits = [f for f in sorted_f if f.get("severity") == "Critical"]
-        highs = [f for f in sorted_f if f.get("severity") == "High"]
-
-        if not crits and not highs:
-            return (
-                "# Risk Scenario\n\n"
-                "Based on the findings identified, the immediate exploitation risk "
-                "is **low**. No critical or high-severity vulnerabilities were "
-                "discovered that would enable rapid compromise.\n\n"
-                "However, medium-severity findings could potentially be chained "
-                "together by a persistent attacker over a longer timeframe.\n\n"
-                "---\n*Generated by ForgeBrain (template mode)*\n"
-            )
-
-        # Build attack chain from top findings
-        chain_findings = (crits + highs)[:5]
-        chain_titles = [f.get("title", "Unknown") for f in chain_findings]
-
-        # Classify finding types for scenario building
-        has_sqli    = any("sqli" in t.lower() or "sql" in t.lower() for t in chain_titles)
-        has_rce     = any("rce" in t.lower() or "command" in t.lower() for t in chain_titles)
-        has_auth    = any("auth" in t.lower() or "credential" in t.lower() for t in chain_titles)
-        has_xss     = any("xss" in t.lower() for t in chain_titles)
-        has_ssrf    = any("ssrf" in t.lower() for t in chain_titles)
-        has_upload  = any("upload" in t.lower() for t in chain_titles)
-        has_ad      = any(kw in t.lower() for t in chain_titles
-                         for kw in ("dcsync", "kerberoast", "golden", "ntlm", "ad "))
-        has_ai      = any(kw in t.lower() for t in chain_titles
-                         for kw in ("prompt injection", "jailbreak", "model", "llm", "ai "))
-
-        scenario_parts: list[str] = [
-            "# Risk Scenario — What an Attacker Could Do in 30 Minutes\n",
-        ]
-
-        # Opening
-        scenario_parts.append(
-            "Based on the vulnerabilities discovered during this assessment, "
-            "the following realistic attack scenario demonstrates the potential "
-            "business impact:\n"
+        return advisory_report_projection(
+            projection_kind="risk_scenario",
+            entry_count=len(findings),
         )
-
-        # Build the chain
-        steps: list[str] = []
-        if has_sqli:
-            steps.append(
-                "An attacker could exploit the SQL injection vulnerability to "
-                "extract database contents, including user credentials, personal "
-                "data, and application secrets."
-            )
-        if has_auth or has_sqli:
-            steps.append(
-                "Using extracted or compromised credentials, the attacker could "
-                "authenticate as a legitimate user and escalate privileges."
-            )
-        if has_xss:
-            steps.append(
-                "The cross-site scripting vulnerability could be weaponized to "
-                "hijack administrator sessions, enabling full application takeover."
-            )
-        if has_ssrf:
-            steps.append(
-                "The SSRF vulnerability could be leveraged to access internal "
-                "services, cloud metadata endpoints, and pivot into the "
-                "internal network."
-            )
-        if has_upload:
-            steps.append(
-                "The file upload vulnerability could be exploited to deploy a "
-                "web shell, providing persistent remote command execution on "
-                "the server."
-            )
-        if has_rce:
-            steps.append(
-                "With remote code execution capability, the attacker gains full "
-                "control of the compromised server — enabling data exfiltration, "
-                "ransomware deployment, or lateral movement."
-            )
-        if has_ad:
-            steps.append(
-                "Active Directory weaknesses could be chained to achieve domain "
-                "admin privileges, granting the attacker unrestricted access to "
-                "all domain-joined systems and data."
-            )
-        if has_ai:
-            steps.append(
-                "AI/LLM vulnerabilities discovered could be exploited via prompt "
-                "injection to bypass safety controls, extract training data or system "
-                "context, and pivot to backend services through model-server trust "
-                "relationships."
-            )
-
-        if not steps:
-            # Fallback generic chain
-            steps = [
-                "An attacker could leverage the identified high-severity "
-                "vulnerabilities to gain initial access to the target system.",
-                "Once inside, privilege escalation and lateral movement become "
-                "feasible, potentially compromising additional systems.",
-                "The end result could include data exfiltration, service "
-                "disruption, or establishment of persistent backdoor access.",
-            ]
-
-        for i, step in enumerate(steps, 1):
-            scenario_parts.append(f"**Step {i}:** {step}\n")
-
-        # Impact summary
-        scenario_parts.append(
-            f"\n## Impact Assessment\n\n"
-            f"With **{len(crits)}** critical and **{len(highs)}** high-severity "
-            f"findings, the attack surface presents **{'CRITICAL' if crits else 'HIGH'}** "
-            f"risk. A motivated attacker with moderate skill could realistically "
-            f"achieve significant compromise within 30 minutes of initial engagement.\n"
-        )
-
-        # Urgency
-        if crits:
-            scenario_parts.append(
-                "\n> ⚠️ **URGENT:** Critical vulnerabilities require immediate "
-                "remediation. Each day of exposure increases the probability of "
-                "exploitation.\n"
-            )
-
-        scenario_parts.append("\n---\n*Generated by ForgeBrain (template mode)*\n")
-        return "\n".join(scenario_parts)
 
     # ══════════════════════════════════════════════════════════════════
     # HELPERS
@@ -1170,10 +687,13 @@ class TestReportNarrator:
         result = narrator._template_executive_summary(
             findings, "https://example.com", "Q2 Pentest", "External web"
         )
-        assert "CRITICAL" in result
-        assert "SQL Injection" in result
-        assert "https://example.com" in result
-        assert "Q2 Pentest" in result
+        assert "Advisory projection only" in result
+        assert "not published as execution" in result
+        assert "Submitted advisory records: **3**" in result
+        assert "CRITICAL" not in result
+        assert "SQL Injection" not in result
+        assert "https://example.com" not in result
+        assert "Q2 Pentest" not in result
 
     def test_template_executive_summary_low_risk(self) -> None:
         narrator = ReportNarrator()
@@ -1183,12 +703,17 @@ class TestReportNarrator:
         result = narrator._template_executive_summary(
             findings, "10.0.0.1", "Assessment", ""
         )
-        assert "LOW" in result
+        assert "Advisory projection only" in result
+        assert "Submitted advisory records: **1**" in result
+        assert "TLS 1.0" not in result
+        assert "10.0.0.1" not in result
 
     def test_template_attack_narrative_empty(self) -> None:
         narrator = ReportNarrator()
         result = narrator._template_attack_narrative([])
-        assert "No attack chain log" in result
+        assert "Advisory projection only" in result
+        assert "does not assert" in result
+        assert "Recorded advisory entries: **0**" in result
 
     def test_template_attack_narrative_with_steps(self) -> None:
         narrator = ReportNarrator()
@@ -1201,15 +726,21 @@ class TestReportNarrator:
              "framework": "netforge", "phase": "LATERAL"},
         ]
         result = narrator._template_attack_narrative(chain)
-        assert "Step 1" in result
-        assert "Port scan" in result
-        assert "3" in result  # 3 actions
-        assert "netforge" in result
+        assert "Advisory projection only" in result
+        assert "does not assert" in result
+        assert "Recorded advisory entries: **3**" in result
+        assert "Observation detail withheld" in result
+        assert "Step 1" not in result
+        assert "Port scan" not in result
+        assert "Success — dumped users table" not in result
+        assert "netforge" not in result
 
     def test_template_remediation_roadmap_empty(self) -> None:
         narrator = ReportNarrator()
         result = narrator._template_remediation_roadmap([])
-        assert "No findings" in result
+        assert "Advisory projection only" in result
+        assert "not published as execution" in result
+        assert "Submitted advisory records: **0**" in result
 
     def test_template_remediation_roadmap_with_findings(self) -> None:
         narrator = ReportNarrator()
@@ -1220,9 +751,12 @@ class TestReportNarrator:
             {"title": "Server version header", "severity": "Low"},
         ]
         result = narrator._template_remediation_roadmap(findings)
-        assert "Immediate" in result
-        assert "SQL Injection" in result
-        assert "Estimated Total Effort" in result
+        assert "Advisory projection only" in result
+        assert "not published as execution" in result
+        assert "Submitted advisory records: **4**" in result
+        assert "Immediate" not in result
+        assert "SQL Injection" not in result
+        assert "Estimated Total Effort" not in result
 
     def test_template_finding_description(self) -> None:
         narrator = ReportNarrator()
@@ -1237,9 +771,12 @@ class TestReportNarrator:
             "references": ["CWE-89", "OWASP A03:2021"],
         }
         result = narrator._template_finding_description(finding)
-        assert "Blind SQL Injection" in result
-        assert "Critical" in result
-        assert "CWE-89" in result
+        assert "Advisory projection only" in result
+        assert "not published as execution" in result
+        assert "Submitted advisory records: **1**" in result
+        assert "Blind SQL Injection" not in result
+        assert "Critical" not in result
+        assert "CWE-89" not in result
 
     def test_template_risk_scenario_no_critical(self) -> None:
         narrator = ReportNarrator()
@@ -1247,7 +784,10 @@ class TestReportNarrator:
             {"title": "Info disclosure", "severity": "Low"},
         ]
         result = narrator._template_risk_scenario(findings)
-        assert "low" in result.lower()
+        assert "Advisory projection only" in result
+        assert "not published as execution" in result
+        assert "Submitted advisory records: **1**" in result
+        assert "Info disclosure" not in result
 
     def test_template_risk_scenario_with_critical(self) -> None:
         narrator = ReportNarrator()
@@ -1257,8 +797,12 @@ class TestReportNarrator:
             {"title": "XSS in admin panel", "severity": "High"},
         ]
         result = narrator._template_risk_scenario(findings)
-        assert "CRITICAL" in result or "Critical" in result
-        assert "Step 1" in result
+        assert "Advisory projection only" in result
+        assert "not published as execution" in result
+        assert "Submitted advisory records: **3**" in result
+        assert "CRITICAL" not in result
+        assert "Critical" not in result
+        assert "Step 1" not in result
 
     def test_lookup_effort_known(self) -> None:
         narrator = ReportNarrator()
@@ -1288,7 +832,7 @@ class TestReportNarrator:
         assert result[2]["severity"] == "Low"
 
     def test_executive_summary_async(self) -> None:
-        """Test that executive_summary() works end-to-end in rule-based mode."""
+        """Generic executive-summary input remains advisory end to end."""
         import asyncio
         narrator = ReportNarrator()
         findings = [
@@ -1297,39 +841,53 @@ class TestReportNarrator:
         result = asyncio.run(
             narrator.executive_summary(findings, "https://target.com", "Test Engagement")
         )
-        assert "CRITICAL" in result
-        assert "SQLi" in result
+        assert "Advisory projection only" in result
+        assert "not published as execution" in result
+        assert "Submitted advisory records: **1**" in result
+        assert "CRITICAL" not in result
+        assert "SQLi" not in result
 
     def test_attack_narrative_async(self) -> None:
-        """Test that attack_narrative() works end-to-end in rule-based mode."""
+        """Caller attack text remains advisory end to end."""
         import asyncio
         narrator = ReportNarrator()
         chain = [
             {"action": "Recon", "target": "10.0.0.1", "result": "Open ports found"},
         ]
         result = asyncio.run(narrator.attack_narrative(chain))
-        assert "Recon" in result
+        assert "Advisory projection only" in result
+        assert "does not assert" in result
+        assert "Recorded advisory entries: **1**" in result
+        assert "Recon" not in result
+        assert "Open ports found" not in result
 
     def test_remediation_roadmap_async(self) -> None:
-        """Test that remediation_roadmap() works end-to-end in rule-based mode."""
+        """Generic remediation input remains advisory end to end."""
         import asyncio
         narrator = ReportNarrator()
         findings = [
             {"title": "XSS", "severity": "High"},
         ]
         result = asyncio.run(narrator.remediation_roadmap(findings))
-        assert "XSS" in result
+        assert "Advisory projection only" in result
+        assert "not published as execution" in result
+        assert "Submitted advisory records: **1**" in result
+        assert "XSS" not in result
 
     def test_finding_description_async(self) -> None:
-        """Test that finding_description() works end-to-end in rule-based mode."""
+        """Generic finding input remains advisory end to end."""
         import asyncio
         narrator = ReportNarrator()
         finding = {"title": "SSRF", "severity": "High", "target": "https://app.com"}
         result = asyncio.run(narrator.finding_description(finding))
-        assert "SSRF" in result
+        assert "Advisory projection only" in result
+        assert "not published as execution" in result
+        assert "Submitted advisory records: **1**" in result
+        assert "SSRF" not in result
+        assert "https://app.com" not in result
 
     def test_risk_scenario_async(self) -> None:
-        """Test that risk_scenario() works end-to-end in rule-based mode."""
+        """Generic risk-scenario input remains advisory end to end."""
         import asyncio
         narrator = ReportNarrator()
         findings = [
@@ -1337,4 +895,8 @@ class TestReportNarrator:
             {"title": "Auth bypass", "severity": "High"},
         ]
         result = asyncio.run(narrator.risk_scenario(findings))
-        assert "Step" in result
+        assert "Advisory projection only" in result
+        assert "not published as execution" in result
+        assert "Submitted advisory records: **2**" in result
+        assert "SQL Injection" not in result
+        assert "Auth bypass" not in result

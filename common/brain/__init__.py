@@ -1,5 +1,7 @@
-"""ForgeBrain — AI Reasoning Engine for Forge Suite v5 APEX.
+"""ForgeBrain advisory reasoning for Forge Suite v5 APEX.
 
-Uses Claude (Anthropic API) as the intelligence layer across all 4 frameworks.
-Graceful degradation: if no ANTHROPIC_API_KEY, falls back to rule-based heuristics.
+Model and rule output cannot approve or execute work.  Production actions must
+cross :mod:`common.brain.truth_boundary` and the canonical authorization/job
+services.  Without an external adapter, local rule-based advisory behavior is
+retained.
 """

@@ -33,6 +33,7 @@ from common.artifact_io import (
     atomic_write_bytes,
     ensure_private_directory,
     read_verified_regular_file,
+    validate_private_directory_readonly,
 )
 from common.redaction import redact_text, redact_value
 
@@ -417,6 +418,7 @@ class EvidenceCustodyStore:
         audit_sink: Callable[[Mapping[str, Any]], None] | None = None,
         redaction_version: str = REDACTION_VERSION,
         redactor: Callable[[str], str] | None = None,
+        create: bool = True,
     ) -> None:
         self.root = Path(root)
         self.tenant_id = _id(tenant_id, "tenant_id")
@@ -427,8 +429,13 @@ class EvidenceCustodyStore:
         # custom hook may add masking; it cannot disable central masking.
         self.redactor = redactor or (lambda value: value)
         try:
-            ensure_private_directory(self.root)
-            ensure_private_directory(self._tenant_root())
+            directory_boundary = (
+                ensure_private_directory
+                if create
+                else validate_private_directory_readonly
+            )
+            directory_boundary(self.root)
+            directory_boundary(self._tenant_root())
         except (ArtifactBoundaryError, OSError) as exc:
             raise CustodyError("artifact custody root is unavailable") from exc
 

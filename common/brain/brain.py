@@ -3,22 +3,22 @@
 Wraps the Anthropic AsyncAnthropic client to provide AI-powered
 security analysis across all 4 frameworks: NetForge, WebForge, ADForge, AIForge.
 
-Features:
-    - analyze_finding()      → FP verdict with confidence + severity adjustment
-    - detect_false_negatives()→ what was probably missed based on context
-    - plan_next_attack()     → autonomous attack path planning
-    - advise_evasion()       → WAF bypass payload generation
-    - interpret_error()      → technology identification from error responses
-    - write_executive_summary()→ C-suite narrative
-    - write_attack_narrative()→ red team story from chain log
-    - autonomous_decision()  → unsupervised mode decision making
+Advisory features:
+    - analyze_finding()      → canonical-review-required advisory result
+    - detect_false_negatives()→ disabled until canonical plan persistence
+    - plan_next_attack()     → disabled until canonical plan persistence
+    - advise_evasion()       → disabled until canonical plan persistence
+    - interpret_error()      → evidence-lineage-required advisory result
+    - write_executive_summary()→ bounded non-authoritative notice
+    - write_attack_narrative()→ bounded non-authoritative notice
+    - autonomous_decision()  → fail-closed no-action decision
 
 Engagement Memory:
     Rolling buffer of last N events across all frameworks fed to each call.
     SHA-256 cache deduplicates identical findings.
 
 Graceful Degradation:
-    No ANTHROPIC_API_KEY → rule-based heuristics, tools still work 100%.
+    Missing model access never relaxes the canonical truth boundary.
 
 FOR AUTHORIZED PENETRATION TESTING AND RED TEAM OPERATIONS ONLY.
 """
@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib
 import json
 import logging
 import os
@@ -38,8 +37,13 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from common.brain.truth_boundary import (
+    advisory_narrative_projection,
+    advisory_report_projection,
+    project_model_input,
+)
 from common.evidence import ordinary_finding_projection
-from common.redaction import redact_text
+from common.redaction import redact_text, redact_value
 from common.version import PRODUCT_LABEL
 
 log = logging.getLogger("forge.brain")
@@ -180,6 +184,11 @@ class PlannedAction:
     requires_confirm: bool = True
     expected_outcome: str  = ""
 
+    def __post_init__(self) -> None:
+        # Model and rule-based planner output is advisory metadata only.
+        self.auto_execute = False
+        self.requires_confirm = True
+
 
 @dataclass
 class EvasionAdvice:
@@ -285,17 +294,30 @@ class EngagementMemory:
     context windows for brain API calls.
     """
 
-    def __init__(self, max_entries: int = 100) -> None:
+    def __init__(
+        self,
+        max_entries: int = 100,
+        *,
+        tenant_id: str = "default",
+        engagement_id: str = "default-engagement",
+    ) -> None:
         self._entries: deque[EngagementMemoryEntry] = deque(maxlen=max_entries)
         self._max = max_entries
+        self._tenant_id = str(tenant_id)
+        self._engagement_id = str(engagement_id)
 
     def add(self, event_type: str, framework: str, data: dict[str, Any]) -> None:
-        """Record a new event."""
+        """Record only a bounded allowlisted tenant-scoped projection."""
+        projected = project_model_input(
+            {"event_type": event_type, **dict(data)},
+            tenant_id=self._tenant_id,
+            engagement_id=self._engagement_id,
+        )
         self._entries.append(EngagementMemoryEntry(
             timestamp=datetime.now(timezone.utc).isoformat(),
             event_type=event_type,
             framework=framework,
-            data=data,
+            data=projected,
         ))
 
     def get_context(self, last_n: int = 15) -> list[dict[str, Any]]:
@@ -335,29 +357,26 @@ class EngagementMemory:
 # ══════════════════════════════════════════════════════════════════════
 
 class _ResponseCache:
-    """SHA-256 keyed cache to avoid re-analyzing identical findings."""
+    """Bounded cache keyed only by a redacted tenant-scoped digest."""
 
     def __init__(self, max_size: int = 500) -> None:
         self._cache: dict[str, Any] = {}
         self._max = max_size
         self._hits = 0
 
-    def _key(self, content: str) -> str:
-        return hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
-
-    def get(self, content: str) -> Any | None:
-        result = self._cache.get(self._key(content))
+    def get(self, key: str) -> Any | None:
+        result = self._cache.get(str(key))
         if result is not None:
             self._hits += 1
         return result
 
-    def put(self, content: str, result: Any) -> None:
+    def put(self, key: str, result: Any) -> None:
         if len(self._cache) >= self._max:
             # Evict oldest 10%
             keys = list(self._cache.keys())
             for k in keys[: len(keys) // 10]:
                 del self._cache[k]
-        self._cache[self._key(content)] = result
+        self._cache[str(key)] = redact_value(result)
 
     @property
     def hits(self) -> int:
@@ -397,11 +416,13 @@ class ForgeBrain:
         rate_per_minute: int | None = None,
         max_memory: int | None = None,
         api_timeout: float | None = None,
+        tenant_id: str = "default",
+        engagement_id: str = "default-engagement",
     ) -> None:
         """Initialize ForgeBrain.
 
         Args:
-            api_key:         Anthropic API key. Falls back to ANTHROPIC_API_KEY env var.
+            api_key:         Retained compatibility argument; model access is disabled.
             model:           Heavy reasoning model. Default: claude-opus-4-8.
             fast_model:      Fast model for FP analysis. Default: claude-haiku-4-5-20251001.
             rate_per_minute: API call rate limit. Default: 20.
@@ -409,7 +430,7 @@ class ForgeBrain:
             api_timeout:     Seconds before an API call times out. Default: 60.
                              Override via FORGE_BRAIN_TIMEOUT env var.
         """
-        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+        del api_key
         self._model: str = model or os.environ.get(
             "FORGE_BRAIN_MODEL", "claude-opus-4-8"
         ) or "claude-opus-4-8"
@@ -419,33 +440,25 @@ class ForgeBrain:
         self._rpm = rate_per_minute or int(os.environ.get("FORGE_BRAIN_RPM", "20"))
         self._max_memory = max_memory or int(os.environ.get("FORGE_BRAIN_MAX_MEMORY", "100"))
         self._timeout = api_timeout or float(os.environ.get("FORGE_BRAIN_TIMEOUT", "60"))
+        self._tenant_id = str(tenant_id or "").strip()
+        self._engagement_id = str(engagement_id or "").strip()
+        if not self._tenant_id or not self._engagement_id:
+            raise ValueError("ForgeBrain tenant and engagement context are required")
 
         self._client: Any = None
         self._rate_limiter = _TokenBucket(self._rpm)
         self._cache = _ResponseCache()
-        self.memory = EngagementMemory(self._max_memory)
+        self.memory = EngagementMemory(
+            self._max_memory,
+            tenant_id=self._tenant_id,
+            engagement_id=self._engagement_id,
+        )
         self._total_calls = 0
         self._seed_built_in_knowledge()
 
-        # Initialize API client if key available
-        if self._api_key:
-            try:
-                AsyncAnthropic = importlib.import_module("anthropic").AsyncAnthropic
-                self._client = AsyncAnthropic(api_key=self._api_key)
-                log.info(
-                    "ForgeBrain initialized — model=%s, fast=%s, rpm=%d",
-                    self._model, self._fast_model, self._rpm,
-                )
-            except ImportError:
-                log.warning(
-                    "anthropic package not installed — brain running in rule-based mode. "
-                    "Install: pip install anthropic>=0.40.0"
-                )
-        else:
-            log.info(
-                "No ANTHROPIC_API_KEY set — ForgeBrain running in rule-based fallback mode. "
-                "All tools work, but AI-powered analysis is disabled."
-            )
+        log.info(
+            "ForgeBrain model adapter disabled pending canonical projection custody"
+        )
 
     def _seed_built_in_knowledge(self) -> None:
         """Pre-seed engagement memory with anonymized built-in TTP knowledge."""
@@ -469,8 +482,16 @@ class ForgeBrain:
 
     @property
     def available(self) -> bool:
-        """Check if the AI brain is available (API key + client loaded)."""
-        return self._client is not None
+        """Return false while the raw model adapter is disabled."""
+        return False
+
+    def model_projection(self, value: Mapping[str, Any]) -> dict[str, Any]:
+        """Return the one allowlisted tenant-scoped model input view."""
+        return project_model_input(
+            value,
+            tenant_id=self._tenant_id,
+            engagement_id=self._engagement_id,
+        )
 
     @property
     def stats(self) -> BrainStats:
@@ -497,66 +518,25 @@ class ForgeBrain:
         temperature: float = 0.3,
         timeout_s: float | None = None,
     ) -> str:
-        """Make a rate-limited, cached API call to Claude.
+        """Reject the legacy raw-string model adapter.
 
-        Args:
-            prompt:      User message content.
-            system:      System message.
-            model:       Model override (defaults to self._model).
-            max_tokens:  Max response tokens.
-            temperature: Sampling temperature.
-            timeout_s:   Per-call timeout override (defaults to self._timeout).
-
-        Returns:
-            Claude's text response.
-
-        Raises:
-            RuntimeError:         If API client not available.
-            asyncio.TimeoutError: If the call exceeds the timeout.
+        Task 106 has no typed, canonical report projection that can safely
+        consume arbitrary model prose. Model-backed compatibility paths remain
+        disabled until such a contract exists.
         """
-        if not self._client:
-            raise RuntimeError("ForgeBrain API client not initialized")
 
-        # Check cache
-        cache_key = f"{model or self._model}:{system[:100]}:{prompt}"
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        # Rate limit
-        await self._rate_limiter.acquire()
-        self._total_calls += 1
-
-        try:
-            response = await asyncio.wait_for(
-                self._client.messages.create(
-                    model=model or self._model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    system=system or self._default_system(),
-                    messages=[{"role": "user", "content": prompt}],
-                ),
-                timeout=timeout_s or self._timeout,
-            )
-            text = response.content[0].text
-            self._cache.put(cache_key, text)
-            return text
-
-        except asyncio.TimeoutError:
-            log.error("Brain API call timed out after %ss", timeout_s or self._timeout)
-            raise
-        except Exception as exc:
-            log.error("Brain API call failed: %s", exc)
-            raise
+        del prompt, system, model, max_tokens, temperature, timeout_s
+        raise RuntimeError("raw_model_adapter_disabled")
 
     def _default_system(self) -> str:
         """Default system prompt for the brain."""
         return (
             f"You are ForgeBrain, the AI reasoning engine for {PRODUCT_LABEL} — "
-            "an enterprise offensive security platform. You analyze vulnerability findings, "
-            "plan attack chains, detect false positives/negatives, advise on evasion, "
-            "and write executive summaries. You are precise, technical, and think like an "
-            "experienced penetration tester and red team operator. "
+            "an authorized security platform. You analyze redacted finding projections, "
+            "suggest advisory plans, detect possible false positives/negatives, "
+            "and write evidence-bounded summaries. You never approve or execute work, "
+            "and never claim that a suggestion, simulation, event, or narrative is an "
+            "observed outcome. "
             "Always respond in valid JSON unless explicitly told otherwise."
         )
 
@@ -573,42 +553,18 @@ class ForgeBrain:
         """
         ordinary_finding = ordinary_finding_projection(finding)
         finding_id = str(ordinary_finding.get("id") or "unknown")
-
-        if not self.available:
-            return self._rule_based_analyze(ordinary_finding)
-
-        context = _ordinary_memory_metadata(
-            self.memory.get_context(last_n=15)
-        )
-        prompt = json.dumps({
-            "task": "analyze_finding",
-            "finding": ordinary_finding,
-            "engagement_context": context,
-            "instructions": (
-                "Analyze this security finding. Determine if it's a TRUE_POSITIVE, "
-                "FALSE_POSITIVE, or NEEDS_VERIFICATION. Consider: "
-                "1) Is the evidence strong enough? 2) Could this be a server artifact? "
-                "3) Does the detection method match the vuln type? "
-                "Respond with JSON: {verdict, confidence, reasoning, action, "
-                "severity_adjustment, fn_risk}"
+        return AnalysisResult(
+            finding_id=finding_id,
+            verdict=Verdict.NEEDS_VERIFICATION,
+            confidence=Confidence.LOW,
+            reasoning=(
+                "Advisory analysis only; resolve canonical observation, finding, "
+                "proof, and evidence lineage before assigning a verdict."
             ),
-        }, indent=2, default=str)
-
-        try:
-            raw = await self._call(prompt, model=self._fast_model, max_tokens=1024)
-            data = self._parse_json(raw)
-            return AnalysisResult(
-                finding_id=finding_id,
-                verdict=Verdict(data.get("verdict", "NEEDS_VERIFICATION")),
-                confidence=Confidence(data.get("confidence", "MEDIUM")),
-                reasoning=data.get("reasoning", ""),
-                action=data.get("action", ""),
-                severity_adjustment=data.get("severity_adjustment", "unchanged"),
-                fn_risk=data.get("fn_risk", ""),
-            )
-        except Exception as exc:
-            log.warning("Brain analyze_finding failed, using rule-based: %s", exc)
-            return self._rule_based_analyze(ordinary_finding)
+            action="canonical_review_required",
+            severity_adjustment="unchanged",
+            fn_risk="unknown",
+        )
 
     async def detect_false_negatives(
         self,
@@ -626,48 +582,8 @@ class ForgeBrain:
         Returns:
             List of FalseNegativeHint with suggested follow-up actions.
         """
-        if not self.available:
-            return self._rule_based_fn_detect(findings, modules_run)
-
-        prompt = json.dumps({
-            "task": "detect_false_negatives",
-            "findings_summary": [
-                {"title": f.get("title"), "severity": f.get("severity"),
-                 "module": f.get("module"), "target": f.get("target")}
-                for f in findings[:30]
-            ],
-            "modules_run": modules_run,
-            "target_context": target_context,
-            "engagement_context": self.memory.get_findings_context(last_n=20),
-            "instructions": (
-                "Based on the findings, modules run, and target context, identify "
-                "likely missed vulnerabilities (false negatives). Consider: "
-                "1) SQLi found → check second-order, stored SQLi "
-                "2) File upload found → polyglot, double extension, null byte "
-                "3) SSRF found → blind SSRF, AWS metadata, gopher "
-                "4) JWT found → alg:none, weak HMAC, key confusion "
-                "Respond with JSON array: [{likely_vuln, reason, suggested_module, "
-                "suggested_payload, priority, mitre}]"
-            ),
-        }, indent=2, default=str)
-
-        try:
-            raw = await self._call(prompt, model=self._fast_model, max_tokens=2048)
-            items = self._parse_json_array(raw)
-            return [
-                FalseNegativeHint(
-                    likely_vuln=item.get("likely_vuln", ""),
-                    reason=item.get("reason", ""),
-                    suggested_module=item.get("suggested_module", ""),
-                    suggested_payload=item.get("suggested_payload", ""),
-                    priority=item.get("priority", 5),
-                    mitre=item.get("mitre", ""),
-                )
-                for item in items
-            ]
-        except Exception as exc:
-            log.warning("Brain detect_false_negatives failed: %s", exc)
-            return self._rule_based_fn_detect(findings, modules_run)
+        del findings, modules_run, target_context
+        return []
 
     async def plan_next_attack(
         self,
@@ -685,48 +601,8 @@ class ForgeBrain:
         Returns:
             Prioritized list of PlannedAction steps.
         """
-        if not self.available:
-            return self._rule_based_plan(intel, target_context)
-
-        prompt = json.dumps({
-            "task": "plan_next_attack",
-            "intel": intel,
-            "target_context": target_context,
-            "opsec_level": opsec_level,
-            "engagement_context": self.memory.get_context(last_n=30),
-            "instructions": (
-                "Plan the next attack steps. Consider MITRE ATT&CK kill chain: "
-                "RECON → INITIAL_ACCESS → EXECUTION → PERSISTENCE → PRIV_ESC → "
-                "LATERAL → COLLECTION → EXFIL. "
-                "For each action specify: framework (netforge/webforge/adforge/aiforge), "
-                "module, rationale, auto_execute (true for safe recon), "
-                "requires_confirm (true for exploitation). "
-                "Respond with JSON array: [{priority, phase, mitre, framework, module, "
-                "target, rationale, auto_execute, requires_confirm, expected_outcome}]"
-            ),
-        }, indent=2, default=str)
-
-        try:
-            raw = await self._call(prompt, model=self._model, max_tokens=3000)
-            items = self._parse_json_array(raw)
-            return [
-                PlannedAction(
-                    priority=item.get("priority", 5),
-                    phase=item.get("phase", ""),
-                    mitre=item.get("mitre", ""),
-                    framework=item.get("framework", ""),
-                    module=item.get("module", ""),
-                    target=item.get("target", ""),
-                    rationale=item.get("rationale", ""),
-                    auto_execute=item.get("auto_execute", False),
-                    requires_confirm=item.get("requires_confirm", True),
-                    expected_outcome=item.get("expected_outcome", ""),
-                )
-                for item in items
-            ]
-        except Exception as exc:
-            log.warning("Brain plan_next_attack failed: %s", exc)
-            return self._rule_based_plan(intel, target_context)
+        del intel, target_context, opsec_level
+        return []
 
     async def advise_evasion(
         self,
@@ -746,39 +622,8 @@ class ForgeBrain:
         Returns:
             List of EvasionAdvice with alternative payloads.
         """
-        if not self.available:
-            return self._rule_based_evasion(blocked_payload, waf_name, vuln_type)
-
-        prompt = json.dumps({
-            "task": "advise_evasion",
-            "blocked_payload": blocked_payload,
-            "waf_name": waf_name,
-            "vuln_type": vuln_type,
-            "target": target,
-            "instructions": (
-                f"The payload was blocked by {waf_name or 'a WAF/filter'}. "
-                f"Generate 3-5 alternative {vuln_type} payloads that might bypass this filter. "
-                "Consider: encoding, case manipulation, double encoding, comment injection, "
-                "concatenation, alternative syntax, and WAF-specific bypasses. "
-                "Respond with JSON array: [{payload, technique, confidence, notes}]"
-            ),
-        }, indent=2, default=str)
-
-        try:
-            raw = await self._call(prompt, model=self._fast_model, max_tokens=2048)
-            items = self._parse_json_array(raw)
-            return [
-                EvasionAdvice(
-                    payload=item.get("payload", ""),
-                    technique=item.get("technique", ""),
-                    confidence=Confidence(item.get("confidence", "MEDIUM")),
-                    notes=item.get("notes", ""),
-                )
-                for item in items
-            ]
-        except Exception as exc:
-            log.warning("Brain advise_evasion failed: %s", exc)
-            return self._rule_based_evasion(blocked_payload, waf_name, vuln_type)
+        del blocked_payload, waf_name, vuln_type, target
+        return []
 
     async def interpret_error(
         self,
@@ -796,39 +641,17 @@ class ForgeBrain:
         Returns:
             ErrorInterpretation with technology, injectability assessment.
         """
-        if not self.available:
-            return self._rule_based_interpret(error_response, payload, vuln_type)
-
-        prompt = json.dumps({
-            "task": "interpret_error",
-            "error_response": error_response[:3000],
-            "payload": payload,
-            "vuln_type": vuln_type,
-            "instructions": (
-                "Analyze this error response. Identify: "
-                "1) Backend technology (web server, framework, database) "
-                "2) Whether the parameter is injectable "
-                "3) Whether a WAF/filter was detected "
-                "4) Suggest next payload to try "
-                "Respond with JSON: {interpretation, technology, is_injectable, "
-                "filter_detected, next_payload, confidence}"
+        del error_response, payload, vuln_type
+        return ErrorInterpretation(
+            interpretation=(
+                "Advisory interpretation withheld pending canonical observation "
+                "and evidence lineage."
             ),
-        }, indent=2, default=str)
-
-        try:
-            raw = await self._call(prompt, model=self._fast_model, max_tokens=1024)
-            data = self._parse_json(raw)
-            return ErrorInterpretation(
-                interpretation=data.get("interpretation", ""),
-                technology=data.get("technology", ""),
-                is_injectable=data.get("is_injectable", False),
-                filter_detected=data.get("filter_detected", False),
-                next_payload=data.get("next_payload", ""),
-                confidence=Confidence(data.get("confidence", "MEDIUM")),
-            )
-        except Exception as exc:
-            log.warning("Brain interpret_error failed: %s", exc)
-            return self._rule_based_interpret(error_response, payload, vuln_type)
+            technology="unknown",
+            is_injectable=False,
+            filter_detected=False,
+            confidence=Confidence.LOW,
+        )
 
     async def write_executive_summary(
         self,
@@ -849,48 +672,11 @@ class ForgeBrain:
         findings = [ordinary_finding_projection(item) for item in findings]
         target = _ordinary_label(target, limit=2_000)
         engagement_name = _ordinary_label(engagement_name, limit=500)
-        if not self.available:
-            return self._rule_based_exec_summary(findings, target, engagement_name)
-
-        severity_counts: dict[str, int] = {}
-        for f in findings:
-            sev = f.get("severity", "Informational")
-            severity_counts[sev] = severity_counts.get(sev, 0) + 1
-
-        prompt = json.dumps({
-            "task": "write_executive_summary",
-            "engagement_name": engagement_name,
-            "target": target,
-            "total_findings": len(findings),
-            "severity_breakdown": severity_counts,
-            "top_findings": [
-                {"title": f.get("title"), "severity": f.get("severity"),
-                 "description": f.get("description", "")[:200]}
-                for f in findings[:10]
-            ],
-            "instructions": (
-                "Write a professional executive summary for C-suite leadership. "
-                "Use clear, non-technical language. Include: overall risk rating, "
-                "key findings, business impact, and remediation priorities. "
-                "Format as markdown prose (not JSON). 300-500 words."
-            ),
-        }, indent=2, default=str)
-
-        try:
-            raw = await self._call(
-                prompt,
-                model=self._model,
-                max_tokens=2048,
-                system=(
-                    "You are a senior security consultant writing an executive summary "
-                    "for C-suite leadership. Write clearly, professionally, and focus "
-                    "on business impact. Respond in markdown prose, not JSON."
-                ),
-            )
-            return raw
-        except Exception as exc:
-            log.warning("Brain write_executive_summary failed: %s", exc)
-            return self._rule_based_exec_summary(findings, target, engagement_name)
+        del target, engagement_name
+        return advisory_report_projection(
+            projection_kind="executive_summary",
+            entry_count=len(findings),
+        )
 
     async def write_attack_narrative(self, chain_log: list[dict[str, Any]]) -> str:
         """Generate a step-by-step attack narrative from chain log.
@@ -902,37 +688,7 @@ class ForgeBrain:
             Attack narrative as a formatted string.
         """
         chain_log = _ordinary_chain_log(chain_log)
-        if not self.available:
-            return self._rule_based_narrative(chain_log)
-
-        prompt = json.dumps({
-            "task": "write_attack_narrative",
-            "chain_log": chain_log[:30],
-            "instructions": (
-                "Write a compelling attack narrative from this chain log. "
-                "Describe what an attacker did step by step, what was discovered, "
-                "and what the impact was. Write as a story — 'First we... then we found... "
-                "which led us to...' Never infer or reproduce payloads, raw responses, "
-                "original evidence, caller-controlled paths, or secret values; refer to "
-                "verified canonical evidence derivatives. Format as markdown prose, not JSON."
-            ),
-        }, indent=2, default=str)
-
-        try:
-            return await self._call(
-                prompt,
-                model=self._model,
-                max_tokens=3000,
-                system=(
-                    "You are an expert red team operator writing an attack narrative "
-                    "for a penetration test report. Write technically accurate but "
-                    "readable prose that tells the story of the engagement. "
-                    "Respond in markdown, not JSON."
-                ),
-            )
-        except Exception as exc:
-            log.warning("Brain write_attack_narrative failed: %s", exc)
-            return self._rule_based_narrative(chain_log)
+        return advisory_narrative_projection(chain_log)
 
     async def autonomous_decision(
         self,
@@ -950,38 +706,17 @@ class ForgeBrain:
         Returns:
             AutonomousDecision with chosen action and reasoning.
         """
-        if not self.available:
-            return self._rule_based_autonomous(situation, options, opsec_level)
-
-        prompt = json.dumps({
-            "task": "autonomous_decision",
-            "situation": situation,
-            "options": options,
-            "opsec_level": opsec_level,
-            "engagement_context": self.memory.get_context(last_n=10),
-            "instructions": (
-                "Choose the best action for this situation. Consider: "
-                "1) OpSec level constraints "
-                "2) Risk vs reward "
-                "3) Kill chain progression "
-                "4) Whether to abort if risk is too high "
-                "Respond with JSON: {decision, reasoning, confidence, risk_level, abort}"
+        del situation, options, opsec_level
+        return AutonomousDecision(
+            decision="no_action",
+            reasoning=(
+                "Legacy autonomous decision path is disabled pending canonical "
+                "advisory plan persistence."
             ),
-        }, indent=2, default=str)
-
-        try:
-            raw = await self._call(prompt, model=self._fast_model, max_tokens=1024)
-            data = self._parse_json(raw)
-            return AutonomousDecision(
-                decision=data.get("decision", options[0] if options else ""),
-                reasoning=data.get("reasoning", ""),
-                confidence=Confidence(data.get("confidence", "MEDIUM")),
-                risk_level=RiskLevel(data.get("risk_level", "MEDIUM")),
-                abort=data.get("abort", False),
-            )
-        except Exception as exc:
-            log.warning("Brain autonomous_decision failed: %s", exc)
-            return self._rule_based_autonomous(situation, options, opsec_level)
+            confidence=Confidence.LOW,
+            risk_level=RiskLevel.HIGH,
+            abort=True,
+        )
 
     # ── JSON Parsing Helpers ──────────────────────────────────────────
 
@@ -1020,59 +755,16 @@ class ForgeBrain:
     def _rule_based_analyze(self, finding: dict[str, Any]) -> AnalysisResult:
         """Rule-based FP analysis when brain is unavailable."""
         finding_id = finding.get("id", "unknown")
-        severity = finding.get("severity", "").lower()
-        title = finding.get("title", "").lower()
-        module = finding.get("module", "")
-        evidence = finding.get("evidence", {})
-
-        # High confidence indicators
-        has_request = bool(evidence.get("request_raw"))
-        has_response = bool(evidence.get("response_raw"))
-        has_screenshot = bool(evidence.get("screenshot_path"))
-
-        # Time-based SQLi with delay evidence → HIGH confidence
-        if "time-based" in title and "sqli" in module.lower():
-            return AnalysisResult(
-                finding_id=finding_id,
-                verdict=Verdict.TRUE_POSITIVE,
-                confidence=Confidence.HIGH if has_request else Confidence.MEDIUM,
-                reasoning="Time-based SQL injection with measurable delay — strong evidence",
-                action="verify_with_variant",
-                severity_adjustment="unchanged",
-            )
-
-        # Error-based with DB-specific error → HIGH confidence
-        if "error" in title.lower() and any(
-            db in title for db in ["mysql", "mssql", "postgresql", "oracle", "sqlite"]
-        ):
-            return AnalysisResult(
-                finding_id=finding_id,
-                verdict=Verdict.TRUE_POSITIVE,
-                confidence=Confidence.HIGH,
-                reasoning="Database-specific error pattern detected — not a generic 500",
-                action="exploit_further",
-                severity_adjustment="unchanged",
-            )
-
-        # XSS with canary reflection → MEDIUM-HIGH
-        if "xss" in title.lower() and has_response:
-            return AnalysisResult(
-                finding_id=finding_id,
-                verdict=Verdict.TRUE_POSITIVE,
-                confidence=Confidence.MEDIUM,
-                reasoning="XSS payload reflected in response — verify not HTML-encoded",
-                action="verify_in_browser",
-                severity_adjustment="unchanged",
-            )
-
-        # Generic — needs verification
         return AnalysisResult(
-            finding_id=finding_id,
+            finding_id=str(finding_id),
             verdict=Verdict.NEEDS_VERIFICATION,
             confidence=Confidence.LOW,
-            reasoning="Insufficient evidence for automated verdict — manual review recommended",
-            action="manual_verify",
+            reasoning=(
+                "Advisory analysis only; canonical verification is required."
+            ),
+            action="canonical_review_required",
             severity_adjustment="unchanged",
+            fn_risk="unknown",
         )
 
     def _rule_based_fn_detect(
@@ -1298,63 +990,15 @@ class ForgeBrain:
         engagement_name: str,
     ) -> str:
         """Rule-based executive summary when brain is unavailable."""
-        severity_counts: dict[str, int] = {}
-        for f in findings:
-            sev = f.get("severity", "Informational")
-            severity_counts[sev] = severity_counts.get(sev, 0) + 1
-
-        critical = severity_counts.get("Critical", 0)
-        high = severity_counts.get("High", 0)
-        medium = severity_counts.get("Medium", 0)
-        low = severity_counts.get("Low", 0)
-
-        if critical > 0:
-            risk = "CRITICAL"
-        elif high > 0:
-            risk = "HIGH"
-        elif medium > 0:
-            risk = "MEDIUM"
-        else:
-            risk = "LOW"
-
-        top_findings = "\n".join(
-            f"- **{f.get('title')}** ({f.get('severity')})"
-            for f in findings[:5]
-        )
-
-        return (
-            f"# Executive Summary — {engagement_name}\n\n"
-            f"**Target:** {target}\n"
-            f"**Overall Risk Rating:** {risk}\n"
-            f"**Total Findings:** {len(findings)}\n\n"
-            f"## Severity Breakdown\n"
-            f"- Critical: {critical}\n"
-            f"- High: {high}\n"
-            f"- Medium: {medium}\n"
-            f"- Low: {low}\n\n"
-            f"## Top Findings\n{top_findings}\n\n"
-            f"## Recommendation\n"
-            f"{'Immediate remediation required for critical vulnerabilities.' if critical > 0 else ''}\n"
-            f"{'High-priority findings should be addressed within 7 days.' if high > 0 else ''}\n"
+        del target, engagement_name
+        return advisory_report_projection(
+            projection_kind="executive_summary",
+            entry_count=len(findings),
         )
 
     def _rule_based_narrative(self, chain_log: list[dict[str, Any]]) -> str:
         """Rule-based attack narrative when brain is unavailable."""
-        if not chain_log:
-            return "No attack chain log available."
-
-        steps = []
-        for i, step in enumerate(chain_log, 1):
-            action = step.get("action", "Unknown action")
-            result = step.get("result", "")
-            target = step.get("target", "")
-            steps.append(f"{i}. **{action}** against `{target}`\n   Result: {result}")
-
-        return (
-            "# Attack Narrative\n\n"
-            + "\n\n".join(steps)
-            + "\n\n---\n*Generated by ForgeBrain (rule-based mode)*\n"
-        )
+        return advisory_narrative_projection(chain_log)
 
     def _rule_based_autonomous(
         self,
@@ -1363,35 +1007,16 @@ class ForgeBrain:
         opsec_level: str,
     ) -> AutonomousDecision:
         """Rule-based autonomous decision when brain is unavailable."""
-        # Conservative: pick the safest option (usually first/recon)
-        safe_keywords = ["recon", "scan", "enumerate", "check", "detect", "discover"]
-        risky_keywords = ["exploit", "inject", "execute", "lateral", "persist"]
-
-        chosen = options[0] if options else "skip"
-        risk = RiskLevel.LOW
-
-        for opt in options:
-            opt_lower = opt.lower()
-            if any(kw in opt_lower for kw in safe_keywords):
-                chosen = opt
-                risk = RiskLevel.LOW
-                break
-
-        # Abort if opsec is stealth and options are all risky
-        abort = (
-            opsec_level == "stealth"
-            and all(
-                any(kw in opt.lower() for kw in risky_keywords)
-                for opt in options
-            )
-        )
-
+        del situation, options, opsec_level
         return AutonomousDecision(
-            decision=chosen,
-            reasoning="Rule-based: selected safest available option",
+            decision="no_action",
+            reasoning=(
+                "Legacy autonomous decision path is disabled pending canonical "
+                "advisory plan persistence."
+            ),
             confidence=Confidence.LOW,
-            risk_level=risk,
-            abort=abort,
+            risk_level=RiskLevel.HIGH,
+            abort=True,
         )
 
 
@@ -1434,7 +1059,7 @@ class TestForgeBrain:
         assert cache.hits == 1
         assert cache.get("other_content") is None
 
-    def test_rule_based_analyze(self) -> None:
+    def test_rule_based_analyze_is_advisory_only(self) -> None:
         brain = ForgeBrain(api_key="")
         finding = {
             "id": "test-123",
@@ -1444,8 +1069,12 @@ class TestForgeBrain:
             "evidence": {"request_raw": "GET /page?id=1' AND SLEEP(5)--"},
         }
         result = brain._rule_based_analyze(finding)
-        assert result.verdict == Verdict.TRUE_POSITIVE
-        assert result.confidence == Confidence.HIGH
+        assert result.verdict == Verdict.NEEDS_VERIFICATION
+        assert result.confidence == Confidence.LOW
+        assert result.action == "canonical_review_required"
+        assert result.severity_adjustment == "unchanged"
+        assert "Advisory analysis only" in result.reasoning
+        assert "SLEEP(5)" not in result.reasoning
 
     def test_rule_based_fn_detect(self) -> None:
         brain = ForgeBrain(api_key="")
@@ -1474,8 +1103,28 @@ class TestForgeBrain:
             {"title": "XSS", "severity": "High", "description": "test"},
         ]
         summary = brain._rule_based_exec_summary(findings, "https://example.com", "Test")
-        assert "CRITICAL" in summary
-        assert "SQLi" in summary
+        assert "Advisory projection only" in summary
+        assert "not published as execution" in summary
+        assert "Submitted advisory records: **2**" in summary
+        assert "CRITICAL" not in summary
+        assert "SQLi" not in summary
+        unsupported_claim = (
+            "COMPLETE: executed network action; finding verified; evidence created."
+        )
+        narrative = brain._rule_based_narrative(
+            [
+                {
+                    "action": unsupported_claim,
+                    "result": unsupported_claim,
+                    "verification_state": "verified",
+                }
+            ]
+        )
+        assert "Advisory projection only" in narrative
+        assert "does not assert" in narrative
+        assert "Recorded advisory entries: **1**" in narrative
+        assert unsupported_claim not in narrative
+        assert "verification_state=verified" not in narrative
 
     def test_stats_property(self) -> None:
         brain = ForgeBrain(api_key="")

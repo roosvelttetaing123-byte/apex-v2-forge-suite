@@ -449,7 +449,9 @@ def test_dashboard_scan_job_reads_and_deletes_are_tenant_filtered(
     finally:
         session.close()
 
-def test_state_store_sqlite_backend_restores_tenant_and_findings(tmp_path: Path) -> None:
+def test_state_store_sqlite_backend_restores_tenant_not_unresolved_finding(
+    tmp_path: Path,
+) -> None:
     from common.dashboard.event_bus import Event, EventBus, EventType
     from common.dashboard.state_store import StateStore
     from common.db import create_db
@@ -465,10 +467,15 @@ def test_state_store_sqlite_backend_restores_tenant_and_findings(tmp_path: Path)
             target="https://example.test",
             persist_db=session,
             tenant_id="tenant-a",
+            engagement_id="engagement-a",
         )
         bus.emit(Event(
             event_type=EventType.FINDING_NEW,
+            run_id="run-1",
             data={
+                "tenant_id": "tenant-a",
+                "engagement_id": "engagement-a",
+                "run_id": "run-1",
                 "id": "finding-1",
                 "title": "Header Missing",
                 "severity": "Low",
@@ -492,7 +499,8 @@ def test_state_store_sqlite_backend_restores_tenant_and_findings(tmp_path: Path)
     assert restored is not None
     snap = restored.snapshot()
     assert snap["tenant_id"] == "tenant-a"
-    assert snap["findings"][0]["id"] == "finding-1"
+    assert snap["engagement_id"] == "engagement-a"
+    assert snap["findings"] == []
 
 
 def test_state_store_sqlite_backend_isolates_same_run_across_tenants(
@@ -1462,9 +1470,11 @@ def test_dashboard_subprocess_output_is_redacted_before_disk_tail_and_event(
             "?token=CANARY_EVENT_TOKEN_002"
         ),
         "status": "running",
+        "engagement_id": "engagement-redaction-fixture",
+        "run_id": "run-redaction-fixture",
     }
     with (
-        patch.object(server.event_bus, "emit_simple") as emit,
+        patch.object(server, "_emit_scoped_event") as emit,
         patch.object(server, "_update_scan_history_status"),
         patch.object(server, "_sync_scan_job_from_active"),
         patch.object(server, "_load_scan_job", return_value=None),
@@ -1517,9 +1527,11 @@ def test_dashboard_nonzero_engine_exit_remains_failed_and_interrupted(
         "type": "web",
         "target": LAB_URL,
         "status": "running",
+        "engagement_id": "engagement-failed-fixture",
+        "run_id": "run-failed-fixture",
     }
     with (
-        patch.object(server.event_bus, "emit_simple") as emit,
+        patch.object(server, "_emit_scoped_event") as emit,
         patch.object(server, "_update_scan_history_status") as update_history,
         patch.object(server, "_sync_scan_job_from_active") as sync_job,
         patch.object(server, "_load_scan_job", return_value=None),
@@ -1579,3 +1591,117 @@ def test_dashboard_supervisor_metadata_redacts_proxy_credentials() -> None:
     assert proxy_url not in rendered
     assert rendered.count("<redacted>") == 2
     assert "FORGE_ROUTE_PROXY_CREDENTIAL_REFERENCE" not in rendered
+
+
+def test_dashboard_retries_exact_process_identity_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from common.dashboard.server import DashboardServer
+    from common.job_state import ProcessIdentity
+
+    launch_nonce = "launch-task106-retry"
+    expected = ProcessIdentity(
+        pid=4245,
+        start_token="task106-start-token",
+        command_digest="task106-command-digest",
+        boot_id="task106-boot-id",
+        launch_nonce=launch_nonce,
+    )
+
+    class FakeProcess:
+        pid = expected.pid
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    class RetrySupervisor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def capture(self, process: object, *, launch_nonce: str) -> ProcessIdentity | None:
+            assert process is fake_process
+            assert launch_nonce == expected.launch_nonce
+            self.calls += 1
+            return expected if self.calls == 2 else None
+
+    fake_process = FakeProcess()
+    supervisor = RetrySupervisor()
+    server = DashboardServer(auth=False)
+    server._job_process_supervisor = supervisor
+    monkeypatch.setattr("common.dashboard.server.time.sleep", lambda _delay: None)
+
+    captured = server._capture_durable_process_identity(
+        fake_process,  # type: ignore[arg-type]
+        launch_nonce=launch_nonce,
+    )
+
+    assert captured == expected
+    assert supervisor.calls == 2
+
+
+def test_dashboard_identity_capture_fails_closed_after_child_exit() -> None:
+    from common.dashboard.server import DashboardServer
+    from common.job_state import ProcessIdentityError
+
+    class ExitedProcess:
+        pid = 4246
+
+        @staticmethod
+        def poll() -> int:
+            return 1
+
+    class MissingSupervisor:
+        @staticmethod
+        def capture(_process: object, *, launch_nonce: str) -> None:
+            assert launch_nonce == "launch-task106-exited"
+            return None
+
+    server = DashboardServer(auth=False)
+    server._job_process_supervisor = MissingSupervisor()
+
+    with pytest.raises(ProcessIdentityError, match="exited before"):
+        server._capture_durable_process_identity(
+            ExitedProcess(),  # type: ignore[arg-type]
+            launch_nonce="launch-task106-exited",
+        )
+
+
+def test_dashboard_identity_capture_deadline_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from common.dashboard.server import DashboardServer
+    from common.job_state import ProcessIdentityError
+
+    class LiveProcess:
+        pid = 4247
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    class MissingSupervisor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def capture(self, _process: object, *, launch_nonce: str) -> None:
+            assert launch_nonce == "launch-task106-timeout"
+            self.calls += 1
+            return None
+
+    supervisor = MissingSupervisor()
+    server = DashboardServer(auth=False)
+    server._job_process_supervisor = supervisor
+    monotonic = MagicMock(side_effect=[10.0, 10.0, 10.5])
+    sleep = MagicMock()
+    monkeypatch.setattr("common.dashboard.server.time.monotonic", monotonic)
+    monkeypatch.setattr("common.dashboard.server.time.sleep", sleep)
+
+    with pytest.raises(ProcessIdentityError, match="could not be captured"):
+        server._capture_durable_process_identity(
+            LiveProcess(),  # type: ignore[arg-type]
+            launch_nonce="launch-task106-timeout",
+        )
+
+    assert supervisor.calls == 2
+    sleep.assert_called_once_with(0.01)

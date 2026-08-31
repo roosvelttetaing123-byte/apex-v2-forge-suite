@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import pytest
+
+import common.outbound_policy as outbound_policy_module
 from webforge.core.browser_engine import (
     BrowserEngine,
     DOMTaintResult,
@@ -12,6 +16,24 @@ from webforge.core.browser_engine import (
     dom_xss_taint_scan,
 )
 from tests.test_outbound_policy import NOW, TARGET, _policy
+
+
+@pytest.fixture(autouse=True)
+def _freeze_browser_route_wall_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the imported outbound fixture valid in slow coverage runs."""
+
+    test_now = datetime.now(timezone.utc).replace(microsecond=0)
+    test_clock = _policy.__globals__["_TEST_CLOCK"]
+    monkeypatch.setitem(globals(), "NOW", test_now)
+    monkeypatch.setitem(_policy.__globals__, "NOW", test_now)
+    monkeypatch.setitem(test_clock, "now", test_now)
+    monkeypatch.setattr(
+        outbound_policy_module,
+        "_system_utc_now",
+        lambda: test_clock["now"],
+    )
 
 
 class FakePage:

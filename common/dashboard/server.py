@@ -62,10 +62,10 @@ from common.dashboard.event_bus import (
     IssuedEventCredential,
 )
 from common.dashboard.state_store import StateStore
+from common.brain.truth_boundary import validated_job_success
 from common.confidence_policy import normalise_finding
 from common.canonical import (
     FindingStatus as CanonicalFindingStatus,
-    RetestStatus as CanonicalRetestStatus,
 )
 from common.canonical_evidence import (
     CanonicalEvidenceContext,
@@ -429,6 +429,8 @@ DASHBOARD_MUTATION_ROUTE_TEMPLATES = frozenset(
 _PUBLIC_RATE_LIMIT = 30
 _PUBLIC_RATE_WINDOW_SECONDS = 60.0
 _WEBSOCKET_CONNECTION_LIMIT = 64
+_PROCESS_IDENTITY_CAPTURE_TIMEOUT_SECONDS = 0.5
+_PROCESS_IDENTITY_CAPTURE_POLL_SECONDS = 0.01
 _CANONICAL_RESULT_DATABASE_NAMES = frozenset(
     {"adforge.db", "aiforge.db", "netforge.db", "webforge.db"}
 )
@@ -1368,10 +1370,12 @@ class DashboardServer:
             framework="forge",
             target="",
             tenant_id=self.tenant_id,
+            strict_event_scope=True,
         )
         state_tenant = str(getattr(self.state_store, "tenant_id", "") or "")
         if state_tenant != self.tenant_id:
             raise ValueError("dashboard state tenant does not match server tenant")
+        self.state_store.enforce_strict_event_scope()
         self.host = host
         self.port = port
         # The legacy no-auth switch no longer bypasses API or WebSocket
@@ -1399,6 +1403,9 @@ class DashboardServer:
         self._active_scans: dict[str, dict[str, Any]] = {}
         self._job_state_service: JobStateService | None = None
         self._job_state_service_path: str | None = None
+        self.state_store.set_canonical_truth_resolver(
+            self._resolve_dashboard_canonical_truth
+        )
         self._job_process_supervisor = _DashboardProcessSupervisor()
         forge_root = Path(__file__).parent.parent.parent
         self._dashboard_state_root = _configured_dashboard_state_root()
@@ -1412,6 +1419,65 @@ class DashboardServer:
 
         # Subscribe to all events for WebSocket broadcast
         self.event_bus.subscribe(None, self._on_event)
+
+    def _resolve_dashboard_canonical_truth(
+        self, value: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        """Resolve success from persisted Task 103 proof and Task 102 evidence."""
+
+        service = self._job_state_service
+        if (
+            service is None
+            or getattr(service, "_closed", False)
+            or self._job_state_service_path != str(self._scan_jobs_db_path)
+        ):
+            return None
+        job_id = str(value.get("canonical_job_id") or value.get("job_id") or "")
+        if not job_id:
+            return None
+        return validated_job_success(
+            service,
+            database_path=self._scan_jobs_db_path,
+            tenant_id=self.tenant_id,
+            job_id=job_id,
+        )
+
+    def _emit_scoped_event(
+        self,
+        event_type: EventType,
+        *,
+        source: str,
+        engagement_id: str,
+        run_id: str,
+        **data: Any,
+    ) -> None:
+        """Emit one server-owned event with exact tenant/engagement/run context."""
+
+        engagement = str(engagement_id or "").strip()
+        run = str(run_id or "").strip()
+        if (
+            not engagement
+            or not run
+            or len(engagement) > 300
+            or len(run) > 300
+            or any(character.isspace() for character in engagement)
+            or any(character.isspace() for character in run)
+        ):
+            raise ValueError("dashboard event context is invalid")
+        payload = {
+            **data,
+            "tenant_id": self.tenant_id,
+            "engagement_id": engagement,
+            "run_id": run,
+        }
+        self.event_bus.emit(
+            Event(
+                event_type=event_type,
+                data=payload,
+                source=source,
+                run_id=run,
+            )
+        )
 
     def _durable_job_state(self) -> JobStateService:
         """Return startup-initialized authority without request-time recovery."""
@@ -1794,22 +1860,123 @@ class DashboardServer:
                 if info["status"] == JobState.CANCELED.value
                 else EventType.SCAN_INTERRUPTED
             )
-            self.event_bus.emit_simple(
-                event_type,
-                source="dashboard",
-                scan_id=scan_key,
-                scan_type=info.get("type", ""),
-                target=safe_target_display(str(info.get("target", ""))),
-                returncode=rc,
-                log_path=str(log_path),
-            )
+            engagement_id = str(info.get("engagement_id") or "")
+            run_id = str(info.get("run_id") or "")
+            if engagement_id and run_id:
+                self._emit_scoped_event(
+                    event_type,
+                    source="dashboard",
+                    engagement_id=engagement_id,
+                    run_id=run_id,
+                    scan_id=scan_key,
+                    scan_type=info.get("type", ""),
+                    target=safe_target_display(str(info.get("target", ""))),
+                    status=info["status"],
+                    returncode=rc,
+                    log_path=str(log_path),
+                )
+            else:
+                log.warning(
+                    "Unscoped scan lifecycle event suppressed for %s",
+                    str(redact_authorization_value(scan_key))[:100],
+                )
             self._update_scan_history_status(root_scan_id, info["status"])
             self._sync_scan_job_from_active(root_scan_id, fallback=info["status"])
-        threading.Thread(
+        monitor = threading.Thread(
             target=_worker,
             name=f"ScanMonitor-{scan_key}",
             daemon=True,
-        ).start()
+        )
+        # The process cache owns the monitor handle until its final durable
+        # exit reconciliation is complete. Cancellation and shutdown callers
+        # must not tear down JobStateService merely because the child PID has
+        # exited; the monitor still owns a bounded authority write.
+        info["monitor_thread"] = monitor
+        monitor.start()
+        ready = info.get("monitor_ready")
+        if isinstance(ready, threading.Event):
+            ready.set()
+
+    def _wait_for_scan_monitors(
+        self,
+        scan_id: str,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        """Wait for the exact scan's monitor threads to finish authority writes."""
+
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        infos = [
+            info
+            for key, info in list(self._active_scans.items())
+            if self._base_scan_id(key) == scan_id
+        ]
+        monitors: list[threading.Thread] = []
+        seen: set[int] = set()
+        for info in infos:
+            ready = info.get("monitor_ready")
+            if isinstance(ready, threading.Event) and not ready.is_set():
+                remaining = max(0.0, deadline - time.monotonic())
+                if not ready.wait(remaining):
+                    return False
+            monitor = info.get("monitor_thread")
+            if not isinstance(monitor, threading.Thread):
+                proc = info.get("proc")
+                if proc is not None and proc.poll() is None:
+                    return False
+                continue
+            if id(monitor) in seen:
+                continue
+            seen.add(id(monitor))
+            monitors.append(monitor)
+        for monitor in monitors:
+            if monitor is threading.current_thread():
+                return False
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                monitor.join(remaining)
+            except RuntimeError:
+                return False
+            if monitor.is_alive():
+                return False
+        return True
+
+    def _emit_scoped_scan_aborts(
+        self,
+        scan_keys: list[str],
+        *,
+        reason: str,
+    ) -> None:
+        """Project canceled state once per scan using canonical active bindings."""
+
+        grouped: dict[str, list[str]] = {}
+        for key in scan_keys:
+            grouped.setdefault(self._base_scan_id(key), []).append(key)
+        for scan_id, keys in sorted(grouped.items()):
+            info = next(
+                (
+                    value
+                    for key, value in self._active_scans.items()
+                    if self._base_scan_id(key) == scan_id
+                    and value.get("engagement_id")
+                    and value.get("run_id")
+                ),
+                None,
+            )
+            if info is None:
+                raise DashboardArtifactError(
+                    "scan abort event lacks canonical engagement/run binding"
+                )
+            self._emit_scoped_event(
+                EventType.SCAN_ABORTED,
+                source="dashboard",
+                engagement_id=str(info["engagement_id"]),
+                run_id=str(info["run_id"]),
+                scan_id=scan_id,
+                killed=sorted(keys),
+                reason=str(reason)[:200],
+                status=JobState.CANCELED.value,
+            )
 
     def _on_event(self, event: Event) -> None:
         """Broadcast event to all connected WebSocket clients."""
@@ -2435,6 +2602,7 @@ class DashboardServer:
             limit=1000,
             actor_id=actor_id,
         )
+        safe["findings_count"] = len(safe["findings"])
         if role in {Role.OPERATOR, Role.ADMIN}:
             safe["credentials"] = [
                 {
@@ -2442,8 +2610,8 @@ class DashboardServer:
                     for key in (
                         "id",
                         "cred_type",
-                        "account",
-                        "target",
+                        "credential_reference",
+                        "credential_state",
                         "discovered_by",
                         "timestamp",
                     )
@@ -2482,6 +2650,7 @@ class DashboardServer:
                     "target_framework",
                     "target_module",
                     "auto_execute",
+                    "execution_state",
                     "timestamp",
                 )
                 if key in item
@@ -2509,6 +2678,10 @@ class DashboardServer:
 
     def _public_event(self, event: Event) -> dict[str, Any]:
         """Serialize an event through a type-specific field allowlist."""
+        if event.event_type in {EventType.FINDING_NEW, EventType.FINDING_UPDATED}:
+            raise DashboardArtifactError(
+                "raw finding event publication requires canonical snapshot refresh"
+            )
         common_module = {
             "name",
             "phase",
@@ -2538,39 +2711,14 @@ class DashboardServer:
             "status",
             "returncode",
         }
-        finding = {
+        credential = {
             "id",
-            "finding_id",
-            "title",
-            "severity",
-            "module",
-            "target",
-            "cvss_score",
-            "url",
-            "port",
-            "service",
-            "description",
-            "mitre_attack",
-            "confidence",
-            "status",
-            "vpr_score",
-            "vpr_priority",
-            "verification_state",
-            "proof_type",
-            "maturity",
-            "action",
-            "dry_run",
-            "job_id",
-            "retest_id",
-            "retest_reason_code",
-            "retest_state",
-            "retest_status",
-            "retest_verdict",
-            "review_owner_operator_id",
-            "review_revision_id",
-            "review_version",
+            "framework",
+            "credential_reference",
+            "credential_state",
+            "tenant_id",
+            "engagement_id",
         }
-        credential = {"type", "account", "target", "module", "discovered_by"}
         control = {
             "command",
             "job_id",
@@ -2615,8 +2763,6 @@ class DashboardServer:
             EventType.SCAN_ABORTED,
         }:
             allowed = lifecycle
-        elif event.event_type in {EventType.FINDING_NEW, EventType.FINDING_UPDATED}:
-            allowed = finding
         elif event.event_type is EventType.CREDENTIAL_FOUND:
             allowed = credential
         elif event.event_type is EventType.CONTROL_COMMAND:
@@ -2636,42 +2782,6 @@ class DashboardServer:
         else:
             allowed = set()
         event_data: Mapping[str, Any] = event.data
-        if event.event_type in {EventType.FINDING_NEW, EventType.FINDING_UPDATED}:
-            if event.data.get("action") == "retest":
-                verdict = event.data.get("retest_verdict")
-                state = str(event.data.get("retest_state") or "")
-                if verdict is not None:
-                    try:
-                        CanonicalRetestStatus(str(verdict))
-                    except ValueError:
-                        raise DashboardArtifactError(
-                            "canonical retest event verdict is invalid"
-                        ) from None
-                if state not in {
-                    "planned",
-                    "authorized",
-                    "queued",
-                    "running",
-                    "terminal",
-                    "canceled",
-                }:
-                    raise DashboardArtifactError(
-                        "canonical retest event state is invalid"
-                    )
-                if (state == "terminal") != (verdict is not None):
-                    raise DashboardArtifactError(
-                        "canonical retest event mixes lifecycle and verdict truth"
-                    )
-                expected_status = str(verdict) if verdict is not None else state
-                if event.data.get("retest_status") != expected_status:
-                    raise DashboardArtifactError(
-                        "canonical retest event status is inconsistent"
-                    )
-            event_data = (
-                dict(event.data)
-                if event.data.get("action") == "retest"
-                else normalise_finding(dict(event.data))
-            )
         data = {
             key: self._bounded_public_value(value)
             for key, value in event_data.items()
@@ -3740,6 +3850,7 @@ class DashboardServer:
         @app.post("/api/v1/scans/{scan_id}/cancel")
         async def api_scan_cancel(request: Request, scan_id: str):
             payload = _require_auth(request, Role.OPERATOR)
+            cancellation_started = time.monotonic()
             try:
                 job = server._durable_job_state().cancel_job(
                     scan_id,
@@ -3761,6 +3872,34 @@ class DashboardServer:
             server._write_scan_control_files(
                 scan_id, {"paused": False, "aborted": True}
             )
+            monitor_budget = max(
+                0.0,
+                5.75 - (time.monotonic() - cancellation_started),
+            )
+            monitors_quiesced = await asyncio.to_thread(
+                server._wait_for_scan_monitors,
+                scan_id,
+                timeout_seconds=monitor_budget,
+            )
+            if not monitors_quiesced:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "scan_monitor_quiescence_timeout"},
+                )
+            try:
+                server._emit_scoped_scan_aborts(
+                    [
+                        key
+                        for key in server._active_scans
+                        if server._base_scan_id(key) == scan_id
+                    ],
+                    reason="operator_cancellation",
+                )
+            except DashboardArtifactError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "scan_abort_reconciliation_failed"},
+                ) from exc
             return {"status": job["state"], "job": job}
 
         @app.post("/api/v1/scans/{scan_id}/retry")
@@ -3899,10 +4038,17 @@ class DashboardServer:
             """Abort the current scan."""
             payload = _require_auth(request, Role.ADMIN)
             server._write_all_control_files({"paused": False, "aborted": True})
-            killed = server._terminate_active_scans(status="aborted")
-            server.event_bus.emit_simple(
-                EventType.SCAN_ABORTED, source="dashboard", killed=killed,
-            )
+            try:
+                killed = server._terminate_active_scans(status="aborted")
+                server._emit_scoped_scan_aborts(
+                    killed,
+                    reason="operator_abort",
+                )
+            except DashboardArtifactError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "scan_abort_reconciliation_failed"},
+                ) from exc
             _audit(
                 request,
                 "control.abort",
@@ -3921,7 +4067,17 @@ class DashboardServer:
             reason = str(body.get("reason", "")).strip()[:500]
             if enabled:
                 server._write_all_control_files({"paused": False, "aborted": True})
-                killed = server._terminate_active_scans(status="aborted")
+                try:
+                    killed = server._terminate_active_scans(status="aborted")
+                    server._emit_scoped_scan_aborts(
+                        killed,
+                        reason="kill_switch",
+                    )
+                except DashboardArtifactError as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={"reason_code": "scan_abort_reconciliation_failed"},
+                    ) from exc
             else:
                 killed = []
             state = server._set_kill_switch(enabled, reason=reason, operator=payload.username)
@@ -4542,6 +4698,10 @@ class DashboardServer:
                     "proc": proc,
                     "type": framework_name,
                     "target": process_target,
+                    "tenant_id": server.tenant_id,
+                    "engagement_id": str(prepared["job"]["engagement_id"]),
+                    "run_id": str(prepared["job"]["run_id"]),
+                    "monitor_ready": threading.Event(),
                     "started_at": time.time(),
                     "engagement": engagement,
                     "mode": mode if framework_name == "web" else "external",
@@ -4593,8 +4753,11 @@ class DashboardServer:
             )
 
             event_authorization = web_authorization or net_authorization
-            server.event_bus.emit_simple(
-                EventType.SCAN_START, source="dashboard",
+            server._emit_scoped_event(
+                EventType.SCAN_START,
+                source="dashboard",
+                engagement_id=str(prepared["job"]["engagement_id"]),
+                run_id=str(prepared["job"]["run_id"]),
                 target=safe_target_display(target), scan_type=scan_type, mode=mode,
                 engagement=engagement, scan_id=scan_id,
                 resolved_ip=network_target or "",
@@ -4731,10 +4894,17 @@ class DashboardServer:
             """Kill all running scan subprocesses."""
             payload = _require_auth(request, Role.OPERATOR)
             server._write_all_control_files({"paused": False, "aborted": True})
-            killed = server._terminate_active_scans(status="stopped")
-            server.event_bus.emit_simple(
-                EventType.SCAN_ABORTED, source="dashboard", reason="operator_stop",
-            )
+            try:
+                killed = server._terminate_active_scans(status="stopped")
+                server._emit_scoped_scan_aborts(
+                    killed,
+                    reason="operator_stop",
+                )
+            except DashboardArtifactError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"reason_code": "scan_abort_reconciliation_failed"},
+                ) from exc
             _audit(
                 request,
                 "scan.stop",
@@ -6008,6 +6178,10 @@ class DashboardServer:
                     'proc': proc,
                     'type': framework_name,
                     'target': process_target,
+                    'tenant_id': server.tenant_id,
+                    'engagement_id': str(prepared['job']['engagement_id']),
+                    'run_id': str(prepared['job']['run_id']),
+                    'monitor_ready': threading.Event(),
                     'started_at': time.time(),
                     'engagement': engagement,
                     'mode': mode if framework_name == 'web' else 'external',
@@ -6078,9 +6252,13 @@ class DashboardServer:
             )
 
             event_authorization = web_authorization or net_authorization
-            server.event_bus.emit_simple(
-                EventType.SCAN_START, source='scan_builder',
+            server._emit_scoped_event(
+                EventType.SCAN_START,
+                source='scan_builder',
+                engagement_id=str(prepared['job']['engagement_id']),
+                run_id=str(prepared['job']['run_id']),
                 target=safe_target_display(target), scan_type=scan_type, scan_id=scan_id,
+                engagement=engagement,
                 modules=modules, actual_modules=(web_modules + net_modules),
                 authorization=(
                     event_authorization.to_event_payload()
@@ -6830,6 +7008,39 @@ class DashboardServer:
 
     async def _broadcast_event(self, event: Event) -> None:
         """Broadcast an event to all connected WebSocket clients."""
+        for websocket, payload in list(self._ws_clients.items()):
+            if payload.is_expired():
+                await self._expire_websocket_session(websocket)
+        # Authority-sensitive event names are invalidations, not proof.
+        # Clients must refresh the canonical dashboard snapshot before
+        # presenting network/module activity, progress, completion, findings,
+        # target state, or shell-session state.
+        if event.event_type in {
+            EventType.SCAN_START,
+            EventType.SCAN_COMPLETE,
+            EventType.PHASE_START,
+            EventType.PHASE_COMPLETE,
+            EventType.MODULE_START,
+            EventType.MODULE_PROGRESS,
+            EventType.MODULE_COMPLETE,
+            EventType.MODULE_FAIL,
+            EventType.MODULE_SKIP,
+            EventType.REQUEST_SENT,
+            EventType.REQUEST_ERROR,
+            EventType.WAF_BLOCK,
+            EventType.RATE_LIMIT_HIT,
+            EventType.TARGET_DISCOVERED,
+            EventType.TARGET_PWNED,
+            EventType.SHELL_SESSION,
+            EventType.BRAIN_VERDICT,
+            EventType.CHAIN_ACTION_NEW,
+        }:
+            return
+        if event.event_type in {EventType.FINDING_NEW, EventType.FINDING_UPDATED}:
+            # Finding and retest events are invalidations only. Generic clients
+            # must refresh the canonical finding snapshot before presenting
+            # title, severity, proof, workflow status, or retest verdict.
+            return
         if not self._ws_clients:
             return
         event_tenant = event.data.get("tenant_id")
@@ -7536,8 +7747,10 @@ class DashboardServer:
     def _terminate_active_scans(self, status: str = "stopped") -> list[str]:
         """Cancel durable jobs through full persisted child identity only."""
 
+        deadline = time.monotonic() + 5.75
         service = self._durable_job_state()
         canceled: list[str] = []
+        quiescence_ids: list[str] = []
         scan_ids = sorted(
             {
                 self._base_scan_id(key)
@@ -7552,6 +7765,11 @@ class DashboardServer:
                 )
                 continue
             try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DashboardArtifactError(
+                        "aggregate scan cancellation deadline exhausted"
+                    )
                 job = service.cancel_job(
                     scan_id,
                     tenant_id=self.tenant_id,
@@ -7562,7 +7780,7 @@ class DashboardServer:
                     ),
                     reason=f"operator {status}",
                     supervisor=self._job_process_supervisor,
-                    sla_seconds=5.0,
+                    sla_seconds=min(5.0, remaining),
                 )
             except (InvalidTransition, LeaseError, KeyError) as exc:
                 log.warning(
@@ -7575,7 +7793,17 @@ class DashboardServer:
                 if self._base_scan_id(key) == scan_id:
                     info["status"] = job["state"]
                     canceled.append(key)
+            quiescence_ids.append(scan_id)
             self._sync_scan_job_from_active(scan_id)
+        for scan_id in quiescence_ids:
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self._wait_for_scan_monitors(
+                scan_id,
+                timeout_seconds=remaining,
+            ):
+                raise DashboardArtifactError(
+                    "scan monitor did not quiesce after durable cancellation"
+                )
         return canceled
 
     # ── Scan History (lightweight JSON store) ─────────────────────────
@@ -10969,14 +11197,10 @@ class DashboardServer:
             proc = info.get("proc")
             if intent is None or proc is None:
                 raise ProcessIdentityError("dashboard child launch intent is missing")
-            identity = self._job_process_supervisor.capture(
+            identity = self._capture_durable_process_identity(
                 proc,
                 launch_nonce=str(intent["launch_nonce"]),
             )
-            if identity is None:
-                raise ProcessIdentityError(
-                    "dashboard child process identity could not be captured"
-                )
             service.register_process(
                 scan_id,
                 str(attempt["id"]),
@@ -11019,6 +11243,33 @@ class DashboardServer:
             worker_id="dashboard",
         )
         self._write_control_file(control_file, paused=False, aborted=False)
+
+    def _capture_durable_process_identity(
+        self,
+        process: subprocess.Popen[str],
+        *,
+        launch_nonce: str,
+    ) -> ProcessIdentity:
+        """Wait briefly for the exact nonce-bound child identity to become readable."""
+
+        deadline = time.monotonic() + _PROCESS_IDENTITY_CAPTURE_TIMEOUT_SECONDS
+        while True:
+            identity = self._job_process_supervisor.capture(
+                process,
+                launch_nonce=launch_nonce,
+            )
+            if identity is not None:
+                return identity
+            if process.poll() is not None:
+                raise ProcessIdentityError(
+                    "dashboard child exited before its process identity was captured"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ProcessIdentityError(
+                    "dashboard child process identity could not be captured"
+                )
+            time.sleep(min(_PROCESS_IDENTITY_CAPTURE_POLL_SECONDS, remaining))
 
     def _abort_durable_scan_launch(
         self,
